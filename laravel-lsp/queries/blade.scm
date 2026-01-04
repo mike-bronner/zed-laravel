@@ -139,3 +139,18 @@
 (self_closing_tag
   (tag_name) @slot_tag
   (#match? @slot_tag "^x-slot:"))
+
+; ============================================================================
+; Pattern 8: Blade directives used as HTML attributes
+; ============================================================================
+; Matches: <div @if($show) class="visible" @endif>
+;          <button @disabled($isDisabled)>
+;          <input @checked($isChecked) @readonly($isReadonly)>
+;
+; When Blade directives appear inside HTML tag brackets (between < and >),
+; the tree-sitter-blade grammar parses them as attribute_name nodes.
+; We capture these to extract the directive and its arguments.
+
+(attribute
+  (attribute_name) @directive_attribute
+  (#match? @directive_attribute "^@"))

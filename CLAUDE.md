@@ -184,6 +184,24 @@ The LSP uses a dedicated thread for Salsa incremental computation to avoid lifet
 - **Fallback pattern**: Use Salsa cache first, fall back to direct computation if unavailable
 - **Priority merging**: Framework=0, Package=1, App=2 (higher wins)
 
+### Position Indexing Convention
+
+All positions are **0-based** throughout the stack:
+- Tree-sitter `Point`: row/column are 0-based
+- LSP `Position`: line/character are 0-based
+- All match structs: row/column/end_column are 0-based
+
+**Key fields in match structs:**
+
+| Field | Points to |
+|-------|-----------|
+| `column` | Start of entire pattern (e.g., `@` in `@include`) |
+| `end_column` | End of entire pattern (e.g., after `)` in `@include('x')`) |
+| `string_column` | Start of **content** inside quotes (first char after quote) |
+| `string_end_column` | End of content (position one past last char, before closing quote) |
+
+**Rule**: Never manually calculate string positions in `main.rs`. Use `string_column`/`string_end_column` from Salsa.
+
 ### Cache Invalidation Architecture (CRITICAL)
 
 **All file-derived features MUST use Salsa incremental computation:**

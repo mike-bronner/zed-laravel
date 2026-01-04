@@ -262,6 +262,10 @@ pub struct DirectiveReference<'db> {
     pub line: u32,
     pub column: u32,
     pub end_column: u32,
+    /// Column of first character INSIDE the quoted string (after opening quote)
+    pub string_column: u32,
+    /// Column one past the last character INSIDE the quoted string (before closing quote)
+    pub string_end_column: u32,
 }
 
 /// A parsed env reference found in code
@@ -700,6 +704,8 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         dir.row as u32,
                         dir.column as u32,
                         full_end_column as u32,
+                        dir.string_column as u32,
+                        dir.string_end_column as u32,
                     ));
                 }
 
@@ -1539,6 +1545,10 @@ pub struct DirectiveReferenceData {
     pub line: u32,
     pub column: u32,
     pub end_column: u32,
+    /// Column of first character INSIDE the quoted string (after opening quote)
+    pub string_column: u32,
+    /// Column one past the last character INSIDE the quoted string (before closing quote)
+    pub string_end_column: u32,
 }
 
 /// Env reference data for transfer across async boundaries
@@ -3362,6 +3372,8 @@ impl SalsaActor {
                     line: d.line(&self.db),
                     column: d.column(&self.db),
                     end_column: d.end_column(&self.db),
+                    string_column: d.string_column(&self.db),
+                    string_end_column: d.string_end_column(&self.db),
                 })
             })
             .collect();

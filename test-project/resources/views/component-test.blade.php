@@ -88,6 +88,39 @@
 
         {{--
         ============================================================================
+        Blade Directives & Brackets Inside HTML Attributes
+        ============================================================================
+
+        TEST: Directives and echo statements inside HTML tag attributes should work.
+        Cmd+Click on config('app.name') inside the value attribute should navigate.
+        @feature directive inside attributes should also be recognized.
+        --}}
+
+        {{-- Echo statements in attributes --}}
+        <input type="text" value="{{ config('app.name') }}" placeholder="{{ __('messages.placeholder') }}">
+
+        {{-- Directives in attributes --}}
+        <div class="container @if($active) bg-blue-500 @endif" data-env="{{ env('APP_ENV') }}">
+            Content with conditional classes
+        </div>
+
+        {{-- @class directive (common Blade pattern) --}}
+        <button @class(['btn', 'btn-primary' => $isPrimary, 'btn-disabled' => $disabled])>
+            Styled Button
+        </button>
+
+        {{-- Feature flag in attribute values --}}
+        <div class="@if (Feature::active('new-design')) new-design @else old-design @endif">
+            Feature-flagged styling
+        </div>
+
+        {{-- @feature directive in attribute values --}}
+        <div class="@feature ('news') beta-badge @endfeature">
+            Beta content
+        </div>
+@fe
+        {{--
+        ============================================================================
         Expected Behavior:
         ============================================================================
 

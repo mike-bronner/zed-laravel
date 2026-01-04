@@ -448,6 +448,315 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
     features
 }
 
+/// Information about a discovered Blade directive
+#[derive(Debug, Clone)]
+struct BladeDirectiveInfo {
+    /// The directive name (e.g., "if", "foreach", "feature")
+    pub name: String,
+    /// Description of the directive
+    pub description: String,
+    /// Whether the directive accepts parameters
+    pub has_params: bool,
+    /// The closing directive name if this is a block directive (e.g., "endif" for "if")
+    pub closing: Option<String>,
+    /// Source of the directive: "laravel", "app", or package name
+    pub source: String,
+}
+
+/// Scan Laravel's BladeCompiler traits for built-in directives
+fn scan_laravel_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+    use regex::Regex;
+
+    let mut directives = Vec::new();
+
+    // Path to Laravel's Blade compiler concerns (traits)
+    let concerns_dir = project_root
+        .join("vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns");
+
+    if !concerns_dir.exists() {
+        // Fallback: return minimal core directives
+        return get_fallback_blade_directives();
+    }
+
+    // Regex to match compile* methods: protected function compileIf($expression)
+    let compile_method_re = Regex::new(r"protected\s+function\s+compile([A-Z][a-zA-Z]*)\s*\(").unwrap();
+
+    // Scan all PHP files in the Concerns directory
+    for entry in WalkDir::new(&concerns_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+    {
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            for cap in compile_method_re.captures_iter(&content) {
+                if let Some(name_match) = cap.get(1) {
+                    let method_name = name_match.as_str();
+                    // Convert CamelCase to lowercase directive name
+                    let directive_name = camel_to_directive(method_name);
+
+                    // Skip "end" prefixed directives - they're closings, not standalone
+                    if directive_name.starts_with("end") {
+                        continue;
+                    }
+                    // Skip "else" variants - they're part of other directives
+                    if directive_name.starts_with("else") && directive_name != "else" {
+                        continue;
+                    }
+
+                    // Determine if it has a closing directive
+                    let closing = find_closing_directive(&directive_name, &content);
+
+                    // Check if it has parameters (look for $expression in method signature)
+                    let has_params = content.contains(&format!("compile{}($", method_name)) ||
+                                    content.contains(&format!("compile{}( $", method_name));
+
+                    // Generate description from trait file name
+                    let source_file = entry.path().file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    let description = generate_directive_description(&directive_name, source_file);
+
+                    directives.push(BladeDirectiveInfo {
+                        name: directive_name,
+                        description,
+                        has_params,
+                        closing,
+                        source: "laravel".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Remove duplicates (some directives might appear multiple times)
+    directives.sort_by(|a, b| a.name.cmp(&b.name));
+    directives.dedup_by(|a, b| a.name == b.name);
+
+    // If we found nothing, return fallback
+    if directives.is_empty() {
+        return get_fallback_blade_directives();
+    }
+
+    directives
+}
+
+/// Convert CamelCase method name to lowercase directive name
+fn camel_to_directive(name: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if i > 0 && c.is_uppercase() {
+            // Don't add underscore, just lowercase
+        }
+        result.push(c.to_ascii_lowercase());
+    }
+    result
+}
+
+/// Find if a directive has a closing directive
+fn find_closing_directive(directive: &str, content: &str) -> Option<String> {
+    // Look for compileEnd{Directive} method
+    let pascal = directive.chars().next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default() + &directive[1..];
+
+    let end_method = format!("compileEnd{}", pascal);
+    if content.contains(&end_method) {
+        return Some(format!("end{}", directive));
+    }
+
+    // Special cases
+    match directive {
+        "if" => Some("endif".into()),
+        "unless" => Some("endunless".into()),
+        "foreach" => Some("endforeach".into()),
+        "forelse" => Some("endforelse".into()),
+        "for" => Some("endfor".into()),
+        "while" => Some("endwhile".into()),
+        "switch" => Some("endswitch".into()),
+        "section" => Some("endsection".into()),
+        "push" => Some("endpush".into()),
+        "prepend" => Some("endprepend".into()),
+        "php" => Some("endphp".into()),
+        "verbatim" => Some("endverbatim".into()),
+        "component" => Some("endcomponent".into()),
+        "slot" => Some("endslot".into()),
+        "once" => Some("endonce".into()),
+        "auth" => Some("endauth".into()),
+        "guest" => Some("endguest".into()),
+        "can" => Some("endcan".into()),
+        "cannot" => Some("endcannot".into()),
+        "canany" => Some("endcanany".into()),
+        "env" => Some("endenv".into()),
+        "production" => Some("endproduction".into()),
+        "error" => Some("enderror".into()),
+        "isset" => Some("endisset".into()),
+        "empty" => Some("endempty".into()),
+        "fragment" => Some("endfragment".into()),
+        "session" => Some("endsession".into()),
+        "persist" => Some("endpersist".into()),
+        "teleport" => Some("endteleport".into()),
+        _ => None,
+    }
+}
+
+/// Generate a description for a directive based on its name and source file
+fn generate_directive_description(directive: &str, source_file: &str) -> String {
+    // Map source files to categories
+    let category = match source_file {
+        "CompilesConditionals" => "Conditional",
+        "CompilesLoops" => "Loop",
+        "CompilesIncludes" => "Include",
+        "CompilesComponents" => "Component",
+        "CompilesLayouts" => "Layout",
+        "CompilesStacks" => "Stack",
+        "CompilesAuthorizations" => "Authorization",
+        "CompilesErrors" => "Validation",
+        "CompilesFragments" => "Fragment",
+        "CompilesTranslations" => "Translation",
+        "CompilesSessions" => "Session",
+        "CompilesClasses" => "CSS Class",
+        "CompilesStyles" => "Style",
+        _ => "Blade",
+    };
+
+    format!("{} directive", category)
+}
+
+/// Scan for custom Blade directives registered via Blade::directive()
+fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+    use regex::Regex;
+
+    let mut directives = Vec::new();
+
+    // Regex to match Blade::directive('name', ...) or $blade->directive('name', ...)
+    let directive_re = Regex::new(r#"(?:Blade::|->)directive\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]"#).unwrap();
+
+    // Scan app service providers
+    let app_providers = project_root.join("app/Providers");
+    if app_providers.exists() {
+        scan_directory_for_directives(&app_providers, &directive_re, "app", &mut directives);
+    }
+
+    // Scan vendor packages for service providers
+    let vendor_dir = project_root.join("vendor");
+    if vendor_dir.exists() {
+        // Look for common packages that register directives
+        let packages_to_scan = [
+            ("laravel/framework", "laravel"),
+            ("livewire/livewire", "livewire"),
+            ("laravel/pennant", "pennant"),
+            ("spatie/laravel-permission", "spatie/permission"),
+            ("spatie/laravel-html", "spatie/html"),
+        ];
+
+        for (package, source) in packages_to_scan {
+            let package_path = vendor_dir.join(package);
+            if package_path.exists() {
+                // Look for service providers
+                for entry in WalkDir::new(&package_path)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path().extension().map_or(false, |ext| ext == "php") &&
+                        e.path().to_string_lossy().contains("ServiceProvider")
+                    })
+                {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        for cap in directive_re.captures_iter(&content) {
+                            if let Some(name) = cap.get(1) {
+                                directives.push(BladeDirectiveInfo {
+                                    name: name.as_str().to_string(),
+                                    description: format!("Custom directive from {}", source),
+                                    has_params: true, // Assume custom directives have params
+                                    closing: None,    // Custom directives are typically inline
+                                    source: source.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    directives
+}
+
+/// Helper to scan a directory for Blade::directive() calls
+fn scan_directory_for_directives(
+    dir: &Path,
+    re: &regex::Regex,
+    source: &str,
+    directives: &mut Vec<BladeDirectiveInfo>,
+) {
+    for entry in WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+    {
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            for cap in re.captures_iter(&content) {
+                if let Some(name) = cap.get(1) {
+                    directives.push(BladeDirectiveInfo {
+                        name: name.as_str().to_string(),
+                        description: format!("Custom directive from {}", source),
+                        has_params: true,
+                        closing: None,
+                        source: source.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Get all Blade directives (Laravel built-in + custom)
+fn get_all_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
+    let mut all_directives = scan_laravel_blade_directives(project_root);
+    let custom_directives = scan_custom_blade_directives(project_root);
+
+    // Add custom directives, avoiding duplicates
+    for custom in custom_directives {
+        if !all_directives.iter().any(|d| d.name == custom.name) {
+            all_directives.push(custom);
+        }
+    }
+
+    // Sort by name for consistent ordering
+    all_directives.sort_by(|a, b| a.name.cmp(&b.name));
+
+    all_directives
+}
+
+/// Fallback list of core Blade directives when Laravel framework isn't found
+fn get_fallback_blade_directives() -> Vec<BladeDirectiveInfo> {
+    vec![
+        BladeDirectiveInfo { name: "if".into(), description: "Conditional statement".into(), has_params: true, closing: Some("endif".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "elseif".into(), description: "Else-if branch".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "else".into(), description: "Else branch".into(), has_params: false, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "unless".into(), description: "Negative conditional".into(), has_params: true, closing: Some("endunless".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "foreach".into(), description: "Loop through collection".into(), has_params: true, closing: Some("endforeach".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "forelse".into(), description: "Loop with empty fallback".into(), has_params: true, closing: Some("endforelse".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "for".into(), description: "For loop".into(), has_params: true, closing: Some("endfor".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "while".into(), description: "While loop".into(), has_params: true, closing: Some("endwhile".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "include".into(), description: "Include a view".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "extends".into(), description: "Extend a layout".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "section".into(), description: "Define section content".into(), has_params: true, closing: Some("endsection".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "yield".into(), description: "Yield section content".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "csrf".into(), description: "CSRF token field".into(), has_params: false, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "method".into(), description: "HTTP method field".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "auth".into(), description: "Authenticated user block".into(), has_params: true, closing: Some("endauth".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "guest".into(), description: "Guest user block".into(), has_params: true, closing: Some("endguest".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "php".into(), description: "Raw PHP block".into(), has_params: false, closing: Some("endphp".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "vite".into(), description: "Vite asset".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "props".into(), description: "Component props".into(), has_params: true, closing: None, source: "laravel".into() },
+        BladeDirectiveInfo { name: "slot".into(), description: "Component slot".into(), has_params: true, closing: Some("endslot".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "component".into(), description: "Render component".into(), has_params: true, closing: Some("endcomponent".into()), source: "laravel".into() },
+        BladeDirectiveInfo { name: "livewire".into(), description: "Livewire component".into(), has_params: true, closing: None, source: "livewire".into() },
+        BladeDirectiveInfo { name: "feature".into(), description: "Laravel Pennant feature flag".into(), has_params: true, closing: Some("endfeature".into()), source: "pennant".into() },
+    ]
+}
+
 /// Laravel's built-in validation rules
 /// Reference: https://laravel.com/docs/12.x/validation#available-validation-rules
 fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
@@ -633,88 +942,8 @@ struct LaravelLanguageServer {
 /// Default Salsa debounce delay in milliseconds
 const DEFAULT_SALSA_DEBOUNCE_MS: u64 = 200;
 
-/// Built-in Laravel Blade directives for autocomplete
-/// Each entry: (name, description, has_params, closing_directive)
-const BLADE_DIRECTIVES: &[(&str, &str, bool, Option<&str>)] = &[
-    // Control structures
-    ("if", "Conditional statement", true, Some("endif")),
-    ("elseif", "Else-if branch", true, None),
-    ("else", "Else branch", false, None),
-    ("unless", "Negative conditional", true, Some("endunless")),
-    ("isset", "Check if variable is set", true, Some("endisset")),
-    ("empty", "Check if variable is empty", true, Some("endempty")),
-    ("switch", "Switch statement", true, Some("endswitch")),
-    ("case", "Switch case", true, None),
-    ("default", "Switch default case", false, None),
-    // Loops
-    ("foreach", "Loop through collection", true, Some("endforeach")),
-    ("forelse", "Loop with empty fallback", true, Some("endforelse")),
-    ("for", "For loop", true, Some("endfor")),
-    ("while", "While loop", true, Some("endwhile")),
-    ("continue", "Continue to next iteration", true, None),
-    ("break", "Break out of loop", true, None),
-    // Includes & Components
-    ("include", "Include a view", true, None),
-    ("includeIf", "Include if view exists", true, None),
-    ("includeWhen", "Include conditionally", true, None),
-    ("includeUnless", "Include unless condition", true, None),
-    ("includeFirst", "Include first existing view", true, None),
-    ("each", "Render view for each item", true, None),
-    ("component", "Render component", true, Some("endcomponent")),
-    ("slot", "Define component slot", true, Some("endslot")),
-    // Layouts
-    ("extends", "Extend a layout", true, None),
-    ("section", "Define section content", true, Some("endsection")),
-    ("yield", "Yield section content", true, None),
-    ("parent", "Include parent section", false, None),
-    ("show", "Show and yield section", false, None),
-    ("hasSection", "Check if section exists", true, None),
-    ("sectionMissing", "Check if section is missing", true, None),
-    ("stack", "Render pushed content", true, None),
-    ("push", "Push to stack", true, Some("endpush")),
-    ("pushOnce", "Push once to stack", true, Some("endPushOnce")),
-    ("prepend", "Prepend to stack", true, Some("endprepend")),
-    ("prependOnce", "Prepend once to stack", true, Some("endPrependOnce")),
-    // Authentication & Authorization
-    ("auth", "Authenticated user block", true, Some("endauth")),
-    ("guest", "Guest user block", true, Some("endguest")),
-    ("can", "Authorization check", true, Some("endcan")),
-    ("cannot", "Negative authorization", true, Some("endcannot")),
-    ("canany", "Any permission check", true, Some("endcanany")),
-    // Environment
-    ("env", "Environment check", true, Some("endenv")),
-    ("production", "Production environment", false, Some("endproduction")),
-    // Forms & CSRF
-    ("csrf", "CSRF token field", false, None),
-    ("method", "HTTP method field", true, None),
-    ("error", "Validation error", true, Some("enderror")),
-    // Assets
-    ("vite", "Vite asset", true, None),
-    // PHP
-    ("php", "Raw PHP block", false, Some("endphp")),
-    // Other
-    ("verbatim", "Escape Blade syntax", false, Some("endverbatim")),
-    ("json", "JSON encode variable", true, None),
-    ("js", "JavaScript variable", true, None),
-    ("class", "Conditional CSS classes", true, None),
-    ("style", "Conditional inline styles", true, None),
-    ("checked", "Checked attribute helper", true, None),
-    ("selected", "Selected attribute helper", true, None),
-    ("disabled", "Disabled attribute helper", true, None),
-    ("readonly", "Readonly attribute helper", true, None),
-    ("required", "Required attribute helper", true, None),
-    ("once", "Render once", false, Some("endonce")),
-    ("props", "Component props", true, None),
-    ("aware", "Component aware props", true, None),
-    ("fragment", "Fragment for Livewire/htmx", true, Some("endfragment")),
-    ("session", "Session check", true, Some("endsession")),
-    // Livewire
-    ("livewire", "Livewire component", true, None),
-    ("livewireStyles", "Livewire styles", false, None),
-    ("livewireScripts", "Livewire scripts", false, None),
-    ("persist", "Persist Livewire state", true, Some("endpersist")),
-    ("teleport", "Teleport content", true, Some("endteleport")),
-];
+// NOTE: Blade directives are now dynamically discovered via get_all_blade_directives()
+// which scans the Laravel framework, app service providers, and packages.
 
 /// Blade-specific settings
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { "blade": { ... } } } } }
@@ -1530,6 +1759,88 @@ impl LaravelLanguageServer {
             info!("⚙️  Updating directive spacing: {} → {}", old_spacing, new_spacing);
             *self.directive_spacing.write().await = new_spacing;
         }
+    }
+
+    /// Extract Blade directive tokens for semantic highlighting
+    ///
+    /// Finds all `@directive` patterns in the content and converts them to
+    /// LSP semantic tokens with delta encoding. Each token is marked as KEYWORD
+    /// type (index 0 in our legend).
+    ///
+    /// The delta encoding format is:
+    /// - delta_line: lines since previous token
+    /// - delta_start: characters since previous token (or start of line if new line)
+    /// - length: token length in characters
+    /// - token_type: 0 for KEYWORD
+    /// - token_modifiers: 0 (no modifiers)
+    fn extract_blade_directive_tokens(&self, content: &str) -> Vec<SemanticToken> {
+        use regex::Regex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            // Match Blade directives: @if, @foreach, @feature, @customDirective, etc.
+            // Also matches @end... directives
+            static ref DIRECTIVE_RE: Regex = Regex::new(r"@[a-zA-Z]+").unwrap();
+        }
+
+        // First pass: collect all directive positions with line/column
+        let mut directives: Vec<(u32, u32, u32)> = Vec::new(); // (line, col, length)
+
+        // Build a line/column map by scanning through the content
+        let bytes = content.as_bytes();
+        let mut line_starts: Vec<usize> = vec![0]; // byte offset of each line start
+
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
+
+        // Find all directive matches
+        for mat in DIRECTIVE_RE.find_iter(content) {
+            let start_byte = mat.start();
+            let length = mat.len() as u32;
+
+            // Find which line this byte offset is on
+            let line = line_starts
+                .iter()
+                .position(|&start| start > start_byte)
+                .map(|i| i - 1)
+                .unwrap_or(line_starts.len() - 1) as u32;
+
+            // Calculate column (character offset from line start)
+            let line_start_byte = line_starts[line as usize];
+            let col = (start_byte - line_start_byte) as u32;
+
+            directives.push((line, col, length));
+        }
+
+        // Second pass: convert to delta-encoded semantic tokens
+        let mut tokens: Vec<SemanticToken> = Vec::new();
+        let mut prev_line: u32 = 0;
+        let mut prev_col: u32 = 0;
+
+        for (line, col, length) in directives {
+            let delta_line = line - prev_line;
+            let delta_start = if delta_line == 0 {
+                col - prev_col
+            } else {
+                col // Reset to absolute column on new line
+            };
+
+            tokens.push(SemanticToken {
+                delta_line,
+                delta_start,
+                length,
+                token_type: 0,       // KEYWORD (index 0 in our legend)
+                token_modifiers_bitset: 0,
+            });
+
+            prev_line = line;
+            prev_col = col;
+        }
+
+        tokens
     }
 
     /// Register config files with Salsa for incremental computation
@@ -3798,7 +4109,9 @@ impl LaravelLanguageServer {
 
         // Pattern: (pattern_string, quote_char, pattern_length)
         let patterns: Vec<(&str, char, usize)> = vec![
-            // Blade @feature directive
+            // Blade @feature directive (with optional space before paren)
+            ("@feature ('", '\'', 11),
+            ("@feature (\"", '"', 11),
             ("@feature('", '\'', 10),
             ("@feature(\"", '"', 10),
             // Direct Feature:: calls
@@ -10125,15 +10438,17 @@ return [
                             let feature_path = root.join(format!("app/Features/{}.php", class_name));
 
                             if !feature_path.exists() {
+                                // Use pre-calculated string_column/string_end_column from Salsa
+                                // These point to the content INSIDE the quotes (the feature name)
                                 let diagnostic = Diagnostic {
                                     range: Range {
                                         start: Position {
                                             line: dir_ref.line,
-                                            character: dir_ref.column,
+                                            character: dir_ref.string_column,
                                         },
                                         end: Position {
                                             line: dir_ref.line,
-                                            character: dir_ref.end_column,
+                                            character: dir_ref.string_end_column,
                                         },
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
@@ -10363,6 +10678,25 @@ impl LanguageServer for LaravelLanguageServer {
                     first_trigger_character: "{".to_string(),
                     more_trigger_character: Some(vec!["!".to_string(), "-".to_string()]),
                 }),
+
+                // ✅ Semantic tokens for dynamic Blade directive highlighting
+                // Provides real-time highlighting that updates on every keystroke,
+                // overriding tree-sitter's incremental parsing which can leave stale highlights
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: vec![
+                                    SemanticTokenType::KEYWORD,  // index 0 - @directive
+                                ],
+                                token_modifiers: vec![],
+                            },
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            ..Default::default()
+                        }
+                    )
+                ),
 
                 ..Default::default()
             },
@@ -10922,34 +11256,43 @@ impl LanguageServer for LaravelLanguageServer {
                     let use_spacing = *self.directive_spacing.read().await;
                     let paren = if use_spacing { " (" } else { "(" };
 
+                    // Get discovered directives (from framework + app + packages)
+                    let directives = {
+                        let root_guard = self.root_path.read().await;
+                        match root_guard.as_ref() {
+                            Some(root) => get_all_blade_directives(root),
+                            None => get_fallback_blade_directives(),
+                        }
+                    };
+
                     let prefix_lower = directive_prefix.to_lowercase();
-                    let items: Vec<CompletionItem> = BLADE_DIRECTIVES
+                    let items: Vec<CompletionItem> = directives
                         .iter()
-                        .filter(|(name, _, _, _)| name.to_lowercase().starts_with(&prefix_lower))
-                        .map(|(name, description, has_params, closing)| {
+                        .filter(|d| d.name.to_lowercase().starts_with(&prefix_lower))
+                        .map(|d| {
                             // Build snippet based on params and closing directive
                             // Use configured spacing: @if($1) or @if ($1)
-                            let insert_text = match (has_params, closing) {
+                            let insert_text = match (d.has_params, &d.closing) {
                                 // Block directive with params: @if($1)\n\t$0\n@endif
-                                (true, Some(end)) => format!("{}{}$1)\n\t$0\n@{}", name, paren, end),
+                                (true, Some(end)) => format!("{}{}$1)\n\t$0\n@{}", d.name, paren, end),
                                 // Block directive without params: @php\n\t$0\n@endphp
-                                (false, Some(end)) => format!("{}\n\t$0\n@{}", name, end),
+                                (false, Some(end)) => format!("{}\n\t$0\n@{}", d.name, end),
                                 // Inline directive with params: @include($1)$0
-                                (true, None) => format!("{}{}$1)$0", name, paren),
+                                (true, None) => format!("{}{}$1)$0", d.name, paren),
                                 // Inline directive without params: @csrf
-                                (false, None) => name.to_string(),
+                                (false, None) => d.name.clone(),
                             };
 
-                            let label = if closing.is_some() {
-                                format!("@{}...@{}", name, closing.unwrap())
+                            let label = if let Some(ref end) = d.closing {
+                                format!("@{}...@{}", d.name, end)
                             } else {
-                                format!("@{}", name)
+                                format!("@{}", d.name)
                             };
 
                             CompletionItem {
                                 label,
                                 kind: Some(CompletionItemKind::KEYWORD),
-                                detail: Some(description.to_string()),
+                                detail: Some(format!("{} ({})", d.description, d.source)),
                                 insert_text: Some(insert_text),
                                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                                 documentation: None,
@@ -11499,15 +11842,24 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for feature context (Laravel Pennant)
+            info!("   🔍 Checking feature context for line: '{}'", line_text);
             if let Some(feature_prefix) = Self::get_feature_call_context(line_text, position.character) {
-                debug!("   Feature context, filter prefix: '{}'", feature_prefix);
+                info!("   ✅ Feature context detected, filter prefix: '{}'", feature_prefix);
 
                 // Get project root
                 let features = {
                     let root_guard = self.root_path.read().await;
                     match root_guard.as_ref() {
-                        Some(root) => scan_feature_classes(root),
-                        None => Vec::new(),
+                        Some(root) => {
+                            info!("   📁 Scanning for features in: {:?}", root);
+                            let found = scan_feature_classes(root);
+                            info!("   📋 Found {} feature classes", found.len());
+                            found
+                        },
+                        None => {
+                            info!("   ⚠️ No root path available");
+                            Vec::new()
+                        }
                     }
                 };
 
@@ -11824,6 +12176,48 @@ impl LanguageServer for LaravelLanguageServer {
                 items,
             })))
         }
+    }
+
+    /// Provides semantic tokens for Blade directive highlighting
+    ///
+    /// This overrides tree-sitter's incremental parsing which can leave stale highlights
+    /// when editing directives (e.g., changing @feature to @featured). The LSP semantic
+    /// tokens are re-requested on every change, providing instant highlight updates.
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        let path = uri.path();
+
+        // Only process Blade files
+        if !path.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        info!("🎨 semantic_tokens_full called for {}", uri);
+
+        // Get document content from cache
+        let content = {
+            let docs = self.documents.read().await;
+            match docs.get(uri) {
+                Some((text, _)) => text.clone(),
+                None => {
+                    debug!("   Document not found in cache");
+                    return Ok(None);
+                }
+            }
+        };
+
+        // Extract directive tokens
+        let tokens = self.extract_blade_directive_tokens(&content);
+
+        info!("   Found {} directive tokens", tokens.len());
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: tokens,
+        })))
     }
 }
 

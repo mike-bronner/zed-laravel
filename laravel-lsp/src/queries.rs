@@ -730,6 +730,9 @@ pub fn extract_all_blade_patterns<'a>(
 
             // Directive patterns
             "directive" => {
+                // Trim whitespace - directives inside HTML attributes may have leading spaces
+                let text = text.trim();
+
                 // Skip closing directives
                 if text.starts_with("@end") {
                     continue;
@@ -737,26 +740,27 @@ pub fn extract_all_blade_patterns<'a>(
 
                 if !text.starts_with('@') {
                     warn!("Directive text doesn't start with @: '{}'", text);
+                    continue;
                 }
 
                 let directive_name = text.strip_prefix('@').unwrap_or(text);
 
-                // Look for parameter sibling
-                let arguments = find_next_parameter_sibling(node, source_bytes);
+                // Look for parameter sibling - returns both text and column position
+                let param_info = find_next_parameter_sibling(node, source_bytes);
 
-                let full_text = if let Some(param) = arguments {
-                    format!("{}{}", text, param)
-                } else {
-                    text.to_string()
+                let (arguments, full_text) = match &param_info {
+                    Some(info) => (Some(info.text), format!("{}{}", text, info.text)),
+                    None => (None, text.to_string()),
                 };
 
                 let directive_column = start_pos.column;
                 let directive_end_column = end_pos.column;
 
-                // Calculate string column positions for view-referencing and translation directives
-                let (string_column, string_end_column) = match (directive_name, &arguments) {
-                    ("extends" | "include" | "slot" | "component" | "lang", Some(args)) => {
-                        calculate_string_column_range(directive_column, directive_name, args)
+                // Calculate string column positions for view-referencing, translation, and feature directives
+                // Use the actual parameter column from tree-sitter for accurate positioning
+                let (string_column, string_end_column) = match (directive_name, &param_info) {
+                    ("extends" | "include" | "slot" | "component" | "lang" | "feature", Some(info)) => {
+                        calculate_string_column_range(info.column, info.text)
                             .unwrap_or((directive_column, directive_end_column))
                     }
                     _ => (directive_column, directive_end_column),
@@ -798,6 +802,65 @@ pub fn extract_all_blade_patterns<'a>(
                     row: start_pos.row,
                     column: start_pos.column,
                     end_column: end_pos.column,
+                });
+            }
+
+            // Blade directives used as HTML attributes (e.g., @if($show), @disabled($x))
+            "directive_attribute" => {
+                let text = text.trim();
+
+                // Skip closing directives like @endif
+                if text.starts_with("@end") {
+                    continue;
+                }
+
+                if !text.starts_with('@') {
+                    warn!("Directive attribute doesn't start with @: '{}'", text);
+                    continue;
+                }
+
+                // Parse directive name and arguments from attribute_name like "@if($showClass)"
+                // The text includes both the directive name and arguments
+                let after_at = &text[1..]; // Remove leading @
+
+                // Find the opening parenthesis to split name and args
+                // Also track paren_pos for accurate string position calculation
+                let (directive_name, arguments, paren_pos) = if let Some(pos) = after_at.find('(') {
+                    let name = &after_at[..pos];
+                    let args = &after_at[pos..];
+                    (name, Some(args), Some(pos))
+                } else {
+                    // No parentheses - directive without arguments (e.g., @endif as attribute)
+                    (after_at, None, None)
+                };
+
+                let full_text = text.to_string();
+                let directive_column = start_pos.column;
+                let directive_end_column = end_pos.column;
+
+                // Calculate string column positions for view-referencing directives
+                // For directive_attribute, calculate parameter column from paren position
+                let (string_column, string_end_column) = match (directive_name, &arguments, paren_pos) {
+                    ("extends" | "include" | "slot" | "component" | "lang" | "feature", Some(args), Some(pos)) => {
+                        // Parameter column = directive_column + @ + paren_pos
+                        let parameter_column = directive_column + 1 + pos;
+                        calculate_string_column_range(parameter_column, args)
+                            .unwrap_or((directive_column, directive_end_column))
+                    }
+                    _ => (directive_column, directive_end_column),
+                };
+
+                result.directives.push(DirectiveMatch {
+                    directive_name,
+                    full_text,
+                    arguments,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: directive_column,
+                    end_column: directive_end_column,
+                    string_column,
+                    string_end_column,
                 });
             }
 
@@ -872,18 +935,29 @@ fn check_has_fallback_argument(node: tree_sitter::Node) -> bool {
     false
 }
 
+/// Parameter info extracted from tree-sitter node
+struct ParameterInfo<'a> {
+    /// The text content of the parameter (e.g., "('beta-mode')")
+    text: &'a str,
+    /// The column where the parameter starts (position of '(' or first quote)
+    column: usize,
+}
+
 /// Find the next parameter sibling node after a directive node
+/// Returns both the text and the column position for accurate string position calculation
 fn find_next_parameter_sibling<'a>(
     directive_node: tree_sitter::Node,
     source: &'a [u8],
-) -> Option<&'a str> {
+) -> Option<ParameterInfo<'a>> {
     let parent = directive_node.parent()?;
     let mut cursor = parent.walk();
 
     let mut found_directive = false;
     for child in parent.children(&mut cursor) {
         if found_directive && child.kind() == "parameter" {
-            return child.utf8_text(source).ok();
+            let text = child.utf8_text(source).ok()?;
+            let column = child.start_position().column;
+            return Some(ParameterInfo { text, column });
         }
         if child.id() == directive_node.id() {
             found_directive = true;
@@ -893,26 +967,64 @@ fn find_next_parameter_sibling<'a>(
     None
 }
 
-/// Calculate the column range of the quoted string within a directive's arguments
+/// Calculate the column range of the quoted string content within a directive's arguments.
+///
+/// Returns (string_start, string_end) where:
+/// - string_start: column of the first character INSIDE the quotes (after the opening quote)
+/// - string_end: column one past the last character INSIDE the quotes (before the closing quote)
+///
+/// # Arguments
+/// * `parameter_column` - The column where the parameter node starts (position of '(' from tree-sitter)
+/// * `arguments` - The arguments string, may include parenthesis: `('view')` or just `'view'`
+///
+/// # Examples
+/// For `@include('view')` with parameter at column 8:
+/// - Returns Some((10, 14)) - pointing to "view" content
+///
+/// For `@feature ('beta-mode')` with parameter at column 9:
+/// - Returns Some((11, 20)) - pointing to "beta-mode" content (accounts for space)
 fn calculate_string_column_range(
-    directive_column: usize,
-    directive_name: &str,
+    parameter_column: usize,
     arguments: &str,
 ) -> Option<(usize, usize)> {
-    let directive_len = directive_name.len() + 1; // +1 for the @ symbol
-
     let trimmed = arguments.trim_start();
     let spaces_before = arguments.len() - trimmed.len();
 
-    let quote_char = trimmed.chars().next()?;
+    // Handle args that may or may not include the opening parenthesis
+    // Tree-sitter may capture: ('name') or 'name') or just 'name'
+    //
+    // Key insight: parameter_column from tree-sitter points to where the parameter node STARTS:
+    // - If args include '(': parameter_column points to '('
+    // - If args don't include '(': parameter_column already points past '(' (to the quote)
+    let (paren_offset, content) = if trimmed.starts_with('(') {
+        // Args include '(' - need to skip past it
+        (1, &trimmed[1..])
+    } else {
+        // Args don't include '(' - we're already past it, no offset needed
+        (0, trimmed)
+    };
+
+    // Skip any spaces after the opening paren (inside the arguments)
+    let content_trimmed = content.trim_start();
+    let inner_spaces = content.len() - content_trimmed.len();
+
+    let quote_char = content_trimmed.chars().next()?;
     if quote_char != '\'' && quote_char != '"' {
         return None;
     }
 
-    let closing_quote_pos = trimmed[1..].find(quote_char)?;
+    // Find the closing quote position within the content after the opening quote
+    let closing_quote_pos = content_trimmed[1..].find(quote_char)?;
 
-    let string_start = directive_column + directive_len + 1 + spaces_before;
-    let string_end = string_start + closing_quote_pos + 2;
+    // Calculate position using the actual parameter column from tree-sitter
+    // parameter_column points to where the parameter node starts
+    // + spaces_before (if any leading spaces in args - usually 0)
+    // + paren_offset (1 if we need to skip '(', 0 if already past it)
+    // + inner_spaces (spaces after paren, before quote)
+    // + 1 (for the opening quote)
+    let string_start = parameter_column + spaces_before + paren_offset + inner_spaces + 1;
+    // string_end is one past the last content character (exclusive end)
+    let string_end = string_start + closing_quote_pos;
 
     Some((string_start, string_end))
 }
@@ -1079,6 +1191,71 @@ mod tests {
         assert_eq!(second.directive_name, "feature");
         assert!(second.arguments.as_ref().unwrap().contains("beta-mode"),
             "Second @feature should have 'beta-mode' argument");
+    }
+
+    #[test]
+    fn test_blade_patterns_inside_html_attributes() {
+        // Test that Blade patterns inside HTML tag attributes are recognized
+        // This includes:
+        // 1. Echo statements in attribute values: value="{{ config('app.name') }}"
+        // 2. Directives inside attribute values: class="@if($x) blue @endif"
+        // 3. Directives surrounding attributes: <div @if($show) class="visible" @endif>
+        // 4. Blade attribute directives: @disabled($x), @checked($x), @selected($x)
+        let blade_code = r#"
+<input type="text" value="{{ config('app.name') }}" placeholder="{{ __('messages.placeholder') }}">
+<div class="container @if($active) bg-blue @endif" data-env="{{ env('APP_ENV') }}">
+    Content
+</div>
+<div class="@feature('beta-mode') beta @endfeature">Beta</div>
+<div @if($showClass) class="conditional" @endif data-static="always">
+    Conditional attribute
+</div>
+<button @disabled($isDisabled) @readonly($isReadonly) type="submit">
+    Submit
+</button>
+<input @checked($isChecked) type="checkbox">
+        "#;
+
+        let tree = parse_blade(blade_code).expect("Should parse Blade");
+        let lang = language_blade();
+        let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
+            .expect("Should extract patterns");
+
+        println!("Echo PHP patterns found: {:?}", patterns.echo_php);
+        println!("Directives found: {:?}", patterns.directives.iter().map(|d| format!("{}: {:?}", d.directive_name, d.arguments)).collect::<Vec<_>>());
+
+        // Check that echo statements in attributes are captured
+        let has_config_echo = patterns.echo_php.iter()
+            .any(|e| e.php_content.contains("config('app.name')"));
+        assert!(has_config_echo, "Should find config() in attribute echo: {:?}", patterns.echo_php);
+
+        // Check that directives in attribute values are captured
+        let if_count = patterns.directives.iter()
+            .filter(|d| d.directive_name == "if")
+            .count();
+        // We should find 2 @if directives:
+        // 1. class="container @if($active) bg-blue @endif" (inside attribute value)
+        // 2. <div @if($showClass) class="conditional" @endif> (wrapping attributes)
+        assert!(if_count >= 2, "Should find at least 2 @if directives, found: {}", if_count);
+
+        // Check that @feature in attributes is captured
+        let has_feature_directive = patterns.directives.iter()
+            .any(|d| d.directive_name == "feature");
+        assert!(has_feature_directive, "Should find @feature directive in attribute");
+
+        // Check that Blade attribute directives are captured (@disabled, @checked, @readonly)
+        let has_disabled = patterns.directives.iter()
+            .any(|d| d.directive_name == "disabled");
+        assert!(has_disabled, "Should find @disabled directive: {:?}",
+            patterns.directives.iter().map(|d| &d.directive_name).collect::<Vec<_>>());
+
+        let has_checked = patterns.directives.iter()
+            .any(|d| d.directive_name == "checked");
+        assert!(has_checked, "Should find @checked directive");
+
+        let has_readonly = patterns.directives.iter()
+            .any(|d| d.directive_name == "readonly");
+        assert!(has_readonly, "Should find @readonly directive");
     }
 
     #[test]
@@ -1511,6 +1688,66 @@ mod tests {
             assert_eq!(feature.column, 23, "column should point to first char of feature name");
             assert_eq!(feature.end_column, 30, "end_column should be after last char");
         }
+    }
+
+    #[test]
+    fn test_calculate_string_column_range() {
+        // Test the helper function that calculates string column positions for directives
+        // Now uses parameter_column (where tree-sitter says the parameter node starts)
+        // instead of calculating from directive position.
+
+        // Test 1: Args with full parentheses - @include('view')
+        // Position: 0         1
+        //           0123456789012345678
+        //           @include('view')
+        // parameter_column = 8 (where '(' is), content 'view' at columns 10-14
+        let result = calculate_string_column_range(8, "('view')");
+        assert_eq!(result, Some((10, 14)), "@include('view') - 'view' at columns 10-14");
+
+        // Test 2: Args with double quotes - @feature("beta-mode")
+        // Position: 0         1         2
+        //           012345678901234567890
+        //           @feature("beta-mode")
+        // parameter_column = 8 (where '(' is), content 'beta-mode' at columns 10-19
+        let result = calculate_string_column_range(8, "(\"beta-mode\")");
+        assert_eq!(result, Some((10, 19)), "@feature(\"beta-mode\") - 'beta-mode' at columns 10-19");
+
+        // Test 3: Args without opening paren (tree-sitter captures just the quoted part)
+        // When args don't include '(', parameter_column already points past it
+        // Original: @include('view')
+        // parameter_column = 9 (where quote is), args = 'view') or 'view'
+        // We DON'T add 1 for paren because we're already past it
+        let result = calculate_string_column_range(9, "'view')");
+        assert_eq!(result, Some((10, 14)), "Args without ( - parameter already past paren");
+
+        let result = calculate_string_column_range(9, "'view'");
+        assert_eq!(result, Some((10, 14)), "Args without parens - parameter at quote");
+
+        // Test 4: Directive with space before paren - @feature ('beta-mode')
+        // Position: 0         1         2
+        //           0123456789012345678901
+        //           @feature ('beta-mode')
+        // parameter_column = 9 (where '(' is after the space)
+        // content 'beta-mode' should be at columns 11-20
+        let result = calculate_string_column_range(9, "('beta-mode')");
+        assert_eq!(result, Some((11, 20)), "@feature ('beta-mode') with space - at columns 11-20");
+
+        // Test 5: Indented directive - @include('partial')
+        // Position: 0         1         2         3
+        //           0123456789012345678901234567890123
+        //               @include('partial')
+        // 4 spaces + @include = 12, parameter at column 12
+        let result = calculate_string_column_range(12, "('partial')");
+        assert_eq!(result, Some((14, 21)), "Indented directive at columns 14-21");
+
+        // Test 6: Args with spaces after opening paren
+        // parameter at column 8
+        let result = calculate_string_column_range(8, "(  'view')");
+        assert_eq!(result, Some((12, 16)), "Spaces after ( - at columns 12-16");
+
+        // Test 7: Invalid args (no quotes)
+        let result = calculate_string_column_range(8, "($condition)");
+        assert_eq!(result, None, "Args without quotes should return None");
     }
 
 }

@@ -2,21 +2,52 @@
 //!
 //! Tracks file mtimes to avoid unnecessary rescanning.
 //! Caches middleware, bindings, and component data to disk.
+//!
+//! Cache location follows XDG Base Directory Specification:
+//! - Linux: ~/.cache/laravel-lsp/{project-hash}/cache.json
+//! - macOS: ~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/cache.json
+//! - Windows: %LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\cache.json
 
 use anyhow::{Context, Result};
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// Current cache version - increment when cache format changes
 /// v2: Split 'file' into 'class_file' (for existence) and 'source_file' (for navigation)
-const CACHE_VERSION: u32 = 2;
+/// v3: Moved cache to XDG-compliant location
+const CACHE_VERSION: u32 = 3;
 
-/// Cache file name
-const CACHE_FILE: &str = ".laravel-lsp/cache.json";
+/// Get the XDG-compliant cache directory for a project
+///
+/// Returns platform-specific cache directory:
+/// - Linux: ~/.cache/laravel-lsp/{project-hash}/
+/// - macOS: ~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/
+/// - Windows: %LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\
+fn get_cache_dir(project_root: &Path) -> Option<PathBuf> {
+    // Get platform-specific cache directory
+    let proj_dirs = ProjectDirs::from("com", "genealabs", "laravel-lsp")?;
+    let cache_base = proj_dirs.cache_dir();
+
+    // Create unique hash for this project based on its absolute path
+    let canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let project_hash = format!("{:x}", hasher.finish());
+
+    Some(cache_base.join(project_hash))
+}
+
+/// Get the cache file path for a project
+fn get_cache_file(project_root: &Path) -> Option<PathBuf> {
+    get_cache_dir(project_root).map(|dir| dir.join("cache.json"))
+}
 
 /// Stored file modification time
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,8 +199,8 @@ pub enum RescanType {
 
 /// Manages the LSP cache
 pub struct CacheManager {
-    /// Path to the cache file
-    cache_path: PathBuf,
+    /// Path to the cache file (XDG-compliant location)
+    cache_path: Option<PathBuf>,
     /// The loaded cache (None if not loaded or invalid)
     cache: Option<LspCache>,
     /// Project root
@@ -178,68 +209,88 @@ pub struct CacheManager {
 
 impl CacheManager {
     /// Load cache from disk for the given project root
+    ///
+    /// Loads cache from XDG-compliant location.
     pub fn load(project_root: &Path) -> Self {
-        let cache_path = project_root.join(CACHE_FILE);
+        let cache_path = get_cache_file(project_root);
         let mut manager = CacheManager {
             cache_path: cache_path.clone(),
             cache: None,
             project_root: project_root.to_path_buf(),
         };
 
-        // Try to load existing cache
-        if cache_path.exists() {
-            match fs::read_to_string(&cache_path) {
-                Ok(content) => match serde_json::from_str::<LspCache>(&content) {
-                    Ok(cache) => {
-                        // Validate cache
-                        if cache.version != CACHE_VERSION {
-                            info!(
-                                "Cache version mismatch (got {}, expected {}), will rescan",
-                                cache.version, CACHE_VERSION
-                            );
-                        } else if cache.project_root != project_root {
-                            info!("Cache project root mismatch, will rescan");
-                        } else {
-                            info!(
-                                "Loaded cache: {} middleware, {} bindings",
-                                cache.vendor_scan.middleware.len()
-                                    + cache.app_scan.middleware.len(),
-                                cache.vendor_scan.bindings.len() + cache.app_scan.bindings.len()
-                            );
-                            manager.cache = Some(cache);
+        // Try to load from XDG location
+        if let Some(ref path) = cache_path {
+            if path.exists() {
+                match fs::read_to_string(path) {
+                    Ok(content) => match serde_json::from_str::<LspCache>(&content) {
+                        Ok(cache) => {
+                            // Validate cache
+                            if cache.version != CACHE_VERSION {
+                                info!(
+                                    "Cache version mismatch (got {}, expected {}), will rescan",
+                                    cache.version, CACHE_VERSION
+                                );
+                            } else if cache.project_root != project_root {
+                                info!("Cache project root mismatch, will rescan");
+                            } else {
+                                info!(
+                                    "Loaded cache from {:?}: {} middleware, {} bindings",
+                                    path,
+                                    cache.vendor_scan.middleware.len()
+                                        + cache.app_scan.middleware.len(),
+                                    cache.vendor_scan.bindings.len() + cache.app_scan.bindings.len()
+                                );
+                                manager.cache = Some(cache);
+                            }
                         }
-                    }
+                        Err(e) => {
+                            warn!("Failed to parse cache file: {}", e);
+                        }
+                    },
                     Err(e) => {
-                        warn!("Failed to parse cache file: {}", e);
+                        debug!("Failed to read cache file: {}", e);
                     }
-                },
-                Err(e) => {
-                    debug!("Failed to read cache file: {}", e);
                 }
+            } else {
+                debug!("No cache file found at {:?}", path);
             }
         } else {
-            debug!("No cache file found at {:?}", cache_path);
+            warn!("Could not determine XDG cache directory, caching disabled");
         }
 
         manager
     }
 
-    /// Save cache to disk
+    /// Save cache to disk (XDG-compliant location)
     pub fn save(&self) -> Result<()> {
+        let cache_path = match &self.cache_path {
+            Some(p) => p,
+            None => {
+                debug!("No cache path available, skipping save");
+                return Ok(());
+            }
+        };
+
         if let Some(ref cache) = self.cache {
             // Create cache directory if needed
-            if let Some(parent) = self.cache_path.parent() {
+            if let Some(parent) = cache_path.parent() {
                 fs::create_dir_all(parent).context("Failed to create cache directory")?;
             }
 
             let content =
                 serde_json::to_string_pretty(cache).context("Failed to serialize cache")?;
 
-            fs::write(&self.cache_path, content).context("Failed to write cache file")?;
+            fs::write(cache_path, content).context("Failed to write cache file")?;
 
-            info!("Saved cache to {:?}", self.cache_path);
+            info!("Saved cache to {:?}", cache_path);
         }
         Ok(())
+    }
+
+    /// Get the cache file path (for debugging/testing)
+    pub fn cache_path(&self) -> Option<&Path> {
+        self.cache_path.as_deref()
     }
 
     /// Check if a watch file has changed and needs rescanning
@@ -545,5 +596,40 @@ mod tests {
 
         assert_eq!(mtime1, mtime2);
         assert_ne!(mtime1, mtime3);
+    }
+
+    #[test]
+    fn test_xdg_cache_path() {
+        use std::path::Path;
+
+        let project_root = Path::new("/Users/mike/Developer/some-project");
+
+        // Verify we can get a cache path
+        let cache_file = get_cache_file(project_root);
+        assert!(cache_file.is_some(), "Should be able to determine cache path");
+
+        let cache_path = cache_file.unwrap();
+        println!("Cache path for {:?}: {:?}", project_root, cache_path);
+
+        // Verify the path structure on macOS
+        #[cfg(target_os = "macos")]
+        {
+            let path_str = cache_path.to_string_lossy();
+            assert!(
+                path_str.contains("Library/Caches/com.genealabs.laravel-lsp"),
+                "macOS cache should be in ~/Library/Caches/com.genealabs.laravel-lsp, got: {}",
+                path_str
+            );
+            assert!(
+                path_str.ends_with("cache.json"),
+                "Cache file should be cache.json, got: {}",
+                path_str
+            );
+        }
+
+        // Verify the cache directory can be determined
+        let cache_dir = get_cache_dir(project_root);
+        assert!(cache_dir.is_some());
+        println!("Cache dir for {:?}: {:?}", project_root, cache_dir.unwrap());
     }
 }

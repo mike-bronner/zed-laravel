@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # File system and paths
 walkdir = "2.5"
 glob = "0.3"
+directories = "6"  # Cross-platform XDG cache directories
 
 # Regex for pattern matching
 regex = "1.11"

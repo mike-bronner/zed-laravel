@@ -373,62 +373,63 @@ When working on this project:
 
 ---
 
-## Session State (2026-01-02)
+## Session State (2026-01-05)
 
 ### Last Session Summary
 
-**Focus**: Eloquent cast type autocomplete and extension troubleshooting
+**Focus**: Dynamic Blade directive discovery and XDG-compliant cache location
 
 ### Features Completed This Session
 
 | Feature | Description |
 |---------|-------------|
-| Cast Type Autocomplete | Autocomplete for `$casts` property and `casts()` method with 27+ built-in types |
-| Cast Type Scanning | Scans Laravel framework, packages (Spatie), and `app/Casts/` for custom casts |
-| Context-Aware Detection | `ArrayContext` enum distinguishes validation vs casts vs other model arrays |
-| README Reorganization | Blade moved to its own section; cast types documented |
+| Feature Autocomplete Spacing | Fixed `@feature ('name')` (with space) not triggering autocomplete |
+| Dynamic Blade Directives | Replaced hardcoded directive list with runtime discovery from framework/packages |
+| XDG Cache Location | Moved cache from `.laravel-lsp/cache.json` to XDG-compliant system cache |
 
 ### Key Files Modified
 
-- `laravel-lsp/src/main.rs` - Cast type autocomplete, context detection, debug logging
-- `README.md` - Reorganized with Blade section, added Eloquent Cast Types docs
-- `~/.config/zed/settings.json` - Removed `blade` from `auto_install_extensions`
+- `laravel-lsp/src/main.rs` - Blade directive discovery functions, feature autocomplete spacing
+- `laravel-lsp/src/cache_manager.rs` - XDG cache path helpers, updated load/save methods
+- `laravel-lsp/Cargo.toml` - Added `directories = "6"` crate
 
-### Cast Type Implementation
+### Blade Directive Discovery
+
+Directives are now discovered at runtime instead of hardcoded:
 
 ```rust
-// Built-in cast types (get_laravel_cast_types)
-string, integer, float, boolean, array, object, collection,
-datetime, date, timestamp, immutable_date, immutable_datetime,
-encrypted, encrypted:array, encrypted:collection, encrypted:object,
-hashed, decimal:, real, double, AsEnumCollection:, AsEnumArrayObject:
+// Scans Laravel framework's BladeCompiler traits
+scan_laravel_blade_directives()
+// - Parses vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns/*.php
+// - Extracts compile* methods (e.g., compileIf -> @if)
 
-// Scanned from vendor/app (scan_all_casts)
-- vendor/laravel/framework/src/Illuminate/Database/Eloquent/Casts/
-- vendor/spatie/laravel-data/src/Casts/
-- vendor/spatie/laravel-enum/src/Casts/
-- app/Casts/
+// Scans for custom directives
+scan_custom_blade_directives()
+// - Searches for Blade::directive('name', ...) calls in app/ and vendor/
+
+// Combined with fallback
+get_all_blade_directives()
+// - Returns discovered + fallback directives if Laravel not found
 ```
 
-### Context Detection (ArrayContext enum)
+### XDG Cache Location
 
-| Context | Triggers | Result |
-|---------|----------|--------|
-| `Validation` | `$rules`, `rules()`, `->validate()`, `Validator::make()` | Show validation rules |
-| `Casts` | `$casts`, `function casts()` | Show cast types |
-| `MassAssignment` | `$fillable`, `$guarded` | No completions |
-| `Visibility` | `$hidden`, `$visible`, `$appends` | No completions |
-| `Unknown` | None of above | Fall back to pattern matching |
+Cache now follows XDG Base Directory Specification:
 
-### Troubleshooting Notes
+| Platform | Cache Location |
+|----------|----------------|
+| **macOS** | `~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/cache.json` |
+| **Linux** | `~/.cache/laravel-lsp/{project-hash}/cache.json` |
+| **Windows** | `%LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\cache.json` |
 
-- **Dev extension not loading**: Must use "zed: install dev extension" after deleting installed version
-- **Extension auto-reinstalling**: Check `auto_install_extensions` in Zed settings
-- **WASM parse errors**: Delete corrupted extension from `~/Library/Application Support/Zed/extensions/installed/`
-- **Debug logging**: Uses `info!()` macro, visible in Zed's LSP logs panel
+```rust
+// Key functions in cache_manager.rs
+get_cache_dir(project_root: &Path) -> Option<PathBuf>  // XDG cache dir + project hash
+get_cache_file(project_root: &Path) -> Option<PathBuf> // cache dir + "cache.json"
+```
 
 ### Current Status
 
 - Build: **Passing**
 - Tests: **77 integration tests passing**
-- Cast autocomplete: **Working** with `CompletionItemKind::KEYWORD`
+- Cache: **XDG-compliant** (no longer pollutes project directories)

@@ -400,8 +400,6 @@ struct FeatureInfo {
     pub class_name: String,
     /// The full PHP namespace (e.g., "App\\Features\\NewApi")
     pub full_class: String,
-    /// The file path to the feature class
-    pub file_path: PathBuf,
 }
 
 /// Scan for feature classes in app/Features/
@@ -440,7 +438,6 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
                 feature_key,
                 class_name,
                 full_class,
-                file_path: path.to_path_buf(),
             });
         }
     }
@@ -600,7 +597,7 @@ fn find_closing_directive(directive: &str, content: &str) -> Option<String> {
 }
 
 /// Generate a description for a directive based on its name and source file
-fn generate_directive_description(directive: &str, source_file: &str) -> String {
+fn generate_directive_description(_directive: &str, source_file: &str) -> String {
     // Map source files to categories
     let category = match source_file {
         "CompilesConditionals" => "Conditional",

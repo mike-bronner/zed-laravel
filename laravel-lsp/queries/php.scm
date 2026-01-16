@@ -437,6 +437,51 @@
   (#match? @method_name "^(middleware|withoutMiddleware)$"))
 
 ; ============================================================================
+; Pattern 11b: 'middleware' => [...] in Route::group() configuration arrays
+; ============================================================================
+; Matches: Route::group(['middleware' => ['api', 'auth']], ...)
+;          Route::group(['middleware' => 'web'], ...)
+;          ['middleware' => ['auth']] in any route configuration context
+;
+; This captures middleware specified in configuration arrays, not method calls
+
+; Single-quoted middleware in array: 'middleware' => ['api']
+(array_element_initializer
+  (string
+    (string_content) @_mw_key)
+  (array_creation_expression
+    (array_element_initializer
+      (string
+        (string_content) @middleware_name)))
+  (#eq? @_mw_key "middleware"))
+
+; Double-quoted middleware in array: 'middleware' => ["api"]
+(array_element_initializer
+  (string
+    (string_content) @_mw_key)
+  (array_creation_expression
+    (array_element_initializer
+      (encapsed_string
+        (string_content) @middleware_name)))
+  (#eq? @_mw_key "middleware"))
+
+; Single string middleware: 'middleware' => 'web'
+(array_element_initializer
+  (string
+    (string_content) @_mw_key)
+  (string
+    (string_content) @middleware_name)
+  (#eq? @_mw_key "middleware"))
+
+; Double-quoted single string middleware: 'middleware' => "web"
+(array_element_initializer
+  (string
+    (string_content) @_mw_key)
+  (encapsed_string
+    (string_content) @middleware_name)
+  (#eq? @_mw_key "middleware"))
+
+; ============================================================================
 ; Pattern 12: __('translation.key') - Translation helper function
 ; ============================================================================
 ; Matches: __('messages.welcome')
@@ -1467,3 +1512,394 @@
         (name) @constant_name)))
   (#match? @feature_method_name "^(active|inactive|value|when)$")
   (#eq? @constant_name "class"))
+
+; ============================================================================
+; Pattern 31: Middleware alias definitions in $middlewareAliases property
+; ============================================================================
+; Matches: protected $middlewareAliases = ['auth' => Authenticate::class];
+;          protected $routeMiddleware = ['guest' => RedirectIfAuthenticated::class];
+;
+; These are defined in app/Http/Kernel.php and map string aliases to classes
+;
+; AST structure:
+;   property_declaration
+;     property_element
+;       name: variable_name
+;       default_value: array_creation_expression
+;         array_element_initializer
+;           string > string_content (the alias key)
+;           class_constant_access_expression
+;             name (class name)
+;             name ("class")
+
+; Single-quoted alias key
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_def_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (string
+          (string_content) @middleware_alias_key)
+        (class_constant_access_expression
+          .
+          (name) @middleware_alias_class))))
+  (#match? @mw_def_property "\\$(middlewareAliases|routeMiddleware)"))
+
+; Double-quoted alias key
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_def_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (encapsed_string
+          (string_content) @middleware_alias_key)
+        (class_constant_access_expression
+          .
+          (name) @middleware_alias_class))))
+  (#match? @mw_def_property "\\$(middlewareAliases|routeMiddleware)"))
+
+; Qualified (namespaced) class name with single-quoted key
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_def_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (string
+          (string_content) @middleware_alias_key)
+        (class_constant_access_expression
+          .
+          (qualified_name) @middleware_alias_class))))
+  (#match? @mw_def_property "\\$(middlewareAliases|routeMiddleware)"))
+
+; Qualified (namespaced) class name with double-quoted key
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_def_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (encapsed_string
+          (string_content) @middleware_alias_key)
+        (class_constant_access_expression
+          .
+          (qualified_name) @middleware_alias_class))))
+  (#match? @mw_def_property "\\$(middlewareAliases|routeMiddleware)"))
+
+; ============================================================================
+; Pattern 32: Middleware group definitions in $middlewareGroups property
+; ============================================================================
+; Matches: protected $middlewareGroups = ['web' => [...]];
+;          protected $middlewareGroups = ['api' => [...]];
+;
+; Groups contain arrays of middleware classes, not single class references
+
+; Single-quoted group key with array value
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_group_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (string
+          (string_content) @middleware_group_key)
+        (array_creation_expression))))
+  (#eq? @mw_group_property "$middlewareGroups"))
+
+; Double-quoted group key with array value
+(property_declaration
+  (property_element
+    name: (variable_name) @mw_group_property
+    default_value: (array_creation_expression
+      (array_element_initializer
+        (encapsed_string
+          (string_content) @middleware_group_key)
+        (array_creation_expression))))
+  (#eq? @mw_group_property "$middlewareGroups"))
+
+; ============================================================================
+; Pattern 33: Method body array assignment for Laravel 11+ Middleware.php
+; ============================================================================
+; Matches: $aliases = ['auth' => Authenticate::class, ...]
+; Matches: $middleware = ['web' => [...], 'api' => [...]]
+;
+; This captures middleware definitions in defaultAliases() and getMiddlewareGroups()
+; methods where the array is assigned to a local variable
+
+; Single-quoted key with class constant value (for $aliases)
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (string
+        (string_content) @middleware_alias_key)
+      (class_constant_access_expression
+        .
+        (name) @middleware_alias_class)))
+  (#match? @_mw_assign_var "\\$aliases"))
+
+; Double-quoted key with class constant value (for $aliases)
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (encapsed_string
+        (string_content) @middleware_alias_key)
+      (class_constant_access_expression
+        .
+        (name) @middleware_alias_class)))
+  (#match? @_mw_assign_var "\\$aliases"))
+
+; Single-quoted key with qualified class constant (for $aliases)
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (string
+        (string_content) @middleware_alias_key)
+      (class_constant_access_expression
+        .
+        (qualified_name) @middleware_alias_class)))
+  (#match? @_mw_assign_var "\\$aliases"))
+
+; Double-quoted key with qualified class constant (for $aliases)
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (encapsed_string
+        (string_content) @middleware_alias_key)
+      (class_constant_access_expression
+        .
+        (qualified_name) @middleware_alias_class)))
+  (#match? @_mw_assign_var "\\$aliases"))
+
+; Single-quoted key with array value (for $middleware groups like 'web', 'api')
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (string
+        (string_content) @middleware_group_key)
+      (array_creation_expression)))
+  (#match? @_mw_assign_var "\\$middleware"))
+
+; Double-quoted key with array value (for $middleware groups)
+(assignment_expression
+  left: (variable_name) @_mw_assign_var
+  right: (array_creation_expression
+    (array_element_initializer
+      (encapsed_string
+        (string_content) @middleware_group_key)
+      (array_creation_expression)))
+  (#match? @_mw_assign_var "\\$middleware"))
+
+; ============================================================================
+; Pattern 34: $middleware->alias('name', Class::class) - single alias
+; ============================================================================
+; Matches: $middleware->alias('auth', Authenticate::class)
+
+; Single-quoted alias name with simple class name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (name) @middleware_alias_class)))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; Single-quoted alias name with qualified class name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (qualified_name) @middleware_alias_class)))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; Double-quoted alias name with simple class name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (name) @middleware_alias_class)))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; Double-quoted alias name with qualified class name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (qualified_name) @middleware_alias_class)))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; ============================================================================
+; Pattern 35: $middleware->alias(['key' => Class::class, ...]) - array of aliases
+; ============================================================================
+; Matches: $middleware->alias(['auth' => Authenticate::class, 'guest' => ...])
+
+; Single-quoted keys in array argument
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @middleware_alias_key)
+          (class_constant_access_expression
+            .
+            (name) @middleware_alias_class)))))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; Single-quoted keys with qualified class names in array argument
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @middleware_alias_key)
+          (class_constant_access_expression
+            .
+            (qualified_name) @middleware_alias_class)))))
+  (#eq? @_mw_method "alias")
+  (#match? @_mw_obj "\\$middleware"))
+
+; ============================================================================
+; Pattern 36: $middleware->group('name', [...]) - group definition
+; ============================================================================
+; Matches: $middleware->group('custom', [FirstMiddleware::class, ...])
+
+; Single-quoted group name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_group_key))
+    (argument
+      (array_creation_expression)))
+  (#eq? @_mw_method "group")
+  (#match? @_mw_obj "\\$middleware"))
+
+; Double-quoted group name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @middleware_group_key))
+    (argument
+      (array_creation_expression)))
+  (#eq? @_mw_method "group")
+  (#match? @_mw_obj "\\$middleware"))
+
+; ============================================================================
+; Pattern 37: $middleware->appendToGroup() / prependToGroup() calls
+; ============================================================================
+; Matches: $middleware->appendToGroup('web', CustomMiddleware::class)
+; Matches: $middleware->prependToGroup('api', [First::class, Second::class])
+;
+; These calls don't define new groups - they just confirm the group exists
+; So we capture the group name to validate it's a known group
+
+; appendToGroup with single-quoted group name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_group_key)))
+  (#match? @_mw_method "(appendToGroup|prependToGroup)")
+  (#match? @_mw_obj "\\$middleware"))
+
+; appendToGroup with double-quoted group name
+(member_call_expression
+  object: (variable_name) @_mw_obj
+  name: (name) @_mw_method
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @middleware_group_key)))
+  (#match? @_mw_method "(appendToGroup|prependToGroup)")
+  (#match? @_mw_obj "\\$middleware"))
+
+; ============================================================================
+; Pattern 38: $router->aliasMiddleware() / middlewareGroup() - service providers
+; ============================================================================
+; Matches: $router->aliasMiddleware('auth', Authenticate::class)
+; Matches: $router->middlewareGroup('custom', [...])
+
+; aliasMiddleware with single-quoted alias and simple class
+(member_call_expression
+  object: (variable_name) @_router_obj
+  name: (name) @_router_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (name) @middleware_alias_class)))
+  (#eq? @_router_method "aliasMiddleware")
+  (#match? @_router_obj "\\$router"))
+
+; aliasMiddleware with single-quoted alias and qualified class
+(member_call_expression
+  object: (variable_name) @_router_obj
+  name: (name) @_router_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_alias_key))
+    (argument
+      (class_constant_access_expression
+        .
+        (qualified_name) @middleware_alias_class)))
+  (#eq? @_router_method "aliasMiddleware")
+  (#match? @_router_obj "\\$router"))
+
+; middlewareGroup with single-quoted group name
+(member_call_expression
+  object: (variable_name) @_router_obj
+  name: (name) @_router_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @middleware_group_key))
+    (argument
+      (array_creation_expression)))
+  (#eq? @_router_method "middlewareGroup")
+  (#match? @_router_obj "\\$router"))

@@ -373,63 +373,90 @@ When working on this project:
 
 ---
 
-## Session State (2026-01-05)
+## Session State (2026-01-14)
 
 ### Last Session Summary
 
-**Focus**: Dynamic Blade directive discovery and XDG-compliant cache location
+**Focus**: Fixed autocomplete text replacement behavior across all completion handlers
 
-### Features Completed This Session
+### Issues Fixed
 
-| Feature | Description |
-|---------|-------------|
-| Feature Autocomplete Spacing | Fixed `@feature ('name')` (with space) not triggering autocomplete |
-| Dynamic Blade Directives | Replaced hardcoded directive list with runtime discovery from framework/packages |
-| XDG Cache Location | Moved cache from `.laravel-lsp/cache.json` to XDG-compliant system cache |
+1. **Config keys with hyphens not detected** - Updated regex in `parse_config_keys()` from `[a-zA-Z_][a-zA-Z0-9_]*` to `[a-zA-Z_][a-zA-Z0-9_-]*` to support kebab-case keys like `'frequent-legacy-bank'`
 
-### Key Files Modified
+2. **Autocomplete inserting instead of replacing** - When selecting an autocomplete item, it was inserting text at cursor instead of replacing the existing string content. This caused issues like showing closing quotes/parentheses in results.
 
-- `laravel-lsp/src/main.rs` - Blade directive discovery functions, feature autocomplete spacing
-- `laravel-lsp/src/cache_manager.rs` - XDG cache path helpers, updated load/save methods
-- `laravel-lsp/Cargo.toml` - Added `directories = "6"` crate
+### Solution: StringContext + text_edit
 
-### Blade Directive Discovery
-
-Directives are now discovered at runtime instead of hardcoded:
+Created a new `StringContext` struct (line ~1713) to track string position info:
 
 ```rust
-// Scans Laravel framework's BladeCompiler traits
-scan_laravel_blade_directives()
-// - Parses vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns/*.php
-// - Extracts compile* methods (e.g., compileIf -> @if)
-
-// Scans for custom directives
-scan_custom_blade_directives()
-// - Searches for Blade::directive('name', ...) calls in app/ and vendor/
-
-// Combined with fallback
-get_all_blade_directives()
-// - Returns discovered + fallback directives if Laravel not found
+struct StringContext {
+    prefix: String,      // Text typed so far (for filtering)
+    start_col: u32,      // Column where string content starts (after opening quote)
+    end_col: u32,        // Column where string content ends (before closing quote)
+    quote_char: char,    // The quote character used
+}
 ```
 
-### XDG Cache Location
+Added `find_string_end()` helper (line ~3371) to find closing quote position.
 
-Cache now follows XDG Base Directory Specification:
+### Files Modified
 
-| Platform | Cache Location |
-|----------|----------------|
-| **macOS** | `~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/cache.json` |
-| **Linux** | `~/.cache/laravel-lsp/{project-hash}/cache.json` |
-| **Windows** | `%LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\cache.json` |
+| File | Changes |
+|------|---------|
+| `laravel-lsp/src/main.rs` | Added `StringContext` struct, `find_string_end()` helper, updated 12 context functions and all completion handlers |
+
+### Context Functions Updated (all return `StringContext` now)
+
+1. `get_config_call_context`
+2. `get_view_call_context`
+3. `get_route_call_context`
+4. `get_middleware_call_context`
+5. `get_asset_call_context`
+6. `get_vite_call_context`
+7. `get_binding_call_context`
+8. `get_feature_call_context`
+9. `get_translation_call_context`
+10. `get_env_call_context`
+11. `get_env_interpolation_context` (for `${VAR}` in .env files)
+12. `get_phpunit_env_context` (for `<env name="VAR">` in PHPUnit XML)
+
+### Completion Handler Pattern
+
+All handlers now use `text_edit` to replace string content:
 
 ```rust
-// Key functions in cache_manager.rs
-get_cache_dir(project_root: &Path) -> Option<PathBuf>  // XDG cache dir + project hash
-get_cache_file(project_root: &Path) -> Option<PathBuf> // cache dir + "cache.json"
+CompletionItem {
+    label: key.clone(),
+    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+        range: Range {
+            start: Position { line: position.line, character: ctx.start_col },
+            end: Position { line: position.line, character: ctx.end_col },
+        },
+        new_text: key.clone(),
+    })),
+    ..Default::default()
+}
 ```
 
 ### Current Status
 
-- Build: **Passing**
-- Tests: **77 integration tests passing**
-- Cache: **XDG-compliant** (no longer pollutes project directories)
+- Build: **Passing** (no warnings)
+- Tests: **134 tests passing** (57 unit + 77 integration)
+- Binary: `target/release/laravel-lsp` updated
+
+### Testing
+
+To test the fix:
+1. Reload Zed extensions (`Cmd+Shift+P` → "zed: reload extensions")
+2. Type `config('app.` and select an autocomplete item
+3. Should replace the string content, not insert at cursor
+
+### Key Code Locations
+
+| Component | Line(s) | Purpose |
+|-----------|---------|---------|
+| `StringContext` struct | ~1713-1726 | Position info for text replacement |
+| `find_string_end()` | ~3371-3380 | Find closing quote position |
+| Config regex fix | ~8149 | Added hyphen support in key pattern |
+| Example handler | Search for `get_config_call_context` usage | Pattern for all handlers |

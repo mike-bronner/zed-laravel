@@ -21,6 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::config::kebab_to_pascal_case;
+use crate::parser::{language_php, parse_php};
+use crate::queries::extract_all_php_patterns;
 
 // ============================================================================
 // Database Definition
@@ -1243,11 +1245,6 @@ pub fn parse_service_provider_source<'db>(
     use regex::Regex;
 
     lazy_static! {
-        /// Matches middleware array entries: 'alias' => Class::class
-        static ref MIDDLEWARE_RE: Regex = Regex::new(
-            r#"['"]([^'"]+)['"]\s*=>\s*\\?([A-Za-z0-9_\\]+)::class"#
-        ).unwrap();
-
         /// Matches $this->app->bind('name', ...) or ->singleton(...)
         static ref BINDING_RE: Regex = Regex::new(
             r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*(?:function|\[)?[^)]*\\?([A-Za-z0-9_\\]+)(?:::class)?)?\s*\)"#
@@ -1284,28 +1281,66 @@ pub fn parse_service_provider_source<'db>(
     let mut blade_components = Vec::new();
     let mut component_namespaces = Vec::new();
 
-    // Parse middleware registrations
-    for cap in MIDDLEWARE_RE.captures_iter(text) {
-        if let (Some(alias), Some(class)) = (cap.get(1), cap.get(2)) {
-            let alias_str = alias.as_str();
-            let class_str = class.as_str().trim_start_matches('\\');
+    // Parse middleware using tree-sitter for accurate context-aware extraction
+    if let Ok(tree) = parse_php(text) {
+        let language = language_php();
+        if let Ok(patterns) = extract_all_php_patterns(&tree, text, &language) {
+            tracing::debug!(
+                "📦 Parsing {:?}: {} alias defs, {} group defs",
+                path,
+                patterns.middleware_alias_defs.len(),
+                patterns.middleware_group_defs.len()
+            );
+            // Process middleware alias definitions (from $middlewareAliases property)
+            for alias_def in &patterns.middleware_alias_defs {
+                let class_str = alias_def.class_name.trim_start_matches('\\');
+                let file_path = resolve_class_to_file_internal(class_str, &root);
 
-            // Calculate line number
-            let line = text[..alias.start()].lines().count() as u32;
+                let alias_name = MiddlewareName::new(db, alias_def.alias.to_string());
+                middleware.push(ParsedMiddlewareReg::new(
+                    db,
+                    alias_name,
+                    class_str.to_string(),
+                    file_path,
+                    alias_def.row as u32,
+                    priority,
+                    path.clone(),
+                ));
+            }
 
-            // Resolve class to file path
-            let file_path = resolve_class_to_file_internal(class_str, &root);
+            // Process middleware group definitions (from $middlewareGroups property)
+            // Track existing aliases to avoid duplicates
+            let existing_aliases: std::collections::HashSet<String> = middleware.iter()
+                .map(|m| m.alias(db).name(db).to_string())
+                .collect();
 
-            let alias_name = MiddlewareName::new(db, alias_str.to_string());
-            middleware.push(ParsedMiddlewareReg::new(
-                db,
-                alias_name,
-                class_str.to_string(),
-                file_path,
-                line,
-                priority,
-                path.clone(),
-            ));
+            for group_def in &patterns.middleware_group_defs {
+                // Skip if already registered as an alias
+                if existing_aliases.contains(group_def.group_name) {
+                    continue;
+                }
+
+                tracing::debug!("   Found group: '{}'", group_def.group_name);
+                let alias_name = MiddlewareName::new(db, group_def.group_name.to_string());
+                middleware.push(ParsedMiddlewareReg::new(
+                    db,
+                    alias_name,
+                    format!("MiddlewareGroup<{}>", group_def.group_name), // Placeholder to indicate it's a group
+                    None, // Groups don't have a single file
+                    group_def.row as u32,
+                    priority,
+                    path.clone(),
+                ));
+            }
+
+            if !middleware.is_empty() {
+                tracing::info!(
+                    "🔐 Extracted {} middleware from {:?}: {:?}",
+                    middleware.len(),
+                    path,
+                    middleware.iter().map(|m| m.alias(db).name(db).to_string()).collect::<Vec<_>>()
+                );
+            }
         }
     }
 

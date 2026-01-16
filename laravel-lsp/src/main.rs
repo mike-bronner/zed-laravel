@@ -1710,6 +1710,21 @@ enum BladeLoopType {
     While,
 }
 
+/// Context information for string-based completions (config, view, route, etc.)
+/// Contains position info needed to create proper text_edit ranges
+#[derive(Debug, Clone)]
+struct StringContext {
+    /// The text typed so far inside the string (for filtering completions)
+    prefix: String,
+    /// Column where string content starts (right after opening quote), 0-based
+    start_col: u32,
+    /// Column where string content ends (right before closing quote, or at cursor if incomplete), 0-based
+    end_col: u32,
+    /// The quote character used (' or ")
+    #[allow(dead_code)]
+    quote_char: char,
+}
+
 impl LaravelLanguageServer {
     fn new(client: Client) -> Self {
         Self {
@@ -2002,8 +2017,9 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 1: Package providers
+        // Priority 1: Package providers and Kernel files (for middleware definitions)
         let vendor_path = root.join("vendor");
+        debug!("🔍 Scanning vendor path: {:?} (exists={})", vendor_path, vendor_path.exists());
         if vendor_path.exists() {
             for entry in WalkDir::new(&vendor_path)
                 .max_depth(6)
@@ -2017,18 +2033,29 @@ impl LaravelLanguageServer {
                 }
                 if path.is_file()
                     && path.extension().is_some_and(|ext| ext == "php")
-                    && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().ends_with("ServiceProvider.php")
-                    })
                 {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if self.salsa.register_service_provider_source(
-                            path.to_path_buf(),
-                            content,
-                            1, // package priority
-                            root.to_path_buf(),
-                        ).await.is_ok() {
-                            registered_count += 1;
+                    let file_name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let path_str = path.to_string_lossy();
+
+                    // Scan ServiceProvider files for middleware/binding registrations
+                    // and Http/Kernel.php files for middleware alias/group definitions
+                    let is_service_provider = file_name.ends_with("ServiceProvider.php");
+                    let is_http_kernel = file_name == "Kernel.php"
+                        && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
+
+                    if is_service_provider || is_http_kernel {
+                        debug!("📄 [init] Found vendor file: {} (SP={}, Kernel={})", path_str, is_service_provider, is_http_kernel);
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            if self.salsa.register_service_provider_source(
+                                path.to_path_buf(),
+                                content,
+                                1, // package priority
+                                root.to_path_buf(),
+                            ).await.is_ok() {
+                                registered_count += 1;
+                            }
                         }
                     }
                 }
@@ -2072,6 +2099,22 @@ impl LaravelLanguageServer {
                     {
                         registered_count += 1;
                     }
+                }
+            }
+        }
+
+        // Priority 0: Laravel framework's default middleware configuration (Laravel 11+)
+        // This provides 'web', 'api', 'auth', 'guest', etc. from the framework
+        let framework_middleware_config = root.join("vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php");
+        if framework_middleware_config.exists() {
+            if let Ok(content) = std::fs::read_to_string(&framework_middleware_config) {
+                if self.salsa.register_service_provider_source(
+                    framework_middleware_config,
+                    content,
+                    0, // framework priority (can be overridden by app)
+                    root.to_path_buf(),
+                ).await.is_ok() {
+                    registered_count += 1;
                 }
             }
         }
@@ -2288,7 +2331,7 @@ impl LaravelLanguageServer {
             }
         }
 
-        // Priority 1: Package providers
+        // Priority 1: Package providers and Kernel files (for middleware definitions)
         let vendor_path = root.join("vendor");
         if vendor_path.exists() {
             for entry in WalkDir::new(&vendor_path)
@@ -2303,18 +2346,28 @@ impl LaravelLanguageServer {
                 }
                 if path.is_file()
                     && path.extension().is_some_and(|ext| ext == "php")
-                    && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().ends_with("ServiceProvider.php")
-                    })
                 {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if self.salsa.register_service_provider_source(
-                            path.to_path_buf(),
-                            content,
-                            1, // package priority
-                            root.to_path_buf(),
-                        ).await.is_ok() {
-                            registered_count += 1;
+                    let file_name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let path_str = path.to_string_lossy();
+
+                    // Scan ServiceProvider files for middleware/binding registrations
+                    // and Http/Kernel.php files for middleware alias/group definitions
+                    let is_service_provider = file_name.ends_with("ServiceProvider.php");
+                    let is_http_kernel = file_name == "Kernel.php"
+                        && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
+
+                    if is_service_provider || is_http_kernel {
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            if self.salsa.register_service_provider_source(
+                                path.to_path_buf(),
+                                content,
+                                1, // package priority
+                                root.to_path_buf(),
+                            ).await.is_ok() {
+                                registered_count += 1;
+                            }
                         }
                     }
                 }
@@ -2378,6 +2431,21 @@ impl LaravelLanguageServer {
                     ).await.is_ok() {
                         registered_count += 1;
                     }
+                }
+            }
+        }
+
+        // Priority 0: Laravel framework's default middleware configuration (Laravel 11+)
+        let framework_middleware_config = root.join("vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php");
+        if framework_middleware_config.exists() {
+            if let Ok(content) = std::fs::read_to_string(&framework_middleware_config) {
+                if self.salsa.register_service_provider_source(
+                    framework_middleware_config,
+                    content,
+                    0, // framework priority
+                    root.to_path_buf(),
+                ).await.is_ok() {
+                    registered_count += 1;
                 }
             }
         }
@@ -3368,11 +3436,22 @@ impl LaravelLanguageServer {
     // Completion helpers
     // ========================================================================
 
+    /// Find the end of a string starting at a given position
+    /// Returns the column of the closing quote, or the end of line if not found
+    fn find_string_end(line_text: &str, start_col: usize, quote_char: char) -> u32 {
+        let after_start = &line_text[start_col..];
+        if let Some(end_offset) = after_start.find(quote_char) {
+            (start_col + end_offset) as u32
+        } else {
+            line_text.len() as u32
+        }
+    }
+
     /// Check if cursor is inside env('...') or env("...") in PHP/Blade
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
-    /// Example: `env('APP_` with cursor at end returns Some("APP_")
-    fn get_env_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// Example: `env('APP_` with cursor at end returns Some(StringContext{prefix: "APP_", ...})
+    fn get_env_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3400,14 +3479,22 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_env.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_env.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is inside ${...} in .env files
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns StringContext with position info for text_edit
     ///
-    /// Example: `NEW_VAR=${APP` with cursor at end returns Some("APP")
-    fn get_env_interpolation_context(line_text: &str, character: u32) -> Option<String> {
+    /// Example: `NEW_VAR=${APP` with cursor at end returns context with prefix="APP"
+    fn get_env_interpolation_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3424,14 +3511,26 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_interpolation.to_string())
+        // Find the end of the interpolation (closing } or end of line)
+        let end_col = if let Some(close_pos) = line_text[start_pos..].find('}') {
+            (start_pos + close_pos) as u32
+        } else {
+            line_text.len() as u32
+        };
+
+        Some(StringContext {
+            prefix: after_interpolation.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char: '{', // Not really a quote, but indicates interpolation
+        })
     }
 
     /// Check if cursor is inside <env name="..."> in PHPUnit XML files
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns StringContext with position info for text_edit
     ///
-    /// Example: `<env name="APP_` with cursor at end returns Some("APP_")
-    fn get_phpunit_env_context(line_text: &str, character: u32) -> Option<String> {
+    /// Example: `<env name="APP_` with cursor at end returns context with prefix="APP_"
+    fn get_phpunit_env_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3459,7 +3558,15 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_pattern.to_string())
+        // Find the end of the attribute value (closing " or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, '"');
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char: '"',
+        })
     }
 
     /// Check if cursor is inside config('...') or Config::get('...') calls
@@ -3469,7 +3576,7 @@ impl LaravelLanguageServer {
     /// - `config('app.` returns Some("app.")
     /// - `Config::get('db.` returns Some("db.")
     /// - `Config::string('app.` returns Some("app.")
-    fn get_config_call_context(line_text: &str, character: u32) -> Option<String> {
+    fn get_config_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3558,7 +3665,15 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is inside route('...'), to_route('...'), or other route-related calls
@@ -3568,7 +3683,7 @@ impl LaravelLanguageServer {
     /// - `route('users.` returns Some("users.")
     /// - `to_route('admin.` returns Some("admin.")
     /// - `redirect()->route('` returns Some("")
-    fn get_route_call_context(line_text: &str, character: u32) -> Option<String> {
+    fn get_route_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3634,17 +3749,36 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is inside ->middleware('...') or similar middleware calls
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `->middleware('` returns Some("")
-    /// - `->middleware('auth` returns Some("auth")
-    /// - `->middleware(['auth', '` returns Some("")
-    fn get_middleware_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `->middleware('` returns Some(StringContext{prefix: "", ...})
+    /// - `->middleware('auth` returns Some(StringContext{prefix: "auth", ...})
+    /// - `->middleware(['auth', '` returns Some(StringContext{prefix: "", ...})
+    ///
+    /// The `previous_lines` parameter allows detecting multi-line middleware arrays:
+    /// ```php
+    /// 'middleware' => [
+    ///     'api',
+    ///     '  <-- cursor here, context found from previous lines
+    /// ```
+    fn get_middleware_call_context(
+        line_text: &str,
+        character: u32,
+        previous_lines: Option<&[&str]>,
+    ) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3661,9 +3795,17 @@ impl LaravelLanguageServer {
             // ->middleware([' (array syntax - first element)
             ("->middleware(['", '\'', 15),
             ("->middleware([\"", '"', 15),
+            // 'middleware' => [' (array-key syntax in Route::group config)
+            ("'middleware' => ['", '\'', 18),
+            ("'middleware' => [\"", '"', 18),
+            ("\"middleware\" => ['", '\'', 18),
+            ("\"middleware\" => [\"", '"', 18),
             // ', ' inside middleware array (subsequent elements)
             ("', '", '\'', 4),
             ("\", \"", '"', 4),
+            // ',' without space (also common)
+            (",'", '\'', 2),
+            (",\"", '"', 2),
             // Route::middleware('
             ("Route::middleware('", '\'', 19),
             ("Route::middleware(\"", '"', 19),
@@ -3673,6 +3815,10 @@ impl LaravelLanguageServer {
             // ->withoutMiddleware('
             ("->withoutMiddleware('", '\'', 21),
             ("->withoutMiddleware(\"", '"', 21),
+            // Standalone array element at start of line (for multi-line arrays)
+            // Matches: '  (with leading whitespace) at line start
+            ("'", '\'', 1),
+            ("\"", '"', 1),
         ];
 
         // Find all matches and their positions
@@ -3680,7 +3826,16 @@ impl LaravelLanguageServer {
 
         for (pattern, quote, len) in &patterns {
             if let Some(pos) = before_cursor.rfind(pattern) {
-                matches.push((pos, *quote, *len));
+                // For single-quote patterns at position 0, only match if line starts with whitespace + quote
+                if *len == 1 {
+                    // Check if this is at line start (after optional whitespace)
+                    let trimmed_start = line_text.len() - line_text.trim_start().len();
+                    if pos == trimmed_start {
+                        matches.push((pos, *quote, *len));
+                    }
+                } else {
+                    matches.push((pos, *quote, *len));
+                }
             }
         }
 
@@ -3701,34 +3856,85 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        // For array patterns like "', '", verify we're actually in a middleware context
-        // by checking if ->middleware( or similar appears earlier in the line
+        // For array patterns like "', '" or standalone quotes, verify we're actually in a middleware context
+        // by checking if ->middleware( or similar appears earlier in the line OR in previous lines
         if pattern_len <= 4 {
             let middleware_indicators = [
                 "->middleware(",
+                "->middleware([",
                 "Route::middleware(",
+                "Route::middleware([",
                 "withMiddleware(",
+                "withMiddleware([",
                 "->withoutMiddleware(",
+                "->withoutMiddleware([",
+                "'middleware' => [",  // Array-key syntax in Route::group config
+                "\"middleware\" => [", // Double-quote version
             ];
+
+            // Check current line first
+            let text_before_match = &before_cursor[..pos];
             let has_middleware_context = middleware_indicators
                 .iter()
-                .any(|ind| before_cursor[..pos].contains(ind));
+                .any(|ind| text_before_match.contains(ind));
+
             if !has_middleware_context {
-                return None;
+                // Check previous lines (up to 20 lines back) for middleware array context
+                // We need to find an opening pattern without a matching close
+                if let Some(prev_lines) = previous_lines {
+                    let mut found_in_previous = false;
+                    let mut bracket_depth = 0i32;
+
+                    // Scan backwards through previous lines
+                    for prev_line in prev_lines.iter().rev().take(20) {
+                        // Count brackets to track nesting
+                        for ch in prev_line.chars() {
+                            match ch {
+                                '[' => bracket_depth += 1,
+                                ']' => bracket_depth -= 1,
+                                _ => {}
+                            }
+                        }
+
+                        // Check if this line has a middleware indicator
+                        if middleware_indicators.iter().any(|ind| prev_line.contains(ind)) {
+                            // Found middleware context, and we should still be inside it
+                            // (bracket_depth > 0 means we haven't closed the array yet)
+                            if bracket_depth > 0 {
+                                found_in_previous = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !found_in_previous {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
             }
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is inside view('...'), View::make('...'), or similar view calls
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `view('` returns Some("")
-    /// - `view('users.` returns Some("users.")
-    /// - `View::make('admin.` returns Some("admin.")
-    fn get_view_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `view('` returns Some(StringContext{prefix: "", ...})
+    /// - `view('users.` returns Some(StringContext{prefix: "users.", ...})
+    /// - `View::make('admin.` returns Some(StringContext{prefix: "admin.", ...})
+    fn get_view_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3825,7 +4031,15 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is inside a Blade component tag like `<x-...`
@@ -3928,13 +4142,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside asset('...') call
-    /// Returns the partial path typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `asset('` returns Some("")
-    /// - `asset('css/` returns Some("css/")
-    /// - `asset('images/logo` returns Some("images/logo")
-    fn get_asset_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `asset('` returns Some(StringContext{prefix: "", ...})
+    /// - `asset('css/` returns Some(StringContext{prefix: "css/", ...})
+    /// - `asset('images/logo` returns Some(StringContext{prefix: "images/logo", ...})
+    fn get_asset_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3954,7 +4168,13 @@ impl LaravelLanguageServer {
 
                 // Check that we haven't hit the closing quote
                 if !after_quote.contains(quote_char) {
-                    return Some(after_quote.to_string());
+                    let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+                    return Some(StringContext {
+                        prefix: after_quote.to_string(),
+                        start_col: start_pos as u32,
+                        end_col,
+                        quote_char,
+                    });
                 }
             }
         }
@@ -3963,12 +4183,12 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside @vite('...') or Vite::asset('...') call
-    /// Returns the partial path typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `@vite('` returns Some("")
-    /// - `@vite('resources/js/` returns Some("resources/js/")
-    fn get_vite_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `@vite('` returns Some(StringContext{prefix: "", ...})
+    /// - `@vite('resources/js/` returns Some(StringContext{prefix: "resources/js/", ...})
+    fn get_vite_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -3992,7 +4212,13 @@ impl LaravelLanguageServer {
 
                 // Check that we haven't hit the closing quote
                 if !after_quote.contains(quote_char) {
-                    return Some(after_quote.to_string());
+                    let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+                    return Some(StringContext {
+                        prefix: after_quote.to_string(),
+                        start_col: start_pos as u32,
+                        end_col,
+                        quote_char,
+                    });
                 }
             }
         }
@@ -4051,13 +4277,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside app('...') or resolve('...') container binding calls
-    /// Returns the partial binding name typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `app('` returns Some("")
-    /// - `app('cache` returns Some("cache")
-    /// - `resolve('log` returns Some("log")
-    fn get_binding_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `app('` returns Some(StringContext{prefix: "", ...})
+    /// - `app('cache` returns Some(StringContext{prefix: "cache", ...})
+    /// - `resolve('log` returns Some(StringContext{prefix: "log", ...})
+    fn get_binding_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -4081,7 +4307,13 @@ impl LaravelLanguageServer {
 
                 // Check that we haven't hit the closing quote
                 if !after_quote.contains(quote_char) {
-                    return Some(after_quote.to_string());
+                    let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+                    return Some(StringContext {
+                        prefix: after_quote.to_string(),
+                        start_col: start_pos as u32,
+                        end_col,
+                        quote_char,
+                    });
                 }
             }
         }
@@ -4090,13 +4322,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside Feature::active('...'), Feature::for($user)->active('...'), etc.
-    /// Returns the partial feature name typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `Feature::active('` returns Some("")
-    /// - `Feature::active('new` returns Some("new")
-    /// - `Feature::for($user)->active('beta` returns Some("beta")
-    fn get_feature_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `Feature::active('` returns Some(StringContext{prefix: "", ...})
+    /// - `Feature::active('new` returns Some(StringContext{prefix: "new", ...})
+    /// - `Feature::for($user)->active('beta` returns Some(StringContext{prefix: "beta", ...})
+    fn get_feature_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -4197,7 +4429,15 @@ impl LaravelLanguageServer {
             }
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     /// Check if cursor is after `->` on a model variable or static chain
@@ -6026,13 +6266,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside __('...'), trans('...'), or other translation-related calls
-    /// Returns the partial text typed so far (for filtering completions)
+    /// Returns context with position info for text replacement
     ///
     /// Examples:
-    /// - `__('messages.` returns Some("messages.")
-    /// - `trans('auth.` returns Some("auth.")
-    /// - `Lang::get('` returns Some("")
-    fn get_translation_call_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `__('messages.` returns Some(StringContext{prefix: "messages.", ...})
+    /// - `trans('auth.` returns Some(StringContext{prefix: "auth.", ...})
+    /// - `Lang::get('` returns Some(StringContext{prefix: "", ...})
+    fn get_translation_call_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -6095,7 +6335,15 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        Some(after_pattern.to_string())
+        // Find where the string ends (closing quote or end of line)
+        let end_col = Self::find_string_end(line_text, start_pos, quote_char);
+
+        Some(StringContext {
+            prefix: after_pattern.to_string(),
+            start_col: start_pos as u32,
+            end_col,
+            quote_char,
+        })
     }
 
     // ========================================================================
@@ -6756,88 +7004,90 @@ impl LaravelLanguageServer {
     /// Looks for property/method definitions that indicate the array's purpose
     fn detect_array_context(current_line: &str, surrounding_lines: &[&str]) -> ArrayContext {
         // Combine current line with surrounding lines for analysis
+        // Order doesn't matter - we just check all lines for context markers
         let all_lines: Vec<&str> = std::iter::once(current_line)
             .chain(surrounding_lines.iter().copied())
             .collect();
 
         info!("      🔎 detect_array_context: checking {} lines", all_lines.len());
         info!("         Current line: '{}'", current_line.chars().take(80).collect::<String>());
-        for (i, line) in surrounding_lines.iter().enumerate() {
-            info!("         Surrounding[{}]: '{}'", i, line.chars().take(80).collect::<String>());
-        }
 
+        // Scan all lines for context markers
         for line in &all_lines {
-            let line_lower = line.to_lowercase();
-            let line_trimmed = line.trim();
-
-            // === VALIDATION CONTEXTS (highest priority - check first) ===
-
-            // Request/controller validation
-            if line_lower.contains("->validate(")
-                || line_lower.contains("->validatewithbag(")
-                || line_lower.contains("validator::make(")
-                || line_lower.contains("validator(")
-            {
-                info!("      ✅ Detected ArrayContext::Validation (request/validator) from line: '{}'", line.chars().take(50).collect::<String>());
-                return ArrayContext::Validation;
-            }
-
-            // $rules property or variable
-            if line_lower.contains("$rules")
-                && (line_lower.contains("=") || line_lower.contains("["))
-            {
-                return ArrayContext::Validation;
-            }
-
-            // rules() method definition (Form Request, Livewire)
-            if line_lower.contains("function rules(") || line_lower.contains("function rules (") {
-                return ArrayContext::Validation;
-            }
-
-            // Livewire validation attributes
-            if line_trimmed.starts_with("#[Rule(") || line_trimmed.starts_with("#[Validate(") {
-                return ArrayContext::Validation;
-            }
-
-            // === NON-VALIDATION CONTEXTS ===
-
-            // Casts context: $casts property or casts() method
-            if line_lower.contains("$casts")
-                || line_lower.contains("function casts(")
-                || line_lower.contains("function casts (")
-            {
-                info!("      ✅ Detected ArrayContext::Casts from line: '{}'", line.chars().take(60).collect::<String>());
-                return ArrayContext::Casts;
-            }
-
-            // Mass assignment: $fillable, $guarded
-            if line_lower.contains("$fillable") || line_lower.contains("$guarded") {
-                return ArrayContext::MassAssignment;
-            }
-
-            // Visibility: $hidden, $visible, $appends
-            if line_lower.contains("$hidden")
-                || line_lower.contains("$visible")
-                || line_lower.contains("$appends")
-            {
-                return ArrayContext::Visibility;
-            }
-
-            // Relationships: $with, $withCount
-            if (line_lower.contains("$with") && !line_lower.contains("$without"))
-                || line_lower.contains("$withcount")
-            {
-                return ArrayContext::Relationships;
+            if let Some(context) = Self::identify_array_context_from_line(line) {
+                info!("      ✅ Detected {:?} from line: '{}'", context, line.chars().take(60).collect::<String>());
+                return context;
             }
         }
 
-        // No specific context found
         info!("      ⚠️  No specific context found in {} lines, returning ArrayContext::Unknown", all_lines.len());
-        info!("         First 3 surrounding lines:");
-        for (i, line) in surrounding_lines.iter().take(3).enumerate() {
-            info!("           [{}]: '{}'", i, line.chars().take(70).collect::<String>());
-        }
         ArrayContext::Unknown
+    }
+
+    /// Check a single line for array context markers and return the context type if found
+    fn identify_array_context_from_line(line: &str) -> Option<ArrayContext> {
+        let line_lower = line.to_lowercase();
+        let line_trimmed = line.trim();
+
+        // === VALIDATION CONTEXTS ===
+
+        // Request/controller validation
+        if line_lower.contains("->validate(")
+            || line_lower.contains("->validatewithbag(")
+            || line_lower.contains("validator::make(")
+            || line_lower.contains("validator(")
+        {
+            return Some(ArrayContext::Validation);
+        }
+
+        // $rules property or variable
+        if line_lower.contains("$rules")
+            && (line_lower.contains("=") || line_lower.contains("["))
+        {
+            return Some(ArrayContext::Validation);
+        }
+
+        // rules() method definition (Form Request, Livewire)
+        if line_lower.contains("function rules(") || line_lower.contains("function rules (") {
+            return Some(ArrayContext::Validation);
+        }
+
+        // Livewire validation attributes
+        if line_trimmed.starts_with("#[Rule(") || line_trimmed.starts_with("#[Validate(") {
+            return Some(ArrayContext::Validation);
+        }
+
+        // === NON-VALIDATION CONTEXTS ===
+
+        // Casts context: $casts property or casts() method
+        if line_lower.contains("$casts")
+            || line_lower.contains("function casts(")
+            || line_lower.contains("function casts (")
+        {
+            return Some(ArrayContext::Casts);
+        }
+
+        // Mass assignment: $fillable, $guarded
+        if line_lower.contains("$fillable") || line_lower.contains("$guarded") {
+            return Some(ArrayContext::MassAssignment);
+        }
+
+        // Visibility: $hidden, $visible, $appends
+        if line_lower.contains("$hidden")
+            || line_lower.contains("$visible")
+            || line_lower.contains("$appends")
+        {
+            return Some(ArrayContext::Visibility);
+        }
+
+        // Relationships: $with, $withCount
+        if (line_lower.contains("$with") && !line_lower.contains("$without"))
+            || line_lower.contains("$withcount")
+        {
+            return Some(ArrayContext::Relationships);
+        }
+
+        None
     }
 
     /// Check if cursor is inside a validation rule context
@@ -7109,37 +7359,19 @@ impl LaravelLanguageServer {
             return true;
         }
 
-        // 7. Inside array with => (likely validation array value)
-        //    Pattern: 'field' => 'rules' or 'field' => ['rules']
+        // 7. Inside array with => that contains actual validation rule names
+        //    Only trigger if we find actual validation rules (from cached Laravel rules)
+        //    Avoids false positives with cast types like 'string', 'integer', 'boolean', etc.
         if line_lower.contains("=>") {
             // Check if this looks like a validation rule using cached rules from Laravel framework
-            // First check cached rules (dynamically discovered from vendor)
             for rule in cached_rules {
                 if line_lower.contains(rule) {
                     return true;
                 }
             }
-
-            // Fallback: common rules without parameters (stable, rarely change)
-            // NOTE: These also match cast types! Only use when context is Unknown
-            let base_indicators = [
-                "required", "nullable", "string", "integer", "email",
-                "confirmed", "accepted", "boolean", "numeric", "array",
-                "date", "file", "image", "url",
-            ];
-            for indicator in base_indicators {
-                if line_lower.contains(indicator) {
-                    info!("      🔴 is_validation_context: matched base indicator '{}' in line '{}'", indicator, line_text.chars().take(60).collect::<String>());
-                    return true;
-                }
-            }
-            // Also trigger if value side of => is a string or array starting point
-            // This allows completing even when starting fresh: 'field' => '█'
-            if line_text.contains("=> '") || line_text.contains("=> \"")
-                || line_text.contains("=> [")
-            {
-                return true;
-            }
+            // Note: We intentionally do NOT trigger on generic patterns like `=> '`
+            // because that would cause false positives in $casts and other arrays.
+            // The smart array context detection should handle most cases.
         }
 
         // 8. Livewire #[Rule(...)] or #[Validate(...)] attributes
@@ -8145,7 +8377,8 @@ impl LaravelLanguageServer {
 
         // Simple regex-based parsing for Laravel config files
         // This handles the common patterns: 'key' => value, or "key" => value
-        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"][\s]*=>"#).unwrap();
+        // Note: Allows hyphens in keys (kebab-case is common in Laravel configs)
+        let key_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_-]*)['"][\s]*=>"#).unwrap();
 
         // Track nesting depth and current key path
         let mut key_stack: Vec<String> = vec![base_key.to_string()];
@@ -10740,8 +10973,16 @@ impl LanguageServer for LaravelLanguageServer {
             // Initialize database schema provider for exists:/unique: validation autocomplete
             server.init_database_schema_provider(&root).await;
 
+            // Queue and execute initial vendor/app rescans
+            // This registers middleware and bindings from Laravel framework and service providers
+            info!("🔍 Queueing initial vendor and app rescans...");
+            server.pending_rescans.write().await.insert(RescanType::Vendor);
+            server.pending_rescans.write().await.insert(RescanType::App);
+
             // Execute pending rescans (vendor, app, node_modules)
             server.execute_pending_rescans().await;
+
+            info!("✅ Background Salsa registration complete");
         });
     }
 
@@ -11445,8 +11686,8 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             }
 
-            if let Some(config_prefix) = Self::get_config_call_context(line_text, position.character) {
-                debug!("   Config context, filter prefix: '{}'", config_prefix);
+            if let Some(config_ctx) = Self::get_config_call_context(line_text, position.character) {
+                debug!("   Config context, filter prefix: '{}'", config_ctx.prefix);
 
                 // Get all config keys
                 let config_keys = self.get_all_config_keys().await;
@@ -11454,7 +11695,7 @@ impl LanguageServer for LaravelLanguageServer {
                 // Build completion items, filtering by prefix (case-sensitive)
                 let items: Vec<CompletionItem> = config_keys
                     .into_iter()
-                    .filter(|c| c.key.starts_with(&config_prefix))
+                    .filter(|c| c.key.starts_with(&config_ctx.prefix))
                     .map(|c| {
                         let detail = if c.value.is_empty() {
                             format!("({})", c.source)
@@ -11467,6 +11708,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::CONSTANT),
                             detail: Some(detail),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: config_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: config_ctx.end_col,
+                                    },
+                                },
+                                new_text: c.key.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11485,14 +11739,14 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for view context
-            if let Some(view_prefix) = Self::get_view_call_context(line_text, position.character) {
-                debug!("   View context, filter prefix: '{}'", view_prefix);
+            if let Some(view_ctx) = Self::get_view_call_context(line_text, position.character) {
+                debug!("   View context, filter prefix: '{}'", view_ctx.prefix);
 
                 // Get all view names
                 let view_names = self.get_all_view_names().await;
 
                 // Build completion items, filtering by prefix (case-insensitive)
-                let prefix_lower = view_prefix.to_lowercase();
+                let prefix_lower = view_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = view_names
                     .into_iter()
                     .filter(|v| v.name.to_lowercase().starts_with(&prefix_lower))
@@ -11502,6 +11756,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::FILE),
                             detail: Some(v.path),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: view_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: view_ctx.end_col,
+                                    },
+                                },
+                                new_text: v.name.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11590,8 +11857,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for asset() context
-            if let Some(asset_prefix) = Self::get_asset_call_context(line_text, position.character) {
-                debug!("   Asset context, filter prefix: '{}'", asset_prefix);
+            if let Some(asset_ctx) = Self::get_asset_call_context(line_text, position.character) {
+                debug!("   Asset context, filter prefix: '{}'", asset_ctx.prefix);
 
                 let root = match self.root_path.read().await.clone() {
                     Some(r) => r,
@@ -11602,7 +11869,7 @@ impl LanguageServer for LaravelLanguageServer {
                 let files = self.get_directory_files(&public_dir, None).await;
 
                 // Build completion items, filtering by prefix
-                let prefix_lower = asset_prefix.to_lowercase();
+                let prefix_lower = asset_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = files
                     .into_iter()
                     .filter(|f| f.path.to_lowercase().starts_with(&prefix_lower))
@@ -11612,6 +11879,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::FILE),
                             detail: Some("public/".to_string() + &f.path),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: asset_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: asset_ctx.end_col,
+                                    },
+                                },
+                                new_text: f.path.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11630,8 +11910,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for @vite() context
-            if let Some(vite_prefix) = Self::get_vite_call_context(line_text, position.character) {
-                debug!("   Vite context, filter prefix: '{}'", vite_prefix);
+            if let Some(vite_ctx) = Self::get_vite_call_context(line_text, position.character) {
+                debug!("   Vite context, filter prefix: '{}'", vite_ctx.prefix);
 
                 let root = match self.root_path.read().await.clone() {
                     Some(r) => r,
@@ -11644,7 +11924,7 @@ impl LanguageServer for LaravelLanguageServer {
                 let files = self.get_directory_files(&resources_dir, Some(vite_extensions)).await;
 
                 // Prefix paths with "resources/" for proper Vite resolution
-                let prefix_lower = vite_prefix.to_lowercase();
+                let prefix_lower = vite_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = files
                     .into_iter()
                     .map(|f| format!("resources/{}", f.path))
@@ -11655,6 +11935,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::FILE),
                             detail: None,
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: vite_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: vite_ctx.end_col,
+                                    },
+                                },
+                                new_text: path.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11713,8 +12006,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for container binding context (app('...'), resolve('...'))
-            if let Some(binding_prefix) = Self::get_binding_call_context(line_text, position.character) {
-                debug!("   Binding context, filter prefix: '{}'", binding_prefix);
+            if let Some(binding_ctx) = Self::get_binding_call_context(line_text, position.character) {
+                debug!("   Binding context, filter prefix: '{}'", binding_ctx.prefix);
 
                 // Get all bindings from Salsa
                 let bindings = match self.salsa.get_all_parsed_bindings().await {
@@ -11726,7 +12019,7 @@ impl LanguageServer for LaravelLanguageServer {
                 };
 
                 // Build completion items, filtering by prefix (case-insensitive)
-                let prefix_lower = binding_prefix.to_lowercase();
+                let prefix_lower = binding_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = bindings
                     .into_iter()
                     .filter(|b| b.abstract_name.to_lowercase().starts_with(&prefix_lower))
@@ -11741,6 +12034,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::CLASS),
                             detail: Some(format!("{} ({})", b.concrete_class, source)),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: binding_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: binding_ctx.end_col,
+                                    },
+                                },
+                                new_text: b.abstract_name.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11759,8 +12065,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for route context
-            if let Some(route_prefix) = Self::get_route_call_context(line_text, position.character) {
-                debug!("   Route context, filter prefix: '{}'", route_prefix);
+            if let Some(route_ctx) = Self::get_route_call_context(line_text, position.character) {
+                debug!("   Route context, filter prefix: '{}'", route_ctx.prefix);
 
                 // Get all route names
                 let route_names = self.get_all_route_names().await;
@@ -11768,13 +12074,26 @@ impl LanguageServer for LaravelLanguageServer {
                 // Build completion items, filtering by prefix (case-sensitive)
                 let items: Vec<CompletionItem> = route_names
                     .into_iter()
-                    .filter(|r| r.name.starts_with(&route_prefix))
+                    .filter(|r| r.name.starts_with(&route_ctx.prefix))
                     .map(|r| {
                         CompletionItem {
                             label: r.name.clone(),
                             kind: Some(CompletionItemKind::CONSTANT),
                             detail: Some(format!("({})", r.source)),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: route_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: route_ctx.end_col,
+                                    },
+                                },
+                                new_text: r.name.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11793,8 +12112,15 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for middleware context
-            if let Some(middleware_prefix) = Self::get_middleware_call_context(line_text, position.character) {
-                debug!("   Middleware context, filter prefix: '{}'", middleware_prefix);
+            // Pass previous lines for multi-line array detection
+            let previous_lines: Vec<&str> = lines[..position.line as usize].to_vec();
+            let prev_lines_slice: Option<&[&str]> = if previous_lines.is_empty() {
+                None
+            } else {
+                Some(&previous_lines)
+            };
+            if let Some(middleware_ctx) = Self::get_middleware_call_context(line_text, position.character, prev_lines_slice) {
+                debug!("   Middleware context, filter prefix: '{}'", middleware_ctx.prefix);
 
                 // Get all middleware from Salsa
                 let middleware_list = match self.salsa.get_all_parsed_middleware().await {
@@ -11806,7 +12132,7 @@ impl LanguageServer for LaravelLanguageServer {
                 };
 
                 // Build completion items, filtering by prefix (case-insensitive)
-                let prefix_lower = middleware_prefix.to_lowercase();
+                let prefix_lower = middleware_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = middleware_list
                     .into_iter()
                     .filter(|m| m.alias.to_lowercase().starts_with(&prefix_lower))
@@ -11821,6 +12147,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::MODULE),
                             detail: Some(format!("{} ({})", m.class_name, source)),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: middleware_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: middleware_ctx.end_col,
+                                    },
+                                },
+                                new_text: m.alias.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11840,8 +12179,8 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Check for feature context (Laravel Pennant)
             info!("   🔍 Checking feature context for line: '{}'", line_text);
-            if let Some(feature_prefix) = Self::get_feature_call_context(line_text, position.character) {
-                info!("   ✅ Feature context detected, filter prefix: '{}'", feature_prefix);
+            if let Some(feature_ctx) = Self::get_feature_call_context(line_text, position.character) {
+                info!("   ✅ Feature context detected, filter prefix: '{}'", feature_ctx.prefix);
 
                 // Get project root
                 let features = {
@@ -11861,7 +12200,7 @@ impl LanguageServer for LaravelLanguageServer {
                 };
 
                 // Build completion items, filtering by prefix (case-insensitive)
-                let prefix_lower = feature_prefix.to_lowercase();
+                let prefix_lower = feature_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = features
                     .into_iter()
                     .filter(|f| f.feature_key.to_lowercase().starts_with(&prefix_lower))
@@ -11871,6 +12210,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::CLASS),
                             detail: Some(format!("Feature: {}", f.class_name)),
                             documentation: Some(Documentation::String(f.full_class.clone())),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: feature_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: feature_ctx.end_col,
+                                    },
+                                },
+                                new_text: f.feature_key.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11889,8 +12241,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for translation context
-            if let Some(trans_prefix) = Self::get_translation_call_context(line_text, position.character) {
-                debug!("   Translation context, filter prefix: '{}'", trans_prefix);
+            if let Some(trans_ctx) = Self::get_translation_call_context(line_text, position.character) {
+                debug!("   Translation context, filter prefix: '{}'", trans_ctx.prefix);
 
                 // Get all translation keys
                 let translation_keys = self.get_all_translation_keys().await;
@@ -11898,7 +12250,7 @@ impl LanguageServer for LaravelLanguageServer {
                 // Build completion items, filtering by prefix (case-sensitive)
                 let items: Vec<CompletionItem> = translation_keys
                     .into_iter()
-                    .filter(|t| t.key.starts_with(&trans_prefix))
+                    .filter(|t| t.key.starts_with(&trans_ctx.prefix))
                     .map(|t| {
                         let detail = if t.value.is_empty() {
                             format!("({})", t.source)
@@ -11911,6 +12263,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::TEXT),
                             detail: Some(detail),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: trans_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: trans_ctx.end_col,
+                                    },
+                                },
+                                new_text: t.key.clone(),
+                            })),
                             ..Default::default()
                         }
                     })
@@ -11929,15 +12294,14 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Build surrounding lines context once for both param and rule context checks
+            // Pass ALL preceding lines so smart bracket tracking can find the array declaration
             let surrounding_lines: Vec<&str> = {
                 let line_idx = position.line as usize;
                 let mut context = Vec::new();
-                // Look back up to 10 lines for validation context
-                for i in 1..=10 {
-                    if line_idx >= i {
-                        if let Some(prev_line) = lines.get(line_idx - i) {
-                            context.push(*prev_line);
-                        }
+                // Collect all lines before current (most recent first for legacy compatibility)
+                for i in 1..=line_idx {
+                    if let Some(prev_line) = lines.get(line_idx - i) {
+                        context.push(*prev_line);
                     }
                 }
                 context
@@ -12090,7 +12454,7 @@ impl LanguageServer for LaravelLanguageServer {
         }
 
         // Check for env context
-        let env_filter_prefix = if is_env_file {
+        let env_ctx = if is_env_file {
             // In .env files, check for ${...} interpolation
             Self::get_env_interpolation_context(line_text, position.character)
         } else if is_phpunit_file {
@@ -12102,15 +12466,15 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         // If not in a valid context, return no completions
-        let filter_prefix = match env_filter_prefix {
-            Some(prefix) => prefix,
+        let env_ctx = match env_ctx {
+            Some(ctx) => ctx,
             None => {
                 debug!("   Not in completion context");
                 return Ok(None);
             }
         };
 
-        debug!("   Env filter prefix: '{}'", filter_prefix);
+        debug!("   Env filter prefix: '{}'", env_ctx.prefix);
 
         // Get all env vars from Salsa (.env files)
         let env_vars = match self.salsa.get_all_parsed_env_vars().await {
@@ -12122,10 +12486,22 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         // Build completion items, filtering by prefix
-        let filter_upper = filter_prefix.to_uppercase();
+        let filter_upper = env_ctx.prefix.to_uppercase();
 
         // Track which var names we've seen (from .env files)
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Create the text_edit range once for reuse
+        let edit_range = Range {
+            start: Position {
+                line: position.line,
+                character: env_ctx.start_col,
+            },
+            end: Position {
+                line: position.line,
+                character: env_ctx.end_col,
+            },
+        };
 
         // First, add .env file vars (project-specific, higher priority)
         let mut items: Vec<CompletionItem> = env_vars
@@ -12144,6 +12520,10 @@ impl LanguageServer for LaravelLanguageServer {
                     kind: Some(CompletionItemKind::VARIABLE),
                     detail: Some(format!("{} (from {})", v.value, source_file)),
                     documentation: None,
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: edit_range,
+                        new_text: v.name.clone(),
+                    })),
                     ..Default::default()
                 }
             })
@@ -12153,10 +12533,14 @@ impl LanguageServer for LaravelLanguageServer {
         for (name, value) in std::env::vars() {
             if !seen_names.contains(&name) && name.to_uppercase().starts_with(&filter_upper) {
                 items.push(CompletionItem {
-                    label: name,
+                    label: name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
                     detail: Some(format!("{} (from system)", value)),
                     documentation: None,
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: edit_range,
+                        new_text: name,
+                    })),
                     ..Default::default()
                 });
             }

@@ -9,9 +9,9 @@ use tracing::info;
 /// Find the Laravel project root by walking up from a file path
 ///
 /// Looks for Laravel-specific markers:
-/// - composer.json
-/// - artisan file
-/// - app/ and resources/ directories together
+/// - composer.json + artisan (Laravel app)
+/// - composer.json + app/ + resources/ (Laravel app)
+/// - composer.json + src/ + vendor/ (Laravel package)
 ///
 /// Returns None if no Laravel project root is found.
 pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
@@ -29,16 +29,25 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
         let has_artisan = current.join("artisan").exists();
         let has_app = current.join("app").is_dir();
         let has_resources = current.join("resources").is_dir();
+        let has_src = current.join("src").is_dir();
+        let has_vendor = current.join("vendor").is_dir();
 
-        // If we find composer.json + artisan, it's very likely a Laravel project
+        // If we find composer.json + artisan, it's very likely a Laravel app
         if has_composer && has_artisan {
             info!("Found Laravel project root at {:?} (composer.json + artisan)", current);
             return Some(current.to_path_buf());
         }
 
-        // Or if we find composer.json + app/ + resources/
+        // Or if we find composer.json + app/ + resources/ (Laravel app)
         if has_composer && has_app && has_resources {
             info!("Found Laravel project root at {:?} (composer.json + app + resources)", current);
+            return Some(current.to_path_buf());
+        }
+
+        // Or if we find composer.json + src/ + vendor/ (Laravel package)
+        // This pattern recognizes Laravel package development
+        if has_composer && has_src && has_vendor {
+            info!("Found Laravel package root at {:?} (composer.json + src + vendor)", current);
             return Some(current.to_path_buf());
         }
 

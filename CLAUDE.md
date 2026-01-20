@@ -373,90 +373,96 @@ When working on this project:
 
 ---
 
-## Session State (2026-01-14)
+## Session State (2026-01-17)
 
 ### Last Session Summary
 
-**Focus**: Fixed autocomplete text replacement behavior across all completion handlers
+**Focus**: Fixed Laravel 11+ middleware detection and autocomplete
+
+### Problem
+
+Middleware like 'api', 'web', 'auth' weren't being detected in Laravel 11/12 projects because:
+1. Laravel 11+ uses method-based middleware declarations instead of property-based
+2. Autocomplete wasn't triggering for `'middleware' => [...]` array-key syntax
+3. Vendor/app scanning wasn't happening on LSP startup
 
 ### Issues Fixed
 
-1. **Config keys with hyphens not detected** - Updated regex in `parse_config_keys()` from `[a-zA-Z_][a-zA-Z0-9_]*` to `[a-zA-Z_][a-zA-Z0-9_-]*` to support kebab-case keys like `'frequent-legacy-bank'`
+1. **Laravel 11+ middleware method patterns** - Added tree-sitter queries (patterns 33-38) for:
+   - `defaultAliases()` method body array assignments
+   - `getMiddlewareGroups()` method body array assignments
+   - `$middleware->alias('name', Class::class)` single alias calls
+   - `$middleware->alias([...])` array of aliases
+   - `$middleware->group('name', [...])` group definitions
+   - `$router->aliasMiddleware()` service provider calls
 
-2. **Autocomplete inserting instead of replacing** - When selecting an autocomplete item, it was inserting text at cursor instead of replacing the existing string content. This caused issues like showing closing quotes/parentheses in results.
+2. **Middleware autocomplete for array-key syntax** - Added patterns for:
+   - `'middleware' => ['` (Route::group config style)
+   - `,'` (comma without space, in addition to `', '`)
+   - Multi-line array detection (scans up to 20 previous lines)
 
-### Solution: StringContext + text_edit
+3. **Initial vendor/app rescan on startup** - Fixed `initialized` handler to:
+   - Queue `RescanType::Vendor` and `RescanType::App` on startup
+   - Parse `vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php`
+   - Parse `bootstrap/app.php` and `app/Providers/*.php`
 
-Created a new `StringContext` struct (line ~1713) to track string position info:
-
-```rust
-struct StringContext {
-    prefix: String,      // Text typed so far (for filtering)
-    start_col: u32,      // Column where string content starts (after opening quote)
-    end_col: u32,        // Column where string content ends (before closing quote)
-    quote_char: char,    // The quote character used
-}
-```
-
-Added `find_string_end()` helper (line ~3371) to find closing quote position.
+4. **Removed synthetic defaults** - Deleted `register_laravel_defaults()` in favor of proper parsing
 
 ### Files Modified
 
 | File | Changes |
 |------|---------|
-| `laravel-lsp/src/main.rs` | Added `StringContext` struct, `find_string_end()` helper, updated 12 context functions and all completion handlers |
+| `laravel-lsp/queries/php.scm` | Added patterns 33-38 for method-based middleware |
+| `laravel-lsp/src/main.rs` | Updated `get_middleware_call_context()` for array-key syntax and multi-line; fixed startup to queue vendor/app rescans |
+| `laravel-lsp/src/salsa_impl.rs` | Removed `register_laravel_defaults()` |
+| `laravel-lsp/src/queries.rs` | Added 6 tests for Laravel 11 middleware patterns |
 
-### Context Functions Updated (all return `StringContext` now)
+### Key Code Changes
 
-1. `get_config_call_context`
-2. `get_view_call_context`
-3. `get_route_call_context`
-4. `get_middleware_call_context`
-5. `get_asset_call_context`
-6. `get_vite_call_context`
-7. `get_binding_call_context`
-8. `get_feature_call_context`
-9. `get_translation_call_context`
-10. `get_env_call_context`
-11. `get_env_interpolation_context` (for `${VAR}` in .env files)
-12. `get_phpunit_env_context` (for `<env name="VAR">` in PHPUnit XML)
-
-### Completion Handler Pattern
-
-All handlers now use `text_edit` to replace string content:
-
+**`get_middleware_call_context()` now accepts `previous_lines` parameter:**
 ```rust
-CompletionItem {
-    label: key.clone(),
-    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-        range: Range {
-            start: Position { line: position.line, character: ctx.start_col },
-            end: Position { line: position.line, character: ctx.end_col },
-        },
-        new_text: key.clone(),
-    })),
-    ..Default::default()
-}
+fn get_middleware_call_context(
+    line_text: &str,
+    character: u32,
+    previous_lines: Option<&[&str]>,  // For multi-line array detection
+) -> Option<StringContext>
+```
+
+**Middleware patterns added:**
+```rust
+// Array-key syntax in Route::group
+("'middleware' => ['", '\'', 18),
+// Comma without space
+(",'", '\'', 2),
+```
+
+**Startup rescan fix in `initialized()`:**
+```rust
+// Queue initial vendor/app rescans
+server.pending_rescans.write().await.insert(RescanType::Vendor);
+server.pending_rescans.write().await.insert(RescanType::App);
+server.execute_pending_rescans().await;
 ```
 
 ### Current Status
 
 - Build: **Passing** (no warnings)
-- Tests: **134 tests passing** (57 unit + 77 integration)
+- Tests: **187 tests passing** (66 unit + 44 main + 77 integration)
 - Binary: `target/release/laravel-lsp` updated
 
 ### Testing
 
-To test the fix:
+To test middleware autocomplete:
 1. Reload Zed extensions (`Cmd+Shift+P` → "zed: reload extensions")
-2. Type `config('app.` and select an autocomplete item
-3. Should replace the string content, not insert at cursor
+2. Open a Laravel 11+ project
+3. Type in a route file: `'middleware' => ['api','`
+4. Should see middleware autocomplete suggestions (auth, guest, etc.)
 
 ### Key Code Locations
 
-| Component | Line(s) | Purpose |
-|-----------|---------|---------|
-| `StringContext` struct | ~1713-1726 | Position info for text replacement |
-| `find_string_end()` | ~3371-3380 | Find closing quote position |
-| Config regex fix | ~8149 | Added hyphen support in key pattern |
-| Example handler | Search for `get_config_call_context` usage | Pattern for all handlers |
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| Middleware patterns | `queries/php.scm` patterns 33-38 | Tree-sitter queries for Laravel 11 |
+| `get_middleware_call_context()` | `main.rs:3777` | Detect middleware autocomplete context |
+| Startup rescan | `main.rs:10997-11004` | Queue vendor/app rescans on init |
+| Middleware tests | `queries.rs:1308-1495` | 6 tests for Laravel 11 patterns |

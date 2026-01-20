@@ -306,6 +306,19 @@ pub struct FeatureMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a $name property in a feature class for custom aliases
+/// e.g., public string $name = 'custom-alias';
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureNamePropertyMatch<'a> {
+    /// The custom alias value (e.g., 'custom-alias')
+    pub name_value: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 // ============================================================================
 // Extracted Patterns - Result structs for single-pass extraction
 // ============================================================================
@@ -326,6 +339,8 @@ pub struct ExtractedPhpPatterns<'a> {
     pub url_calls: Vec<UrlMatch<'a>>,
     pub action_calls: Vec<ActionMatch<'a>>,
     pub feature_calls: Vec<FeatureMatch<'a>>,
+    /// Custom $name property values from feature classes
+    pub feature_name_properties: Vec<FeatureNamePropertyMatch<'a>>,
 }
 
 /// Represents PHP content inside Blade echo statements {{ ... }}
@@ -714,6 +729,18 @@ pub fn extract_all_php_patterns<'a>(
                 });
             }
 
+            // Feature class $name property - custom aliases
+            "feature_name_value" => {
+                result.feature_name_properties.push(FeatureNamePropertyMatch {
+                    name_value: text,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
             // Ignore other captures (function_name, class_name, etc. used for matching)
             _ => {}
         }
@@ -723,7 +750,7 @@ pub fn extract_all_php_patterns<'a>(
     let pattern_count = result.views.len() + result.env_calls.len() + result.config_calls.len()
         + result.middleware_calls.len() + result.translation_calls.len() + result.asset_calls.len()
         + result.binding_calls.len() + result.route_calls.len() + result.url_calls.len()
-        + result.action_calls.len() + result.feature_calls.len();
+        + result.action_calls.len() + result.feature_calls.len() + result.feature_name_properties.len();
     info!(
         "📊 PHP extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count
@@ -2140,6 +2167,81 @@ class RouteServiceProvider extends ServiceProvider
         // Test 7: Invalid args (no quotes)
         let result = calculate_string_column_range(8, "($condition)");
         assert_eq!(result, None, "Args without quotes should return None");
+    }
+
+    #[test]
+    fn test_feature_name_property_extraction() {
+        // Test typed property with single quotes
+        let php_code = r#"<?php
+
+namespace App\Features;
+
+class NewApi
+{
+    public string $name = 'custom-feature-alias';
+
+    public function resolve(mixed $scope): mixed
+    {
+        return false;
+    }
+}
+"#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.feature_name_properties.len(), 1, "Should find one $name property");
+        assert_eq!(patterns.feature_name_properties[0].name_value, "custom-feature-alias");
+    }
+
+    #[test]
+    fn test_feature_name_property_untyped() {
+        // Test untyped property with double quotes
+        let php_code = r#"<?php
+
+namespace App\Features;
+
+class BetaMode
+{
+    public $name = "beta-mode-feature";
+
+    public function resolve(mixed $scope): mixed
+    {
+        return true;
+    }
+}
+"#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert_eq!(patterns.feature_name_properties.len(), 1, "Should find one $name property");
+        assert_eq!(patterns.feature_name_properties[0].name_value, "beta-mode-feature");
+    }
+
+    #[test]
+    fn test_feature_name_property_not_captured_for_other_names() {
+        // Ensure we only capture $name, not other properties
+        let php_code = r#"<?php
+
+class SomeClass
+{
+    public string $description = 'some description';
+    public string $title = 'some title';
+    protected $value = 'some value';
+}
+"#;
+
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        assert!(patterns.feature_name_properties.is_empty(), "Should not capture other properties");
     }
 
 }

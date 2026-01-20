@@ -23,9 +23,6 @@ Thumbs.db
 # Extension build artifacts
 *.wasm
 
-# Zed specific
-.zed/
-
 # Release binary directories (created by GitHub Actions)
 laravel-lsp-*/
 

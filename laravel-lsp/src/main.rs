@@ -432,7 +432,10 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
 
             let full_class = format!("App\\Features\\{}", class_path);
             let class_name = stem.to_string();
-            let feature_key = class_name_to_feature_key(stem);
+
+            // Try to extract the $name property from the feature class
+            let feature_key = extract_feature_name_property(path)
+                .unwrap_or_else(|| class_name_to_feature_key(stem));
 
             features.push(FeatureInfo {
                 feature_key,
@@ -443,6 +446,27 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
     }
 
     features
+}
+
+/// Extract the $name property value from a feature class file using tree-sitter
+fn extract_feature_name_property(path: &Path) -> Option<String> {
+    use laravel_lsp::parser::{language_php, parse_php};
+    use laravel_lsp::queries::extract_all_php_patterns;
+
+    // Read the file content
+    let content = std::fs::read_to_string(path).ok()?;
+
+    // Parse with tree-sitter
+    let tree = parse_php(&content).ok()?;
+    let language = language_php();
+
+    // Extract patterns
+    let patterns = extract_all_php_patterns(&tree, &content, &language).ok()?;
+
+    // Return the first $name property value if found
+    patterns.feature_name_properties
+        .first()
+        .map(|p| p.name_value.to_string())
 }
 
 /// Information about a discovered Blade directive
@@ -9196,12 +9220,20 @@ return [
             if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
                 let root = self.root_path.read().await;
                 if let Some(root) = root.as_ref() {
-                    // Convert feature key to class name and build path
-                    let class_name = feature_key_to_class_name(&feature_name);
-                    let feature_path = root.join(format!("app/Features/{}.php", class_name));
+                    // First check scanned features for custom $name property matches
+                    let scanned_features = scan_feature_classes(root);
+                    let feature_path = if let Some(feature_info) = scanned_features.iter().find(|f| f.feature_key == feature_name) {
+                        // Found a feature class with matching $name property or derived key
+                        root.join("app/Features").join(format!("{}.php", feature_info.class_name))
+                    } else {
+                        // Fallback: Convert feature key to class name and build path
+                        let class_name = feature_key_to_class_name(&feature_name);
+                        root.join(format!("app/Features/{}.php", class_name))
+                    };
 
                     if self.file_exists_cached(&feature_path).await {
-                        return self.create_location_link(dir, &feature_path);
+                        // Use string_column/string_end_column for the clickable range (just the feature name)
+                        return self.create_location_link_with_string_range(dir, &feature_path);
                     }
                 }
             }
@@ -9216,6 +9248,22 @@ return [
         let origin_selection_range = Range {
             start: Position { line: dir.line, character: dir.column },
             end: Position { line: dir.line, character: dir.end_column },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(origin_selection_range),
+            target_uri,
+            target_range: Range::default(),
+            target_selection_range: Range::default(),
+        }]))
+    }
+
+    /// Helper to create a LocationLink using string_column/string_end_column range
+    /// This highlights just the string content inside quotes, not the entire directive
+    fn create_location_link_with_string_range(&self, dir: &DirectiveReferenceData, path: &std::path::Path) -> Option<GotoDefinitionResponse> {
+        let target_uri = Url::from_file_path(path).ok()?;
+        let origin_selection_range = Range {
+            start: Position { line: dir.line, character: dir.string_column },
+            end: Position { line: dir.line, character: dir.string_end_column },
         };
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: Some(origin_selection_range),
@@ -9695,9 +9743,16 @@ return [
             resolve_class_to_file(&feature.feature_name, root)?
         } else {
             // String-based: Feature::active('new-api')
-            // Convert kebab-case/snake_case to PascalCase
-            let class_name = feature_key_to_class_name(&feature.feature_name);
-            root.join("app/Features").join(format!("{}.php", class_name))
+            // First check scanned features for custom $name property matches
+            let scanned_features = scan_feature_classes(root);
+            if let Some(feature_info) = scanned_features.iter().find(|f| f.feature_key == feature.feature_name) {
+                // Found a feature class with matching $name property or derived key
+                root.join("app/Features").join(format!("{}.php", feature_info.class_name))
+            } else {
+                // Fallback: Convert kebab-case/snake_case to PascalCase
+                let class_name = feature_key_to_class_name(&feature.feature_name);
+                root.join("app/Features").join(format!("{}.php", class_name))
+            }
         };
 
         if self.file_exists_cached(&path).await {
@@ -10659,15 +10714,25 @@ return [
             }
 
             // Check @feature directives for Laravel Pennant feature classes
+            // Build a map of feature keys to their actual file paths (supports custom $name properties)
+            let feature_map: std::collections::HashMap<String, PathBuf> = scan_feature_classes(root)
+                .into_iter()
+                .map(|f| {
+                    let file_path = root.join("app/Features").join(format!("{}.php", f.class_name));
+                    (f.feature_key, file_path)
+                })
+                .collect();
+
             for dir_ref in &patterns.directives {
                 if dir_ref.name == "feature" {
                     if let Some(ref args) = dir_ref.arguments {
                         if let Some(feature_name) = Self::extract_view_from_directive_args(args) {
-                            // Convert feature key to class name and build path
-                            let class_name = feature_key_to_class_name(&feature_name);
-                            let feature_path = root.join(format!("app/Features/{}.php", class_name));
+                            // Check if feature key exists in scanned features (includes custom $name)
+                            if !feature_map.contains_key(&feature_name) {
+                                // Feature not found - show expected path based on derived class name
+                                let class_name = feature_key_to_class_name(&feature_name);
+                                let feature_path = root.join(format!("app/Features/{}.php", class_name));
 
-                            if !feature_path.exists() {
                                 // Use pre-calculated string_column/string_end_column from Salsa
                                 // These point to the content INSIDE the quotes (the feature name)
                                 let diagnostic = Diagnostic {

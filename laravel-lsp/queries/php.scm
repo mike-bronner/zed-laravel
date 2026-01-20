@@ -1903,3 +1903,30 @@
       (array_creation_expression)))
   (#eq? @_router_method "middlewareGroup")
   (#match? @_router_obj "\\$router"))
+
+; ============================================================================
+; Pattern 39: Feature class $name property for custom aliases
+; ============================================================================
+; Matches: public string $name = 'custom-alias';
+;          public $name = 'custom-alias';
+;          protected string $name = "custom-alias";
+;
+; Used to detect custom feature aliases in Laravel Pennant feature classes.
+; When Feature::active('custom-alias') is used, this finds the class that
+; defines $name = 'custom-alias' instead of just deriving from class name.
+
+; Typed property with single-quoted string value
+(property_declaration
+  (property_element
+    name: (variable_name) @_feature_name_prop
+    default_value: (string
+      (string_content) @feature_name_value))
+  (#eq? @_feature_name_prop "$name"))
+
+; Typed property with double-quoted string value
+(property_declaration
+  (property_element
+    name: (variable_name) @_feature_name_prop
+    default_value: (encapsed_string
+      (string_content) @feature_name_value))
+  (#eq? @_feature_name_prop "$name"))

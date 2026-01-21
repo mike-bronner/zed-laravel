@@ -1,0 +1,9 @@
+{
+  "lsp": {
+    "laravel-lsp": {
+      "binary": {
+        "path": "laravel-lsp/target/release/laravel-lsp"
+      }
+    }
+  }
+}

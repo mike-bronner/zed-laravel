@@ -4067,13 +4067,13 @@ impl LaravelLanguageServer {
     }
 
     /// Check if cursor is inside a Blade component tag like `<x-...`
-    /// Returns the partial component name typed so far (for filtering completions)
+    /// Returns context with the partial component name and position info for text replacement
     ///
     /// Examples:
-    /// - `<x-` returns Some("")
-    /// - `<x-button` returns Some("button")
-    /// - `<x-forms.` returns Some("forms.")
-    fn get_blade_component_context(line_text: &str, character: u32) -> Option<String> {
+    /// - `<x-` returns Some(StringContext { prefix: "", start_col: 3, end_col: 3, ... })
+    /// - `<x-button` returns Some(StringContext { prefix: "button", start_col: 3, end_col: 9, ... })
+    /// - `<x-forms.` returns Some(StringContext { prefix: "forms.", start_col: 3, end_col: 9, ... })
+    fn get_blade_component_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -4098,7 +4098,12 @@ impl LaravelLanguageServer {
 
             // Validate that after_prefix only contains valid component name characters
             if after_prefix.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
-                return Some(after_prefix.to_string());
+                return Some(StringContext {
+                    prefix: after_prefix.to_string(),
+                    start_col: start_pos as u32,
+                    end_col: cursor as u32,
+                    quote_char: ' ', // Not applicable for tag syntax
+                });
             }
         }
 
@@ -9215,6 +9220,22 @@ return [
         // Note: @vite is handled as Asset patterns, not Directive patterns
         // See parse_file_patterns in salsa_impl.rs
 
+        // Handle @livewire('component-name') - Livewire component directive
+        // Navigates to the Blade view using view_path resolution
+        if dir.name == "livewire" {
+            if let Some(component_name) = Self::extract_view_from_directive_args(arguments) {
+                // Resolve using view path (e.g., 'navigation-menu' -> resources/views/navigation-menu.blade.php)
+                let possible_paths = config.resolve_view_path(&component_name);
+
+                for path in possible_paths {
+                    if self.file_exists_cached(&path).await {
+                        // Use string_column/string_end_column for the clickable range (just the component name)
+                        return self.create_location_link_with_string_range(dir, &path);
+                    }
+                }
+            }
+        }
+
         // Handle @feature('feature-name') - Laravel Pennant feature directive
         if dir.name == "feature" {
             if let Some(feature_name) = Self::extract_view_from_directive_args(arguments) {
@@ -11852,14 +11873,14 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for Blade component context (<x-...)
-            if let Some(component_prefix) = Self::get_blade_component_context(line_text, position.character) {
-                debug!("   Blade component context, filter prefix: '{}'", component_prefix);
+            if let Some(component_ctx) = Self::get_blade_component_context(line_text, position.character) {
+                debug!("   Blade component context, filter prefix: '{}'", component_ctx.prefix);
 
                 // Get all Blade components
                 let components = self.get_all_blade_components().await;
 
                 // Build completion items, filtering by prefix (case-insensitive)
-                let prefix_lower = component_prefix.to_lowercase();
+                let prefix_lower = component_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = components
                     .into_iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
@@ -11869,6 +11890,19 @@ impl LanguageServer for LaravelLanguageServer {
                             kind: Some(CompletionItemKind::CLASS),
                             detail: Some(c.path),
                             documentation: None,
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: component_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: component_ctx.end_col,
+                                    },
+                                },
+                                new_text: c.name.clone(),
+                            })),
                             ..Default::default()
                         }
                     })

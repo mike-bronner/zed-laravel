@@ -848,7 +848,7 @@ pub fn extract_all_blade_patterns<'a>(
                 // Calculate string column positions for view-referencing, translation, and feature directives
                 // Use the actual parameter column from tree-sitter for accurate positioning
                 let (string_column, string_end_column) = match (directive_name, &param_info) {
-                    ("extends" | "include" | "slot" | "component" | "lang" | "feature", Some(info)) => {
+                    ("extends" | "include" | "slot" | "component" | "lang" | "feature" | "livewire", Some(info)) => {
                         calculate_string_column_range(info.column, info.text)
                             .unwrap_or((directive_column, directive_end_column))
                     }
@@ -930,7 +930,7 @@ pub fn extract_all_blade_patterns<'a>(
                 // Calculate string column positions for view-referencing directives
                 // For directive_attribute, calculate parameter column from paren position
                 let (string_column, string_end_column) = match (directive_name, &arguments, paren_pos) {
-                    ("extends" | "include" | "slot" | "component" | "lang" | "feature", Some(args), Some(pos)) => {
+                    ("extends" | "include" | "slot" | "component" | "lang" | "feature" | "livewire", Some(args), Some(pos)) => {
                         // Parameter column = directive_column + @ + paren_pos
                         let parameter_column = directive_column + 1 + pos;
                         calculate_string_column_range(parameter_column, args)

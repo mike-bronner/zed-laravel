@@ -373,96 +373,86 @@ When working on this project:
 
 ---
 
-## Session State (2026-01-17)
+## Session State (2026-01-20)
 
 ### Last Session Summary
 
-**Focus**: Fixed Laravel 11+ middleware detection and autocomplete
-
-### Problem
-
-Middleware like 'api', 'web', 'auth' weren't being detected in Laravel 11/12 projects because:
-1. Laravel 11+ uses method-based middleware declarations instead of property-based
-2. Autocomplete wasn't triggering for `'middleware' => [...]` array-key syntax
-3. Vendor/app scanning wasn't happening on LSP startup
+**Focus**: Feature class `$name` property support, `@livewire` directive go-to-definition, Blade component autocomplete fix
 
 ### Issues Fixed
 
-1. **Laravel 11+ middleware method patterns** - Added tree-sitter queries (patterns 33-38) for:
-   - `defaultAliases()` method body array assignments
-   - `getMiddlewareGroups()` method body array assignments
-   - `$middleware->alias('name', Class::class)` single alias calls
-   - `$middleware->alias([...])` array of aliases
-   - `$middleware->group('name', [...])` group definitions
-   - `$router->aliasMiddleware()` service provider calls
+#### 1. Laravel Pennant Feature `$name` Property Support
 
-2. **Middleware autocomplete for array-key syntax** - Added patterns for:
-   - `'middleware' => ['` (Route::group config style)
-   - `,'` (comma without space, in addition to `', '`)
-   - Multi-line array detection (scans up to 20 previous lines)
+Feature classes can now define a custom alias via the `$name` property:
+```php
+class ListManagerFeature {
+    public string $name = 'list-manager';  // Custom alias
+}
+```
 
-3. **Initial vendor/app rescan on startup** - Fixed `initialized` handler to:
-   - Queue `RescanType::Vendor` and `RescanType::App` on startup
-   - Parse `vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php`
-   - Parse `bootstrap/app.php` and `app/Providers/*.php`
+This allows `Feature::active('list-manager')` and `@feature('list-manager')` to correctly resolve to `ListManagerFeature.php`.
 
-4. **Removed synthetic defaults** - Deleted `register_laravel_defaults()` in favor of proper parsing
+**Changes:**
+- Added tree-sitter query (Pattern 39) in `queries/php.scm` to extract `$name` property
+- Added `FeatureNamePropertyMatch` struct in `queries.rs`
+- Added `extract_feature_name_property()` function in `main.rs`
+- Updated `scan_feature_classes()` to parse `$name` from feature files
+- Fixed 4 locations using old feature key → class name conversion:
+  - `create_directive_location_from_salsa()` - `@feature` go-to-definition
+  - `create_feature_location_from_salsa()` - `Feature::active()` go-to-definition
+  - Blade `@feature` diagnostic validation
+  - PHP `Feature::active()` diagnostic validation
+
+#### 2. `@livewire` Directive Go-to-Definition
+
+Added go-to-definition support for `@livewire('component-name')` directive:
+- Resolves to Blade view using `config.resolve_view_path()`
+- Uses `string_column`/`string_end_column` for precise highlighting
+- Added `livewire` to directive list for string column calculation in `queries.rs`
+
+#### 3. Blade Component Autocomplete Text Replacement
+
+Fixed issue where selecting a Blade component from autocomplete would insert instead of replace:
+- Changed `get_blade_component_context()` to return `StringContext` with position info
+- Added `text_edit` with proper range to completion items
 
 ### Files Modified
 
 | File | Changes |
 |------|---------|
-| `laravel-lsp/queries/php.scm` | Added patterns 33-38 for method-based middleware |
-| `laravel-lsp/src/main.rs` | Updated `get_middleware_call_context()` for array-key syntax and multi-line; fixed startup to queue vendor/app rescans |
-| `laravel-lsp/src/salsa_impl.rs` | Removed `register_laravel_defaults()` |
-| `laravel-lsp/src/queries.rs` | Added 6 tests for Laravel 11 middleware patterns |
-
-### Key Code Changes
-
-**`get_middleware_call_context()` now accepts `previous_lines` parameter:**
-```rust
-fn get_middleware_call_context(
-    line_text: &str,
-    character: u32,
-    previous_lines: Option<&[&str]>,  // For multi-line array detection
-) -> Option<StringContext>
-```
-
-**Middleware patterns added:**
-```rust
-// Array-key syntax in Route::group
-("'middleware' => ['", '\'', 18),
-// Comma without space
-(",'", '\'', 2),
-```
-
-**Startup rescan fix in `initialized()`:**
-```rust
-// Queue initial vendor/app rescans
-server.pending_rescans.write().await.insert(RescanType::Vendor);
-server.pending_rescans.write().await.insert(RescanType::App);
-server.execute_pending_rescans().await;
-```
-
-### Current Status
-
-- Build: **Passing** (no warnings)
-- Tests: **187 tests passing** (66 unit + 44 main + 77 integration)
-- Binary: `target/release/laravel-lsp` updated
-
-### Testing
-
-To test middleware autocomplete:
-1. Reload Zed extensions (`Cmd+Shift+P` → "zed: reload extensions")
-2. Open a Laravel 11+ project
-3. Type in a route file: `'middleware' => ['api','`
-4. Should see middleware autocomplete suggestions (auth, guest, etc.)
+| `queries/php.scm` | Added Pattern 39 for `$name` property extraction |
+| `src/queries.rs` | Added `FeatureNamePropertyMatch`, `livewire` to string column calculation, 3 tests |
+| `src/main.rs` | Feature lookup fixes, `@livewire` go-to-definition, Blade component autocomplete fix |
 
 ### Key Code Locations
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| Middleware patterns | `queries/php.scm` patterns 33-38 | Tree-sitter queries for Laravel 11 |
-| `get_middleware_call_context()` | `main.rs:3777` | Detect middleware autocomplete context |
-| Startup rescan | `main.rs:10997-11004` | Queue vendor/app rescans on init |
-| Middleware tests | `queries.rs:1308-1495` | 6 tests for Laravel 11 patterns |
+| Feature `$name` query | `queries/php.scm` Pattern 39 | Extract `$name` property from feature classes |
+| `extract_feature_name_property()` | `main.rs:451-470` | Parse feature file for `$name` property |
+| `scan_feature_classes()` | `main.rs:406-448` | Scan `app/Features/` with `$name` support |
+| `@livewire` go-to-def | `main.rs:9218-9232` | Navigate to Blade view from directive |
+| `@feature` go-to-def | `main.rs:9235-9260` | Navigate to feature class from directive |
+| Blade component context | `main.rs:4076-4111` | Returns `StringContext` with position info |
+| String column directives | `queries.rs:851,933` | List includes `livewire` for highlighting |
+
+### Current Status
+
+- Build: **Passing**
+- Tests: **190 tests passing** (69 unit + 44 main + 77 integration)
+- Binary: `target/release/laravel-lsp` updated
+
+### Testing
+
+**Feature `$name` property:**
+1. Create `app/Features/MyFeature.php` with `public string $name = 'custom-alias';`
+2. Use `@feature('custom-alias')` or `Feature::active('custom-alias')`
+3. Should resolve without error, go-to-definition should work
+
+**`@livewire` directive:**
+1. Use `@livewire('navigation-menu')` in Blade file
+2. Option-click should navigate to `resources/views/navigation-menu.blade.php`
+
+**Blade component autocomplete:**
+1. Type `<x-but` and select from autocomplete
+2. Should replace `but` with full component name, not insert

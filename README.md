@@ -72,6 +72,18 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
+**🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. Enable it in your Zed `settings.json`:
+
+```json
+{
+  "languages": {
+    "Blade": {
+      "semantic_tokens": "combined"
+    }
+  }
+}
+```
+
 ## ✨ Features
 
 ### 🔗 Go-to-Definition
@@ -340,15 +352,9 @@ Route::middleware('admin-only')->group(...);
 - 🌐 Add translations to existing files
 - 🔐 Add environment variables to `.env`
 
-## 🎨 Blade Language Support
+### 🎨 Blade Editing Support
 
-Full Blade template language support with syntax highlighting, smart completions, and editor integration.
-
-### Syntax Highlighting
-
-Blade directives, PHP blocks, echo statements, and comments are all properly highlighted with distinct colors.
-
-### Directive Autocomplete
+#### Directive Autocomplete
 
 Type `@` to see all 100+ Blade directives with descriptions:
 
@@ -366,7 +372,7 @@ Block directives automatically include their closing tags:
 @endif
 ```
 
-### Smart Bracket Expansion
+#### Smart Bracket Expansion
 
 Type `{` and select from snippet completions:
 
@@ -377,9 +383,7 @@ Type `{` and select from snippet completions:
   ↳ {{-- ... --}}  Blade comment
 ```
 
-Cursor is automatically positioned between the brackets for immediate typing.
-
-### Closing Tag Navigation
+#### Closing Tag Navigation
 
 Cmd+Click works on both opening AND closing tags:
 
@@ -390,6 +394,8 @@ Cmd+Click works on both opening AND closing tags:
 <livewire:counter></livewire:counter>
 {{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
 ```
+
+> **Note:** Blade syntax highlighting is provided by the separate [Blade](https://github.com/EmranMR/tree-sitter-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting (distinct colors for `@if`, `@foreach`, etc.), enable semantic tokens in your settings — see the [Configuration](#️-configuration) section above.
 
 ## 🚧 Planned Features
 
@@ -406,9 +412,6 @@ Cmd+Click works on both opening AND closing tags:
 zed-laravel/
 ├── src/lib.rs           # Zed extension (binary download/management)
 ├── extension.toml       # Extension manifest
-├── languages/           # Blade & PHP language definitions
-│   ├── blade/           # Syntax highlighting, injections, indents
-│   └── php_only/        # PHP syntax support
 ├── laravel-lsp/         # Laravel Language Server (the actual LSP)
 │   ├── src/main.rs      # LSP server implementation
 │   ├── src/queries.rs   # Tree-sitter pattern extraction

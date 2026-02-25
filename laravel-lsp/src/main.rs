@@ -1800,14 +1800,14 @@ impl LaravelLanguageServer {
     /// Extract Blade directive tokens for semantic highlighting
     ///
     /// Finds all `@directive` patterns in the content and converts them to
-    /// LSP semantic tokens with delta encoding. Each token is marked as KEYWORD
+    /// LSP semantic tokens with delta encoding. Each token is marked as FUNCTION
     /// type (index 0 in our legend).
     ///
     /// The delta encoding format is:
     /// - delta_line: lines since previous token
     /// - delta_start: characters since previous token (or start of line if new line)
     /// - length: token length in characters
-    /// - token_type: 0 for KEYWORD
+    /// - token_type: 0 for FUNCTION
     /// - token_modifiers: 0 (no modifiers)
     fn extract_blade_directive_tokens(&self, content: &str) -> Vec<SemanticToken> {
         use regex::Regex;
@@ -1868,7 +1868,7 @@ impl LaravelLanguageServer {
                 delta_line,
                 delta_start,
                 length,
-                token_type: 0,       // KEYWORD (index 0 in our legend)
+                token_type: 0,       // FUNCTION (index 0 in our legend)
                 token_modifiers_bitset: 0,
             });
 
@@ -11003,7 +11003,7 @@ impl LanguageServer for LaravelLanguageServer {
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
                                 token_types: vec![
-                                    SemanticTokenType::KEYWORD,  // index 0 - @directive
+                                    SemanticTokenType::FUNCTION,  // index 0 - @directive
                                 ],
                                 token_modifiers: vec![],
                             },
@@ -11664,6 +11664,29 @@ impl LanguageServer for LaravelLanguageServer {
                 if trigger_start > 0 {
                     let start_col = position.character.saturating_sub(trigger_start as u32);
 
+                    // Check for closing characters after cursor that should be replaced
+                    // (e.g., auto-closed `}`, `}}`, `--}}`, `!!}` from typing `{`, `{{`, etc.)
+                    let text_after = if cursor_col < line_text.len() {
+                        &line_text[cursor_col..]
+                    } else {
+                        ""
+                    };
+
+                    // Count how many trailing characters to replace after the cursor
+                    let trailing_len = if text_after.starts_with("--}}") {
+                        4
+                    } else if text_after.starts_with("!!}") {
+                        3
+                    } else if text_after.starts_with("}}") {
+                        2
+                    } else if text_after.starts_with("}") {
+                        1
+                    } else {
+                        0
+                    };
+
+                    let end_col = position.character + trailing_len as u32;
+
                     // Define all bracket snippets
                     let all_brackets = [
                         ("{{", "{{ $0 }}", "Echo (escaped)"),
@@ -11687,7 +11710,10 @@ impl LanguageServer for LaravelLanguageServer {
                                             line: position.line,
                                             character: start_col,
                                         },
-                                        end: position,
+                                        end: Position {
+                                            line: position.line,
+                                            character: end_col,
+                                        },
                                     },
                                     new_text: snippet.to_string(),
                                 })),

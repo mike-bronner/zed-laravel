@@ -72,7 +72,7 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
-**🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. Enable it in your Zed `settings.json`:
+**🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. This is also the only way to get correct highlighting for **custom directives** (e.g., `@myCustomDirective`, Livewire's `@teleport`, Pennant's `@feature`) that tree-sitter doesn't know about. Enable it in your Zed `settings.json`:
 
 ```json
 {
@@ -395,7 +395,7 @@ Cmd+Click works on both opening AND closing tags:
 {{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
 ```
 
-> **Note:** Blade syntax highlighting is provided by the separate [Blade](https://github.com/EmranMR/tree-sitter-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting (distinct colors for `@if`, `@foreach`, etc.), enable semantic tokens in your settings — see the [Configuration](#️-configuration) section above.
+> **Note:** Blade syntax highlighting is provided by the separate [Blade](https://github.com/EmranMR/tree-sitter-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration](#️-configuration) section above.
 
 ## 🚧 Planned Features
 

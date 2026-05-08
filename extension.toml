@@ -8,7 +8,7 @@ repository = "https://github.com/GeneaLabs/zed-laravel"
 
 [lib]
 kind = "Rust"
-version = "0.1.14"
+version = "0.1.15"
 
 [language_servers.laravel-lsp]
 name = "Laravel LSP"

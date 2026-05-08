@@ -32,6 +32,8 @@
 
 Search **"Laravel"** in Zed Extensions and click Install.
 
+**🤝 Recommended companion:** Also install the [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) extension (`bajrangCoder/zed-laravel-blade`) for Blade syntax highlighting, bracket matching, and PHP language server integration. The two extensions complement each other — Blade handles the language definition and grammar, while this extension handles Laravel-specific intelligence (go-to-definition, autocomplete, diagnostics).
+
 **From source:** Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: install dev extension".
 
 ## ⚙️ Configuration
@@ -395,7 +397,7 @@ Cmd+Click works on both opening AND closing tags:
 {{--      ^^^^^^^            ^^^^^^^ Both navigate to Livewire class --}}
 ```
 
-> **Note:** Blade syntax highlighting is provided by the separate [Blade](https://github.com/EmranMR/tree-sitter-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration](#️-configuration) section above.
+> **Note:** Blade syntax highlighting is provided by the separate [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration](#️-configuration) section above.
 
 ## 🚧 Planned Features
 

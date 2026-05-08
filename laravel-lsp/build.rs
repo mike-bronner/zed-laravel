@@ -43,8 +43,7 @@ fn download_and_extract_blade_grammar(dest: &PathBuf) {
         .call()
         .expect("Failed to download tree-sitter-blade grammar");
 
-    // Read the response body into a Vec<u8> (bytes)
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut bytes = Vec::new();
     std::io::copy(&mut reader, &mut bytes)
         .expect("Failed to read download response");

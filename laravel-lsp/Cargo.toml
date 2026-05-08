@@ -12,13 +12,13 @@ tower-lsp = "0.20"
 lsp-types = "0.94"
 
 # Salsa incremental computation
-salsa = "^0.25"
+salsa = "0.26"
 
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # LRU cache for memory management
-lru = "0.12"
+lru = "0.18"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -34,13 +34,13 @@ glob = "0.3"
 directories = "6"  # Cross-platform XDG cache directories
 
 # Regex for pattern matching
-regex = "1.11"
+regex = "1.12"
 lazy_static = "1.5"
-once_cell = "1.19"
+once_cell = "1.21"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Database connectivity for exists:/unique: validation rules
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres", "sqlite"], default-features = false }
@@ -53,21 +53,21 @@ tree-sitter = "0.26"
 tree-sitter-php = "0.24"
 
 # Additional dependencies for Salsa integration
-arc-swap = "1.7"
+arc-swap = "1.9"
 
 [build-dependencies]
 # For downloading grammar from GitHub
-ureq = "2.10"
+ureq = "3"
 
 # For extracting tar.gz archives
-flate2 = "1.0"
+flate2 = "1.1"
 tar = "0.4"
 
 # For compiling C code
-cc = "1.0"
+cc = "1.2"
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.27"
 
 [profile.release]
 lto = true

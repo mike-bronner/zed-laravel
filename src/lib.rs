@@ -122,16 +122,10 @@ impl LaravelExtension {
             ));
         }
 
-        // Make executable on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = fs::metadata(&binary_path) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o755);
-                let _ = fs::set_permissions(&binary_path, perms);
-            }
-        }
+        // Make the binary executable via the Zed host (extensions run as WASM,
+        // so std::os::unix::fs is unavailable here).
+        zed::make_file_executable(&binary_path)
+            .map_err(|e| format!("Failed to make Laravel LSP binary executable: {}", e))?;
 
         Ok(binary_path)
     }

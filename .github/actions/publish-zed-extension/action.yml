@@ -1,0 +1,33 @@
+name: 'Publish Zed Extension'
+description: 'Open or update a PR in zed-industries/extensions for a new release. Reuses the same branch per version, so re-runs update the existing PR rather than creating duplicates.'
+
+inputs:
+  extension-name:
+    description: 'Name of the extension as registered in the upstream extensions repo (e.g., "laravel")'
+    required: true
+  version:
+    description: 'Version number to publish, without "v" prefix (e.g., "0.1.15"). Must already exist as tag "v<version>" on the source repo.'
+    required: true
+  push-to:
+    description: 'Fork of the upstream extensions repo to push to, in "owner/repo" form (e.g., "GeneaLabs/extensions"). Must already exist.'
+    required: true
+  upstream-repo:
+    description: 'Upstream extensions repo'
+    default: 'zed-industries/extensions'
+  committer-token:
+    description: 'PAT with repo + workflow scopes on the fork. Used to push the bump branch and open/update the PR.'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Publish or update PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.committer-token }}
+        EXT_NAME: ${{ inputs.extension-name }}
+        VERSION: ${{ inputs.version }}
+        PUSH_TO: ${{ inputs.push-to }}
+        UPSTREAM: ${{ inputs.upstream-repo }}
+        SOURCE_REPO: ${{ github.repository }}
+      run: bash ${{ github.action_path }}/publish.sh

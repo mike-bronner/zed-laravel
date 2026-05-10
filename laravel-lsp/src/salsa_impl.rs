@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::config::kebab_to_pascal_case;
+use crate::middleware_parser::middleware_base_alias;
 use crate::parser::{language_php, parse_php};
 use crate::queries::extract_all_php_patterns;
 
@@ -3966,9 +3967,7 @@ impl SalsaActor {
 
     /// Handle get middleware by alias
     fn handle_get_middleware_by_alias(&self, alias: &str) -> Option<MiddlewareRegistrationData> {
-        // Handle middleware with parameters (e.g., "throttle:60,1")
-        let base_alias = alias.split(':').next().unwrap_or(alias);
-        self.sp_middleware_aliases.get(base_alias).cloned()
+        self.sp_middleware_aliases.get(middleware_base_alias(alias)).cloned()
     }
 
     /// Handle get binding by name
@@ -4283,14 +4282,18 @@ impl SalsaActor {
     }
 
     /// Handle getting middleware by alias from Salsa-parsed service providers
+    ///
+    /// Strips parameters from the alias before matching — `auth:sanctum` and
+    /// `throttle:60,1` resolve to the `auth` and `throttle` aliases respectively.
     fn handle_get_parsed_middleware(&self, alias: &str) -> Option<ParsedMiddlewareData> {
+        let base_alias = middleware_base_alias(alias);
         let root = self.salsa_sp_root.as_ref()?;
         let mut best: Option<ParsedMiddlewareData> = None;
 
         for sp_file in self.salsa_sp_files.values() {
             let parsed = parse_service_provider_source(&self.db, *sp_file, root.clone());
             for mw in parsed.middleware(&self.db) {
-                if mw.alias(&self.db).name(&self.db) == alias {
+                if mw.alias(&self.db).name(&self.db) == base_alias {
                     let data = ParsedMiddlewareData {
                         alias: mw.alias(&self.db).name(&self.db).clone(),
                         class_name: mw.class_name(&self.db).clone(),

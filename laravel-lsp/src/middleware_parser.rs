@@ -5,6 +5,17 @@
 
 use std::path::{Path, PathBuf};
 
+/// Strip parameters from a middleware reference (e.g., "auth:sanctum" -> "auth").
+///
+/// Laravel middleware can be invoked with parameters that get passed to the
+/// middleware's `handle()` method — `auth:sanctum` is the `auth` alias with
+/// `sanctum` as a guard parameter, `throttle:60,1` is `throttle` with rate-limit
+/// parameters. The portion after the colon is not part of the alias and must
+/// be stripped before looking the alias up in the registry.
+pub fn middleware_base_alias(name: &str) -> &str {
+    name.split(':').next().unwrap_or(name)
+}
+
 /// Resolve a fully qualified class name to a file path
 ///
 /// Converts namespace notation to file path using PSR-4 autoloading conventions
@@ -47,5 +58,22 @@ mod tests {
         let path = result.unwrap();
         assert!(path.ends_with("Authenticate.php"));
         assert!(path.to_string_lossy().contains("app/Http/Middleware"));
+    }
+
+    #[test]
+    fn test_middleware_base_alias_strips_parameters() {
+        // auth:sanctum is the auth alias with sanctum as a guard parameter
+        assert_eq!(middleware_base_alias("auth:sanctum"), "auth");
+        // throttle takes rate-limit parameters
+        assert_eq!(middleware_base_alias("throttle:60,1"), "throttle");
+        // can: takes a permission name
+        assert_eq!(middleware_base_alias("can:edit,post"), "can");
+    }
+
+    #[test]
+    fn test_middleware_base_alias_passthrough_when_no_parameters() {
+        assert_eq!(middleware_base_alias("auth"), "auth");
+        assert_eq!(middleware_base_alias("web"), "web");
+        assert_eq!(middleware_base_alias(""), "");
     }
 }

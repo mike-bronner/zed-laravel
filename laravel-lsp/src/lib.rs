@@ -12,6 +12,7 @@ pub mod cache_manager;
 pub mod validation_rules;
 pub mod database;
 pub mod model_analyzer;
+pub mod route_discovery;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

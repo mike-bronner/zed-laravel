@@ -286,6 +286,48 @@ mod routes {
             "routes/web.php should contain middleware assignments"
         );
     }
+
+    #[test]
+    fn test_route_index_resolves_app_route() {
+        // Project-defined named route lives in routes/web.php — must resolve
+        // without falling through to the legacy hard-coded scan.
+        use laravel_lsp::route_discovery::{build_route_index, discover_route_files};
+
+        let root = test_project_path();
+        let files = discover_route_files(&root);
+        let index = build_route_index(&files);
+
+        let def = index
+            .get("home")
+            .expect("'home' route should be indexed from routes/web.php");
+        assert!(
+            def.file.ends_with("routes/web.php"),
+            "expected routes/web.php, got {:?}",
+            def.file
+        );
+    }
+
+    #[test]
+    fn test_route_index_resolves_package_route() {
+        // 'login' is defined by Fortify in vendor/laravel/fortify/routes/routes.php.
+        // The legacy scan never looked there; the new discovery walks
+        // vendor/*/routes/ and indexes it at PACKAGE priority.
+        use laravel_lsp::route_discovery::{build_route_index, discover_route_files, PRIORITY_PACKAGE};
+
+        let root = test_project_path();
+        let files = discover_route_files(&root);
+        let index = build_route_index(&files);
+
+        let def = index
+            .get("login")
+            .expect("'login' route should be indexed from Fortify package");
+        assert!(
+            def.file.to_string_lossy().contains("fortify"),
+            "expected Fortify routes file, got {:?}",
+            def.file
+        );
+        assert_eq!(def.priority, PRIORITY_PACKAGE);
+    }
 }
 
 // ============================================================================

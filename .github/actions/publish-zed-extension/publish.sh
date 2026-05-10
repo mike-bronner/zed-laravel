@@ -10,8 +10,14 @@ SUBMODULE_PATH="extensions/${EXT_NAME}"
 
 echo "::notice::Publishing ${EXT_NAME} v${VERSION} via ${PUSH_TO} → ${UPSTREAM} (branch: ${BRANCH})"
 
-git config --global user.name "github-actions[bot]"
-git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+# Commit as the PAT owner so signed-CLA checks (e.g., Zed's cla-bot) resolve
+# to a real human rather than github-actions[bot], which can't sign a CLA.
+GIT_USER_LOGIN=$(gh api user --jq .login)
+GIT_USER_ID=$(gh api user --jq .id)
+GIT_USER_NAME=$(gh api user --jq '.name // .login')
+git config --global user.name "${GIT_USER_NAME}"
+git config --global user.email "${GIT_USER_ID}+${GIT_USER_LOGIN}@users.noreply.github.com"
+echo "::notice::Committing as ${GIT_USER_NAME} <${GIT_USER_ID}+${GIT_USER_LOGIN}@users.noreply.github.com>"
 
 EXISTING_PR=$(gh api "repos/${UPSTREAM}/pulls?state=open&head=${FORK_OWNER}:${BRANCH}" --jq '.[0].number // empty')
 if [[ -n "${EXISTING_PR}" ]]; then

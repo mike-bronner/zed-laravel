@@ -227,3 +227,4 @@ jobs:
           version: ${{ needs.update-version.outputs.new_version }}
           push-to: GeneaLabs/extensions
           committer-token: ${{ secrets.ZED_PUBLISHING_TOKEN }}
+          signing-key: ${{ secrets.COMMIT_SIGNING_SSH_KEY }}

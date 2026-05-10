@@ -17,6 +17,9 @@ inputs:
   committer-token:
     description: 'PAT with repo + workflow scopes on the fork. Used to push the bump branch and open/update the PR.'
     required: true
+  signing-key:
+    description: 'Optional SSH private key (PEM-encoded) used to sign commits. The matching public key must be registered on the PAT owner''s GitHub account as a Signing Key (not an Authentication Key). If omitted, commits will be unsigned.'
+    required: false
 
 runs:
   using: 'composite'
@@ -30,4 +33,5 @@ runs:
         PUSH_TO: ${{ inputs.push-to }}
         UPSTREAM: ${{ inputs.upstream-repo }}
         SOURCE_REPO: ${{ github.repository }}
+        SIGNING_KEY: ${{ inputs.signing-key }}
       run: bash ${{ github.action_path }}/publish.sh

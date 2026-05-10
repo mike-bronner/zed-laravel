@@ -25,6 +25,7 @@ ever** — re-runs update the existing PR.
 | `push-to`         | yes      | Fork of `zed-industries/extensions` to push to (e.g., `GeneaLabs/extensions`). Must already exist. |
 | `upstream-repo`   | no       | Defaults to `zed-industries/extensions`.                                    |
 | `committer-token` | yes      | PAT with `repo` + `workflow` scopes on the fork.                            |
+| `signing-key`     | no       | SSH private key for signing commits. Public key must be on the PAT owner's GitHub account as a *Signing Key*. |
 
 ## Behavior
 
@@ -47,9 +48,15 @@ ever** — re-runs update the existing PR.
   repo (true by default if the fork was made cleanly).
 - Add a `ZED_PUBLISHING_TOKEN` repo secret with a PAT that has `repo` +
   `workflow` scopes on the fork's owner account.
-- Push tag `v<version>` to the source repo *before* this action runs. In this
-  repo's `release.yml`, the `update-version` job handles that and `publish`
-  depends on it.
+- Push tag `<version>` (or `v<version>`) to the source repo *before* this
+  action runs. The script auto-detects which form exists. In this repo's
+  `release.yml`, the `update-version` job handles that and `publish` depends
+  on it.
+- (Optional) For signed/verified commits: generate a dedicated SSH key,
+  register the public key on the PAT owner's GitHub account under *Settings →
+  SSH and GPG keys* with **Key type: Signing Key**, and store the private key
+  as the `COMMIT_SIGNING_SSH_KEY` secret. Without this, commits will appear
+  as "Unverified" on GitHub.
 
 ## Usage
 

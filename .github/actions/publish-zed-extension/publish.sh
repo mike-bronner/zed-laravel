@@ -33,6 +33,16 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 git clone "https://x-access-token:${GH_TOKEN}@github.com/${PUSH_TO}.git" "${WORK_DIR}/fork"
 cd "${WORK_DIR}/fork"
 
+if [[ -n "${SIGNING_KEY:-}" ]]; then
+  SSH_KEY_FILE="${WORK_DIR}/signing-key"
+  printf '%s\n' "${SIGNING_KEY}" > "${SSH_KEY_FILE}"
+  chmod 600 "${SSH_KEY_FILE}"
+  git config --global gpg.format ssh
+  git config --global user.signingkey "${SSH_KEY_FILE}"
+  git config --global commit.gpgsign true
+  echo "::notice::SSH commit signing enabled"
+fi
+
 git remote add upstream "https://github.com/${UPSTREAM}.git"
 git fetch upstream "${DEFAULT_BRANCH}"
 

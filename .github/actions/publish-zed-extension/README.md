@@ -54,7 +54,7 @@ ever** — re-runs update the existing PR.
 ## Usage
 
 ```yaml
-- uses: actions/checkout@v5
+- uses: actions/checkout@v6
   with:
     ref: main
 

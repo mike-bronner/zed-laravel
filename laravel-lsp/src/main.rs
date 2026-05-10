@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 // Use the library crate for all modules
 use laravel_lsp::config::find_project_root;
-use laravel_lsp::middleware_parser::resolve_class_to_file;
+use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::cache_manager::{CacheManager, RescanType, ScanResult, MiddlewareEntry, BindingEntry, CachedLaravelConfig, CachedEnvVars};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
@@ -3228,11 +3228,18 @@ impl LaravelLanguageServer {
     /// Returns (class_name, class_file, source_file, source_line)
     /// - class_file: for checking if the middleware class exists
     /// - source_file + source_line: for navigation to alias declaration
+    ///
+    /// Strips parameters from the middleware name before lookup — Laravel
+    /// middleware can be invoked as `auth:sanctum` or `throttle:60,1`, where
+    /// the part after `:` is passed as parameters to the middleware's
+    /// `handle()` method, not part of the alias.
     async fn get_cached_middleware(&self, name: &str) -> Option<(String, Option<PathBuf>, Option<PathBuf>, Option<u32>)> {
+        let base_alias = middleware_base_alias(name);
+
         // First check disk cache (instant)
         if let Some(ref cache) = *self.cache.read().await {
             let all_middleware = cache.get_all_middleware();
-            if let Some(entry) = all_middleware.get(name) {
+            if let Some(entry) = all_middleware.get(base_alias) {
                 return Some((
                     entry.class.clone(),
                     entry.class_file.as_ref().map(PathBuf::from),
@@ -3243,7 +3250,7 @@ impl LaravelLanguageServer {
         }
 
         // Fall back to Salsa (may not be ready yet)
-        if let Ok(Some(mw_data)) = self.salsa.get_parsed_middleware(name.to_string()).await {
+        if let Ok(Some(mw_data)) = self.salsa.get_parsed_middleware(base_alias.to_string()).await {
             return Some((
                 mw_data.class_name.clone(),
                 mw_data.file_path.clone(),
@@ -10200,8 +10207,12 @@ return [
                         // Middleware not in registry - try to resolve it by convention
                         info!("Laravel LSP: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
 
+                        // Strip parameters (e.g., 'auth:sanctum' -> 'auth') before converting,
+                        // otherwise PascalCase produces invalid class names like 'Auth:Sanctum'.
+                        let base_alias = middleware_base_alias(middleware_name);
+
                         // Convert kebab-case to PascalCase (e.g., 'undefined-middleware' -> 'UndefinedMiddleware')
-                        let class_name = Self::kebab_to_pascal_case(middleware_name);
+                        let class_name = Self::kebab_to_pascal_case(base_alias);
                         let app_class = format!("App\\Http\\Middleware\\{}", class_name);
 
                         // Try to resolve as App\Http\Middleware\{ClassName}

@@ -40,11 +40,26 @@ git push origin "${DEFAULT_BRANCH}"
 git checkout -B "${BRANCH}" "upstream/${DEFAULT_BRANCH}"
 
 git submodule update --init "${SUBMODULE_PATH}"
+SOURCE_TAG=""
 (
   cd "${SUBMODULE_PATH}"
-  git fetch --tags origin "v${VERSION}"
-  git checkout "v${VERSION}"
+  for candidate in "${VERSION}" "v${VERSION}"; do
+    if git ls-remote --tags origin "refs/tags/${candidate}" | grep -q .; then
+      echo "${candidate}" > /tmp/source-tag
+      break
+    fi
+  done
+  if [[ ! -s /tmp/source-tag ]]; then
+    echo "::error::No tag matching '${VERSION}' or 'v${VERSION}' found on $(git remote get-url origin)"
+    exit 1
+  fi
+  TAG="$(cat /tmp/source-tag)"
+  echo "::notice::Using source tag '${TAG}'"
+  git fetch --tags --depth 1 origin "refs/tags/${TAG}"
+  git checkout "${TAG}"
 )
+SOURCE_TAG="$(cat /tmp/source-tag)"
+rm -f /tmp/source-tag
 git add "${SUBMODULE_PATH}"
 
 # Update the version line within the [<ext_name>] section only.
@@ -69,7 +84,7 @@ fi
 git commit -m "Bump ${EXT_NAME} to ${VERSION}
 
 Release notes:
-https://github.com/${SOURCE_REPO}/releases/tag/v${VERSION}"
+https://github.com/${SOURCE_REPO}/releases/tag/${SOURCE_TAG}"
 
 git push origin "${BRANCH}" --force
 
@@ -81,7 +96,7 @@ if [[ -z "${EXISTING_PR}" ]]; then
     --title "Bump ${EXT_NAME} to ${VERSION}" \
     --body "Bumps \`${EXT_NAME}\` to v${VERSION}.
 
-Release notes: https://github.com/${SOURCE_REPO}/releases/tag/v${VERSION}"
+Release notes: https://github.com/${SOURCE_REPO}/releases/tag/${SOURCE_TAG}"
   echo "::notice::Created new PR for ${EXT_NAME} v${VERSION}"
 else
   echo "::notice::Force-pushed ${BRANCH} — PR #${EXISTING_PR} updated"

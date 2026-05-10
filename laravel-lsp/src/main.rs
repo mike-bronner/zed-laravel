@@ -14,6 +14,9 @@ use walkdir::WalkDir;
 // Use the library crate for all modules
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
+use laravel_lsp::route_discovery::{
+    build_route_index, discover_route_files, RouteIndex,
+};
 use laravel_lsp::cache_manager::{CacheManager, RescanType, ScanResult, MiddlewareEntry, BindingEntry, CachedLaravelConfig, CachedEnvVars};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
@@ -958,6 +961,10 @@ struct LaravelLanguageServer {
     database_schema: Arc<RwLock<Option<laravel_lsp::database::DatabaseSchemaProvider>>>,
     /// Whether we've shown the database connection error diagnostic this session
     database_diagnostic_shown: Arc<RwLock<bool>>,
+    /// Cached index of named routes discovered across project / packages / framework.
+    /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
+    /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
+    route_index: Arc<RwLock<Option<RouteIndex>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -1773,6 +1780,7 @@ impl LaravelLanguageServer {
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
+            route_index: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -2297,6 +2305,16 @@ impl LaravelLanguageServer {
                 let _ = salsa.register_cached_binding_batch(binding_entries).await;
                 info!("✅ Background Salsa registration complete");
             });
+
+            // The route index is in-memory only — there's no disk cache for it
+            // yet — so we must build it on every fast-path entry too. Without
+            // this, projects with a hot cache skip the slow init entirely and
+            // route goto-definition silently returns no results.
+            let route_root = root.to_path_buf();
+            let server = self.clone_for_spawn();
+            tokio::spawn(async move {
+                server.rebuild_route_index(&route_root).await;
+            });
         }
 
         // Check what needs rescanning before storing cache
@@ -2613,6 +2631,10 @@ impl LaravelLanguageServer {
             }
         }
 
+        // Rebuild the route name index so any route definition changes (added,
+        // renamed, removed) are reflected on the next goto-definition request.
+        self.rebuild_route_index(&root).await;
+
         // Populate cache with ALL parsed middleware/bindings AFTER all rescans complete
         // This ensures we capture middleware from both vendor and app sources
         self.populate_cache_from_salsa().await;
@@ -2806,6 +2828,12 @@ impl LaravelLanguageServer {
         info!("🛡️  Initializing service provider registry from root: {:?}", discovered_root);
         info!("========================================");
         self.register_service_provider_files_with_salsa(&discovered_root).await;
+
+        // Build route name index across project / packages / framework
+        info!("========================================");
+        info!("🛣️  Building route index from root: {:?}", discovered_root);
+        info!("========================================");
+        self.rebuild_route_index(&discovered_root).await;
 
         // Initialize environment variables with Salsa
         info!("========================================");
@@ -9642,61 +9670,58 @@ return [
     /// Create a goto location for a route('name') call
     /// Navigates to the route definition in routes/*.php files
     async fn create_route_location_from_salsa(&self, route: &RouteReferenceData) -> Option<GotoDefinitionResponse> {
-        let root_guard = self.root_path.read().await;
-        let root = root_guard.as_ref()?;
+        // Look up directly in the pre-built index. The index is populated at
+        // init time from `routes/**/*.php`, `vendor/*/routes/**/*.php`,
+        // content-matched vendor PHP files (catches macro bodies like Laravel
+        // UI's AuthRouteMethods), and app service providers that register
+        // routes in their `boot()` methods.
+        let index_guard = self.route_index.read().await;
+        let index = index_guard.as_ref()?;
+        let def = index.get(&route.name)?;
 
-        // Search for route definition in routes directory
-        // Route definitions look like: ->name('route.name') or Route::...->name('route.name')
-        let routes_dir = root.join("routes");
-        if !routes_dir.exists() {
-            return None;
-        }
+        let target_uri = Url::from_file_path(&def.file).ok()?;
+        let origin_selection_range = Range {
+            start: Position { line: route.line, character: route.column },
+            end: Position { line: route.line, character: route.end_column },
+        };
+        let target_range = Range {
+            start: Position { line: def.line, character: def.column },
+            end: Position { line: def.line, character: def.end_column },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(origin_selection_range),
+            target_uri,
+            target_range,
+            target_selection_range: target_range,
+        }]))
+    }
 
-        // Search common route files
-        let route_files = vec!["web.php", "api.php", "channels.php", "console.php"];
+    /// (Re)build the route name index by scanning project + vendor for
+    /// `->name('X')` callsites. Cheap enough for cold start (vendor walk runs
+    /// once); rescans on app-route changes can call this again.
+    async fn rebuild_route_index(&self, root: &Path) {
+        let root = root.to_path_buf();
+        let index = tokio::task::spawn_blocking(move || {
+            let files = discover_route_files(&root);
+            let count = files.len();
+            let index = build_route_index(&files);
+            (count, index)
+        })
+        .await;
 
-        for file_name in route_files {
-            let route_file = routes_dir.join(file_name);
-            if route_file.exists() {
-                if let Ok(content) = tokio::fs::read_to_string(&route_file).await {
-                    // Look for ->name('route_name') pattern
-                    let search_patterns = vec![
-                        format!("->name('{}')", route.name),
-                        format!("->name(\"{}\")", route.name),
-                        format!("'{}' =>", route.name), // Route::resource patterns
-                    ];
-
-                    for pattern in &search_patterns {
-                        if let Some(pos) = content.find(pattern) {
-                            // Calculate line and column from byte position
-                            let before = &content[..pos];
-                            let line = before.matches('\n').count() as u32;
-                            let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-                            let column = (pos - last_newline) as u32;
-
-                            if let Ok(target_uri) = Url::from_file_path(&route_file) {
-                                let origin_selection_range = Range {
-                                    start: Position { line: route.line, character: route.column },
-                                    end: Position { line: route.line, character: route.end_column },
-                                };
-                                let target_range = Range {
-                                    start: Position { line, character: column },
-                                    end: Position { line, character: column + pattern.len() as u32 },
-                                };
-                                return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                                    origin_selection_range: Some(origin_selection_range),
-                                    target_uri,
-                                    target_range,
-                                    target_selection_range: target_range,
-                                }]));
-                            }
-                        }
-                    }
-                }
+        match index {
+            Ok((file_count, index)) => {
+                info!(
+                    "🛣️  Route index built: {} named routes from {} files",
+                    index.len(),
+                    file_count
+                );
+                *self.route_index.write().await = Some(index);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build route index: {}", e);
             }
         }
-
-        None
     }
 
     /// Create a goto location for a url('path') call
@@ -9903,6 +9928,7 @@ return [
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
+            route_index: self.route_index.clone(),
         }
     }
 

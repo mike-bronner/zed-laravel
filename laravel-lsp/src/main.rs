@@ -2950,7 +2950,7 @@ impl LaravelLanguageServer {
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel-lsp".to_string()),
+                    source: Some("laravel".to_string()),
                     message: "Unexpected leading '|' in validation rules".to_string(),
                     related_information: None,
                     tags: None,
@@ -2970,7 +2970,7 @@ impl LaravelLanguageServer {
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel-lsp".to_string()),
+                    source: Some("laravel".to_string()),
                     message: "Unexpected trailing '|' in validation rules".to_string(),
                     related_information: None,
                     tags: None,
@@ -2992,7 +2992,7 @@ impl LaravelLanguageServer {
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: "Empty validation rule between '||'".to_string(),
                         related_information: None,
                         tags: None,
@@ -3032,7 +3032,7 @@ impl LaravelLanguageServer {
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: format!("Unknown validation rule: '{}'", rule_name),
                         related_information: None,
                         tags: None,
@@ -3058,7 +3058,7 @@ impl LaravelLanguageServer {
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
-                                source: Some("laravel-lsp".to_string()),
+                                source: Some("laravel".to_string()),
                                 message: format!("Rule '{}' requires a table name", rule_name),
                                 related_information: None,
                                 tags: None,
@@ -3109,7 +3109,7 @@ impl LaravelLanguageServer {
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         code: None,
-                                        source: Some("laravel-lsp".to_string()),
+                                        source: Some("laravel".to_string()),
                                         message: format!("Table '{}' not found in database", table_name_ref),
                                         related_information: None,
                                         tags: None,
@@ -3134,7 +3134,7 @@ impl LaravelLanguageServer {
                                                 },
                                                 severity: Some(DiagnosticSeverity::ERROR),
                                                 code: None,
-                                                source: Some("laravel-lsp".to_string()),
+                                                source: Some("laravel".to_string()),
                                                 message: format!("Column '{}' not found in table '{}'", column_param, table_name_ref),
                                                 related_information: None,
                                                 tags: None,
@@ -3156,7 +3156,7 @@ impl LaravelLanguageServer {
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
                             code: None,
-                            source: Some("laravel-lsp".to_string()),
+                            source: Some("laravel".to_string()),
                             message: format!("Rule '{}' requires a table name parameter", rule_name),
                             related_information: None,
                             tags: None,
@@ -6772,7 +6772,7 @@ impl LaravelLanguageServer {
                                     },
                                     severity: Some(DiagnosticSeverity::INFORMATION),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n• DB_CONNECTION\n• DB_HOST\n• DB_DATABASE\n• DB_USERNAME\n• DB_PASSWORD",
                                         error.message
@@ -6952,7 +6952,7 @@ impl LaravelLanguageServer {
                             },
                             severity: Some(DiagnosticSeverity::INFORMATION),
                             code: None,
-                            source: Some("laravel-lsp".to_string()),
+                            source: Some("laravel".to_string()),
                             message: "Database not configured. Set DB_CONNECTION, DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env for exists:/unique: autocomplete.".to_string(),
                             related_information: None,
                             tags: None,
@@ -9012,7 +9012,7 @@ return [
             },
             severity: Some(severity),
             code: None,
-            source: Some("laravel-lsp".to_string()),
+            source: Some("laravel".to_string()),
             message,
             related_information: None,
             tags: None,
@@ -9093,7 +9093,7 @@ return [
             },
             severity: Some(DiagnosticSeverity::WARNING),
             code: None,
-            source: Some("laravel-lsp".to_string()),
+            source: Some("laravel".to_string()),
             message,
             related_information: None,
             tags: None,
@@ -9855,7 +9855,7 @@ return [
             },
             severity: Some(DiagnosticSeverity::INFORMATION),
             code: None,
-            source: Some("laravel-lsp".to_string()),
+            source: Some("laravel".to_string()),
             message: "Laravel dependencies not installed. Run 'composer install' for full validation autocomplete support.".to_string(),
             related_information: None,
             tags: None,
@@ -9888,7 +9888,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::INFORMATION),
                     code: None,
-                    source: Some("laravel-lsp".to_string()),
+                    source: Some("laravel".to_string()),
                     message: format!(
                         "Database connection failed: {}\nConfigure database settings in .env for exists:/unique: validation autocomplete.",
                         error.message
@@ -10026,7 +10026,7 @@ return [
                         },
                         severity: Some(severity),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: format!(
                             "View file not found: '{}'\nExpected at: {}",
                             view_ref.name,
@@ -10129,7 +10129,7 @@ return [
                         },
                         severity: Some(severity),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message,
                         related_information: None,
                         tags: None,
@@ -10161,7 +10161,7 @@ return [
                         },
                         severity: Some(DiagnosticSeverity::WARNING),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: format!(
                             "Avoid using env() outside of config files.\n\n\
                             When config is cached (`php artisan config:cache`), the .env file \
@@ -10208,7 +10208,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Middleware '{}' not found\nClass: {}\nExpected at: {}\n\nThe middleware alias is registered but the class file doesn't exist.\n💡 Click to view where the alias is defined.",
                                         middleware_name,
@@ -10261,7 +10261,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Middleware '{}' not found\nExpected at: {}\n\nCreate the middleware or add an alias in bootstrap/app.php",
                                         middleware_name,
@@ -10292,7 +10292,7 @@ return [
                                 },
                                 severity: Some(DiagnosticSeverity::INFORMATION),
                                 code: None,
-                                source: Some("laravel-lsp".to_string()),
+                                source: Some("laravel".to_string()),
                                 message: format!(
                                     "Middleware '{}' not found\n\nIf this middleware exists, add an alias in bootstrap/app.php",
                                     middleware_name
@@ -10390,7 +10390,7 @@ return [
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         code: None,
-                                        source: Some("laravel-lsp".to_string()),
+                                        source: Some("laravel".to_string()),
                                         message,
                                         related_information: None,
                                         tags: None,
@@ -10434,7 +10434,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Container binding '{}' not found\n\nDefine this binding in a service provider's register() method",
                                         binding_name
@@ -10489,7 +10489,7 @@ return [
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
                             code: None,
-                            source: Some("laravel-lsp".to_string()),
+                            source: Some("laravel".to_string()),
                             message: format!(
                                 "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
                                 asset_ref.path,
@@ -10535,7 +10535,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Feature class not found: '{}'\nExpected at: {}",
                                         feature_ref.feature_name,
@@ -10568,7 +10568,7 @@ return [
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
-                                source: Some("laravel-lsp".to_string()),
+                                source: Some("laravel".to_string()),
                                 message: format!(
                                     "Feature not found: '{}'\nExpected at: {}",
                                     feature_ref.feature_name,
@@ -10653,7 +10653,7 @@ return [
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
-                                source: Some("laravel-lsp".to_string()),
+                                source: Some("laravel".to_string()),
                                 message: format!(
                                     "View file not found: '{}'\nExpected at: {}",
                                     view_name,
@@ -10696,7 +10696,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
-                    source: Some("laravel-lsp".to_string()),
+                    source: Some("laravel".to_string()),
                     message: format!(
                         "Blade component not found: '{}'\nExpected at: {}",
                         comp_ref.name,
@@ -10731,7 +10731,7 @@ return [
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: format!(
                             "Livewire component not found: '{}'\nExpected at: {}",
                             lw_ref.name,
@@ -10806,7 +10806,7 @@ return [
                                     },
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     code: None,
-                                    source: Some("laravel-lsp".to_string()),
+                                    source: Some("laravel".to_string()),
                                     message: format!(
                                         "Feature not found: '{}'\nExpected at: {}",
                                         feature_name,
@@ -10863,7 +10863,7 @@ return [
                         },
                         severity: Some(DiagnosticSeverity::WARNING),
                         code: None,
-                        source: Some("laravel-lsp".to_string()),
+                        source: Some("laravel".to_string()),
                         message: format!(
                             "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
                             asset_ref.path,
@@ -10911,7 +10911,7 @@ return [
                     },
                     severity: Some(DiagnosticSeverity::HINT),
                     code: None,
-                    source: Some("laravel-lsp".to_string()),
+                    source: Some("laravel".to_string()),
                     message: format!(
                         "Cannot resolve type for '{}'\n\nTo enable autocomplete, ensure the variable is passed from:\n• Controller with return view('...', compact('{}'))\n• Livewire component with public property\n• View component with constructor parameter\n• @props directive with type hint",
                         access.variable_name,
@@ -11511,8 +11511,8 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Process each diagnostic to see if we can offer a fix
         for diagnostic in &context.diagnostics {
-            // Check if this is our diagnostic (source: laravel-lsp)
-            if diagnostic.source.as_deref() != Some("laravel-lsp") {
+            // Check if this is our diagnostic (source: laravel)
+            if diagnostic.source.as_deref() != Some("laravel") {
                 continue;
             }
 

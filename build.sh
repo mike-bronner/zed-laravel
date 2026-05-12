@@ -91,7 +91,7 @@ echo "Changes: Performance optimizations - Query caching, incremental parsing, d
 echo ""
 echo "Performance improvements:"
 echo "  • Query caching: 10-15x speedup"
-echo "  • Incremental parsing: 5-20x speedup" 
+echo "  • Incremental parsing: 5-20x speedup"
 echo "  • Two-tier debouncing: 50ms cache, 200ms diagnostics"
 echo "  • Pattern registry: Future-proof architecture"
 echo ""

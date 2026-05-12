@@ -11,7 +11,7 @@ kind = "Rust"
 version = "0.1.16"
 
 [language_servers.laravel-lsp]
-name = "Laravel LSP"
+name = "Laravel"
 # XML: for phpunit.xml env var autocomplete
 # Shell Script: Zed treats .env files as Shell Script (see bash/config.toml path_suffixes)
 languages = ["PHP", "Blade", "XML", "Shell Script"]

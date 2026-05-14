@@ -193,6 +193,21 @@ pub struct MiddlewareAliasDefMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a Blade component alias registration in a service provider.
+/// Captures both forms: `$blade->component($view, $alias)` and
+/// `Blade::component($view, $alias)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BladeComponentAliasMatch<'a> {
+    /// The alias used in `<x-{alias}>` tags (e.g., "light-button")
+    pub alias: &'a str,
+    /// The target view path in dot notation or a PHP class FQN
+    /// (e.g., "components.buttons.light-button" or "App\\View\\Components\\Light")
+    pub view: &'a str,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub row: usize,
+}
+
 /// Represents a middleware group definition in Kernel.php
 /// e.g., 'web' => [...] in $middlewareGroups
 #[derive(Debug, Clone, PartialEq)]
@@ -332,6 +347,7 @@ pub struct ExtractedPhpPatterns<'a> {
     pub middleware_calls: Vec<MiddlewareMatch<'a>>,
     pub middleware_alias_defs: Vec<MiddlewareAliasDefMatch<'a>>,
     pub middleware_group_defs: Vec<MiddlewareGroupDefMatch<'a>>,
+    pub blade_component_aliases: Vec<BladeComponentAliasMatch<'a>>,
     pub translation_calls: Vec<TranslationMatch<'a>>,
     pub asset_calls: Vec<AssetMatch<'a>>,
     pub binding_calls: Vec<BindingMatch<'a>>,
@@ -465,6 +481,24 @@ pub fn extract_all_php_patterns<'a>(
                     column: start_pos.column,
                     end_column: end_pos.column,
                 });
+            }
+
+            // Blade component alias registrations
+            // ($blade->component('view.path', 'alias') or Blade::component(...))
+            "blade_alias_name" => {
+                let view = query_match.captures.iter()
+                    .find(|c| query.capture_names()[c.index as usize] == "blade_alias_view")
+                    .and_then(|c| c.node.utf8_text(source_bytes).ok());
+
+                if let Some(view) = view {
+                    result.blade_component_aliases.push(BladeComponentAliasMatch {
+                        alias: text,
+                        view,
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: node.start_position().row,
+                    });
+                }
             }
 
             // Middleware alias definitions (from $middlewareAliases property)
@@ -791,7 +825,12 @@ pub fn extract_all_blade_patterns<'a>(
         match capture_name {
             // Tag patterns - could be x-* components or livewire:* components
             "tag_name" => {
-                if let Some(component_name) = text.strip_prefix("x-") {
+                // Slot tags (<x-slot:name>, <x-slot ...>) are NOT components — they're
+                // named-slot syntax handled separately via the slot_tag capture below.
+                // Skipping them here prevents bogus "component not found" diagnostics.
+                if text == "x-slot" || text.starts_with("x-slot:") {
+                    // intentionally skipped
+                } else if let Some(component_name) = text.strip_prefix("x-") {
                     // Blade component
                     result.components.push(ComponentMatch {
                         component_name,

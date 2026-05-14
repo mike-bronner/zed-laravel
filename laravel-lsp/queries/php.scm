@@ -1905,6 +1905,72 @@
   (#match? @_router_obj "\\$router"))
 
 ; ============================================================================
+; Pattern 38.5: $blade->component() / Blade::component() - service providers
+; ============================================================================
+; Matches: $blade->component('components.buttons.light-button', 'light-button')
+; Matches: Blade::component('components.alert', 'alert')
+; Matches: \Illuminate\Support\Facades\Blade::component('a.b', 'c')
+;
+; First argument is the view path (dot notation) or PHP class name.
+; Second argument is the alias used in the <x-{alias}> tag.
+
+; Instance form, single-quoted args: $blade->component('view.path', 'alias')
+(member_call_expression
+  object: (variable_name) @_blade_obj
+  name: (name) @_blade_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @blade_alias_view))
+    (argument
+      (string
+        (string_content) @blade_alias_name)))
+  (#eq? @_blade_method "component")
+  (#match? @_blade_obj "\\$blade"))
+
+; Instance form, double-quoted args
+(member_call_expression
+  object: (variable_name) @_blade_obj
+  name: (name) @_blade_method
+  arguments: (arguments
+    (argument
+      (encapsed_string
+        (string_content) @blade_alias_view))
+    (argument
+      (encapsed_string
+        (string_content) @blade_alias_name)))
+  (#eq? @_blade_method "component")
+  (#match? @_blade_obj "\\$blade"))
+
+; Static form (Blade::component or fully qualified), single-quoted args
+(scoped_call_expression
+  scope: (name) @_blade_class
+  name: (name) @_blade_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @blade_alias_view))
+    (argument
+      (string
+        (string_content) @blade_alias_name)))
+  (#eq? @_blade_method "component")
+  (#match? @_blade_class "(^|\\\\)Blade$"))
+
+; Static form, qualified class scope, single-quoted args
+(scoped_call_expression
+  scope: (qualified_name) @_blade_class
+  name: (name) @_blade_method
+  arguments: (arguments
+    (argument
+      (string
+        (string_content) @blade_alias_view))
+    (argument
+      (string
+        (string_content) @blade_alias_name)))
+  (#eq? @_blade_method "component")
+  (#match? @_blade_class ".*Blade$"))
+
+; ============================================================================
 ; Pattern 39: Feature class $name property for custom aliases
 ; ============================================================================
 ; Matches: public string $name = 'custom-alias';

@@ -2252,6 +2252,8 @@ impl LaravelLanguageServer {
                     has_livewire: cached_config.has_livewire,
                     view_namespaces: std::collections::HashMap::new(),
                     component_namespaces: std::collections::HashMap::new(),
+                    component_aliases: laravel_lsp::config::load_component_aliases(&cached_config.root),
+                    icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&cached_config.root),
                 };
                 // Store directly in memory - no Salsa channel call!
                 *self.cached_config.write().await = Some(config_data);
@@ -2291,6 +2293,8 @@ impl LaravelLanguageServer {
                 has_livewire: c.has_livewire,
                 view_namespaces: std::collections::HashMap::new(),
                 component_namespaces: std::collections::HashMap::new(),
+                component_aliases: laravel_lsp::config::load_component_aliases(&c.root),
+                icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&c.root),
             });
 
             tokio::spawn(async move {
@@ -9154,6 +9158,71 @@ return [
         None
     }
 
+    /// Create LocationLink for an `<x-slot:name>` tag.
+    ///
+    /// Slots aren't components, so they don't appear in the position index.
+    /// This handler runs as a fallback when no pattern matches the cursor.
+    ///
+    /// Resolution:
+    /// 1. Check whether the cursor actually sits on a named slot tag.
+    /// 2. Walk the Blade AST upward to find the enclosing `<x-component>` tag.
+    /// 3. Resolve that parent component to a view file path using the existing
+    ///    component resolver (which already consults the alias map).
+    /// 4. Search the resolved file for `{{ $slot_name }}` so the jump lands on
+    ///    the relevant line instead of the file's top.
+    async fn create_slot_location(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::slot_navigation::{
+            find_enclosing_parent_component,
+            find_slot_at_position,
+            locate_slot_in_view,
+        };
+
+        let source = {
+            let docs = self.documents.read().await;
+            let (text, _) = docs.get(uri)?;
+            text.clone()
+        };
+
+        let slot = find_slot_at_position(&source, position.line, position.character)?;
+        let parent = find_enclosing_parent_component(&source, slot.byte_start)?;
+
+        let config = self.get_cached_config().await?;
+        let possible_paths = config.resolve_component_path(&parent.name);
+
+        for path in possible_paths {
+            if !self.file_exists_cached(&path).await {
+                continue;
+            }
+            let Ok(target_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+
+            let (target_line, target_col) = locate_slot_in_view(&path, &slot.name)
+                .unwrap_or((0, 0));
+
+            let target_range = Range {
+                start: Position { line: target_line, character: target_col },
+                end: Position {
+                    line: target_line,
+                    character: target_col + slot.name.len() as u32 + 1,
+                },
+            };
+
+            return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                origin_selection_range: None,
+                target_uri,
+                target_range,
+                target_selection_range: target_range,
+            }]));
+        }
+
+        None
+    }
+
     /// Create LocationLink for a Livewire reference from Salsa data
     async fn create_livewire_location_from_salsa(&self, lw: &LivewireReferenceData) -> Option<GotoDefinitionResponse> {
         let config = self.get_cached_config().await?;
@@ -11393,6 +11462,16 @@ impl LanguageServer for LaravelLanguageServer {
         let pattern = match patterns.find_at_position(position.line, position.character) {
             Some(p) => p,
             None => {
+                // Slot fallback: <x-slot:name> tags aren't components and aren't
+                // indexed in the position map. Check whether the cursor sits on
+                // one before declaring nothing-to-do.
+                if let Some(slot_location) = self
+                    .create_slot_location(&uri, position)
+                    .await
+                {
+                    return Ok(Some(slot_location));
+                }
+
                 // Debug: show what middleware patterns exist on this line
                 let mw_on_line: Vec<_> = patterns.middleware_refs.iter()
                     .filter(|m| m.line == position.line)

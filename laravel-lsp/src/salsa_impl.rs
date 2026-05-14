@@ -1708,6 +1708,16 @@ pub struct LaravelConfigData {
     /// Package component namespaces from Blade::componentNamespace() calls
     /// Maps prefix (e.g., "nightshade") to PHP namespace
     pub component_namespaces: HashMap<String, String>,
+    /// Component aliases registered via Blade::component($view, $alias) or via
+    /// config-based registration loops. Maps alias (e.g., "light-button") to
+    /// the target view path in dot notation (e.g., "components.buttons.light-button").
+    /// Consulted before falling back to the directory-convention lookup.
+    pub component_aliases: HashMap<String, String>,
+    /// Icon-set component aliases registered via blade-icons' Factory pattern.
+    /// Maps the full tag name (e.g., "heroicon-o-clock") to the absolute SVG
+    /// file path. Built by walking vendor packages with `resources/svg/` +
+    /// `config/blade-*.php` shape and combining the prefix with each SVG file.
+    pub icon_aliases: HashMap<String, String>,
 }
 
 impl LaravelConfigData {
@@ -1757,6 +1767,39 @@ impl LaravelConfigData {
     /// Resolve a component name to file path
     pub fn resolve_component_path(&self, component_name: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
+
+        // Icon-set check first: <x-heroicon-o-clock> and friends resolve to a
+        // concrete SVG file path. The blade-icons Factory registers each icon
+        // at runtime via a loop over filesystem manifests, so static AST analysis
+        // can't extract the pairs — we precompute the map by walking the SVG
+        // directories of any blade-icons-shaped vendor package.
+        if !component_name.contains("::") {
+            if let Some(svg_path) = self.icon_aliases.get(component_name) {
+                paths.push(PathBuf::from(svg_path));
+                return paths;
+            }
+        }
+
+        // Check explicit Blade component aliases first. Alias registrations like
+        // Blade::component('components.buttons.light-button', 'light-button') or
+        // their config-driven equivalents override the directory convention, so
+        // the alias map wins when there's a hit.
+        if !component_name.contains("::") {
+            if let Some(aliased) = self.component_aliases.get(component_name) {
+                let aliased_path = aliased.replace('.', "/");
+                for view_path in &self.view_paths {
+                    let mut full_path = self.root.join(view_path).join(&aliased_path);
+                    full_path.set_extension("blade.php");
+                    paths.push(full_path);
+                }
+                if paths.is_empty() {
+                    let mut full_path = self.root.join("resources/views").join(&aliased_path);
+                    full_path.set_extension("blade.php");
+                    paths.push(full_path);
+                }
+                return paths;
+            }
+        }
 
         // Handle package components (e.g., "courier::alert")
         let (namespace, actual_component) = if let Some(pos) = component_name.find("::") {
@@ -3719,14 +3762,19 @@ impl SalsaActor {
         }
 
         // Convert to data transfer type
+        let root = config_ref.root(&self.db).clone();
+        let component_aliases = crate::config::load_component_aliases(&root);
+        let icon_aliases = crate::config::scan_vendor_for_icon_sets(&root);
         let data = LaravelConfigData {
-            root: config_ref.root(&self.db).clone(),
+            root,
             view_paths: config_ref.view_paths(&self.db).clone(),
             component_paths: config_ref.component_paths(&self.db).clone(),
             livewire_path: config_ref.livewire_path(&self.db).clone(),
             has_livewire: config_ref.has_livewire(&self.db),
             view_namespaces,
             component_namespaces,
+            component_aliases,
+            icon_aliases,
         };
 
         // Cache the result
@@ -4553,5 +4601,122 @@ mod vite_tests {
         assert_eq!(results[0].2, 8, "start column should be 8");
         // End column should be 8 + 21 = 29
         assert_eq!(results[0].3, 8 + path.len() as u32, "end column should be start + path.len()");
+    }
+}
+
+#[cfg(test)]
+mod component_alias_tests {
+    use super::*;
+
+    fn make_config_with_alias(alias: &str, view: &str) -> LaravelConfigData {
+        let mut aliases = HashMap::new();
+        aliases.insert(alias.to_string(), view.to_string());
+
+        LaravelConfigData {
+            root: PathBuf::from("/project"),
+            view_paths: vec![PathBuf::from("resources/views")],
+            component_paths: Vec::new(),
+            livewire_path: None,
+            has_livewire: false,
+            view_namespaces: HashMap::new(),
+            component_namespaces: HashMap::new(),
+            component_aliases: aliases,
+            icon_aliases: HashMap::new(),
+        }
+    }
+
+    fn make_config_with_icon(tag: &str, svg_path: &str) -> LaravelConfigData {
+        let mut icons = HashMap::new();
+        icons.insert(tag.to_string(), svg_path.to_string());
+
+        LaravelConfigData {
+            root: PathBuf::from("/project"),
+            view_paths: vec![PathBuf::from("resources/views")],
+            component_paths: Vec::new(),
+            livewire_path: None,
+            has_livewire: false,
+            view_namespaces: HashMap::new(),
+            component_namespaces: HashMap::new(),
+            component_aliases: HashMap::new(),
+            icon_aliases: icons,
+        }
+    }
+
+    #[test]
+    fn icon_tag_resolves_to_svg_path() {
+        let config = make_config_with_icon(
+            "heroicon-o-clock",
+            "/abs/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg",
+        );
+        let paths = config.resolve_component_path("heroicon-o-clock");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/abs/vendor/blade-ui-kit/blade-heroicons/resources/svg/o-clock.svg"),
+        );
+    }
+
+    #[test]
+    fn unregistered_icon_tag_falls_through() {
+        let config = make_config_with_icon(
+            "heroicon-o-clock",
+            "/abs/path/o-clock.svg",
+        );
+        let paths = config.resolve_component_path("heroicon-o-bell");
+        // Falls through to directory convention — no svg path returned.
+        assert!(
+            paths.iter().all(|p| !p.to_string_lossy().ends_with("o-bell.svg")),
+            "unregistered icon should not return a phantom svg path: {:?}",
+            paths,
+        );
+    }
+
+    #[test]
+    fn aliased_component_resolves_to_aliased_view_path() {
+        let config = make_config_with_alias("light-button", "components.buttons.light-button");
+
+        let paths = config.resolve_component_path("light-button");
+
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("components/buttons/light-button.blade.php")),
+            "expected aliased path, got: {:?}",
+            paths,
+        );
+    }
+
+    #[test]
+    fn unaliased_component_falls_back_to_directory_convention() {
+        let config = make_config_with_alias("light-button", "components.buttons.light-button");
+
+        // 'unaliased-component' is not registered; should fall through.
+        let paths = config.resolve_component_path("unaliased-component");
+
+        assert!(!paths.is_empty(), "expected fallback paths");
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("buttons/light-button")),
+            "alias must not bleed into unrelated lookups: {:?}",
+            paths,
+        );
+    }
+
+    #[test]
+    fn namespaced_component_bypasses_alias_map() {
+        // Package components (`pkg::comp`) must not be intercepted by the alias map,
+        // since namespace separators carry their own resolution rules.
+        let config = make_config_with_alias("courier::alert", "components.never.this");
+
+        let paths = config.resolve_component_path("courier::alert");
+
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("components/never/this")),
+            "namespaced lookup must bypass alias map: {:?}",
+            paths,
+        );
     }
 }

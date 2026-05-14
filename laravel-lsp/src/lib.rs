@@ -13,6 +13,7 @@ pub mod validation_rules;
 pub mod database;
 pub mod model_analyzer;
 pub mod route_discovery;
+pub mod slot_navigation;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

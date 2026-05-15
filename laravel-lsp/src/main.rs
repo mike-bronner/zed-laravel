@@ -1720,26 +1720,9 @@ struct BladeVariableInfo {
     source: String, // "props", "controller", "component", "livewire", "framework", "loop"
 }
 
-/// Represents a loop block in a Blade file for scope-aware variable resolution
-#[derive(Debug, Clone)]
-struct BladeLoopBlock {
-    /// The type of loop directive (foreach, forelse, for, while)
-    loop_type: BladeLoopType,
-    /// Variables introduced by this loop (e.g., $item, $key from @foreach)
-    variables: Vec<(String, String)>, // (name, php_type)
-    /// Start line (0-indexed)
-    start_line: usize,
-    /// End line (0-indexed), None if unclosed
-    end_line: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum BladeLoopType {
-    Foreach,
-    Forelse,
-    For,
-    While,
-}
+// Blade loop-block types live in the library crate so they can be returned
+// from Salsa tracked queries (see `laravel_lsp::blade_loops`).
+use laravel_lsp::blade_loops::BladeLoopType;
 
 /// Context information for string-based completions (config, view, route, etc.)
 /// Contains position info needed to create proper text_edit ranges
@@ -4703,7 +4686,7 @@ impl LaravelLanguageServer {
     /// 2. Controller methods that render this view
     /// 3. View component class (if this is a component view)
     /// 4. Livewire component (if this is a Livewire view) (highest priority)
-    fn resolve_blade_variable_type_sync(&self, uri: &Url, variable_name: &str) -> Option<String> {
+    async fn resolve_blade_variable_type(&self, uri: &Url, variable_name: &str) -> Option<String> {
         // Get the view path from the URI
         let path = uri.path();
 
@@ -4712,9 +4695,8 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        // Get project root synchronously (we're already in async context but need sync access)
         let root = {
-            let root_guard = self.root_path.try_read().ok()?;
+            let root_guard = self.root_path.read().await;
             root_guard.clone()?
         };
 
@@ -4746,6 +4728,75 @@ impl LaravelLanguageServer {
         if let Some(ref vn) = view_name {
             if let Some(class) = self.check_livewire_component_variable(&root, vn, var_without_dollar) {
                 resolved_type = Some(class);
+            }
+        }
+
+        // Fetch loop blocks via Salsa (memoized). Use std::path::PathBuf to send to the actor.
+        let path_buf = std::path::PathBuf::from(path);
+        let loops = self
+            .salsa
+            .get_loop_blocks(path_buf)
+            .await
+            .ok()
+            .flatten();
+
+        // Check Blade loop variables (@foreach / @forelse / @for).
+        // This runs LAST as a fallback so that earlier sources (props, controller, etc.)
+        // win when a foreach variable shadows an outer-scope variable name.
+        if resolved_type.is_none() {
+            if let Some(ref blocks) = loops {
+                for block in blocks.iter() {
+                    let is_value_var = block.variables.iter().any(|(n, _)| n == var_without_dollar);
+                    if !is_value_var {
+                        continue;
+                    }
+
+                    // Try to derive the element type from the iterable expression.
+                    if let Some(iter_expr) = &block.iterable {
+                        if let Some((elem_type, has_element)) = self.resolve_iterable_type_info(&root, path, iter_expr).await {
+                            if has_element {
+                                // Genuine element type — enables hover/autocomplete on $audit->...
+                                resolved_type = Some(elem_type);
+                                break;
+                            } else {
+                                // Iterable resolved but element type unknown (no PHPDoc generics).
+                                // Return a non-None sentinel so the "Cannot resolve type" diagnostic
+                                // is suppressed; user can add `@return Foo<Element>` to unlock typing.
+                                resolved_type = Some("mixed".to_string());
+                                break;
+                            }
+                        }
+                    }
+
+                    // Variable is defined by a loop but iterable couldn't be resolved.
+                    // Suppress the diagnostic — the variable IS defined, just untyped.
+                    resolved_type = Some("mixed".to_string());
+                    break;
+                }
+            }
+        }
+
+        // $loop is a Blade synthetic — return "Loop" when the file has any loop blocks.
+        // get_model_properties short-circuits on this type to return the hardcoded loop members.
+        if resolved_type.is_none() && var_without_dollar == "loop" {
+            if let Some(ref blocks) = loops {
+                if !blocks.is_empty() {
+                    resolved_type = Some("Loop".to_string());
+                }
+            }
+        }
+
+        // Check @php block assignments (`$outerLoop = $loop;` style).
+        // Variables declared in @php remain in scope for the rest of the Blade file.
+        if resolved_type.is_none() {
+            let path_buf = std::path::PathBuf::from(path);
+            if let Ok(Some(assignments)) = self.salsa.get_php_assignments(path_buf).await {
+                for (name, ty) in assignments.iter() {
+                    if name == var_without_dollar {
+                        resolved_type = Some(ty.clone());
+                        break;
+                    }
+                }
             }
         }
 
@@ -4893,160 +4944,9 @@ impl LaravelLanguageServer {
         Some(after_at.to_string())
     }
 
-    /// Parse variables from @foreach or @forelse directive arguments
-    /// Handles: @foreach($items as $item), @foreach($items as $key => $value)
-    /// Also handles complex expressions: @foreach($category->items as $item)
-    fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
-        use regex::Regex;
-        use lazy_static::lazy_static;
-
-        lazy_static! {
-            // Match: (expression as $key => $value) or (expression as $item)
-            // The expression can be complex like $category->items or $this->getUsers()
-            static ref FOREACH_RE: Regex = Regex::new(
-                r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#
-            ).unwrap();
-        }
-
-        let mut vars = Vec::new();
-
-        if let Some(caps) = FOREACH_RE.captures(arguments) {
-            // $key if present (group 1)
-            if let Some(key_match) = caps.get(1) {
-                vars.push((key_match.as_str().to_string(), "mixed".to_string()));
-            }
-            // $value (group 2)
-            if let Some(value_match) = caps.get(2) {
-                vars.push((value_match.as_str().to_string(), "mixed".to_string()));
-            }
-        }
-
-        vars
-    }
-
-    /// Parse variables from @for directive arguments
-    /// Handles: @for($i = 0; $i < 10; $i++)
-    fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
-        use regex::Regex;
-        use lazy_static::lazy_static;
-
-        lazy_static! {
-            // Match the loop variable in: ($i = 0; ...) or ($i=0; ...)
-            static ref FOR_RE: Regex = Regex::new(
-                r#"\(\s*\$(\w+)\s*="#
-            ).unwrap();
-        }
-
-        let mut vars = Vec::new();
-
-        if let Some(caps) = FOR_RE.captures(arguments) {
-            if let Some(var_match) = caps.get(1) {
-                vars.push((var_match.as_str().to_string(), "int".to_string()));
-            }
-        }
-
-        vars
-    }
-
-    /// Find all loop blocks in Blade content and their boundaries
-    /// Returns a list of loop blocks with start/end lines and extracted variables
-    fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
-        use regex::Regex;
-        use lazy_static::lazy_static;
-
-        lazy_static! {
-            // Match loop start directives with their arguments
-            static ref LOOP_START_RE: Regex = Regex::new(
-                r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#
-            ).unwrap();
-            // Match loop end directives
-            static ref LOOP_END_RE: Regex = Regex::new(
-                r#"@(endforeach|endforelse|endfor|endwhile)"#
-            ).unwrap();
-        }
-
-        let mut blocks = Vec::new();
-        let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, usize)> = Vec::new(); // (type, vars, start_line)
-
-        for (line_idx, line) in content.lines().enumerate() {
-            // Check for loop starts
-            for caps in LOOP_START_RE.captures_iter(line) {
-                let directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let arguments = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                let (loop_type, variables) = match directive {
-                    "foreach" => (BladeLoopType::Foreach, Self::parse_foreach_variables(arguments)),
-                    "forelse" => (BladeLoopType::Forelse, Self::parse_foreach_variables(arguments)),
-                    "for" => (BladeLoopType::For, Self::parse_for_variables(arguments)),
-                    "while" => (BladeLoopType::While, Vec::new()),
-                    _ => continue,
-                };
-
-                open_loops.push((loop_type, variables, line_idx));
-            }
-
-            // Check for loop ends
-            for caps in LOOP_END_RE.captures_iter(line) {
-                let end_directive = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-
-                let expected_type = match end_directive {
-                    "endforeach" => Some(BladeLoopType::Foreach),
-                    "endforelse" => Some(BladeLoopType::Forelse),
-                    "endfor" => Some(BladeLoopType::For),
-                    "endwhile" => Some(BladeLoopType::While),
-                    _ => None,
-                };
-
-                if let Some(expected) = expected_type {
-                    // Find the matching open loop (last one of this type)
-                    if let Some(pos) = open_loops.iter().rposition(|(t, _, _)| *t == expected) {
-                        let (loop_type, variables, start_line) = open_loops.remove(pos);
-                        blocks.push(BladeLoopBlock {
-                            loop_type,
-                            variables,
-                            start_line,
-                            end_line: Some(line_idx),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Add any unclosed loops (cursor might be inside them)
-        for (loop_type, variables, start_line) in open_loops {
-            blocks.push(BladeLoopBlock {
-                loop_type,
-                variables,
-                start_line,
-                end_line: None,
-            });
-        }
-
-        blocks
-    }
-
-    /// Get all loop blocks that enclose the given cursor position
-    /// Returns loops in order from innermost to outermost
-    fn get_enclosing_loops(content: &str, cursor_line: usize) -> Vec<BladeLoopBlock> {
-        let blocks = Self::find_loop_blocks(content);
-
-        let mut enclosing: Vec<BladeLoopBlock> = blocks
-            .into_iter()
-            .filter(|block| {
-                let after_start = cursor_line > block.start_line;
-                let before_end = match block.end_line {
-                    Some(end) => cursor_line < end,
-                    None => true, // Unclosed loop, assume cursor is inside
-                };
-                after_start && before_end
-            })
-            .collect();
-
-        // Sort by start_line descending to get innermost first
-        enclosing.sort_by(|a, b| b.start_line.cmp(&a.start_line));
-
-        enclosing
-    }
+    // Blade loop parsing functions live in `laravel_lsp::blade_loops` so the
+    // Salsa actor can return them from a tracked query. Use them via the
+    // module path (e.g. `laravel_lsp::blade_loops::find_loop_blocks(...)`).
 
     /// Get all available variables for a Blade file
     /// Collects variables from @props, controller, Livewire, view component, and loop directives
@@ -5133,7 +5033,7 @@ impl LaravelLanguageServer {
 
         // 5. Extract loop variables from enclosing loop directives (scope-aware)
         if let (Some(content_str), Some(line)) = (blade_content, cursor_line) {
-            let enclosing_loops = Self::get_enclosing_loops(content_str, line as usize);
+            let enclosing_loops = laravel_lsp::blade_loops::get_enclosing_loops(content_str, line as usize);
 
             // Add variables from each enclosing loop
             for loop_block in &enclosing_loops {
@@ -5161,6 +5061,20 @@ impl LaravelLanguageServer {
                     php_type: "Loop".to_string(),
                     source: "loop".to_string(),
                 });
+            }
+        }
+
+        // 6. Extract @php block variable assignments (file-scoped — visible after @endphp).
+        if let Some(content_str) = blade_content {
+            let php_vars = laravel_lsp::blade_php_block::extract_php_block_assignments(content_str);
+            for (name, php_type) in php_vars {
+                if seen.insert(name.clone()) {
+                    variables.push(BladeVariableInfo {
+                        name,
+                        php_type,
+                        source: "php-block".to_string(),
+                    });
+                }
             }
         }
 
@@ -5552,7 +5466,7 @@ impl LaravelLanguageServer {
                         // Check if it's $this->property (group 2) or $variable (group 3)
                         let var_type = if let Some(prop_match) = arr_cap.get(2) {
                             // It's $this->property
-                            Self::find_property_type_in_content(content, prop_match.as_str())
+                            laravel_lsp::php_class::find_property_type_in_content(content, prop_match.as_str())
                         } else if let Some(var_match) = arr_cap.get(3) {
                             // It's $variable
                             Self::find_variable_type_in_content(content, var_match.as_str())
@@ -5600,7 +5514,7 @@ impl LaravelLanguageServer {
                         // Check if it's $this->property (group 3) or $variable (group 4)
                         let var_type = if let Some(prop_match) = cap.get(3) {
                             // It's $this->property - look up the property type
-                            Self::find_property_type_in_content(content, prop_match.as_str())
+                            laravel_lsp::php_class::find_property_type_in_content(content, prop_match.as_str())
                         } else if let Some(var_match) = cap.get(4) {
                             // It's $variable - look up the variable type
                             Self::find_variable_type_in_content(content, var_match.as_str())
@@ -5655,7 +5569,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(type_match) = caps.get(1) {
-                return Some(Self::simplify_type(type_match.as_str()));
+                return Some(laravel_lsp::php_class::simplify_type(type_match.as_str()));
             }
         }
 
@@ -5670,7 +5584,7 @@ impl LaravelLanguageServer {
         {
             if let Some(type_match) = caps.get(2) {
                 let nullable = caps.get(1).is_some();
-                let type_name = Self::simplify_type(type_match.as_str());
+                let type_name = laravel_lsp::php_class::simplify_type(type_match.as_str());
                 return Some(if nullable { format!("?{}", type_name) } else { type_name });
             }
         }
@@ -5686,7 +5600,7 @@ impl LaravelLanguageServer {
         {
             if let Some(type_match) = caps.get(2) {
                 let nullable = caps.get(1).is_some();
-                let type_name = Self::simplify_type(type_match.as_str());
+                let type_name = laravel_lsp::php_class::simplify_type(type_match.as_str());
                 return Some(if nullable { format!("?{}", type_name) } else { type_name });
             }
         }
@@ -5701,7 +5615,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(class) = caps.get(1) {
-                return Some(Self::simplify_type(class.as_str()));
+                return Some(laravel_lsp::php_class::simplify_type(class.as_str()));
             }
         }
 
@@ -5715,7 +5629,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(Self::simplify_type(model.as_str()));
+                return Some(laravel_lsp::php_class::simplify_type(model.as_str()));
             }
         }
 
@@ -5729,7 +5643,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(format!("Collection<{}>", Self::simplify_type(model.as_str())));
+                return Some(format!("Collection<{}>", laravel_lsp::php_class::simplify_type(model.as_str())));
             }
         }
 
@@ -5743,7 +5657,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(Self::simplify_type(model.as_str()));
+                return Some(laravel_lsp::php_class::simplify_type(model.as_str()));
             }
         }
 
@@ -5757,7 +5671,7 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(format!("Collection<{}>", Self::simplify_type(model.as_str())));
+                return Some(format!("Collection<{}>", laravel_lsp::php_class::simplify_type(model.as_str())));
             }
         }
 
@@ -5783,131 +5697,9 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Simplify a fully qualified class name to just the class name
-    fn simplify_type(type_name: &str) -> String {
-        type_name.rsplit('\\').next().unwrap_or(type_name).to_string()
-    }
-
-    /// Find a class property's type from class definition
-    /// Handles: `protected User $user;`, `private ?Model $model;`, `public $items;` with PHPDoc
-    fn find_property_type_in_content(content: &str, property_name: &str) -> Option<String> {
-        let escaped_prop = regex::escape(property_name);
-
-        // PHP primitive types pattern - must match before class names
-        // Includes: int, string, bool, float, array, object, mixed, null, void, callable, iterable, never
-        let primitive_types = r"int|string|bool|boolean|float|double|array|object|mixed|null|void|callable|iterable|never|true|false";
-
-        // 1. PHPDoc @var annotation above property: /** @var User */ or /** @var int */
-        // Look for @var followed by property declaration
-        let phpdoc_pattern = format!(
-            r#"@var\s+\\?([A-Za-z][a-zA-Z0-9_\\|<>]*)\s*\*/\s*(?:public|protected|private)\s+(?:\?)?(?:[A-Za-z][a-zA-Z0-9_\\]*)?\s*\${}"#,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&phpdoc_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(type_match) = caps.get(1) {
-                return Some(Self::simplify_type(type_match.as_str()));
-            }
-        }
-
-        // 2a. Typed property with primitive type: protected int $count;
-        let primitive_prop_pattern = format!(
-            r#"(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}\s*[;=]"#,
-            primitive_types,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&primitive_prop_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(type_match) = caps.get(2) {
-                let nullable = caps.get(1).is_some();
-                let type_name = type_match.as_str().to_string();
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
-            }
-        }
-
-        // 2b. Typed property with class type: protected User $user;
-        let typed_prop_pattern = format!(
-            r#"(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*[;=]"#,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&typed_prop_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(type_match) = caps.get(2) {
-                let nullable = caps.get(1).is_some();
-                let type_name = Self::simplify_type(type_match.as_str());
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
-            }
-        }
-
-        // 3a. Constructor property promotion with primitive: __construct(protected int $count)
-        let primitive_promoted_pattern = format!(
-            r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}"#,
-            primitive_types,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&primitive_promoted_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(type_match) = caps.get(2) {
-                let nullable = caps.get(1).is_some();
-                let type_name = type_match.as_str().to_string();
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
-            }
-        }
-
-        // 3b. Constructor property promotion with class type: __construct(protected User $user)
-        let promoted_pattern = format!(
-            r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&promoted_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(type_match) = caps.get(2) {
-                let nullable = caps.get(1).is_some();
-                let type_name = Self::simplify_type(type_match.as_str());
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
-            }
-        }
-
-        // 4. Property initialized in constructor with new: $this->user = new User()
-        let constructor_new_pattern = format!(
-            r#"\$this->{}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&constructor_new_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(class) = caps.get(1) {
-                return Some(Self::simplify_type(class.as_str()));
-            }
-        }
-
-        // 5. Property initialized with Model::find() etc
-        let model_assign_pattern = format!(
-            r#"\$this->{}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::(?:find|first|create)"#,
-            escaped_prop
-        );
-        if let Some(caps) = regex::Regex::new(&model_assign_pattern)
-            .ok()
-            .and_then(|re| re.captures(content))
-        {
-            if let Some(model) = caps.get(1) {
-                return Some(Self::simplify_type(model.as_str()));
-            }
-        }
-
-        None
-    }
+    // `simplify_type`, `find_property_type_in_content`, `extract_method_return_type`,
+    // `normalize_generic_type`, `parse_generic_args`, and `iterable_element_type` live
+    // in `laravel_lsp::php_class` so the Salsa actor can call them.
 
     /// Extract variables from a View component class
     fn extract_component_variables(&self, root: &std::path::Path, blade_path: &str) -> Vec<(String, String)> {
@@ -6165,6 +5957,102 @@ impl LaravelLanguageServer {
         }
 
         None
+    }
+
+    /// Map a Blade view path under `resources/views/livewire/` to its Livewire component PHP file.
+    /// Handles nested namespaces: `resources/views/livewire/decision-cloud/audits/index.blade.php`
+    /// -> `app/Livewire/DecisionCloud/Audits/Index.php` (or `app/Http/Livewire/...` for v2).
+    fn view_path_to_livewire_class_path(&self, root: &std::path::Path, view_path: &str) -> Option<std::path::PathBuf> {
+        let livewire_views = root.join("resources").join("views").join("livewire");
+        let views_str = livewire_views.to_string_lossy();
+
+        let relative = view_path.strip_prefix(views_str.as_ref())?.trim_start_matches('/').trim_start_matches('\\');
+        let without_ext = relative.strip_suffix(".blade.php")?;
+
+        // Convert each path segment from kebab-case to PascalCase
+        let class_parts: Vec<String> = without_ext
+            .split('/')
+            .map(|part| Self::kebab_to_pascal(part))
+            .collect();
+        let class_relative = class_parts.join("/");
+
+        // Try Livewire v3 (app/Livewire) first, then v2 (app/Http/Livewire)
+        for base in ["Livewire", "Http/Livewire"] {
+            let path = root.join("app").join(base).join(format!("{}.php", class_relative));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
+    /// Given a Livewire-view iterable expression (e.g. "$this->audits") and the view's path,
+    /// resolve the iterable's declared type, then extract its element type if generics are present.
+    /// Returns:
+    ///   - `Some(("Audit", true))` when an element type was extracted from generics
+    ///   - `Some((type_str, false))` when the iterable resolved but no element type could be inferred
+    ///     (caller may treat this as "iterable but element unknown" — suppress diagnostic, no autocomplete)
+    ///   - `None` when the expression couldn't be resolved at all
+    async fn resolve_iterable_type_info(
+        &self,
+        root: &std::path::Path,
+        view_path: &str,
+        iterable_expr: &str,
+    ) -> Option<(String, bool)> {
+        // Only handle `$this->X` against a Livewire component for now.
+        // `X` can be a public property or a #[Computed] method.
+        let trimmed = iterable_expr.trim();
+        let member = trimmed.strip_prefix("$this->")?;
+
+        // Reject anything with further chaining/calls — we only resolve simple $this->name.
+        // Method-call form $this->name() is also accepted (drop trailing ()).
+        let member_name = member.trim_end_matches("()");
+        if member_name.contains(['-', '>', '(', ')', '.', '[', ']', ' ', ':']) {
+            return None;
+        }
+
+        let class_path = self.view_path_to_livewire_class_path(root, view_path)?;
+
+        // Dispatch through Salsa. The actor auto-registers the file as a SourceFile
+        // and invalidates on mtime change (the file isn't typically open in the editor).
+        let resolved = self
+            .salsa
+            .resolve_livewire_member(class_path, member_name.to_string())
+            .await
+            .ok()
+            .flatten()?;
+
+        let element = laravel_lsp::php_class::iterable_element_type(&resolved);
+        match element {
+            Some(elem) => Some((elem, true)),
+            None => Some((resolved, false)),
+        }
+    }
+
+    /// Hardcoded properties of Laravel's `$loop` Blade variable.
+    /// Reference: https://laravel.com/docs/blade#the-loop-variable
+    fn loop_var_properties() -> Vec<ModelPropertyCompletion> {
+        let entries = [
+            ("index", "int"),
+            ("iteration", "int"),
+            ("remaining", "int"),
+            ("count", "int"),
+            ("first", "bool"),
+            ("last", "bool"),
+            ("even", "bool"),
+            ("odd", "bool"),
+            ("depth", "int"),
+            ("parent", "?stdClass"),
+        ];
+        entries
+            .iter()
+            .map(|(name, ty)| ModelPropertyCompletion {
+                name: (*name).to_string(),
+                php_type: (*ty).to_string(),
+                source: "blade-loop".to_string(),
+            })
+            .collect()
     }
 
     /// Check if variable is defined in a View component class
@@ -6778,7 +6666,7 @@ impl LaravelLanguageServer {
                                     code: None,
                                     source: Some("laravel".to_string()),
                                     message: format!(
-                                        "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n• DB_CONNECTION\n• DB_HOST\n• DB_DATABASE\n• DB_USERNAME\n• DB_PASSWORD",
+                                        "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n- DB_CONNECTION\n- DB_HOST\n- DB_DATABASE\n- DB_USERNAME\n- DB_PASSWORD",
                                         error.message
                                     ),
                                     related_information: None,
@@ -7964,6 +7852,12 @@ impl LaravelLanguageServer {
     /// Combines database columns, casts, accessors, and relationships
     async fn get_model_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
         use laravel_lsp::model_analyzer::{ModelMetadata, map_cast_to_php_type, relationship_to_php_type};
+
+        // Synthetic Blade types — short-circuit before any filesystem lookup so they
+        // never collide with user-defined models of the same name.
+        if class_name == "Loop" {
+            return Self::loop_var_properties();
+        }
 
         let root = match self.root_path.read().await.clone() {
             Some(r) => r,
@@ -10962,7 +10856,7 @@ return [
             }
 
             // Try to resolve the variable type
-            let resolved_type = self.resolve_blade_variable_type_sync(uri, &access.variable_name);
+            let resolved_type = self.resolve_blade_variable_type(uri, &access.variable_name).await;
 
             if resolved_type.is_none() {
                 seen_variables.insert(access.variable_name.clone());
@@ -10982,7 +10876,7 @@ return [
                     code: None,
                     source: Some("laravel".to_string()),
                     message: format!(
-                        "Cannot resolve type for '{}'\n\nTo enable autocomplete, ensure the variable is passed from:\n• Controller with return view('...', compact('{}'))\n• Livewire component with public property\n• View component with constructor parameter\n• @props directive with type hint",
+                        "Cannot resolve type for '{}'\n\nTo enable autocomplete, ensure the variable is passed from:\n- Controller with return view('...', compact('{}'))\n- Livewire component with public property or #[Computed] method\n- View component with constructor parameter\n- @props directive with type hint\n- @foreach loop where the iterable's type carries a generic element (e.g. `@return Collection<int, Audit>`)",
                         access.variable_name,
                         access.variable_name.trim_start_matches('$')
                     ),
@@ -11862,14 +11756,14 @@ impl LanguageServer for LaravelLanguageServer {
 
                 // Resolve the model class from the hint
                 let model_class = if class_hint.starts_with('$') {
-                    // Variable - need to resolve type
-                    // Try explicit type hints/PHPDoc in current file first
-                    Self::resolve_variable_type(&content, &class_hint)
-                        .or_else(|| {
-                            // For Blade files, try to resolve from the source that provides this variable
-                            // (controller, Livewire component, view component, or view composer)
-                            self.resolve_blade_variable_type_sync(uri, &class_hint)
-                        })
+                    // Variable - try explicit type hints/PHPDoc in current file first
+                    match Self::resolve_variable_type(&content, &class_hint) {
+                        Some(t) => Some(t),
+                        // For Blade files, try to resolve from the source that provides this variable
+                        // (controller, Livewire component, view component, or view composer).
+                        // Cannot use `.or_else()` here because the fallback is async.
+                        None => self.resolve_blade_variable_type(uri, &class_hint).await,
+                    }
                 } else {
                     // Direct class name from static chain
                     Some(class_hint)
@@ -12848,613 +12742,7 @@ impl LanguageServer for LaravelLanguageServer {
 
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    mod array_context_detection {
-        use super::*;
-
-        #[test]
-        fn test_detect_casts_property() {
-            let current = "            'email_verified_at' => 'datetime',";
-            let surrounding = vec![
-                "    protected $casts = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Casts
-            );
-        }
-
-        #[test]
-        fn test_detect_casts_method() {
-            let current = "            'email_verified_at' => 'datetime',";
-            let surrounding = vec![
-                "    protected function casts(): array",
-                "    {",
-                "        return [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Casts
-            );
-        }
-
-        #[test]
-        fn test_detect_rules_property() {
-            let current = "            'email' => 'required|email',";
-            let surrounding = vec![
-                "    protected $rules = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_detect_rules_method() {
-            let current = "            'email' => 'required|email',";
-            let surrounding = vec![
-                "    public function rules(): array",
-                "    {",
-                "        return [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_detect_validate_call() {
-            let current = "            'email' => 'required|email',";
-            let surrounding = vec![
-                "        $request->validate([",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_detect_validator_make() {
-            let current = "            'email' => 'required',";
-            let surrounding = vec![
-                "        $validator = Validator::make($data, [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_detect_livewire_rule_attribute() {
-            let current = "    #[Rule('required|email')]";
-            let surrounding: Vec<&str> = vec![];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_detect_fillable() {
-            let current = "        'name',";
-            let surrounding = vec![
-                "    protected $fillable = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::MassAssignment
-            );
-        }
-
-        #[test]
-        fn test_detect_hidden() {
-            let current = "        'password',";
-            let surrounding = vec![
-                "    protected $hidden = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Visibility
-            );
-        }
-
-        #[test]
-        fn test_detect_with_property() {
-            let current = "        'posts',";
-            let surrounding = vec![
-                "    protected $with = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Relationships
-            );
-        }
-
-        #[test]
-        fn test_unknown_context() {
-            let current = "        'some_value',";
-            let surrounding = vec![
-                "        $randomArray = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Unknown
-            );
-        }
-
-        #[test]
-        fn test_validation_priority_over_generic() {
-            // When on a line that has validation-like content but surrounding is ambiguous,
-            // validation patterns should be detected
-            let current = "        $request->validate([";
-            let surrounding: Vec<&str> = vec![];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Validation
-            );
-        }
-
-        #[test]
-        fn test_casts_blocks_validation_completion() {
-            // Even if line contains validation-like words (string, integer, boolean),
-            // being in a casts context should return Casts, not Validation
-            let current = "            'is_active' => 'boolean',";
-            let surrounding = vec![
-                "    protected function casts(): array",
-                "    {",
-                "        return [",
-            ];
-            // "boolean" is both a cast type and a validation rule,
-            // but context should win
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Casts
-            );
-        }
-
-        #[test]
-        fn test_casts_with_realistic_line_order() {
-            // Test with lines in the order they'd actually be collected
-            // (closest line first, furthest last)
-            let current = "            'email_verified_at' => 'datetime',";
-            // Simulating User model casts() method - lines closest to current first
-            let surrounding = vec![
-                "        return [",                         // line N-1
-                "    {",                                    // line N-2
-                "    protected function casts(): array",   // line N-3
-                "     */",                                  // line N-4 (docblock end)
-                "     * @return array<string, string>",    // line N-5
-            ];
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Casts
-            );
-        }
-
-        #[test]
-        fn test_casts_with_docblock_beyond_10_lines() {
-            // If casts() is more than 10 lines away due to large docblock,
-            // context should be Unknown (not incorrectly Validation)
-            let current = "            'field' => 'str";
-            // No casts() or rules() in surrounding 10 lines
-            let surrounding = vec![
-                "        return [",
-                "    {",
-                "     */",
-                "     * Line 1 of long docblock",
-                "     * Line 2 of long docblock",
-                "     * Line 3 of long docblock",
-                "     * Line 4 of long docblock",
-                "     * Line 5 of long docblock",
-                "     * Line 6 of long docblock",
-                "    /**",
-            ];
-            // Should be Unknown, NOT Validation
-            assert_eq!(
-                LaravelLanguageServer::detect_array_context(current, &surrounding),
-                ArrayContext::Unknown
-            );
-        }
-    }
-
-    mod cast_type_context {
-        use super::*;
-
-        #[test]
-        fn test_extract_partial_cast_type_basic() {
-            // After typing => ' we should get empty string
-            let before = "        'email_verified_at' => '";
-            assert_eq!(
-                LaravelLanguageServer::extract_partial_cast_type(before),
-                Some("".to_string())
-            );
-        }
-
-        #[test]
-        fn test_extract_partial_cast_type_with_prefix() {
-            // After typing => 'date we should get "date"
-            let before = "        'email_verified_at' => 'date";
-            assert_eq!(
-                LaravelLanguageServer::extract_partial_cast_type(before),
-                Some("date".to_string())
-            );
-        }
-
-        #[test]
-        fn test_extract_partial_cast_type_double_quotes() {
-            let before = "        'field' => \"int";
-            assert_eq!(
-                LaravelLanguageServer::extract_partial_cast_type(before),
-                Some("int".to_string())
-            );
-        }
-
-        #[test]
-        fn test_extract_partial_cast_type_no_arrow() {
-            // Key position, not value - should return None
-            let before = "        'field";
-            assert_eq!(
-                LaravelLanguageServer::extract_partial_cast_type(before),
-                None
-            );
-        }
-
-        #[test]
-        fn test_extract_partial_cast_type_closed_string() {
-            // Already closed string - cursor is outside
-            let before = "        'field' => 'datetime',";
-            assert_eq!(
-                LaravelLanguageServer::extract_partial_cast_type(before),
-                None
-            );
-        }
-
-        #[test]
-        fn test_get_cast_type_context_in_casts_array() {
-            let line = "        'email_verified_at' => 'date";
-            let surrounding = vec![
-                "    protected $casts = [",
-            ];
-            // Character position should be at end of line (after 'date')
-            assert_eq!(
-                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
-                Some("date".to_string())
-            );
-        }
-
-        #[test]
-        fn test_get_cast_type_context_in_casts_method() {
-            let line = "        'is_admin' => 'bool";
-            let surrounding = vec![
-                "    protected function casts(): array",
-                "    {",
-                "        return [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
-                Some("bool".to_string())
-            );
-        }
-
-        #[test]
-        fn test_get_cast_type_context_not_in_casts() {
-            // In validation context, not casts
-            let line = "        'email' => 'req";
-            let surrounding = vec![
-                "    protected $rules = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
-                None
-            );
-        }
-
-        #[test]
-        fn test_get_cast_type_context_empty_prefix() {
-            let line = "        'field' => '";
-            let surrounding = vec![
-                "    protected $casts = [",
-            ];
-            assert_eq!(
-                LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
-                Some("".to_string())
-            );
-        }
-    }
-
-    mod loop_variable_resolution {
-        use super::*;
-
-        #[test]
-        fn test_parse_foreach_single_variable() {
-            let vars = LaravelLanguageServer::parse_foreach_variables("($users as $user)");
-            assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
-        }
-
-        #[test]
-        fn test_parse_foreach_key_value() {
-            let vars = LaravelLanguageServer::parse_foreach_variables("($items as $key => $value)");
-            assert_eq!(vars, vec![
-                ("key".to_string(), "mixed".to_string()),
-                ("value".to_string(), "mixed".to_string()),
-            ]);
-        }
-
-        #[test]
-        fn test_parse_foreach_with_spaces() {
-            let vars = LaravelLanguageServer::parse_foreach_variables("( $users as $user )");
-            assert_eq!(vars, vec![("user".to_string(), "mixed".to_string())]);
-        }
-
-        #[test]
-        fn test_parse_for_variable() {
-            let vars = LaravelLanguageServer::parse_for_variables("($i = 0; $i < 10; $i++)");
-            assert_eq!(vars, vec![("i".to_string(), "int".to_string())]);
-        }
-
-        #[test]
-        fn test_parse_for_variable_no_spaces() {
-            let vars = LaravelLanguageServer::parse_for_variables("($i=0;$i<10;$i++)");
-            assert_eq!(vars, vec![("i".to_string(), "int".to_string())]);
-        }
-
-        #[test]
-        fn test_find_loop_blocks_single_foreach() {
-            let content = r#"
-@foreach($users as $user)
-    {{ $user->name }}
-@endforeach
-"#;
-            let blocks = LaravelLanguageServer::find_loop_blocks(content);
-            assert_eq!(blocks.len(), 1);
-            assert_eq!(blocks[0].loop_type, BladeLoopType::Foreach);
-            assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
-            assert_eq!(blocks[0].start_line, 1);
-            assert_eq!(blocks[0].end_line, Some(3));
-        }
-
-        #[test]
-        fn test_find_loop_blocks_nested() {
-            let content = r#"
-@foreach($categories as $category)
-    @foreach($category->items as $item)
-        {{ $item->name }}
-    @endforeach
-@endforeach
-"#;
-            let blocks = LaravelLanguageServer::find_loop_blocks(content);
-            assert_eq!(blocks.len(), 2);
-
-            // Inner loop ends first
-            let inner = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "item")).unwrap();
-            assert_eq!(inner.start_line, 2);
-            assert_eq!(inner.end_line, Some(4));
-
-            // Outer loop
-            let outer = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "category")).unwrap();
-            assert_eq!(outer.start_line, 1);
-            assert_eq!(outer.end_line, Some(5));
-        }
-
-        #[test]
-        fn test_find_loop_blocks_for() {
-            let content = r#"
-@for($i = 0; $i < 10; $i++)
-    {{ $i }}
-@endfor
-"#;
-            let blocks = LaravelLanguageServer::find_loop_blocks(content);
-            assert_eq!(blocks.len(), 1);
-            assert_eq!(blocks[0].loop_type, BladeLoopType::For);
-            assert_eq!(blocks[0].variables, vec![("i".to_string(), "int".to_string())]);
-        }
-
-        #[test]
-        fn test_find_loop_blocks_forelse() {
-            let content = r#"
-@forelse($users as $user)
-    {{ $user->name }}
-@empty
-    No users
-@endforelse
-"#;
-            let blocks = LaravelLanguageServer::find_loop_blocks(content);
-            assert_eq!(blocks.len(), 1);
-            assert_eq!(blocks[0].loop_type, BladeLoopType::Forelse);
-            assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
-        }
-
-        #[test]
-        fn test_get_enclosing_loops_inside() {
-            let content = r#"
-@foreach($users as $user)
-    {{ $user->name }}
-@endforeach
-"#;
-            // Line 2 (0-indexed) is inside the loop
-            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 2);
-            assert_eq!(enclosing.len(), 1);
-            assert_eq!(enclosing[0].variables, vec![("user".to_string(), "mixed".to_string())]);
-        }
-
-        #[test]
-        fn test_get_enclosing_loops_outside() {
-            let content = r#"
-@foreach($users as $user)
-    {{ $user->name }}
-@endforeach
-"#;
-            // Line 0 and 4 are outside the loop
-            let before = LaravelLanguageServer::get_enclosing_loops(content, 0);
-            assert_eq!(before.len(), 0);
-
-            let after = LaravelLanguageServer::get_enclosing_loops(content, 4);
-            assert_eq!(after.len(), 0);
-        }
-
-        #[test]
-        fn test_get_enclosing_loops_nested() {
-            let content = r#"
-@foreach($categories as $category)
-    @foreach($category->items as $item)
-        {{ $item->name }}
-    @endforeach
-@endforeach
-"#;
-            // Line 3 is inside both loops
-            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 3);
-            assert_eq!(enclosing.len(), 2);
-
-            // Innermost first
-            assert!(enclosing[0].variables.iter().any(|(n, _)| n == "item"));
-            assert!(enclosing[1].variables.iter().any(|(n, _)| n == "category"));
-        }
-
-        #[test]
-        fn test_get_enclosing_loops_between_nested() {
-            let content = r#"
-@foreach($categories as $category)
-    @foreach($category->items as $item)
-        {{ $item->name }}
-    @endforeach
-    {{ $category->name }}
-@endforeach
-"#;
-            // Line 5 is only inside outer loop (between inner endforeach and outer endforeach)
-            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 5);
-            assert_eq!(enclosing.len(), 1);
-            assert!(enclosing[0].variables.iter().any(|(n, _)| n == "category"));
-        }
-
-        #[test]
-        fn test_while_loop() {
-            let content = r#"
-@while($condition)
-    something
-@endwhile
-"#;
-            let blocks = LaravelLanguageServer::find_loop_blocks(content);
-            assert_eq!(blocks.len(), 1);
-            assert_eq!(blocks[0].loop_type, BladeLoopType::While);
-            assert!(blocks[0].variables.is_empty()); // @while doesn't introduce variables
-
-            // But cursor inside should still get $loop
-            let enclosing = LaravelLanguageServer::get_enclosing_loops(content, 2);
-            assert_eq!(enclosing.len(), 1);
-        }
-    }
-
-    mod slot_variable_resolution {
-        use super::*;
-
-        #[test]
-        fn test_extract_slot_variable_usages_basic() {
-            let content = r#"
-<div>
-    <h1>{{ $title }}</h1>
-    {{ $slot }}
-    <footer>{{ $footer }}</footer>
-</div>
-"#;
-            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
-
-            // $slot is excluded (framework var), $title and $footer should be found
-            assert!(vars.iter().any(|(n, _)| n == "title"));
-            assert!(vars.iter().any(|(n, _)| n == "footer"));
-            assert!(!vars.iter().any(|(n, _)| n == "slot")); // Excluded
-        }
-
-        #[test]
-        fn test_extract_slot_variable_usages_method_calls() {
-            let content = r#"
-@if($header->isNotEmpty())
-    <header>{{ $header }}</header>
-@endif
-"#;
-            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
-            assert!(vars.iter().any(|(n, _)| n == "header"));
-        }
-
-        #[test]
-        fn test_extract_slot_variable_usages_excludes_framework() {
-            let content = r#"
-{{ $errors->first('email') }}
-{{ $slot }}
-{{ $attributes->merge(['class' => 'btn']) }}
-{{ $component->data() }}
-"#;
-            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
-
-            // All framework variables should be excluded
-            assert!(!vars.iter().any(|(n, _)| n == "errors"));
-            assert!(!vars.iter().any(|(n, _)| n == "slot"));
-            assert!(!vars.iter().any(|(n, _)| n == "attributes"));
-            assert!(!vars.iter().any(|(n, _)| n == "component"));
-        }
-
-        #[test]
-        fn test_extract_slot_variable_usages_excludes_loop() {
-            let content = r#"
-@foreach($items as $item)
-    {{ $loop->index }}
-    {{ $item->name }}
-@endforeach
-"#;
-            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
-
-            // $loop should be excluded (framework variable)
-            // $item is found in echo {{ $item->name }}
-            assert!(!vars.iter().any(|(n, _)| n == "loop"));
-            assert!(vars.iter().any(|(n, _)| n == "item")); // Found in echo statement
-            // Note: $items is not found because it's only in directive, not in echo
-        }
-
-        #[test]
-        fn test_is_component_file() {
-            assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/button.blade.php"));
-            assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/forms/input.blade.php"));
-            assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/welcome.blade.php"));
-            assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/layouts/app.blade.php"));
-            assert!(!LaravelLanguageServer::is_component_file("/app/app/Http/Controllers/UserController.php"));
-        }
-
-        #[test]
-        fn test_extract_slot_variable_usages_complex() {
-            let content = r#"
-@props(['type' => 'info'])
-
-<div class="alert alert-{{ $type }}">
-    @if($title ?? false)
-        <h4>{{ $title }}</h4>
-    @endif
-
-    <div class="alert-body">
-        {{ $slot }}
-    </div>
-
-    @if($footer->isNotEmpty())
-        <div class="alert-footer">
-            {{ $footer }}
-        </div>
-    @endif
-</div>
-"#;
-            let vars = LaravelLanguageServer::extract_slot_variable_usages(content);
-
-            // Should find $type, $title, $footer but not $slot
-            assert!(vars.iter().any(|(n, _)| n == "type"));
-            assert!(vars.iter().any(|(n, _)| n == "title"));
-            assert!(vars.iter().any(|(n, _)| n == "footer"));
-            assert!(!vars.iter().any(|(n, _)| n == "slot"));
-        }
-    }
-}
+mod tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {

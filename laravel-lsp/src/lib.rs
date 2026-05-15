@@ -14,6 +14,9 @@ pub mod database;
 pub mod model_analyzer;
 pub mod route_discovery;
 pub mod slot_navigation;
+pub mod blade_loops;
+pub mod blade_php_block;
+pub mod php_class;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

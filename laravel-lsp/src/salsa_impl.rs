@@ -926,6 +926,30 @@ pub fn parse_view_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) 
     paths
 }
 
+/// Parse a Blade file's loop-block structure (@foreach / @forelse / @for / @while).
+/// Memoized: only re-runs when the file's text changes.
+#[salsa::tracked]
+pub fn parse_blade_loop_blocks<'db>(db: &'db dyn Db, file: SourceFile) -> Vec<crate::blade_loops::BladeLoopBlock> {
+    let text = file.text(db);
+    crate::blade_loops::find_loop_blocks(text)
+}
+
+/// Parse simple `$name = ...;` assignments out of a Blade file's `@php ... @endphp` blocks.
+/// Memoized: only re-runs when the file's text changes.
+#[salsa::tracked]
+pub fn parse_blade_php_assignments<'db>(db: &'db dyn Db, file: SourceFile) -> Vec<(String, String)> {
+    let text = file.text(db);
+    crate::blade_php_block::extract_php_block_assignments(text)
+}
+
+/// Resolve a `$this->X` member access against a Livewire component's PHP file.
+/// Tries property type first, then method return type. Memoized per (file_version, member).
+#[salsa::tracked]
+pub fn resolve_livewire_member_type<'db>(db: &'db dyn Db, file: SourceFile, member: String) -> Option<String> {
+    let text = file.text(db);
+    crate::php_class::resolve_member_type(text, &member)
+}
+
 /// Parse config/livewire.php to extract Livewire component path
 #[salsa::tracked]
 pub fn parse_livewire_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) -> Option<PathBuf> {
@@ -2324,6 +2348,23 @@ pub enum SalsaRequest {
         path: PathBuf,
         reply: oneshot::Sender<Option<Arc<ParsedPatternsData>>>,
     },
+    /// Get parsed loop blocks for a Blade file
+    GetLoopBlocks {
+        path: PathBuf,
+        reply: oneshot::Sender<Option<Arc<Vec<crate::blade_loops::BladeLoopBlock>>>>,
+    },
+    /// Get parsed @php block assignments for a Blade file
+    GetPhpAssignments {
+        path: PathBuf,
+        reply: oneshot::Sender<Option<Arc<Vec<(String, String)>>>>,
+    },
+    /// Resolve a `$this->X` member access in a Livewire component PHP file
+    /// (auto-registers the file as a Salsa input via mtime-based invalidation).
+    ResolveLivewireMember {
+        path: PathBuf,
+        member: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// Remove a file from the database
     RemoveFile {
         path: PathBuf,
@@ -2553,6 +2594,39 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::GetPatterns { path, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get parsed Blade loop blocks for a file.
+    /// Memoized — returns the same Arc on repeated calls until the file version changes.
+    pub async fn get_loop_blocks(&self, path: PathBuf) -> Result<Option<Arc<Vec<crate::blade_loops::BladeLoopBlock>>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetLoopBlocks { path, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get parsed `@php` block assignments for a Blade file.
+    /// Memoized — returns the same Arc on repeated calls until the file version changes.
+    pub async fn get_php_assignments(&self, path: PathBuf) -> Result<Option<Arc<Vec<(String, String)>>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetPhpAssignments { path, reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve a `$this->X` member access in a Livewire component PHP file.
+    /// Auto-registers the file as a Salsa input on first access, invalidates on mtime change.
+    pub async fn resolve_livewire_member(&self, path: PathBuf, member: String) -> Result<Option<String>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveLivewireMember { path, member, reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
@@ -3039,6 +3113,18 @@ pub struct SalsaActor {
     /// Key: file path, Value: (file version, cached patterns wrapped in Arc)
     /// Limited to 256 entries to prevent unbounded memory growth
     pattern_cache: LruCache<PathBuf, (i32, Arc<ParsedPatternsData>)>,
+    /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
+    /// Salsa already memoizes the underlying query, but caching the Arc avoids
+    /// re-walking the query graph on every diagnostic / completion request.
+    loop_blocks_cache: LruCache<PathBuf, (i32, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
+    /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file path + version.
+    php_assignments_cache: LruCache<PathBuf, (i32, Arc<Vec<(String, String)>>)>,
+    /// Tracks the on-disk mtime of Livewire component PHP files registered as Salsa inputs.
+    /// These files are not opened in the editor (no `did_open`/`did_change` events), so we
+    /// invalidate by comparing filesystem mtime on each access.
+    livewire_mtimes: HashMap<PathBuf, std::time::SystemTime>,
+    /// Monotonic version counter for Livewire component SourceFiles (incremented per disk re-read).
+    livewire_version_counter: i32,
 
     // === Config Management ===
 
@@ -3113,6 +3199,10 @@ impl SalsaActor {
                 files: HashMap::with_capacity(64),
                 // LRU cache with 256 entry limit to prevent unbounded memory growth
                 pattern_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                livewire_mtimes: HashMap::with_capacity(64),
+                livewire_version_counter: 0,
                 // Config management
                 config_root: None,
                 config_files: HashMap::with_capacity(4),
@@ -3166,9 +3256,23 @@ impl SalsaActor {
                     let result = self.handle_get_patterns(&path);
                     let _ = reply.send(result);
                 }
+                SalsaRequest::GetLoopBlocks { path, reply } => {
+                    let result = self.handle_get_loop_blocks(&path);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::GetPhpAssignments { path, reply } => {
+                    let result = self.handle_get_php_assignments(&path);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveLivewireMember { path, member, reply } => {
+                    let result = self.handle_resolve_livewire_member(&path, &member);
+                    let _ = reply.send(result);
+                }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
                     self.pattern_cache.pop(&path);
+                    self.loop_blocks_cache.pop(&path);
+                    self.php_assignments_cache.pop(&path);
                     let _ = reply.send(());
                 }
 
@@ -3372,8 +3476,10 @@ impl SalsaActor {
 
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
-        // Invalidate pattern cache for this file - will be recomputed on next get_patterns
+        // Invalidate caches for this file - will be recomputed on next request
         self.pattern_cache.pop(&path);
+        self.loop_blocks_cache.pop(&path);
+        self.php_assignments_cache.pop(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -3384,6 +3490,73 @@ impl SalsaActor {
             let file = SourceFile::new(&self.db, path.clone(), version, text);
             self.files.insert(path, file);
         }
+    }
+
+    /// Handle a Blade loop-blocks query. Memoized via Salsa + actor LRU.
+    fn handle_get_loop_blocks(&mut self, path: &PathBuf) -> Option<Arc<Vec<crate::blade_loops::BladeLoopBlock>>> {
+        let file = self.files.get(path)?;
+        let version = file.version(&self.db);
+
+        // Cache hit on matching version
+        if let Some((cached_version, cached)) = self.loop_blocks_cache.get(path) {
+            if *cached_version == version {
+                return Some(Arc::clone(cached));
+            }
+        }
+
+        // Cache miss / stale - call Salsa tracked query (memoized at the Salsa layer too)
+        let blocks = parse_blade_loop_blocks(&self.db, *file);
+        let arc = Arc::new(blocks);
+        self.loop_blocks_cache.put(path.clone(), (version, Arc::clone(&arc)));
+        Some(arc)
+    }
+
+    /// Handle resolving a `$this->X` member access in a Livewire component PHP file.
+    /// Auto-registers the file in Salsa, invalidates on mtime change.
+    fn handle_resolve_livewire_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
+        // Stat the file for current mtime
+        let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+
+        // Decide whether we need to re-read from disk
+        let needs_reload = match self.livewire_mtimes.get(path) {
+            Some(prev_mtime) => *prev_mtime != current_mtime || !self.files.contains_key(path),
+            None => true,
+        };
+
+        if needs_reload {
+            let text = std::fs::read_to_string(path).ok()?;
+            self.livewire_version_counter = self.livewire_version_counter.wrapping_add(1);
+            let version = self.livewire_version_counter;
+
+            if let Some(existing) = self.files.get(path) {
+                existing.set_version(&mut self.db).to(version);
+                existing.set_text(&mut self.db).to(text);
+            } else {
+                let file = SourceFile::new(&self.db, path.clone(), version, text);
+                self.files.insert(path.clone(), file);
+            }
+            self.livewire_mtimes.insert(path.clone(), current_mtime);
+        }
+
+        let file = *self.files.get(path)?;
+        resolve_livewire_member_type(&self.db, file, member.to_string())
+    }
+
+    /// Handle a Blade @php-assignments query. Memoized via Salsa + actor LRU.
+    fn handle_get_php_assignments(&mut self, path: &PathBuf) -> Option<Arc<Vec<(String, String)>>> {
+        let file = self.files.get(path)?;
+        let version = file.version(&self.db);
+
+        if let Some((cached_version, cached)) = self.php_assignments_cache.get(path) {
+            if *cached_version == version {
+                return Some(Arc::clone(cached));
+            }
+        }
+
+        let assignments = parse_blade_php_assignments(&self.db, *file);
+        let arc = Arc::new(assignments);
+        self.php_assignments_cache.put(path.clone(), (version, Arc::clone(&arc)));
+        Some(arc)
     }
 
     /// Handle pattern query - parse file and extract patterns

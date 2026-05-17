@@ -202,3 +202,121 @@ pub fn resolve_member_type(content: &str, member_name: &str) -> Option<String> {
     find_property_type_in_content(content, member_name)
         .or_else(|| extract_method_return_type(content, member_name))
 }
+
+/// Detect whether `content` contains at least one Volt anonymous-class signature.
+/// Matches `new (#[Attr])* class extends [\Namespace\]*Component`, covering:
+///   - bare `Component` (used after `use Livewire\Volt\Component;`)
+///   - fully-qualified `\Livewire\Volt\Component` or `\Livewire\Component`
+///   - leading PHP attributes such as `#[Layout('layouts.app')]`
+///
+/// Used to gate Volt-only behaviors (mount-param promotion) — classic Livewire
+/// classes live in a separate `.php` file under `app/Livewire/` and never match
+/// this pattern.
+pub fn detect_inline_volt_class(content: &str) -> bool {
+    let pattern = r"new\s+(?:#\[[^\]]+\]\s+)*class\s+extends\s+\\?(?:[A-Za-z_][A-Za-z0-9_]*\\\\?)*Component\b";
+    regex::Regex::new(pattern)
+        .ok()
+        .map(|re| re.is_match(content))
+        .unwrap_or(false)
+}
+
+/// Volt promotes typed `mount()` parameters to public properties.
+/// Scan every `function mount(...)` signature in `content` and return the first
+/// parameter named `param_name`. Returns:
+///   - `Some("ClassName")` for class-typed params (FQCN simplified)
+///   - `Some("int" / "string" / ...)` for primitive-typed params
+///   - `Some("?Type")` when the param is nullable
+///   - `Some("mixed")` for untyped params
+///   - `None` when `param_name` does not appear in any `mount()` signature
+pub fn find_mount_promoted_type(content: &str, param_name: &str) -> Option<String> {
+    for params in iter_mount_param_lists(content) {
+        for chunk in split_params(&params) {
+            let parsed = parse_mount_param(&chunk)?;
+            if parsed.name == param_name {
+                return Some(parsed.php_type);
+            }
+        }
+    }
+    None
+}
+
+/// Like `find_mount_promoted_type` but returns every parameter across all
+/// `function mount(...)` signatures in the file. Duplicates by name keep the
+/// first occurrence (matches `find_mount_promoted_type` lookup order).
+pub fn find_all_mount_promoted_params(content: &str) -> Vec<(String, String)> {
+    let mut results: Vec<(String, String)> = Vec::new();
+    for params in iter_mount_param_lists(content) {
+        for chunk in split_params(&params) {
+            if let Some(parsed) = parse_mount_param(&chunk) {
+                if !results.iter().any(|(n, _)| n == &parsed.name) {
+                    results.push((parsed.name, parsed.php_type));
+                }
+            }
+        }
+    }
+    results
+}
+
+struct MountParam {
+    name: String,
+    php_type: String,
+}
+
+fn iter_mount_param_lists(content: &str) -> Vec<String> {
+    let re = match regex::Regex::new(r"function\s+mount\s*\(([^)]*)\)") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    re.captures_iter(content)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
+fn split_params(params: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in params.chars() {
+        match ch {
+            '[' | '(' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ']' | ')' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                chunks.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let last = current.trim().to_string();
+    if !last.is_empty() {
+        chunks.push(last);
+    }
+    chunks
+}
+
+fn parse_mount_param(chunk: &str) -> Option<MountParam> {
+    let trimmed = chunk.trim_start_matches(|c: char| c.is_whitespace() || c == '&');
+    let trimmed = trimmed.trim_start_matches("...");
+    let trimmed = trimmed.trim();
+
+    let re = regex::Regex::new(
+        r"^(?:(\?)?\\?([A-Za-z_][A-Za-z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)",
+    )
+    .ok()?;
+    let caps = re.captures(trimmed)?;
+    let name = caps.get(3)?.as_str().to_string();
+
+    let php_type = match (caps.get(1), caps.get(2)) {
+        (Some(_), Some(t)) => format!("?{}", simplify_type(t.as_str())),
+        (None, Some(t)) => simplify_type(t.as_str()),
+        _ => "mixed".to_string(),
+    };
+
+    Some(MountParam { name, php_type })
+}

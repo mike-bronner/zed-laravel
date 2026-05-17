@@ -1739,6 +1739,10 @@ struct StringContext {
     quote_char: char,
 }
 
+use laravel_lsp::livewire_resolver::{
+    blade_contains_inline_volt_class, volt_mfc_sibling, ComponentKind,
+};
+
 impl LaravelLanguageServer {
     fn new(client: Client) -> Self {
         Self {
@@ -4724,11 +4728,11 @@ impl LaravelLanguageServer {
             resolved_type = Some(class);
         }
 
-        // Check Livewire component (highest priority - overrides all)
-        if let Some(ref vn) = view_name {
-            if let Some(class) = self.check_livewire_component_variable(&root, vn, var_without_dollar) {
-                resolved_type = Some(class);
-            }
+        // Check Livewire component (highest priority - overrides all).
+        // Pass the blade file path so Volt SFC / MFC files resolve in addition to
+        // the classic `resources/views/livewire/` -> `app/Livewire/` mapping.
+        if let Some(class) = self.check_livewire_component_variable(&root, path, var_without_dollar) {
+            resolved_type = Some(class);
         }
 
         // Fetch loop blocks via Salsa (memoized). Use std::path::PathBuf to send to the actor.
@@ -5017,17 +5021,15 @@ impl LaravelLanguageServer {
             }
         }
 
-        // 4. Extract from Livewire component
-        if let Some(ref vn) = view_name {
-            let livewire_vars = self.extract_livewire_variables(&root, vn);
-            for (name, php_type) in livewire_vars {
-                if seen.insert(name.clone()) {
-                    variables.push(BladeVariableInfo {
-                        name,
-                        php_type,
-                        source: "livewire".to_string(),
-                    });
-                }
+        // 4. Extract from Livewire / Volt component (uses blade path so SFC + MFC resolve too).
+        let livewire_vars = self.extract_livewire_variables(&root, path);
+        for (name, php_type) in livewire_vars {
+            if seen.insert(name.clone()) {
+                variables.push(BladeVariableInfo {
+                    name,
+                    php_type,
+                    source: "livewire".to_string(),
+                });
             }
         }
 
@@ -5816,54 +5818,51 @@ impl LaravelLanguageServer {
             .join("/")
     }
 
-    /// Extract variables from a Livewire component
-    fn extract_livewire_variables(&self, root: &std::path::Path, view_name: &str) -> Vec<(String, String)> {
-        let mut vars = Vec::new();
+    /// Extract public properties from the Livewire / Volt component backing a Blade view.
+    /// Works for classic Livewire (`app/Livewire/...`), Volt MFC siblings, and Volt SFC inline
+    /// classes. For Volt sources, `mount()` parameters are merged in as auto-promoted properties.
+    fn extract_livewire_variables(&self, root: &std::path::Path, blade_path: &str) -> Vec<(String, String)> {
+        let mut vars: Vec<(String, String)> = Vec::new();
 
-        // Only for livewire views
-        if !view_name.starts_with("livewire.") {
+        let Some((component_path, kind)) = self.find_livewire_component_php(root, blade_path) else {
             return vars;
-        }
-
-        let component_part = match view_name.strip_prefix("livewire.") {
-            Some(p) => p,
-            None => return vars,
+        };
+        let Ok(content) = std::fs::read_to_string(&component_path) else {
+            return vars;
         };
 
-        let class_name = Self::kebab_to_pascal(component_part);
+        // Public property declarations. Identical regex shape to the original implementation —
+        // it scans the whole source, so Volt SFCs with surrounding Blade markup match through.
+        let prop_re = regex::Regex::new(
+            r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
+        )
+        .ok();
 
-        // Try both Livewire paths
-        let paths = [
-            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
-            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
-        ];
-
-        for path in paths {
-            if path.exists() {
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-
-                // Extract public properties (they're automatically available in the view)
-                let prop_re = regex::Regex::new(
-                    r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
-                ).ok();
-
-                if let Some(re) = prop_re {
-                    for cap in re.captures_iter(&content) {
-                        if let Some(name) = cap.get(3) {
-                            let php_type = cap.get(2)
-                                .map(|t| {
-                                    let type_str = t.as_str();
-                                    type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
-                                })
-                                .unwrap_or_else(|| "mixed".to_string());
-                            vars.push((name.as_str().to_string(), php_type));
-                        }
+        if let Some(re) = prop_re {
+            for cap in re.captures_iter(&content) {
+                if let Some(name) = cap.get(3) {
+                    let php_type = cap
+                        .get(2)
+                        .map(|t| {
+                            let type_str = t.as_str();
+                            type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
+                        })
+                        .unwrap_or_else(|| "mixed".to_string());
+                    let var_name = name.as_str().to_string();
+                    if !vars.iter().any(|(n, _)| n == &var_name) {
+                        vars.push((var_name, php_type));
                     }
                 }
+            }
+        }
 
-                break;
+        // Volt auto-promotes typed `mount()` parameters to public properties. Merge them in
+        // after the explicit-property pass so an explicit `public Foo $x;` wins on conflict.
+        if matches!(kind, ComponentKind::Volt) {
+            for (name, php_type) in laravel_lsp::php_class::find_all_mount_promoted_params(&content) {
+                if !vars.iter().any(|(n, _)| n == &name) {
+                    vars.push((name, php_type));
+                }
             }
         }
 
@@ -5927,32 +5926,20 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Check if variable is defined in a Livewire component
-    fn check_livewire_component_variable(&self, root: &std::path::Path, view_name: &str, var_name: &str) -> Option<String> {
-        // Livewire views are typically in resources/views/livewire/
-        // and map to app/Livewire/ or app/Http/Livewire/
-        if !view_name.starts_with("livewire.") {
-            return None;
+    /// Resolve a Blade-scoped variable (e.g. `$form`) against the Livewire / Volt component
+    /// backing this view. Returns the declared type for explicit `public Type $var;` properties;
+    /// for Volt sources also falls back to scanning `mount()` parameters for type-promoted names.
+    fn check_livewire_component_variable(&self, root: &std::path::Path, blade_path: &str, var_name: &str) -> Option<String> {
+        let (component_path, kind) = self.find_livewire_component_php(root, blade_path)?;
+        let content = std::fs::read_to_string(&component_path).ok()?;
+
+        if let Some(type_name) = Self::extract_property_type(&content, var_name) {
+            return Some(type_name);
         }
 
-        // Convert view name to class name
-        // livewire.user-settings -> UserSettings
-        let component_part = view_name.strip_prefix("livewire.")?;
-        let class_name = Self::kebab_to_pascal(component_part);
-
-        // Try both Livewire v3 and v2 paths
-        let paths = [
-            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
-            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
-        ];
-
-        for class_path in paths {
-            if class_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&class_path) {
-                    if let Some(type_name) = Self::extract_property_type(&content, var_name) {
-                        return Some(type_name);
-                    }
-                }
+        if matches!(kind, ComponentKind::Volt) {
+            if let Some(type_name) = laravel_lsp::php_class::find_mount_promoted_type(&content, var_name) {
+                return Some(type_name);
             }
         }
 
@@ -5987,6 +5974,34 @@ impl LaravelLanguageServer {
         None
     }
 
+    /// Locate the PHP source containing the Livewire / Volt component definition for a Blade view.
+    /// Resolution order (Volt wins over classic when both could apply, matching Volt compiler behavior):
+    ///   1. Volt MFC: sibling `.php` file with the same stem containing `new class extends Component`
+    ///   2. Volt SFC: same `.blade.php` file containing inline `new class extends Component`
+    ///   3. Classic Livewire: `resources/views/livewire/foo.blade.php` -> `app/Livewire/Foo.php`
+    ///
+    /// For Volt SFC the returned path is the blade file itself; the property-extraction regexes
+    /// match through the surrounding Blade content because they pattern-match `public Type $name`
+    /// without caring about file framing.
+    fn find_livewire_component_php(
+        &self,
+        root: &std::path::Path,
+        blade_path: &str,
+    ) -> Option<(std::path::PathBuf, ComponentKind)> {
+        let blade = std::path::Path::new(blade_path);
+
+        if let Some(sibling) = volt_mfc_sibling(blade) {
+            return Some((sibling, ComponentKind::Volt));
+        }
+
+        if blade_contains_inline_volt_class(blade) {
+            return Some((blade.to_path_buf(), ComponentKind::Volt));
+        }
+
+        self.view_path_to_livewire_class_path(root, blade_path)
+            .map(|p| (p, ComponentKind::Classic))
+    }
+
     /// Given a Livewire-view iterable expression (e.g. "$this->audits") and the view's path,
     /// resolve the iterable's declared type, then extract its element type if generics are present.
     /// Returns:
@@ -6012,16 +6027,23 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        let class_path = self.view_path_to_livewire_class_path(root, view_path)?;
+        let (component_path, kind) = self.find_livewire_component_php(root, view_path)?;
 
         // Dispatch through Salsa. The actor auto-registers the file as a SourceFile
         // and invalidates on mtime change (the file isn't typically open in the editor).
-        let resolved = self
-            .salsa
-            .resolve_livewire_member(class_path, member_name.to_string())
-            .await
-            .ok()
-            .flatten()?;
+        // Volt sources go through the variant that adds mount() parameter promotion.
+        let resolved = match kind {
+            ComponentKind::Classic => self
+                .salsa
+                .resolve_livewire_member(component_path, member_name.to_string())
+                .await,
+            ComponentKind::Volt => self
+                .salsa
+                .resolve_volt_member(component_path, member_name.to_string())
+                .await,
+        }
+        .ok()
+        .flatten()?;
 
         let element = laravel_lsp::php_class::iterable_element_type(&resolved);
         match element {

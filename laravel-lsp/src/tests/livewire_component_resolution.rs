@@ -1,37 +1,29 @@
-use laravel_lsp::livewire_resolver::{
-    blade_contains_inline_volt_class, volt_mfc_sibling, ComponentKind,
-};
+use laravel_lsp::livewire_resolver::{blade_contains_inline_class, mfc_sibling};
 use laravel_lsp::php_class::{
-    detect_inline_volt_class, find_all_mount_promoted_params, find_mount_promoted_type,
+    detect_inline_livewire_class, find_all_mount_param_types, find_mount_param_type,
     find_property_type_in_content,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 // ============================================================================
-// detect_inline_volt_class
+// detect_inline_livewire_class
 // ============================================================================
 
 #[test]
 fn detects_bare_component_extends() {
     let src = r#"<?php
-        use Livewire\Volt\Component;
+        use Livewire\Component;
         new class extends Component { public string $foo = "bar"; };
     "#;
-    assert!(detect_inline_volt_class(src));
-}
-
-#[test]
-fn detects_fully_qualified_volt_component() {
-    let src = r#"<?php new class extends \Livewire\Volt\Component { }; "#;
-    assert!(detect_inline_volt_class(src));
+    assert!(detect_inline_livewire_class(src));
 }
 
 #[test]
 fn detects_fully_qualified_livewire_component() {
     let src = r#"<?php new class extends \Livewire\Component { }; "#;
-    assert!(detect_inline_volt_class(src));
+    assert!(detect_inline_livewire_class(src));
 }
 
 #[test]
@@ -39,7 +31,7 @@ fn detects_with_layout_attribute() {
     let src = r#"<?php
         new #[Layout('layouts.app')] class extends Component { };
     "#;
-    assert!(detect_inline_volt_class(src));
+    assert!(detect_inline_livewire_class(src));
 }
 
 #[test]
@@ -47,7 +39,7 @@ fn detects_with_multiple_attributes() {
     let src = r#"<?php
         new #[Layout('x')] #[Title('y')] class extends Component { };
     "#;
-    assert!(detect_inline_volt_class(src));
+    assert!(detect_inline_livewire_class(src));
 }
 
 #[test]
@@ -59,7 +51,7 @@ fn detects_when_embedded_in_blade_content() {
         </div>
         <p>{{ $bar }}</p>
     "#;
-    assert!(detect_inline_volt_class(src));
+    assert!(detect_inline_livewire_class(src));
 }
 
 #[test]
@@ -68,110 +60,110 @@ fn rejects_plain_blade_without_class() {
         <div>{{ $foo }}</div>
         @if ($bar) baz @endif
     "#;
-    assert!(!detect_inline_volt_class(src));
+    assert!(!detect_inline_livewire_class(src));
 }
 
 #[test]
 fn rejects_anonymous_class_extending_unrelated_base() {
     let src = r#"<?php new class extends OtherBase { }; "#;
-    assert!(!detect_inline_volt_class(src));
+    assert!(!detect_inline_livewire_class(src));
 }
 
 #[test]
 fn rejects_named_class_definition() {
     let src = r#"<?php class FooComponent extends Component { } "#;
-    assert!(!detect_inline_volt_class(src));
+    assert!(!detect_inline_livewire_class(src));
 }
 
 // ============================================================================
-// find_mount_promoted_type
+// find_mount_param_type — type *refinement* for declared but untyped properties.
+// Returns None for untyped params; this helper never synthesizes properties.
 // ============================================================================
 
 #[test]
-fn mount_promotes_class_typed_param() {
+fn mount_param_type_is_class() {
     let src = r#"<?php
         new class extends Component {
             public function mount(User $user) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "user"), Some("User".into()));
+    assert_eq!(find_mount_param_type(src, "user"), Some("User".into()));
 }
 
 #[test]
-fn mount_promotes_fully_qualified_class_param() {
+fn mount_param_type_simplifies_fully_qualified_class() {
     let src = r#"<?php
         new class extends Component {
             public function mount(\App\Models\User $user) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "user"), Some("User".into()));
+    assert_eq!(find_mount_param_type(src, "user"), Some("User".into()));
 }
 
 #[test]
-fn mount_promotes_primitive_param() {
+fn mount_param_type_is_primitive() {
     let src = r#"<?php
         new class extends Component {
             public function mount(string $name) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "name"), Some("string".into()));
+    assert_eq!(find_mount_param_type(src, "name"), Some("string".into()));
 }
 
 #[test]
-fn mount_promotes_nullable_class_param() {
+fn mount_param_type_is_nullable() {
     let src = r#"<?php
         new class extends Component {
             public function mount(?User $user) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "user"), Some("?User".into()));
+    assert_eq!(find_mount_param_type(src, "user"), Some("?User".into()));
 }
 
 #[test]
-fn mount_promotes_untyped_param_to_mixed() {
+fn mount_param_type_untyped_returns_none() {
+    // Untyped mount params do not refine — refinement requires type info to add.
     let src = r#"<?php
         new class extends Component {
             public function mount($foo) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "foo"), Some("mixed".into()));
+    assert_eq!(find_mount_param_type(src, "foo"), None);
 }
 
 #[test]
-fn mount_finds_param_among_many() {
+fn mount_param_type_picks_correct_param_among_many() {
     let src = r#"<?php
         new class extends Component {
             public function mount(string $first, User $second, int $third = 5) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "second"), Some("User".into()));
-    assert_eq!(find_mount_promoted_type(src, "third"), Some("int".into()));
+    assert_eq!(find_mount_param_type(src, "second"), Some("User".into()));
+    assert_eq!(find_mount_param_type(src, "third"), Some("int".into()));
 }
 
 #[test]
-fn mount_returns_none_for_missing_param() {
+fn mount_param_type_missing_param_returns_none() {
     let src = r#"<?php
         new class extends Component {
             public function mount(User $user) { }
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "missing"), None);
+    assert_eq!(find_mount_param_type(src, "missing"), None);
 }
 
 #[test]
-fn mount_returns_none_when_no_mount_function() {
+fn mount_param_type_no_mount_function_returns_none() {
     let src = r#"<?php
         new class extends Component {
             public User $user;
         };
     "#;
-    assert_eq!(find_mount_promoted_type(src, "user"), None);
+    assert_eq!(find_mount_param_type(src, "user"), None);
 }
 
 #[test]
-fn mount_first_match_wins_across_multiple_classes() {
-    // A file with two Volt classes — each defining its own mount() — should resolve
-    // the first occurrence by name (first-match-wins, deterministic order).
+fn mount_param_type_first_match_wins_across_classes() {
     let src = r#"<?php
         new class extends Component {
             public function mount(FirstType $shared) { }
@@ -181,31 +173,31 @@ fn mount_first_match_wins_across_multiple_classes() {
         };
     "#;
     assert_eq!(
-        find_mount_promoted_type(src, "shared"),
+        find_mount_param_type(src, "shared"),
         Some("FirstType".into())
     );
 }
 
 // ============================================================================
-// find_all_mount_promoted_params
+// find_all_mount_param_types — only typed params are listed; untyped skipped.
 // ============================================================================
 
 #[test]
-fn all_mount_params_lists_typed_and_untyped() {
+fn all_mount_param_types_skips_untyped() {
     let src = r#"<?php
         new class extends Component {
             public function mount(string $name, $foo, ?Bar $bar) { }
         };
     "#;
-    let params = find_all_mount_promoted_params(src);
-    assert_eq!(params.len(), 3);
+    let params = find_all_mount_param_types(src);
+    assert_eq!(params.len(), 2);
     assert!(params.contains(&("name".to_string(), "string".to_string())));
-    assert!(params.contains(&("foo".to_string(), "mixed".to_string())));
     assert!(params.contains(&("bar".to_string(), "?Bar".to_string())));
+    assert!(!params.iter().any(|(n, _)| n == "foo"));
 }
 
 #[test]
-fn all_mount_params_dedupes_by_name_first_wins() {
+fn all_mount_param_types_dedupes_by_name_first_wins() {
     let src = r#"<?php
         new class extends Component {
             public function mount(FirstType $x) { }
@@ -214,14 +206,14 @@ fn all_mount_params_dedupes_by_name_first_wins() {
             public function mount(SecondType $x, OtherType $y) { }
         };
     "#;
-    let params = find_all_mount_promoted_params(src);
+    let params = find_all_mount_param_types(src);
     assert!(params.contains(&("x".to_string(), "FirstType".to_string())));
     assert!(params.contains(&("y".to_string(), "OtherType".to_string())));
     assert!(!params.contains(&("x".to_string(), "SecondType".to_string())));
 }
 
 // ============================================================================
-// volt_mfc_sibling
+// mfc_sibling
 // ============================================================================
 
 fn write(path: &PathBuf, content: &str) {
@@ -232,7 +224,7 @@ fn write(path: &PathBuf, content: &str) {
 }
 
 #[test]
-fn mfc_sibling_found_when_volt_class_present() {
+fn mfc_sibling_found_when_livewire_class_present() {
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("pages/contact/contact.blade.php");
     let sibling = dir.path().join("pages/contact/contact.php");
@@ -242,20 +234,19 @@ fn mfc_sibling_found_when_volt_class_present() {
         "<?php new class extends Component { public Form $form; };",
     );
 
-    let resolved = volt_mfc_sibling(&blade).expect("sibling should resolve");
+    let resolved = mfc_sibling(&blade).expect("sibling should resolve");
     assert_eq!(resolved, sibling);
 }
 
 #[test]
-fn mfc_sibling_skipped_when_no_volt_signature() {
+fn mfc_sibling_skipped_when_no_livewire_signature() {
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("pages/about.blade.php");
     let sibling = dir.path().join("pages/about.php");
     write(&blade, "<div>about</div>");
-    // Sibling file exists but is not a Volt component (e.g. a config helper)
     write(&sibling, "<?php return ['title' => 'About'];");
 
-    assert!(volt_mfc_sibling(&blade).is_none());
+    assert!(mfc_sibling(&blade).is_none());
 }
 
 #[test]
@@ -264,11 +255,11 @@ fn mfc_sibling_skipped_when_no_sibling_file() {
     let blade = dir.path().join("pages/lonely.blade.php");
     write(&blade, "<div>standalone</div>");
 
-    assert!(volt_mfc_sibling(&blade).is_none());
+    assert!(mfc_sibling(&blade).is_none());
 }
 
 // ============================================================================
-// blade_contains_inline_volt_class
+// blade_contains_inline_class
 // ============================================================================
 
 #[test]
@@ -281,7 +272,7 @@ fn sfc_detected_when_blade_has_inline_class() {
            <p>{{ $msg }}</p>"#,
     );
 
-    assert!(blade_contains_inline_volt_class(&blade));
+    assert!(blade_contains_inline_class(&blade));
 }
 
 #[test]
@@ -290,43 +281,55 @@ fn sfc_not_detected_for_plain_blade() {
     let blade = dir.path().join("livewire/bar.blade.php");
     write(&blade, "<div>plain {{ $foo }}</div>");
 
-    assert!(!blade_contains_inline_volt_class(&blade));
+    assert!(!blade_contains_inline_class(&blade));
 }
 
 #[test]
 fn sfc_not_detected_for_missing_file() {
     let path = PathBuf::from("/nonexistent/blade/file.blade.php");
-    assert!(!blade_contains_inline_volt_class(&path));
+    assert!(!blade_contains_inline_class(&path));
 }
 
 // ============================================================================
-// End-to-end: property type lookup across all three patterns
+// End-to-end: property type lookup with refinement semantics
 // ============================================================================
 //
-// These tests mirror the real LSP flow. They don't construct a Backend (that
-// requires LSP client wiring); instead they exercise the same helpers the
-// Backend methods compose: the resolver picks a source path + kind, then the
-// property-type extractor scans that source.
+// `lookup_type` mirrors the Backend's resolution order:
+//   1. Pick component source (MFC sibling > SFC inline > classic mapping handled by Backend)
+//   2. Verify the property is actually declared (refinement never synthesizes)
+//   3. Prefer explicit property type, then refine via matching `mount()` param
 
-fn lookup_type(blade_path: &PathBuf, var_name: &str) -> Option<String> {
-    // Match the resolver order used inside `Backend::find_livewire_component_php`.
-    let (component_path, kind) = if let Some(sibling) = volt_mfc_sibling(blade_path) {
-        (sibling, ComponentKind::Volt)
-    } else if blade_contains_inline_volt_class(blade_path) {
-        (blade_path.clone(), ComponentKind::Volt)
+fn has_public_property(content: &str, name: &str) -> bool {
+    let escaped = regex::escape(name);
+    let pattern = format!(
+        r"public\s+(?:\??\\?[A-Za-z_][A-Za-z0-9_\\]*\s+)?\${}\b",
+        escaped
+    );
+    regex::Regex::new(&pattern)
+        .ok()
+        .map(|re| re.is_match(content))
+        .unwrap_or(false)
+}
+
+fn lookup_type(blade_path: &Path, var_name: &str) -> Option<String> {
+    let component_path = if let Some(sibling) = mfc_sibling(blade_path) {
+        sibling
+    } else if blade_contains_inline_class(blade_path) {
+        blade_path.to_path_buf()
     } else {
         return None;
     };
 
     let content = fs::read_to_string(&component_path).ok()?;
 
+    if !has_public_property(&content, var_name) {
+        return None;
+    }
+
     if let Some(t) = find_property_type_in_content(&content, var_name) {
         return Some(t);
     }
-    if matches!(kind, ComponentKind::Volt) {
-        return find_mount_promoted_type(&content, var_name);
-    }
-    None
+    find_mount_param_type(&content, var_name)
 }
 
 #[test]
@@ -349,24 +352,6 @@ fn e2e_mfc_with_explicit_property_resolves() {
 }
 
 #[test]
-fn e2e_mfc_with_mount_promoted_param_resolves() {
-    let dir = TempDir::new().unwrap();
-    let blade = dir.path().join("pages/profile/profile.blade.php");
-    let sibling = dir.path().join("pages/profile/profile.php");
-    write(&blade, "<div>{{ $user->name }}</div>");
-    write(
-        &sibling,
-        r#"<?php
-            new class extends Component {
-                public function mount(\App\Models\User $user) { }
-            };
-        "#,
-    );
-
-    assert_eq!(lookup_type(&blade, "user"), Some("User".to_string()));
-}
-
-#[test]
 fn e2e_sfc_with_explicit_property_resolves() {
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("livewire/counter.blade.php");
@@ -385,14 +370,39 @@ fn e2e_sfc_with_explicit_property_resolves() {
 }
 
 #[test]
-fn e2e_sfc_with_mount_promoted_param_resolves() {
+fn e2e_mfc_untyped_property_refined_by_mount_param() {
+    // Property exists but is untyped; mount() param supplies the type.
+    let dir = TempDir::new().unwrap();
+    let blade = dir.path().join("pages/profile/profile.blade.php");
+    let sibling = dir.path().join("pages/profile/profile.php");
+    write(&blade, "<div>{{ $user->name }}</div>");
+    write(
+        &sibling,
+        r#"<?php
+            new class extends Component {
+                public $user;
+                public function mount(\App\Models\User $user) {
+                    $this->user = $user;
+                }
+            };
+        "#,
+    );
+
+    assert_eq!(lookup_type(&blade, "user"), Some("User".to_string()));
+}
+
+#[test]
+fn e2e_sfc_untyped_property_refined_by_mount_param() {
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("livewire/welcome.blade.php");
     write(
         &blade,
         r#"<?php
             new class extends Component {
-                public function mount(string $heading) { }
+                public $heading;
+                public function mount(string $heading) {
+                    $this->heading = $heading;
+                }
             };
             ?>
             <h1>{{ $heading }}</h1>
@@ -403,26 +413,48 @@ fn e2e_sfc_with_mount_promoted_param_resolves() {
 }
 
 #[test]
-fn e2e_sfc_with_untyped_mount_param_resolves_to_mixed() {
+fn e2e_typed_property_keeps_its_type_even_when_mount_param_differs() {
+    // Explicit property type wins over mount() param type. (Wouldn't normally
+    // differ in real code, but the property declaration is the source of truth.)
     let dir = TempDir::new().unwrap();
-    let blade = dir.path().join("livewire/bag.blade.php");
+    let blade = dir.path().join("livewire/post.blade.php");
     write(
         &blade,
         r#"<?php
             new class extends Component {
-                public function mount($payload) { }
+                public Post $post;
+                public function mount(SomeOther $post) {
+                    $this->post = $post;
+                }
             };
         "#,
     );
 
-    assert_eq!(lookup_type(&blade, "payload"), Some("mixed".to_string()));
+    assert_eq!(lookup_type(&blade, "post"), Some("Post".to_string()));
+}
+
+#[test]
+fn e2e_no_property_declaration_returns_none_even_with_mount_param() {
+    // Critical regression guard: Livewire never synthesizes properties from
+    // mount() params alone. The LSP must not surface a type for `$user` here.
+    let dir = TempDir::new().unwrap();
+    let blade = dir.path().join("livewire/synth.blade.php");
+    write(
+        &blade,
+        r#"<?php
+            new class extends Component {
+                public function mount(User $user) {
+                    $foo = $user->name;
+                }
+            };
+        "#,
+    );
+
+    assert_eq!(lookup_type(&blade, "user"), None);
 }
 
 #[test]
 fn e2e_multi_class_blade_resolves_properties_from_any_class() {
-    // Two Volt classes in one file (malformed per Volt's compiler, but the
-    // resolver shouldn't break or pretend the file is empty). The regex scans
-    // top-to-bottom and finds the first matching declaration.
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("livewire/twin.blade.php");
     write(
@@ -452,8 +484,6 @@ fn e2e_plain_blade_returns_none() {
 
 #[test]
 fn e2e_mfc_takes_priority_over_sfc() {
-    // If a blade has BOTH a sibling Volt class AND an inline Volt class, the
-    // MFC sibling wins (matches the resolver's documented ordering).
     let dir = TempDir::new().unwrap();
     let blade = dir.path().join("pages/dual/dual.blade.php");
     let sibling = dir.path().join("pages/dual/dual.php");
@@ -478,4 +508,45 @@ fn e2e_mfc_takes_priority_over_sfc() {
         lookup_type(&blade, "shared"),
         Some("SiblingType".to_string())
     );
+}
+
+#[test]
+fn e2e_regression_emoji_directory_mfc_resolves() {
+    // Mirrors the exact layout used by the Crossbible contact-us component:
+    //   resources/views/pages/⚡contact-us/contact-us.blade.php
+    //   resources/views/pages/⚡contact-us/contact-us.php
+    // The directory carries Livewire 4's ⚡ marker (non-ASCII); the sibling .php
+    // file holds the anonymous-class component definition.
+    let dir = TempDir::new().unwrap();
+    let blade = dir
+        .path()
+        .join("resources/views/pages/\u{26A1}contact-us/contact-us.blade.php");
+    let sibling = dir
+        .path()
+        .join("resources/views/pages/\u{26A1}contact-us/contact-us.php");
+
+    write(&blade, "<div>{{ $form->name }}</div>");
+    write(
+        &sibling,
+        r#"<?php
+
+declare(strict_types=1);
+
+use App\Livewire\Forms\ContactForm;
+use Livewire\Component;
+
+new class extends Component
+{
+    public ContactForm $form;
+    public bool $isSubmitted = false;
+
+    public function submit(): void
+    {
+        // ...
+    }
+};
+"#,
+    );
+
+    assert_eq!(lookup_type(&blade, "form"), Some("ContactForm".to_string()));
 }

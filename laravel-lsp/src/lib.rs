@@ -17,7 +17,9 @@ pub mod slot_navigation;
 pub mod blade_loops;
 pub mod blade_php_block;
 pub mod php_class;
+pub mod class_locator;
 pub mod livewire_resolver;
+pub mod route_binding;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

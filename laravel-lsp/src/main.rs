@@ -1740,7 +1740,7 @@ struct StringContext {
 }
 
 use laravel_lsp::livewire_resolver::{
-    blade_contains_inline_volt_class, volt_mfc_sibling, ComponentKind,
+    blade_contains_inline_class, extract_blade_variable_at_cursor, mfc_sibling,
 };
 
 impl LaravelLanguageServer {
@@ -4691,8 +4691,12 @@ impl LaravelLanguageServer {
     /// 3. View component class (if this is a component view)
     /// 4. Livewire component (if this is a Livewire view) (highest priority)
     async fn resolve_blade_variable_type(&self, uri: &Url, variable_name: &str) -> Option<String> {
-        // Get the view path from the URI
-        let path = uri.path();
+        // Decode the URI to a filesystem path. `uri.path()` returns the raw,
+        // percent-encoded URI path — `to_file_path()` decodes it, which is
+        // required for any directory or file name containing non-ASCII
+        // characters (e.g. the ⚡ marker on Livewire 4 component directories).
+        let file_path = uri.to_file_path().ok()?;
+        let path = file_path.to_str()?;
 
         // Only process Blade files
         if !path.ends_with(".blade.php") {
@@ -4847,6 +4851,96 @@ impl LaravelLanguageServer {
         None
     }
 
+    /// Goto-definition fallback for Blade variables and property accesses.
+    /// Called from `goto_definition` when the standard pattern matcher finds
+    /// nothing at the cursor.
+    ///
+    /// - Cursor on `$form` → jumps to `public ContactForm $form;` inside the
+    ///   Livewire component backing this view.
+    /// - Cursor on `$form->name` → jumps to `public string $name;` inside
+    ///   `ContactForm.php` (the resolved class file).
+    ///
+    /// Returns `None` if the cursor isn't on a variable reference, the variable
+    /// doesn't resolve to a known component, or the declaration can't be located.
+    async fn blade_variable_goto_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        let file_path = uri.to_file_path().ok()?;
+        let path = file_path.to_str()?;
+
+        let content = match self.documents.read().await.get(uri).cloned() {
+            Some((c, _)) => c,
+            None => std::fs::read_to_string(path).ok()?,
+        };
+        let line_text = content.lines().nth(position.line as usize)?.to_string();
+
+        let (var_name, property) =
+            extract_blade_variable_at_cursor(&line_text, position.character)?;
+
+        let root = self.root_path.read().await.clone()?;
+
+        let (target_path, declaration_position) = match property {
+            // $var → component file + property declaration line for $var
+            None => {
+                let component_path = self.find_livewire_component_php(&root, path)?;
+                let component_content = std::fs::read_to_string(&component_path).ok()?;
+                let pos = laravel_lsp::php_class::find_property_declaration_position(
+                    &component_content,
+                    &var_name,
+                )?;
+                (component_path, pos)
+            }
+            // $var->prop → class file (whatever type $var resolves to) + prop line
+            Some(prop_name) => {
+                let var_type = self
+                    .resolve_blade_variable_type(uri, &format!("${}", var_name))
+                    .await?;
+                let class_path =
+                    laravel_lsp::class_locator::find_php_class_file(&var_type, &root)?;
+                let class_content = std::fs::read_to_string(&class_path).ok()?;
+                let pos = laravel_lsp::php_class::find_property_declaration_position(
+                    &class_content,
+                    &prop_name,
+                )?;
+                (class_path, pos)
+            }
+        };
+
+        let (line, start_col, end_col) = declaration_position;
+        let target_uri = Url::from_file_path(&target_path).ok()?;
+
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range: Range {
+                start: Position {
+                    line,
+                    character: start_col,
+                },
+                end: Position {
+                    line,
+                    character: end_col,
+                },
+            },
+        }))
+    }
+
+    /// Resolve the type of a property `prop` on a given class. Uses the class
+    /// locator to find the class file, then scans for `public Type $prop`.
+    /// Returns `None` when the class can't be found or the property isn't
+    /// declared with a recognizable type.
+    async fn resolve_property_type_on_class(
+        &self,
+        class_name: &str,
+        property_name: &str,
+    ) -> Option<String> {
+        let root = self.root_path.read().await.clone()?;
+        let class_path = laravel_lsp::class_locator::find_php_class_file(class_name, &root)?;
+        let content = std::fs::read_to_string(&class_path).ok()?;
+        laravel_lsp::php_class::find_property_type_in_content(&content, property_name)
+    }
+
     /// Detect if user is typing a variable name (e.g., `$u`, `$user`)
     /// Returns the prefix they've typed (without $) if in variable name context
     /// Returns None if they're in `$var->` context (property access)
@@ -4955,7 +5049,15 @@ impl LaravelLanguageServer {
     /// Get all available variables for a Blade file
     /// Collects variables from @props, controller, Livewire, view component, and loop directives
     fn get_blade_available_variables(&self, uri: &Url, content: Option<&str>, cursor_line: Option<u32>) -> Vec<BladeVariableInfo> {
-        let path = uri.path();
+        // Decode the URI to a filesystem path. See `resolve_blade_variable_type`
+        // for the rationale — non-ASCII path segments (e.g. ⚡-prefixed Livewire
+        // 4 component directories) require URI decoding before filesystem use.
+        let Ok(file_path) = uri.to_file_path() else {
+            return Vec::new();
+        };
+        let Some(path) = file_path.to_str() else {
+            return Vec::new();
+        };
 
         if !path.ends_with(".blade.php") {
             return Vec::new();
@@ -5818,21 +5920,26 @@ impl LaravelLanguageServer {
             .join("/")
     }
 
-    /// Extract public properties from the Livewire / Volt component backing a Blade view.
-    /// Works for classic Livewire (`app/Livewire/...`), Volt MFC siblings, and Volt SFC inline
-    /// classes. For Volt sources, `mount()` parameters are merged in as auto-promoted properties.
+    /// Extract public properties from the Livewire component backing a Blade view.
+    /// Works for Livewire 4 single-file components, multi-file components, and
+    /// class-based components (the Livewire 3 carry-over format).
+    ///
+    /// Untyped declarations (`public $foo;`) get their type refined from a matching
+    /// `mount()` parameter type-hint when one is available — mirroring Livewire's
+    /// runtime auto-assignment behavior. The property declaration is always required;
+    /// mount params alone never synthesize a property.
     fn extract_livewire_variables(&self, root: &std::path::Path, blade_path: &str) -> Vec<(String, String)> {
         let mut vars: Vec<(String, String)> = Vec::new();
 
-        let Some((component_path, kind)) = self.find_livewire_component_php(root, blade_path) else {
+        let Some(component_path) = self.find_livewire_component_php(root, blade_path) else {
             return vars;
         };
         let Ok(content) = std::fs::read_to_string(&component_path) else {
             return vars;
         };
 
-        // Public property declarations. Identical regex shape to the original implementation —
-        // it scans the whole source, so Volt SFCs with surrounding Blade markup match through.
+        // Public property declarations. The regex scans the whole source, so SFCs with
+        // surrounding Blade markup match through.
         let prop_re = regex::Regex::new(
             r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
         )
@@ -5841,27 +5948,31 @@ impl LaravelLanguageServer {
         if let Some(re) = prop_re {
             for cap in re.captures_iter(&content) {
                 if let Some(name) = cap.get(3) {
-                    let php_type = cap
-                        .get(2)
-                        .map(|t| {
+                    let var_name = name.as_str().to_string();
+                    if vars.iter().any(|(n, _)| n == &var_name) {
+                        continue;
+                    }
+
+                    let php_type = match cap.get(2) {
+                        Some(t) => {
                             let type_str = t.as_str();
                             type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
-                        })
-                        .unwrap_or_else(|| "mixed".to_string());
-                    let var_name = name.as_str().to_string();
-                    if !vars.iter().any(|(n, _)| n == &var_name) {
-                        vars.push((var_name, php_type));
-                    }
-                }
-            }
-        }
+                        }
+                        // Untyped property → mount param refinement, then route binding,
+                        // then fall back to "mixed". Same three-tier order as the
+                        // single-variable lookup in `check_livewire_component_variable`.
+                        None => laravel_lsp::php_class::find_mount_param_type(&content, &var_name)
+                            .or_else(|| {
+                                laravel_lsp::route_binding::find_route_binding_type(
+                                    std::path::Path::new(blade_path),
+                                    root,
+                                    &var_name,
+                                )
+                            })
+                            .unwrap_or_else(|| "mixed".to_string()),
+                    };
 
-        // Volt auto-promotes typed `mount()` parameters to public properties. Merge them in
-        // after the explicit-property pass so an explicit `public Foo $x;` wins on conflict.
-        if matches!(kind, ComponentKind::Volt) {
-            for (name, php_type) in laravel_lsp::php_class::find_all_mount_promoted_params(&content) {
-                if !vars.iter().any(|(n, _)| n == &name) {
-                    vars.push((name, php_type));
+                    vars.push((var_name, php_type));
                 }
             }
         }
@@ -5926,24 +6037,36 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Resolve a Blade-scoped variable (e.g. `$form`) against the Livewire / Volt component
-    /// backing this view. Returns the declared type for explicit `public Type $var;` properties;
-    /// for Volt sources also falls back to scanning `mount()` parameters for type-promoted names.
+    /// Resolve a Blade-scoped variable (e.g. `$form`) against the Livewire component backing
+    /// this view. Returns the declared type for explicit `public Type $var;` properties.
+    ///
+    /// Type resolution falls through three tiers, all gated on the property being declared
+    /// (Livewire never synthesizes properties from mount params or route bindings alone):
+    ///   1. Explicit property type (`public Post $post;`)
+    ///   2. Matching `mount()` parameter's type-hint (Livewire auto-assigns the param value)
+    ///   3. Matching `Route::livewire(...)` parameter, with the model class inferred from
+    ///      the param name via Laravel's PascalCase convention (`{post}` → `Post`)
     fn check_livewire_component_variable(&self, root: &std::path::Path, blade_path: &str, var_name: &str) -> Option<String> {
-        let (component_path, kind) = self.find_livewire_component_php(root, blade_path)?;
+        let component_path = self.find_livewire_component_php(root, blade_path)?;
         let content = std::fs::read_to_string(&component_path).ok()?;
+
+        if !Self::has_public_property(&content, var_name) {
+            return None;
+        }
 
         if let Some(type_name) = Self::extract_property_type(&content, var_name) {
             return Some(type_name);
         }
 
-        if matches!(kind, ComponentKind::Volt) {
-            if let Some(type_name) = laravel_lsp::php_class::find_mount_promoted_type(&content, var_name) {
-                return Some(type_name);
-            }
+        if let Some(type_name) = laravel_lsp::php_class::find_mount_param_type(&content, var_name) {
+            return Some(type_name);
         }
 
-        None
+        laravel_lsp::route_binding::find_route_binding_type(
+            std::path::Path::new(blade_path),
+            root,
+            var_name,
+        )
     }
 
     /// Map a Blade view path under `resources/views/livewire/` to its Livewire component PHP file.
@@ -5974,32 +6097,36 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Locate the PHP source containing the Livewire / Volt component definition for a Blade view.
-    /// Resolution order (Volt wins over classic when both could apply, matching Volt compiler behavior):
-    ///   1. Volt MFC: sibling `.php` file with the same stem containing `new class extends Component`
-    ///   2. Volt SFC: same `.blade.php` file containing inline `new class extends Component`
-    ///   3. Classic Livewire: `resources/views/livewire/foo.blade.php` -> `app/Livewire/Foo.php`
+    /// Locate the PHP source containing the Livewire component definition for a Blade view.
+    /// Covers all three Livewire 4 component formats; resolution order matches Livewire's
+    /// own component-discovery preference (co-located formats win when both apply):
+    ///   1. **Multi-File Component (MFC)** — sibling `.php` file with the same stem
+    ///      containing `new class extends Component` (typical layout: `⚡foo/foo.blade.php`
+    ///      paired with `⚡foo/foo.php`).
+    ///   2. **Single-File Component (SFC)** — the same `.blade.php` file containing
+    ///      inline `<?php new class extends Component ...; ?>`.
+    ///   3. **Class-based** (Livewire 3 carry-over) —
+    ///      `resources/views/livewire/foo.blade.php` mapped to `app/Livewire/Foo.php`.
     ///
-    /// For Volt SFC the returned path is the blade file itself; the property-extraction regexes
+    /// For SFC the returned path is the blade file itself; the property-extraction regexes
     /// match through the surrounding Blade content because they pattern-match `public Type $name`
     /// without caring about file framing.
     fn find_livewire_component_php(
         &self,
         root: &std::path::Path,
         blade_path: &str,
-    ) -> Option<(std::path::PathBuf, ComponentKind)> {
+    ) -> Option<std::path::PathBuf> {
         let blade = std::path::Path::new(blade_path);
 
-        if let Some(sibling) = volt_mfc_sibling(blade) {
-            return Some((sibling, ComponentKind::Volt));
+        if let Some(sibling) = mfc_sibling(blade) {
+            return Some(sibling);
         }
 
-        if blade_contains_inline_volt_class(blade) {
-            return Some((blade.to_path_buf(), ComponentKind::Volt));
+        if blade_contains_inline_class(blade) {
+            return Some(blade.to_path_buf());
         }
 
         self.view_path_to_livewire_class_path(root, blade_path)
-            .map(|p| (p, ComponentKind::Classic))
     }
 
     /// Given a Livewire-view iterable expression (e.g. "$this->audits") and the view's path,
@@ -6027,23 +6154,16 @@ impl LaravelLanguageServer {
             return None;
         }
 
-        let (component_path, kind) = self.find_livewire_component_php(root, view_path)?;
+        let component_path = self.find_livewire_component_php(root, view_path)?;
 
         // Dispatch through Salsa. The actor auto-registers the file as a SourceFile
         // and invalidates on mtime change (the file isn't typically open in the editor).
-        // Volt sources go through the variant that adds mount() parameter promotion.
-        let resolved = match kind {
-            ComponentKind::Classic => self
-                .salsa
-                .resolve_livewire_member(component_path, member_name.to_string())
-                .await,
-            ComponentKind::Volt => self
-                .salsa
-                .resolve_volt_member(component_path, member_name.to_string())
-                .await,
-        }
-        .ok()
-        .flatten()?;
+        let resolved = self
+            .salsa
+            .resolve_livewire_member(component_path, member_name.to_string())
+            .await
+            .ok()
+            .flatten()?;
 
         let element = laravel_lsp::php_class::iterable_element_type(&resolved);
         match element {
@@ -6143,6 +6263,23 @@ impl LaravelLanguageServer {
         }
 
         None
+    }
+
+    /// Check whether a `public $name` declaration exists in `content` — regardless of
+    /// whether the declaration carries an explicit type. Used to gate mount-param type
+    /// refinement: a mount() param's type must not be surfaced as a property's type
+    /// unless the property itself is declared (Livewire never synthesizes properties
+    /// from mount() params alone).
+    fn has_public_property(content: &str, property_name: &str) -> bool {
+        let escaped = regex::escape(property_name);
+        let pattern = format!(
+            r"public\s+(?:\??\\?[A-Za-z_][A-Za-z0-9_\\]*\s+)?\${}\b",
+            escaped
+        );
+        regex::Regex::new(&pattern)
+            .ok()
+            .map(|re| re.is_match(content))
+            .unwrap_or(false)
     }
 
     /// Extract property type from a PHP class (public properties with type hints)
@@ -7854,6 +7991,46 @@ impl LaravelLanguageServer {
 
     /// Find the model file path for a given class name
     /// Searches in app/Models/ directory
+    /// Heuristic check: does `content` define a class that extends Laravel's
+    /// `Model`? Used by `get_class_properties` to decide whether to run the
+    /// Eloquent-rich flow (DB schema, casts, relationships) or fall back to
+    /// the generic public-property scan that works for any PHP class.
+    fn content_extends_model(content: &str) -> bool {
+        let pattern = r"class\s+\w+\s+extends\s+\\?(?:Illuminate\\Database\\Eloquent\\)?Model\b";
+        regex::Regex::new(pattern)
+            .ok()
+            .map(|re| re.is_match(content))
+            .unwrap_or(false)
+    }
+
+    /// Locate any PHP class file under `app/` (or `src/`) and return its
+    /// `public Type $foo` declarations. Used as the generic fallback when a
+    /// class isn't an Eloquent model — Livewire Forms, Livewire components,
+    /// DTOs, value objects all flow through here.
+    fn extract_generic_class_properties(
+        root: &std::path::Path,
+        class_name: &str,
+    ) -> Vec<ModelPropertyCompletion> {
+        let Some(class_path) = laravel_lsp::class_locator::find_php_class_file(class_name, root)
+        else {
+            return Vec::new();
+        };
+        let Ok(content) = std::fs::read_to_string(&class_path) else {
+            return Vec::new();
+        };
+
+        let mut props: Vec<ModelPropertyCompletion> = laravel_lsp::php_class::extract_class_properties(&content)
+            .into_iter()
+            .map(|(name, php_type)| ModelPropertyCompletion {
+                name,
+                php_type,
+                source: "class".to_string(),
+            })
+            .collect();
+        props.sort_by(|a, b| a.name.cmp(&b.name));
+        props
+    }
+
     fn find_model_file(&self, root: &std::path::Path, class_name: &str) -> Option<std::path::PathBuf> {
         // Try app/Models/ClassName.php first (Laravel 8+)
         let model_path = root.join("app").join("Models").join(format!("{}.php", class_name));
@@ -7870,9 +8047,12 @@ impl LaravelLanguageServer {
         None
     }
 
-    /// Get all properties for a model class
-    /// Combines database columns, casts, accessors, and relationships
-    async fn get_model_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
+    /// Get all properties for a class. Returns Eloquent-rich data (DB columns,
+    /// casts, accessors, relationships) when the class lives in a standard
+    /// model location AND extends `Model`; otherwise falls back to a generic
+    /// `public Type $foo` scan that works for Livewire components, Livewire
+    /// Forms, DTOs, value objects — any class with public properties.
+    async fn get_class_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
         use laravel_lsp::model_analyzer::{ModelMetadata, map_cast_to_php_type, relationship_to_php_type};
 
         // Synthetic Blade types — short-circuit before any filesystem lookup so they
@@ -7886,8 +8066,22 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Find the model file
-        let model_path = match self.find_model_file(&root, class_name) {
+        // Try the model paths first (`app/Models/X.php`, `app/X.php`). When the
+        // file is there AND it actually extends `Model`, run the full Eloquent
+        // resolution. Anything else (Livewire Forms, DTOs, etc.) falls through
+        // to the generic public-property scan below.
+        let model_path = self.find_model_file(&root, class_name);
+        let appears_to_be_model = model_path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|content| Self::content_extends_model(&content))
+            .unwrap_or(false);
+
+        if !appears_to_be_model {
+            return Self::extract_generic_class_properties(&root, class_name);
+        }
+
+        let model_path = match model_path {
             Some(p) => p,
             None => return Vec::new(),
         };
@@ -10981,9 +11175,12 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                 )),
                 
-                // ❌ REMOVED: hover_provider
-                // We only support goto_definition (Option+click navigation).
-                // Hover popups are redundant - the underline already indicates navigability.
+                // ✅ Hover provider — shows resolved type information for Blade
+                // variables and their property accesses. For Livewire-component
+                // properties, displays both the declared type and (when not
+                // statically determinable) a "value: undetermined" indicator
+                // per Mike's spec.
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
 
                 // ✅ Completion provider for autocomplete features
                 // Triggers on various characters depending on context:
@@ -11004,6 +11201,8 @@ impl LanguageServer for LaravelLanguageServer {
                         ".".to_string(),  // connection.table in exists:/unique:
                         ",".to_string(),  // table,column in exists:/unique:
                         "@".to_string(),  // Blade directives: @if, @foreach, etc.
+                        "$".to_string(),  // Blade variables: $name, $form, etc. (shows full list on bare $)
+                        ">".to_string(),  // Property access: $form-> triggers property completion
                     ]),
                     ..Default::default()
                 }),
@@ -11388,6 +11587,18 @@ impl LanguageServer for LaravelLanguageServer {
                     return Ok(Some(slot_location));
                 }
 
+                // Blade-variable fallback: when the cursor sits on a `$var` or
+                // `$var->prop` reference in a `.blade.php` file, jump to the
+                // declaration site instead of returning nothing.
+                if uri.path().ends_with(".blade.php") {
+                    if let Some(loc) = self
+                        .blade_variable_goto_definition(&uri, position)
+                        .await
+                    {
+                        return Ok(Some(loc));
+                    }
+                }
+
                 // Debug: show what middleware patterns exist on this line
                 let mw_on_line: Vec<_> = patterns.middleware_refs.iter()
                     .filter(|m| m.line == position.line)
@@ -11472,10 +11683,79 @@ impl LanguageServer for LaravelLanguageServer {
         Ok(location)
     }
 
-    // ❌ REMOVED: hover handler
-    // We don't advertise hover capability, so this method is not needed.
-    // Navigation is handled by goto_definition (Option+click).
+    /// Hover provider — shows resolved type information for Blade variables and
+    /// their property accesses. Per Mike's spec, three states are surfaced:
+    ///   - Known type, known value (rare — currently only `@php` literal assignments)
+    ///   - Known type, undetermined value (typical: `public ContactForm $form;`)
+    ///   - Undetermined type, undetermined value (cursor on a variable with no resolvable source)
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
 
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let path = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let content = match self.documents.read().await.get(uri).cloned() {
+            Some((c, _version)) => c,
+            None => std::fs::read_to_string(path).unwrap_or_default(),
+        };
+        let line_text = content
+            .lines()
+            .nth(position.line as usize)
+            .unwrap_or("")
+            .to_string();
+
+        let Some((var_name, property)) =
+            extract_blade_variable_at_cursor(&line_text, position.character)
+        else {
+            return Ok(None);
+        };
+
+        let var_dollar = format!("${}", var_name);
+        let resolved_var_type = self
+            .resolve_blade_variable_type(uri, &var_dollar)
+            .await;
+
+        let hover_markdown = match (resolved_var_type, property) {
+            (Some(var_type), Some(prop_name)) => {
+                let prop_type = self
+                    .resolve_property_type_on_class(&var_type, &prop_name)
+                    .await;
+                let type_line = prop_type
+                    .clone()
+                    .unwrap_or_else(|| "undetermined".to_string());
+                format!(
+                    "**${}->{}**\n\n- Type: `{}`\n- Value: `undetermined`",
+                    var_name, prop_name, type_line
+                )
+            }
+            (Some(var_type), None) => format!(
+                "**${}**\n\n- Type: `{}`\n- Value: `undetermined`",
+                var_name, var_type
+            ),
+            (None, _) => format!(
+                "**${}**\n\n- Type: `undetermined`\n- Value: `undetermined`",
+                var_name
+            ),
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: hover_markdown,
+            }),
+            range: None,
+        }))
+    }
 
 
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
@@ -11795,7 +12075,7 @@ impl LanguageServer for LaravelLanguageServer {
                     debug!("   Resolved model class: {}", class_name);
 
                     // Get model properties
-                    let properties = self.get_model_properties(&class_name).await;
+                    let properties = self.get_class_properties(&class_name).await;
 
                     // Build completion items, filtering by prefix
                     let prefix_lower = typed_prefix.to_lowercase();
@@ -11809,10 +12089,21 @@ impl LanguageServer for LaravelLanguageServer {
                                 _ => CompletionItemKind::FIELD,
                             };
 
+                            // Hide the source label for generic class-property scans —
+                            // it's redundant when the property completion is already
+                            // attached to a class context. Eloquent-derived sources
+                            // (database/cast/accessor/relationship) keep the label
+                            // because the distinction is meaningful for users.
+                            let detail = if p.source == "class" {
+                                p.php_type.clone()
+                            } else {
+                                format!("{} ({})", p.php_type, p.source)
+                            };
+
                             CompletionItem {
                                 label: p.name.clone(),
                                 kind: Some(kind),
-                                detail: Some(format!("{} ({})", p.php_type, p.source)),
+                                detail: Some(detail),
                                 documentation: None,
                                 ..Default::default()
                             }

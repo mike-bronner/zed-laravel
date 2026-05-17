@@ -950,20 +950,6 @@ pub fn resolve_livewire_member_type<'db>(db: &'db dyn Db, file: SourceFile, memb
     crate::php_class::resolve_member_type(text, &member)
 }
 
-/// Volt-aware variant of `resolve_livewire_member_type`. Falls back to scanning
-/// `function mount(...)` signatures for an auto-promoted parameter when neither
-/// a typed property nor a method return type matches.
-///
-/// Must NOT be used against classic Livewire component files — classic Livewire
-/// does not auto-promote `mount()` params, and the fallback would surface
-/// false-positive types for parameters that were never assigned to properties.
-#[salsa::tracked]
-pub fn resolve_volt_member_type<'db>(db: &'db dyn Db, file: SourceFile, member: String) -> Option<String> {
-    let text = file.text(db);
-    crate::php_class::resolve_member_type(text, &member)
-        .or_else(|| crate::php_class::find_mount_promoted_type(text, &member))
-}
-
 /// Parse config/livewire.php to extract Livewire component path
 #[salsa::tracked]
 pub fn parse_livewire_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) -> Option<PathBuf> {
@@ -2379,14 +2365,6 @@ pub enum SalsaRequest {
         member: String,
         reply: oneshot::Sender<Option<String>>,
     },
-    /// Volt-aware variant of `ResolveLivewireMember`. Adds `mount()` parameter
-    /// promotion as a fallback after the standard property / method checks.
-    /// Used when the source is a Volt MFC sibling or Volt SFC blade file.
-    ResolveVoltMember {
-        path: PathBuf,
-        member: String,
-        reply: oneshot::Sender<Option<String>>,
-    },
     /// Remove a file from the database
     RemoveFile {
         path: PathBuf,
@@ -2654,17 +2632,6 @@ impl SalsaHandle {
         reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
     }
 
-    /// Volt-aware variant of `resolve_livewire_member`. Use when the resolved
-    /// source is known to be a Volt MFC sibling or Volt SFC blade file so that
-    /// `mount()` parameter promotion is considered after the standard checks.
-    pub async fn resolve_volt_member(&self, path: PathBuf, member: String) -> Result<Option<String>, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::ResolveVoltMember { path, member, reply: reply_tx })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
-    }
 
     /// Remove a file from the database
     pub async fn remove_file(&self, path: PathBuf) -> Result<(), &'static str> {
@@ -3302,10 +3269,6 @@ impl SalsaActor {
                     let result = self.handle_resolve_livewire_member(&path, &member);
                     let _ = reply.send(result);
                 }
-                SalsaRequest::ResolveVoltMember { path, member, reply } => {
-                    let result = self.handle_resolve_volt_member(&path, &member);
-                    let _ = reply.send(result);
-                }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
                     self.pattern_cache.pop(&path);
@@ -3554,13 +3517,6 @@ impl SalsaActor {
     fn handle_resolve_livewire_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
         let file = self.ensure_livewire_source_loaded(path)?;
         resolve_livewire_member_type(&self.db, file, member.to_string())
-    }
-
-    /// Volt-aware variant. Loads the same way as `handle_resolve_livewire_member`
-    /// but dispatches to the tracked query that considers `mount()` promotion.
-    fn handle_resolve_volt_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
-        let file = self.ensure_livewire_source_loaded(path)?;
-        resolve_volt_member_type(&self.db, file, member.to_string())
     }
 
     /// Register an external component PHP file as a Salsa input, reloading from

@@ -203,16 +203,14 @@ pub fn resolve_member_type(content: &str, member_name: &str) -> Option<String> {
         .or_else(|| extract_method_return_type(content, member_name))
 }
 
-/// Detect whether `content` contains at least one Volt anonymous-class signature.
-/// Matches `new (#[Attr])* class extends [\Namespace\]*Component`, covering:
-///   - bare `Component` (used after `use Livewire\Volt\Component;`)
-///   - fully-qualified `\Livewire\Volt\Component` or `\Livewire\Component`
+/// Detect whether `content` contains at least one inline anonymous-class
+/// Livewire component signature. Matches `new (#[Attr])* class extends [\Namespace\]*Component`:
+///   - bare `Component` (after `use Livewire\Component;`)
+///   - fully-qualified `\Livewire\Component`
 ///   - leading PHP attributes such as `#[Layout('layouts.app')]`
 ///
-/// Used to gate Volt-only behaviors (mount-param promotion) — classic Livewire
-/// classes live in a separate `.php` file under `app/Livewire/` and never match
-/// this pattern.
-pub fn detect_inline_volt_class(content: &str) -> bool {
+/// Used to detect Livewire 4 single-file and multi-file component sources.
+pub fn detect_inline_livewire_class(content: &str) -> bool {
     let pattern = r"new\s+(?:#\[[^\]]+\]\s+)*class\s+extends\s+\\?(?:[A-Za-z_][A-Za-z0-9_]*\\\\?)*Component\b";
     regex::Regex::new(pattern)
         .ok()
@@ -220,36 +218,121 @@ pub fn detect_inline_volt_class(content: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Volt promotes typed `mount()` parameters to public properties.
-/// Scan every `function mount(...)` signature in `content` and return the first
-/// parameter named `param_name`. Returns:
+/// Scan every `function mount(...)` signature in `content` and return the type
+/// declared on the first parameter named `param_name`. Returns `None` for
+/// untyped params — type *refinement* of an existing declaration must not
+/// downgrade the property to `"mixed"` just because the matching `mount()`
+/// param has no type-hint.
+///
+/// Returns:
 ///   - `Some("ClassName")` for class-typed params (FQCN simplified)
 ///   - `Some("int" / "string" / ...)` for primitive-typed params
 ///   - `Some("?Type")` when the param is nullable
-///   - `Some("mixed")` for untyped params
-///   - `None` when `param_name` does not appear in any `mount()` signature
-pub fn find_mount_promoted_type(content: &str, param_name: &str) -> Option<String> {
+///   - `None` when the param is untyped, or no matching param exists
+///
+/// **This does NOT synthesize properties.** Livewire 4 requires a `public $name`
+/// declaration for `$name` to appear in Blade. This helper only supplies type
+/// information for properties that are already declared without an explicit type
+/// — Livewire's runtime auto-assigns the matching mount() param's value into
+/// the property, so the IDE can safely show the param's type.
+pub fn find_mount_param_type(content: &str, param_name: &str) -> Option<String> {
     for params in iter_mount_param_lists(content) {
         for chunk in split_params(&params) {
             let parsed = parse_mount_param(&chunk)?;
             if parsed.name == param_name {
-                return Some(parsed.php_type);
+                return parsed.php_type;
             }
         }
     }
     None
 }
 
-/// Like `find_mount_promoted_type` but returns every parameter across all
-/// `function mount(...)` signatures in the file. Duplicates by name keep the
-/// first occurrence (matches `find_mount_promoted_type` lookup order).
-pub fn find_all_mount_promoted_params(content: &str) -> Vec<(String, String)> {
+/// Extract every `public` property declaration from `content`, returning
+/// `(name, type)` pairs. Untyped declarations resolve to `"mixed"`. Used as
+/// the generic property lister for class types that aren't Eloquent models
+/// (Livewire components, Livewire Forms, plain DTOs, value objects).
+///
+/// Skips `static` properties and non-public visibility. The regex scans the
+/// whole content, so works on both standard class files and inline
+/// anonymous-class Livewire SFC sources.
+pub fn extract_class_properties(content: &str) -> Vec<(String, String)> {
+    let prop_re = match regex::Regex::new(
+        r#"public\s+(?:(\?)?\\?([A-Za-z_][A-Za-z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)\s*[;=]"#,
+    ) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut props = Vec::new();
+    for cap in prop_re.captures_iter(content) {
+        let Some(name) = cap.get(3) else { continue };
+        let name = name.as_str().to_string();
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let php_type = match cap.get(2) {
+            Some(t) => {
+                let nullable = cap.get(1).is_some();
+                let simple = simplify_type(t.as_str());
+                if nullable {
+                    format!("?{}", simple)
+                } else {
+                    simple
+                }
+            }
+            None => "mixed".to_string(),
+        };
+        props.push((name, php_type));
+    }
+    props
+}
+
+/// Locate the source position (0-based line, column range) of a `public ... $name`
+/// declaration in `content`. Returns `None` if the property isn't declared.
+///
+/// The returned column range covers the `$name` identifier (including the
+/// `$` sigil), which is what LSP goto-definition wants — clicking lands the
+/// cursor on the property name rather than the surrounding declaration.
+pub fn find_property_declaration_position(
+    content: &str,
+    property_name: &str,
+) -> Option<(u32, u32, u32)> {
+    let escaped = regex::escape(property_name);
+    let pattern = format!(
+        r"public\s+(?:\??\\?[A-Za-z_][A-Za-z0-9_\\]*\s+)?(\${})\b",
+        escaped
+    );
+    let re = regex::Regex::new(&pattern).ok()?;
+    let caps = re.captures(content)?;
+    let sigil_match = caps.get(1)?;
+    let byte_offset = sigil_match.start();
+
+    let mut line = 0u32;
+    let mut last_line_start = 0usize;
+    for (i, ch) in content[..byte_offset].char_indices() {
+        if ch == '\n' {
+            line += 1;
+            last_line_start = i + 1;
+        }
+    }
+    let start_col = (byte_offset - last_line_start) as u32;
+    let end_col = start_col + sigil_match.as_str().len() as u32;
+    Some((line, start_col, end_col))
+}
+
+/// Iterate every typed parameter across all `function mount(...)` signatures
+/// in `content`. Untyped params are skipped (see `find_mount_param_type` for
+/// the rationale). Duplicates by name keep the first occurrence.
+pub fn find_all_mount_param_types(content: &str) -> Vec<(String, String)> {
     let mut results: Vec<(String, String)> = Vec::new();
     for params in iter_mount_param_lists(content) {
         for chunk in split_params(&params) {
             if let Some(parsed) = parse_mount_param(&chunk) {
-                if !results.iter().any(|(n, _)| n == &parsed.name) {
-                    results.push((parsed.name, parsed.php_type));
+                if let Some(php_type) = parsed.php_type {
+                    if !results.iter().any(|(n, _)| n == &parsed.name) {
+                        results.push((parsed.name, php_type));
+                    }
                 }
             }
         }
@@ -259,7 +342,8 @@ pub fn find_all_mount_promoted_params(content: &str) -> Vec<(String, String)> {
 
 struct MountParam {
     name: String,
-    php_type: String,
+    /// `None` for untyped params — callers decide how to handle the absence.
+    php_type: Option<String>,
 }
 
 fn iter_mount_param_lists(content: &str) -> Vec<String> {
@@ -305,17 +389,16 @@ fn parse_mount_param(chunk: &str) -> Option<MountParam> {
     let trimmed = trimmed.trim_start_matches("...");
     let trimmed = trimmed.trim();
 
-    let re = regex::Regex::new(
-        r"^(?:(\?)?\\?([A-Za-z_][A-Za-z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)",
-    )
-    .ok()?;
+    let re =
+        regex::Regex::new(r"^(?:(\?)?\\?([A-Za-z_][A-Za-z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)")
+            .ok()?;
     let caps = re.captures(trimmed)?;
     let name = caps.get(3)?.as_str().to_string();
 
     let php_type = match (caps.get(1), caps.get(2)) {
-        (Some(_), Some(t)) => format!("?{}", simplify_type(t.as_str())),
-        (None, Some(t)) => simplify_type(t.as_str()),
-        _ => "mixed".to_string(),
+        (Some(_), Some(t)) => Some(format!("?{}", simplify_type(t.as_str()))),
+        (None, Some(t)) => Some(simplify_type(t.as_str())),
+        _ => None,
     };
 
     Some(MountParam { name, php_type })

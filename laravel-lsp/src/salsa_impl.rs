@@ -2632,6 +2632,7 @@ impl SalsaHandle {
         reply_rx.await.map_err(|_| "Salsa actor dropped reply channel")
     }
 
+
     /// Remove a file from the database
     pub async fn remove_file(&self, path: PathBuf) -> Result<(), &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3514,10 +3515,15 @@ impl SalsaActor {
     /// Handle resolving a `$this->X` member access in a Livewire component PHP file.
     /// Auto-registers the file in Salsa, invalidates on mtime change.
     fn handle_resolve_livewire_member(&mut self, path: &PathBuf, member: &str) -> Option<String> {
-        // Stat the file for current mtime
+        let file = self.ensure_livewire_source_loaded(path)?;
+        resolve_livewire_member_type(&self.db, file, member.to_string())
+    }
+
+    /// Register an external component PHP file as a Salsa input, reloading from
+    /// disk whenever its mtime advances. Returns the cached `SourceFile` handle.
+    fn ensure_livewire_source_loaded(&mut self, path: &PathBuf) -> Option<SourceFile> {
         let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
 
-        // Decide whether we need to re-read from disk
         let needs_reload = match self.livewire_mtimes.get(path) {
             Some(prev_mtime) => *prev_mtime != current_mtime || !self.files.contains_key(path),
             None => true,
@@ -3538,8 +3544,7 @@ impl SalsaActor {
             self.livewire_mtimes.insert(path.clone(), current_mtime);
         }
 
-        let file = *self.files.get(path)?;
-        resolve_livewire_member_type(&self.db, file, member.to_string())
+        self.files.get(path).copied()
     }
 
     /// Handle a Blade @php-assignments query. Memoized via Salsa + actor LRU.

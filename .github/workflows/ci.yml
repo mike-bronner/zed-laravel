@@ -42,9 +42,11 @@ jobs:
       - name: Install test-project Composer dependencies
         # `test-project/vendor/` is gitignored. The route-discovery
         # integration tests need real vendor packages (e.g. Fortify)
-        # to exercise package-priority routing.
+        # to exercise package-priority routing. `--no-dev` skips Pest
+        # and PHPUnit (which require PHP 8.3) — we don't run PHP tests
+        # here, just exercise the on-disk vendor layout.
         working-directory: test-project
-        run: composer install --no-interaction --prefer-dist --no-progress
+        run: composer install --no-interaction --prefer-dist --no-progress --no-dev
 
       - name: cargo fmt --check
         run: cargo fmt --check

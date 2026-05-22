@@ -195,6 +195,64 @@
   (#eq? @function_name "env"))
 
 ; ============================================================================
+; Pattern 5b: Env::get('VAR_NAME') - Env facade
+; ============================================================================
+; Matches: Env::get('APP_NAME')
+;          Env::get("DB_HOST", 'localhost')
+;          \Env::get('APP_KEY')
+;
+; The Env facade is the OO equivalent of the env() helper. Uses the same
+; @env_var capture name so existing EnvMatch dispatch handles it.
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @env_var)))
+  (#eq? @class_name "Env")
+  (#eq? @method_name "get"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @env_var)))
+  (#eq? @class_name "Env")
+  (#eq? @method_name "get"))
+
+; Fully qualified Env class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @env_var)))
+  (#match? @class_name ".*Env$")
+  (#eq? @method_name "get"))
+
+; Fully qualified Env class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @env_var)))
+  (#match? @class_name ".*Env$")
+  (#eq? @method_name "get"))
+
+; ============================================================================
 ; Pattern 6: config('config.key') function calls
 ; ============================================================================
 ; Matches: config('app.name')
@@ -227,11 +285,13 @@
 ; ============================================================================
 ; Matches: Config::get('app.name')
 ;          Config::string('app.name')
-;          Config::integer('app.timeout')
-;          Config::boolean('app.debug')
+;          Config::integer('app.timeout') / Config::int('app.timeout')
+;          Config::boolean('app.debug')   / Config::bool('app.debug')
+;          Config::float('app.weight')
 ;          Config::array('app.providers')
 ;
-; This captures config key access via the Config facade
+; This captures config key access via the Config facade. Both legacy
+; (integer/boolean) and modern (int/bool/float) accessor names are matched.
 
 ; Single-quoted strings
 (scoped_call_expression
@@ -243,7 +303,7 @@
       (string
         (string_content) @config_key)))
   (#eq? @class_name "Config")
-  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|set|has)$"))
 
 ; Double-quoted strings
 (scoped_call_expression
@@ -255,7 +315,7 @@
       (encapsed_string
         (string_content) @config_key)))
   (#eq? @class_name "Config")
-  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|set|has)$"))
 
 ; Also match fully qualified Config class - single quotes
 (scoped_call_expression
@@ -267,7 +327,7 @@
       (string
         (string_content) @config_key)))
   (#match? @class_name ".*Config$")
-  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|set|has)$"))
 
 ; Also match fully qualified Config class - double quotes
 (scoped_call_expression
@@ -279,7 +339,84 @@
       (encapsed_string
         (string_content) @config_key)))
   (#match? @class_name ".*Config$")
-  (#match? @method_name "^(get|string|integer|boolean|array|set|has)$"))
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|set|has)$"))
+
+; ============================================================================
+; Pattern 6c: Config::getMany(['key1', 'key2']) - Bulk config retrieval
+; ============================================================================
+; Matches: Config::getMany(['app.name', 'app.env'])
+;          Config::getMany(["database.default", "database.connections.mysql.host"])
+;
+; Each array element is captured as a separate config key, the same way
+; middleware arrays in Route::middleware([...]) are captured.
+
+; Single-quoted strings in array
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (string
+            (string_content) @config_key)))))
+  (#eq? @class_name "Config")
+  (#eq? @method_name "getMany"))
+
+; Double-quoted strings in array
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    (argument
+      (array_creation_expression
+        (array_element_initializer
+          (encapsed_string
+            (string_content) @config_key)))))
+  (#eq? @class_name "Config")
+  (#eq? @method_name "getMany"))
+
+; ============================================================================
+; Pattern 6d: config()->string('key') - Fluent instance accessors
+; ============================================================================
+; Matches: config()->string('app.name')
+;          config()->int('app.timeout')
+;          config()->bool('app.debug')
+;          config()->float('app.weight')
+;          config()->array('app.providers')
+;          config()->integer(...)   (legacy alias)
+;          config()->boolean(...)   (legacy alias)
+;          config()->get('app.name')
+;
+; The argumentless config() helper returns the Repository instance, which
+; exposes typed accessors. The AST is a member_call_expression whose object
+; is the function_call_expression for config().
+
+; Single-quoted strings
+(member_call_expression
+  object: (function_call_expression
+    function: (name) @config_fn)
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @config_key)))
+  (#eq? @config_fn "config")
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|has)$"))
+
+; Double-quoted strings
+(member_call_expression
+  object: (function_call_expression
+    function: (name) @config_fn)
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @config_key)))
+  (#eq? @config_fn "config")
+  (#match? @method_name "^(get|string|int|integer|bool|boolean|float|array|has)$"))
 
 ; ============================================================================
 ; Pattern 7: route('route.name') function calls
@@ -309,6 +446,34 @@
       (encapsed_string
         (string_content) @route_name)))
   (#eq? @function_name "route"))
+
+; ============================================================================
+; Pattern 7b: signed_route('route.name') function calls
+; ============================================================================
+; Matches: signed_route('verify.email')
+;          signed_route("password.reset", ['token' => $token])
+;
+; Same resolution as route() — looks up a named route. Captures route name.
+
+; Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @function_name "signed_route"))
+
+; Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @function_name "signed_route"))
 
 ; ============================================================================
 ; Pattern 8: Route::middleware('auth') - Static method calls with single middleware
@@ -722,6 +887,65 @@
         (name) @constant_name)))
   (#eq? @function_name "resolve")
   (#eq? @constant_name "class"))
+
+; ============================================================================
+; Pattern 17b: App::bound('key') / App::isShared('key') - App facade lookups
+; ============================================================================
+; Matches: App::bound('cache')
+;          App::isShared('App\Contracts\SomeInterface')
+;          \App::bound("auth")
+;
+; These are the OO facade equivalents of the app() / resolve() helpers,
+; used to introspect the container by string binding name. Reuses the
+; @binding_name capture so the existing BindingMatch dispatch handles it.
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @binding_name)))
+  (#eq? @class_name "App")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @binding_name)))
+  (#eq? @class_name "App")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Fully qualified App class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @binding_name)))
+  (#match? @class_name ".*App$")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Fully qualified App class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @binding_name)))
+  (#match? @class_name ".*App$")
+  (#match? @method_name "^(bound|isShared)$"))
 
 ; ============================================================================
 ; Pattern 12b: Route::group(['middleware' => 'auth'], ...) - Group with middleware in options array
@@ -1185,12 +1409,13 @@
   (#eq? @method_name "has"))
 
 ; ============================================================================
-; Pattern 23: URL::route('name') - Generate URL to named route
+; Pattern 23: URL::route('name') / URL::signedRoute('name') - Generate URL
 ; ============================================================================
 ; Matches: URL::route('home')
 ;          URL::route('user.profile', ['id' => 1])
+;          URL::signedRoute('verify.email')
 ;
-; Alternative to route() helper for generating URLs
+; Alternative to route() / signed_route() helpers for generating URLs
 
 ; Single-quoted strings
 (scoped_call_expression
@@ -1202,7 +1427,7 @@
       (string
         (string_content) @route_name)))
   (#eq? @class_name "URL")
-  (#eq? @method_name "route"))
+  (#match? @method_name "^(route|signedRoute)$"))
 
 ; Double-quoted strings
 (scoped_call_expression
@@ -1214,7 +1439,7 @@
       (encapsed_string
         (string_content) @route_name)))
   (#eq? @class_name "URL")
-  (#eq? @method_name "route"))
+  (#match? @method_name "^(route|signedRoute)$"))
 
 ; ============================================================================
 ; Pattern 24: Route::is('name') / Route::currentRouteNamed('name')

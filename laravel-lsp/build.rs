@@ -45,8 +45,7 @@ fn download_and_extract_blade_grammar(dest: &PathBuf) {
 
     let mut reader = response.into_body().into_reader();
     let mut bytes = Vec::new();
-    std::io::copy(&mut reader, &mut bytes)
-        .expect("Failed to read download response");
+    std::io::copy(&mut reader, &mut bytes).expect("Failed to read download response");
 
     // The downloaded file is a .tar.gz (gzipped tarball)
     // We need to:
@@ -61,19 +60,18 @@ fn download_and_extract_blade_grammar(dest: &PathBuf) {
     let mut archive = tar::Archive::new(decompressed);
 
     // Create the destination directory
-    fs::create_dir_all(dest.parent().unwrap())
-        .expect("Failed to create grammar directory");
+    fs::create_dir_all(dest.parent().unwrap()).expect("Failed to create grammar directory");
 
     // Extract to a temporary location (archive root is "tree-sitter-blade-main")
     let temp_dir = dest.parent().unwrap().join("tree-sitter-blade-temp");
-    archive.unpack(&temp_dir)
+    archive
+        .unpack(&temp_dir)
         .expect("Failed to extract tar archive");
 
     // Move the extracted folder to our desired location
     // The archive extracts to "tree-sitter-blade-main/"
     let extracted = temp_dir.join("tree-sitter-blade-main");
-    fs::rename(extracted, dest)
-        .expect("Failed to move extracted grammar");
+    fs::rename(extracted, dest).expect("Failed to move extracted grammar");
 
     // Clean up temp directory
     fs::remove_dir_all(temp_dir).ok();
@@ -89,7 +87,10 @@ fn compile_blade_grammar(grammar_dir: &Path) {
 
     let src_dir = grammar_dir.join("src");
 
-    println!("cargo:warning=Compiling Blade grammar C code from {:?}", src_dir);
+    println!(
+        "cargo:warning=Compiling Blade grammar C code from {:?}",
+        src_dir
+    );
 
     // The cc crate is a build-time dependency that wraps the C compiler
     // It automatically detects your system's C compiler (gcc, clang, msvc)

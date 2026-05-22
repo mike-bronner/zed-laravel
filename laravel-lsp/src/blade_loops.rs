@@ -39,9 +39,8 @@ pub enum BladeLoopType {
 /// `@foreach($category->items as $item)`.
 pub fn parse_foreach_variables(arguments: &str) -> Vec<(String, String)> {
     lazy_static! {
-        static ref FOREACH_RE: Regex = Regex::new(
-            r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#
-        ).unwrap();
+        static ref FOREACH_RE: Regex =
+            Regex::new(r#"\([^)]+\s+as\s+(?:\$(\w+)\s*=>\s*)?\$(\w+)\s*\)"#).unwrap();
     }
 
     let mut vars = Vec::new();
@@ -63,7 +62,8 @@ pub fn parse_foreach_iterable(arguments: &str) -> Option<String> {
         static ref ITER_RE: Regex = Regex::new(r#"\(\s*(.+?)\s+as\s+\$"#).unwrap();
     }
 
-    ITER_RE.captures(arguments)
+    ITER_RE
+        .captures(arguments)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_string())
 }
@@ -88,16 +88,15 @@ pub fn parse_for_variables(arguments: &str) -> Vec<(String, String)> {
 /// Returns a list of loop blocks with start/end lines and extracted variables.
 pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
     lazy_static! {
-        static ref LOOP_START_RE: Regex = Regex::new(
-            r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#
-        ).unwrap();
-        static ref LOOP_END_RE: Regex = Regex::new(
-            r#"@(endforeach|endforelse|endfor|endwhile)"#
-        ).unwrap();
+        static ref LOOP_START_RE: Regex =
+            Regex::new(r#"@(foreach|forelse|for|while)\s*(\([^)]*\))"#).unwrap();
+        static ref LOOP_END_RE: Regex =
+            Regex::new(r#"@(endforeach|endforelse|endfor|endwhile)"#).unwrap();
     }
 
     let mut blocks = Vec::new();
-    let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, Option<String>, usize)> = Vec::new();
+    let mut open_loops: Vec<(BladeLoopType, Vec<(String, String)>, Option<String>, usize)> =
+        Vec::new();
 
     for (line_idx, line) in content.lines().enumerate() {
         for caps in LOOP_START_RE.captures_iter(line) {
@@ -105,8 +104,16 @@ pub fn find_loop_blocks(content: &str) -> Vec<BladeLoopBlock> {
             let arguments = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
             let (loop_type, variables, iterable) = match directive {
-                "foreach" => (BladeLoopType::Foreach, parse_foreach_variables(arguments), parse_foreach_iterable(arguments)),
-                "forelse" => (BladeLoopType::Forelse, parse_foreach_variables(arguments), parse_foreach_iterable(arguments)),
+                "foreach" => (
+                    BladeLoopType::Foreach,
+                    parse_foreach_variables(arguments),
+                    parse_foreach_iterable(arguments),
+                ),
+                "forelse" => (
+                    BladeLoopType::Forelse,
+                    parse_foreach_variables(arguments),
+                    parse_foreach_iterable(arguments),
+                ),
                 "for" => (BladeLoopType::For, parse_for_variables(arguments), None),
                 "while" => (BladeLoopType::While, Vec::new(), None),
                 _ => continue,
@@ -172,6 +179,6 @@ pub fn get_enclosing_loops(content: &str, cursor_line: usize) -> Vec<BladeLoopBl
         })
         .collect();
 
-    enclosing.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+    enclosing.sort_by_key(|b| std::cmp::Reverse(b.start_line));
     enclosing
 }

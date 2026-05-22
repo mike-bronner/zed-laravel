@@ -137,7 +137,9 @@ impl ModelMetadata {
     /// Extract casts from casts(): array method
     fn extract_casts_method(content: &str) -> Option<HashMap<String, String>> {
         // Find the casts() method and its return array
-        let re = Regex::new(r"(?s)function\s+casts\s*\(\s*\)\s*:\s*array\s*\{\s*return\s*\[([^\]]*)\]").ok()?;
+        let re =
+            Regex::new(r"(?s)function\s+casts\s*\(\s*\)\s*:\s*array\s*\{\s*return\s*\[([^\]]*)\]")
+                .ok()?;
         let caps = re.captures(content)?;
         let array_content = caps.get(1)?.as_str();
 
@@ -172,9 +174,9 @@ impl ModelMetadata {
         let mut accessors = Vec::new();
 
         // Old-style: getFirstNameAttribute(): string
-        let old_style_re = Regex::new(
-            r"(?:public\s+)?function\s+get(\w+)Attribute\s*\([^)]*\)\s*(?::\s*(\w+))?"
-        ).unwrap();
+        let old_style_re =
+            Regex::new(r"(?:public\s+)?function\s+get(\w+)Attribute\s*\([^)]*\)\s*(?::\s*(\w+))?")
+                .unwrap();
 
         for caps in old_style_re.captures_iter(content) {
             if let Some(name) = caps.get(1) {
@@ -189,9 +191,8 @@ impl ModelMetadata {
         }
 
         // New-style: firstName(): Attribute
-        let new_style_re = Regex::new(
-            r"(?:public\s+)?function\s+(\w+)\s*\([^)]*\)\s*:\s*Attribute"
-        ).unwrap();
+        let new_style_re =
+            Regex::new(r"(?:public\s+)?function\s+(\w+)\s*\([^)]*\)\s*:\s*Attribute").unwrap();
 
         for caps in new_style_re.captures_iter(content) {
             if let Some(name) = caps.get(1) {
@@ -215,9 +216,17 @@ impl ModelMetadata {
 
         // Common relationship types - ordered longest first to avoid partial matches
         let relationship_types = [
-            "belongsToMany", "belongsTo",  // belongsToMany before belongsTo
-            "hasManyThrough", "hasOneThrough", "hasMany", "hasOne",  // through variants first
-            "morphToMany", "morphedByMany", "morphMany", "morphOne", "morphTo",  // morph variants
+            "belongsToMany",
+            "belongsTo", // belongsToMany before belongsTo
+            "hasManyThrough",
+            "hasOneThrough",
+            "hasMany",
+            "hasOne", // through variants first
+            "morphToMany",
+            "morphedByMany",
+            "morphMany",
+            "morphOne",
+            "morphTo", // morph variants
         ];
 
         for rel_type in relationship_types {
@@ -232,8 +241,14 @@ impl ModelMetadata {
                     if let Some(method) = caps.get(1) {
                         let method_name = method.as_str().to_string();
                         // Don't add duplicates
-                        if !relationships.iter().any(|r: &RelationshipInfo| r.method_name == method_name) {
-                            let related_model = Self::extract_related_model_from_relationship(content, &method_name);
+                        if !relationships
+                            .iter()
+                            .any(|r: &RelationshipInfo| r.method_name == method_name)
+                        {
+                            let related_model = Self::extract_related_model_from_relationship(
+                                content,
+                                &method_name,
+                            );
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -255,8 +270,14 @@ impl ModelMetadata {
                     if let Some(method) = caps.get(1) {
                         let method_name = method.as_str().to_string();
                         // Don't add duplicates
-                        if !relationships.iter().any(|r: &RelationshipInfo| r.method_name == method_name) {
-                            let related_model = Self::extract_related_model_from_relationship(content, &method_name);
+                        if !relationships
+                            .iter()
+                            .any(|r: &RelationshipInfo| r.method_name == method_name)
+                        {
+                            let related_model = Self::extract_related_model_from_relationship(
+                                content,
+                                &method_name,
+                            );
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -278,9 +299,11 @@ impl ModelMetadata {
         let method_re = Regex::new(&format!(
             r"function\s+{}\s*\([^)]*\)[^{{]*\{{\s*return\s+\$this->\w+\(\s*(\w+)::class",
             regex::escape(method_name)
-        )).ok()?;
+        ))
+        .ok()?;
 
-        method_re.captures(content)
+        method_re
+            .captures(content)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     }
@@ -351,7 +374,8 @@ pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> 
             format!("?{}", model)
         }
         // Collection relationships
-        "hasMany" | "belongsToMany" | "morphMany" | "morphToMany" | "morphedByMany" | "hasManyThrough" => {
+        "hasMany" | "belongsToMany" | "morphMany" | "morphToMany" | "morphedByMany"
+        | "hasManyThrough" => {
             format!("Collection<{}>", model)
         }
         _ => "mixed".to_string(),
@@ -359,165 +383,4 @@ pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_class_name() {
-        let content = r#"
-            class User extends Model
-            {
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.class_name, "User");
-    }
-
-    #[test]
-    fn test_extract_table_name() {
-        let content = r#"
-            class User extends Model
-            {
-                protected $table = 'app_users';
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.table_name, Some("app_users".to_string()));
-    }
-
-    #[test]
-    fn test_extract_casts_property() {
-        let content = r#"
-            class User extends Model
-            {
-                protected $casts = [
-                    'email_verified_at' => 'datetime',
-                    'is_admin' => 'boolean',
-                    'settings' => 'array',
-                ];
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.casts.get("email_verified_at"), Some(&"datetime".to_string()));
-        assert_eq!(metadata.casts.get("is_admin"), Some(&"boolean".to_string()));
-        assert_eq!(metadata.casts.get("settings"), Some(&"array".to_string()));
-    }
-
-    #[test]
-    fn test_extract_casts_method() {
-        let content = r#"
-            class User extends Model
-            {
-                protected function casts(): array
-                {
-                    return [
-                        'email_verified_at' => 'datetime',
-                        'password' => 'hashed',
-                    ];
-                }
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.casts.get("email_verified_at"), Some(&"datetime".to_string()));
-        assert_eq!(metadata.casts.get("password"), Some(&"hashed".to_string()));
-    }
-
-    #[test]
-    fn test_extract_old_style_accessor() {
-        let content = r#"
-            class User extends Model
-            {
-                public function getFullNameAttribute(): string
-                {
-                    return $this->first_name . ' ' . $this->last_name;
-                }
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.accessors.len(), 1);
-        assert_eq!(metadata.accessors[0].property_name, "full_name");
-        assert_eq!(metadata.accessors[0].return_type, Some("string".to_string()));
-    }
-
-    #[test]
-    fn test_extract_new_style_accessor() {
-        let content = r#"
-            class User extends Model
-            {
-                protected function firstName(): Attribute
-                {
-                    return Attribute::make(
-                        get: fn (string $value) => ucfirst($value),
-                    );
-                }
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.accessors.len(), 1);
-        assert_eq!(metadata.accessors[0].property_name, "first_name");
-        assert!(metadata.accessors[0].is_attribute_style);
-    }
-
-    #[test]
-    fn test_extract_relationships() {
-        let content = r#"
-            class User extends Model
-            {
-                public function posts(): HasMany
-                {
-                    return $this->hasMany(Post::class);
-                }
-
-                public function profile(): HasOne
-                {
-                    return $this->hasOne(Profile::class);
-                }
-
-                public function roles(): BelongsToMany
-                {
-                    return $this->belongsToMany(Role::class);
-                }
-            }
-        "#;
-        let metadata = ModelMetadata::from_content(content);
-        assert_eq!(metadata.relationships.len(), 3);
-
-        let posts = metadata.relationships.iter().find(|r| r.method_name == "posts").unwrap();
-        assert_eq!(posts.relationship_type, "hasMany");
-        assert_eq!(posts.related_model, Some("Post".to_string()));
-
-        let profile = metadata.relationships.iter().find(|r| r.method_name == "profile").unwrap();
-        assert_eq!(profile.relationship_type, "hasOne");
-        assert_eq!(profile.related_model, Some("Profile".to_string()));
-
-        let roles = metadata.relationships.iter().find(|r| r.method_name == "roles").unwrap();
-        assert_eq!(roles.relationship_type, "belongsToMany");
-        assert_eq!(roles.related_model, Some("Role".to_string()));
-    }
-
-    #[test]
-    fn test_pascal_to_snake() {
-        assert_eq!(ModelMetadata::pascal_to_snake("FirstName"), "first_name");
-        assert_eq!(ModelMetadata::pascal_to_snake("EmailVerifiedAt"), "email_verified_at");
-        assert_eq!(ModelMetadata::pascal_to_snake("ID"), "i_d");
-        assert_eq!(ModelMetadata::pascal_to_snake("Name"), "name");
-    }
-
-    #[test]
-    fn test_map_cast_to_php_type() {
-        assert_eq!(map_cast_to_php_type("datetime"), "Carbon");
-        assert_eq!(map_cast_to_php_type("boolean"), "bool");
-        assert_eq!(map_cast_to_php_type("array"), "array");
-        assert_eq!(map_cast_to_php_type("integer"), "int");
-        assert_eq!(map_cast_to_php_type("float"), "float");
-        assert_eq!(map_cast_to_php_type("CustomCast"), "CustomCast");
-    }
-
-    #[test]
-    fn test_relationship_to_php_type() {
-        assert_eq!(relationship_to_php_type("hasOne", Some("Profile")), "?Profile");
-        assert_eq!(relationship_to_php_type("belongsTo", Some("User")), "?User");
-        assert_eq!(relationship_to_php_type("hasMany", Some("Post")), "Collection<Post>");
-        assert_eq!(relationship_to_php_type("belongsToMany", Some("Role")), "Collection<Role>");
-    }
-}
+mod tests;

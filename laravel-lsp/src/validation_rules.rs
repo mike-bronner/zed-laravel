@@ -60,8 +60,9 @@ impl LaravelRulesParser {
 
     /// Get path to ValidatesAttributes.php trait
     fn get_validates_attributes_path(&self) -> PathBuf {
-        self.project_root
-            .join("vendor/laravel/framework/src/Illuminate/Validation/Concerns/ValidatesAttributes.php")
+        self.project_root.join(
+            "vendor/laravel/framework/src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        )
     }
 
     /// Get path to Dimensions.php rule class
@@ -72,8 +73,7 @@ impl LaravelRulesParser {
 
     /// Get path to Symfony MimeTypes.php
     fn get_mime_types_path(&self) -> PathBuf {
-        self.project_root
-            .join("vendor/symfony/mime/MimeTypes.php")
+        self.project_root.join("vendor/symfony/mime/MimeTypes.php")
     }
 
     /// Parse all validation rules from Laravel framework
@@ -102,9 +102,8 @@ impl LaravelRulesParser {
         let mut rules = Vec::new();
 
         // Match: public function validateSomething( or protected function validateSomething(
-        let method_regex = Regex::new(
-            r"(?:public|protected)\s+function\s+validate([A-Z][a-zA-Z]*)\s*\("
-        ).unwrap();
+        let method_regex =
+            Regex::new(r"(?:public|protected)\s+function\s+validate([A-Z][a-zA-Z]*)\s*\(").unwrap();
 
         for caps in method_regex.captures_iter(content) {
             if let Some(method_name) = caps.get(1) {
@@ -130,15 +129,45 @@ impl LaravelRulesParser {
     fn determine_param_type(&self, rule_name: &str, _content: &str) -> (bool, ParamType) {
         // Rules that reference other fields
         let field_ref_rules = [
-            "after", "after_or_equal", "before", "before_or_equal", "date_equals",
-            "different", "same", "gt", "gte", "lt", "lte",
-            "required_if", "required_unless", "required_with", "required_with_all",
-            "required_without", "required_without_all", "required_if_accepted", "required_if_declined",
-            "prohibited_if", "prohibited_unless", "prohibits",
-            "exclude_if", "exclude_unless", "exclude_with", "exclude_without",
-            "missing_if", "missing_unless", "missing_with", "missing_with_all",
-            "present_if", "present_unless", "present_with", "present_with_all",
-            "accepted_if", "declined_if", "confirmed", "in_array", "in_array_keys",
+            "after",
+            "after_or_equal",
+            "before",
+            "before_or_equal",
+            "date_equals",
+            "different",
+            "same",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "required_if",
+            "required_unless",
+            "required_with",
+            "required_with_all",
+            "required_without",
+            "required_without_all",
+            "required_if_accepted",
+            "required_if_declined",
+            "prohibited_if",
+            "prohibited_unless",
+            "prohibits",
+            "exclude_if",
+            "exclude_unless",
+            "exclude_with",
+            "exclude_without",
+            "missing_if",
+            "missing_unless",
+            "missing_with",
+            "missing_with_all",
+            "present_if",
+            "present_unless",
+            "present_with",
+            "present_with_all",
+            "accepted_if",
+            "declined_if",
+            "confirmed",
+            "in_array",
+            "in_array_keys",
         ];
 
         // Database rules
@@ -152,11 +181,42 @@ impl LaravelRulesParser {
 
         // Rules with no parameters
         let no_param_rules = [
-            "required", "nullable", "bail", "sometimes", "filled", "present", "missing",
-            "accepted", "declined", "boolean", "string", "integer", "numeric", "array", "list",
-            "file", "image", "email", "url", "active_url", "ip", "ipv4", "ipv6", "mac_address",
-            "json", "alpha", "alpha_dash", "alpha_num", "ascii", "lowercase", "uppercase",
-            "ulid", "uuid", "hex_color", "prohibited", "exclude",
+            "required",
+            "nullable",
+            "bail",
+            "sometimes",
+            "filled",
+            "present",
+            "missing",
+            "accepted",
+            "declined",
+            "boolean",
+            "string",
+            "integer",
+            "numeric",
+            "array",
+            "list",
+            "file",
+            "image",
+            "email",
+            "url",
+            "active_url",
+            "ip",
+            "ipv4",
+            "ipv6",
+            "mac_address",
+            "json",
+            "alpha",
+            "alpha_dash",
+            "alpha_num",
+            "ascii",
+            "lowercase",
+            "uppercase",
+            "ulid",
+            "uuid",
+            "hex_color",
+            "prohibited",
+            "exclude",
         ];
 
         if no_param_rules.contains(&rule_name) {
@@ -215,8 +275,19 @@ impl LaravelRulesParser {
             for caps in constraint_regex.captures_iter(&content) {
                 if let Some(key) = caps.get(1) {
                     let key_str = key.as_str();
-                    if ["min_width", "max_width", "min_height", "max_height", "width", "height", "ratio", "min_ratio", "max_ratio"]
-                        .contains(&key_str) && !options.contains(&key_str.to_string())
+                    if [
+                        "min_width",
+                        "max_width",
+                        "min_height",
+                        "max_height",
+                        "width",
+                        "height",
+                        "ratio",
+                        "min_ratio",
+                        "max_ratio",
+                    ]
+                    .contains(&key_str)
+                        && !options.contains(&key_str.to_string())
                     {
                         options.push(key_str.to_string());
                     }
@@ -294,23 +365,40 @@ impl LaravelRulesParser {
     /// Default MIME extensions if parsing fails
     fn default_mime_extensions() -> Vec<String> {
         vec![
-            "avi", "bmp", "csv", "doc", "docx", "gif", "jpeg", "jpg", "json",
-            "mov", "mp3", "mp4", "pdf", "png", "ppt", "pptx", "rar", "svg",
-            "txt", "webm", "webp", "xls", "xlsx", "xml", "zip",
-        ].into_iter().map(String::from).collect()
+            "avi", "bmp", "csv", "doc", "docx", "gif", "jpeg", "jpg", "json", "mov", "mp3", "mp4",
+            "pdf", "png", "ppt", "pptx", "rar", "svg", "txt", "webm", "webp", "xls", "xlsx", "xml",
+            "zip",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     /// Default MIME types if parsing fails
     fn default_mime_types() -> Vec<String> {
         vec![
-            "application/json", "application/msword", "application/pdf",
-            "application/vnd.ms-excel", "application/vnd.ms-powerpoint",
-            "application/xml", "application/zip",
-            "audio/mpeg", "audio/wav",
-            "image/gif", "image/jpeg", "image/png", "image/svg+xml", "image/webp",
-            "text/csv", "text/plain",
-            "video/mp4", "video/webm",
-        ].into_iter().map(String::from).collect()
+            "application/json",
+            "application/msword",
+            "application/pdf",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
+            "application/xml",
+            "application/zip",
+            "audio/mpeg",
+            "audio/wav",
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/svg+xml",
+            "image/webp",
+            "text/csv",
+            "text/plain",
+            "video/mp4",
+            "video/webm",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     /// Get common PHP timezone identifiers
@@ -318,17 +406,38 @@ impl LaravelRulesParser {
         // These are the most commonly used timezones
         // A full list would be too long for autocomplete
         vec![
-            "Africa/Cairo", "Africa/Johannesburg", "Africa/Lagos",
-            "America/Chicago", "America/Denver", "America/Los_Angeles",
-            "America/New_York", "America/Sao_Paulo", "America/Toronto",
-            "Asia/Dubai", "Asia/Hong_Kong", "Asia/Kolkata", "Asia/Seoul",
-            "Asia/Shanghai", "Asia/Singapore", "Asia/Tokyo",
-            "Australia/Melbourne", "Australia/Sydney",
-            "Europe/Amsterdam", "Europe/Berlin", "Europe/London",
-            "Europe/Madrid", "Europe/Moscow", "Europe/Paris", "Europe/Rome",
-            "Pacific/Auckland", "Pacific/Honolulu",
+            "Africa/Cairo",
+            "Africa/Johannesburg",
+            "Africa/Lagos",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/New_York",
+            "America/Sao_Paulo",
+            "America/Toronto",
+            "Asia/Dubai",
+            "Asia/Hong_Kong",
+            "Asia/Kolkata",
+            "Asia/Seoul",
+            "Asia/Shanghai",
+            "Asia/Singapore",
+            "Asia/Tokyo",
+            "Australia/Melbourne",
+            "Australia/Sydney",
+            "Europe/Amsterdam",
+            "Europe/Berlin",
+            "Europe/London",
+            "Europe/Madrid",
+            "Europe/Moscow",
+            "Europe/Paris",
+            "Europe/Rome",
+            "Pacific/Auckland",
+            "Pacific/Honolulu",
             "UTC",
-        ].into_iter().map(String::from).collect()
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     /// Scan app/Rules for custom validation rules
@@ -343,7 +452,7 @@ impl LaravelRulesParser {
         if let Ok(entries) = std::fs::read_dir(&rules_path) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "php") {
+                if path.extension().is_some_and(|e| e == "php") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         // Convert PascalCase to snake_case
                         let rule_name = Self::camel_to_snake(stem);
@@ -379,30 +488,4 @@ impl LaravelRulesParser {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_camel_to_snake() {
-        assert_eq!(LaravelRulesParser::camel_to_snake("Required"), "required");
-        assert_eq!(LaravelRulesParser::camel_to_snake("AfterOrEqual"), "after_or_equal");
-        assert_eq!(LaravelRulesParser::camel_to_snake("RequiredIf"), "required_if");
-        assert_eq!(LaravelRulesParser::camel_to_snake("Gt"), "gt");
-    }
-
-    #[test]
-    fn test_default_dimension_options() {
-        let options = LaravelRulesParser::default_dimension_options();
-        assert!(options.contains(&"min_width".to_string()));
-        assert!(options.contains(&"max_height".to_string()));
-        assert!(options.contains(&"ratio".to_string()));
-    }
-
-    #[test]
-    fn test_default_mime_extensions() {
-        let extensions = LaravelRulesParser::default_mime_extensions();
-        assert!(extensions.contains(&"jpg".to_string()));
-        assert!(extensions.contains(&"pdf".to_string()));
-        assert!(extensions.contains(&"png".to_string()));
-    }
-}
+mod tests;

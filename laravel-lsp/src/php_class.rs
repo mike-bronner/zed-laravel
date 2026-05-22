@@ -7,7 +7,11 @@
 /// Simplify a fully qualified class name to just the class name.
 /// `\Illuminate\Pagination\LengthAwarePaginator` -> `LengthAwarePaginator`
 pub fn simplify_type(type_name: &str) -> String {
-    type_name.rsplit('\\').next().unwrap_or(type_name).to_string()
+    type_name
+        .rsplit('\\')
+        .next()
+        .unwrap_or(type_name)
+        .to_string()
 }
 
 /// Find a class property's type from class definition.
@@ -23,7 +27,10 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"@var\s+\\?([A-Za-z][a-zA-Z0-9_\\|<>]*)\s*\*/\s*(?:public|protected|private)\s+(?:\?)?(?:[A-Za-z][a-zA-Z0-9_\\]*)?\s*\${}"#,
         escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&phpdoc_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&phpdoc_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(type_match) = caps.get(1) {
             return Some(simplify_type(type_match.as_str()));
         }
@@ -34,11 +41,18 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}\s*[;=]"#,
         primitive_types, escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&primitive_prop_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&primitive_prop_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(type_match) = caps.get(2) {
             let nullable = caps.get(1).is_some();
             let type_name = type_match.as_str().to_string();
-            return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            return Some(if nullable {
+                format!("?{}", type_name)
+            } else {
+                type_name
+            });
         }
     }
 
@@ -47,11 +61,18 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*[;=]"#,
         escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&typed_prop_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&typed_prop_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(type_match) = caps.get(2) {
             let nullable = caps.get(1).is_some();
             let type_name = simplify_type(type_match.as_str());
-            return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            return Some(if nullable {
+                format!("?{}", type_name)
+            } else {
+                type_name
+            });
         }
     }
 
@@ -60,11 +81,18 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?({})(?:\s+|\s*\|\s*[a-zA-Z]+\s+)\${}"#,
         primitive_types, escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&primitive_promoted_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&primitive_promoted_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(type_match) = caps.get(2) {
             let nullable = caps.get(1).is_some();
             let type_name = type_match.as_str().to_string();
-            return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            return Some(if nullable {
+                format!("?{}", type_name)
+            } else {
+                type_name
+            });
         }
     }
 
@@ -73,11 +101,18 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"__construct\s*\([^)]*(?:public|protected|private)\s+(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
         escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&promoted_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&promoted_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(type_match) = caps.get(2) {
             let nullable = caps.get(1).is_some();
             let type_name = simplify_type(type_match.as_str());
-            return Some(if nullable { format!("?{}", type_name) } else { type_name });
+            return Some(if nullable {
+                format!("?{}", type_name)
+            } else {
+                type_name
+            });
         }
     }
 
@@ -86,7 +121,10 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"\$this->{}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#,
         escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&constructor_new_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&constructor_new_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(class) = caps.get(1) {
             return Some(simplify_type(class.as_str()));
         }
@@ -97,7 +135,10 @@ pub fn find_property_type_in_content(content: &str, property_name: &str) -> Opti
         r#"\$this->{}\s*=\s*\\?([A-Z][a-zA-Z0-9_\\]*)::(?:find|first|create)"#,
         escaped_prop
     );
-    if let Some(caps) = regex::Regex::new(&model_assign_pattern).ok().and_then(|re| re.captures(content)) {
+    if let Some(caps) = regex::Regex::new(&model_assign_pattern)
+        .ok()
+        .and_then(|re| re.captures(content))
+    {
         if let Some(model) = caps.get(1) {
             return Some(simplify_type(model.as_str()));
         }
@@ -118,7 +159,9 @@ pub fn extract_method_return_type(content: &str, method_name: &str) -> Option<St
     let decl_re = regex::Regex::new(&decl_pattern).ok()?;
     let decl_match = decl_re.captures(content)?;
     let method_pos = decl_match.get(0)?.start();
-    let declared = decl_match.get(1).map(|m| normalize_generic_type(m.as_str()));
+    let declared = decl_match
+        .get(1)
+        .map(|m| normalize_generic_type(m.as_str()));
 
     let scan_start = method_pos.saturating_sub(600);
     let preface = &content[scan_start..method_pos];
@@ -146,10 +189,16 @@ pub fn extract_method_return_type(content: &str, method_name: &str) -> Option<St
 /// on the base type while preserving generic arguments.
 /// `"\Illuminate\Pagination\LengthAwarePaginator<int, \App\Audit>"` -> `"LengthAwarePaginator<int, Audit>"`
 pub fn normalize_generic_type(type_str: &str) -> String {
-    let trimmed = type_str.trim().trim_start_matches('?').trim_start_matches('\\');
+    let trimmed = type_str
+        .trim()
+        .trim_start_matches('?')
+        .trim_start_matches('\\');
     if let Some((base, args)) = parse_generic_args(trimmed) {
         let base_simple = simplify_type(&base);
-        let args_simple: Vec<String> = args.into_iter().map(|a| normalize_generic_type(&a)).collect();
+        let args_simple: Vec<String> = args
+            .into_iter()
+            .map(|a| normalize_generic_type(&a))
+            .collect();
         format!("{}<{}>", base_simple, args_simple.join(", "))
     } else {
         simplify_type(trimmed)
@@ -171,8 +220,14 @@ pub fn parse_generic_args(type_str: &str) -> Option<(String, Vec<String>)> {
     let mut current = String::new();
     for ch in inner.chars() {
         match ch {
-            '<' => { depth += 1; current.push(ch); }
-            '>' => { depth -= 1; current.push(ch); }
+            '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                depth -= 1;
+                current.push(ch);
+            }
             ',' if depth == 0 => {
                 args.push(current.trim().to_string());
                 current.clear();

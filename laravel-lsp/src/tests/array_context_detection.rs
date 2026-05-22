@@ -3,9 +3,7 @@ use crate::{ArrayContext, LaravelLanguageServer};
 #[test]
 fn test_detect_casts_property() {
     let current = "            'email_verified_at' => 'datetime',";
-    let surrounding = vec![
-        "    protected $casts = [",
-    ];
+    let surrounding = vec!["    protected $casts = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Casts
@@ -29,9 +27,7 @@ fn test_detect_casts_method() {
 #[test]
 fn test_detect_rules_property() {
     let current = "            'email' => 'required|email',";
-    let surrounding = vec![
-        "    protected $rules = [",
-    ];
+    let surrounding = vec!["    protected $rules = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Validation
@@ -55,9 +51,7 @@ fn test_detect_rules_method() {
 #[test]
 fn test_detect_validate_call() {
     let current = "            'email' => 'required|email',";
-    let surrounding = vec![
-        "        $request->validate([",
-    ];
+    let surrounding = vec!["        $request->validate(["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Validation
@@ -67,9 +61,7 @@ fn test_detect_validate_call() {
 #[test]
 fn test_detect_validator_make() {
     let current = "            'email' => 'required',";
-    let surrounding = vec![
-        "        $validator = Validator::make($data, [",
-    ];
+    let surrounding = vec!["        $validator = Validator::make($data, ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Validation
@@ -89,9 +81,7 @@ fn test_detect_livewire_rule_attribute() {
 #[test]
 fn test_detect_fillable() {
     let current = "        'name',";
-    let surrounding = vec![
-        "    protected $fillable = [",
-    ];
+    let surrounding = vec!["    protected $fillable = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::MassAssignment
@@ -101,9 +91,7 @@ fn test_detect_fillable() {
 #[test]
 fn test_detect_hidden() {
     let current = "        'password',";
-    let surrounding = vec![
-        "    protected $hidden = [",
-    ];
+    let surrounding = vec!["    protected $hidden = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Visibility
@@ -113,9 +101,7 @@ fn test_detect_hidden() {
 #[test]
 fn test_detect_with_property() {
     let current = "        'posts',";
-    let surrounding = vec![
-        "    protected $with = [",
-    ];
+    let surrounding = vec!["    protected $with = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Relationships
@@ -125,9 +111,7 @@ fn test_detect_with_property() {
 #[test]
 fn test_unknown_context() {
     let current = "        'some_value',";
-    let surrounding = vec![
-        "        $randomArray = [",
-    ];
+    let surrounding = vec!["        $randomArray = ["];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),
         ArrayContext::Unknown
@@ -171,11 +155,11 @@ fn test_casts_with_realistic_line_order() {
     let current = "            'email_verified_at' => 'datetime',";
     // Simulating User model casts() method - lines closest to current first
     let surrounding = vec![
-        "        return [",                         // line N-1
-        "    {",                                    // line N-2
-        "    protected function casts(): array",   // line N-3
-        "     */",                                  // line N-4 (docblock end)
-        "     * @return array<string, string>",    // line N-5
+        "        return [",                      // line N-1
+        "    {",                                 // line N-2
+        "    protected function casts(): array", // line N-3
+        "     */",                               // line N-4 (docblock end)
+        "     * @return array<string, string>",  // line N-5
     ];
     assert_eq!(
         LaravelLanguageServer::detect_array_context(current, &surrounding),

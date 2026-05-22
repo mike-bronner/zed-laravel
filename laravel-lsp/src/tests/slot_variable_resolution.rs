@@ -59,16 +59,26 @@ fn test_extract_slot_variable_usages_excludes_loop() {
     // $item is found in echo {{ $item->name }}
     assert!(!vars.iter().any(|(n, _)| n == "loop"));
     assert!(vars.iter().any(|(n, _)| n == "item")); // Found in echo statement
-    // Note: $items is not found because it's only in directive, not in echo
+                                                    // Note: $items is not found because it's only in directive, not in echo
 }
 
 #[test]
 fn test_is_component_file() {
-    assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/button.blade.php"));
-    assert!(LaravelLanguageServer::is_component_file("/app/resources/views/components/forms/input.blade.php"));
-    assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/welcome.blade.php"));
-    assert!(!LaravelLanguageServer::is_component_file("/app/resources/views/layouts/app.blade.php"));
-    assert!(!LaravelLanguageServer::is_component_file("/app/app/Http/Controllers/UserController.php"));
+    assert!(LaravelLanguageServer::is_component_file(
+        "/app/resources/views/components/button.blade.php"
+    ));
+    assert!(LaravelLanguageServer::is_component_file(
+        "/app/resources/views/components/forms/input.blade.php"
+    ));
+    assert!(!LaravelLanguageServer::is_component_file(
+        "/app/resources/views/welcome.blade.php"
+    ));
+    assert!(!LaravelLanguageServer::is_component_file(
+        "/app/resources/views/layouts/app.blade.php"
+    ));
+    assert!(!LaravelLanguageServer::is_component_file(
+        "/app/app/Http/Controllers/UserController.php"
+    ));
 }
 
 #[test]

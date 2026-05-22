@@ -52,9 +52,7 @@ fn test_extract_partial_cast_type_closed_string() {
 #[test]
 fn test_get_cast_type_context_in_casts_array() {
     let line = "        'email_verified_at' => 'date";
-    let surrounding = vec![
-        "    protected $casts = [",
-    ];
+    let surrounding = vec!["    protected $casts = ["];
     // Character position should be at end of line (after 'date')
     assert_eq!(
         LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
@@ -80,9 +78,7 @@ fn test_get_cast_type_context_in_casts_method() {
 fn test_get_cast_type_context_not_in_casts() {
     // In validation context, not casts
     let line = "        'email' => 'req";
-    let surrounding = vec![
-        "    protected $rules = [",
-    ];
+    let surrounding = vec!["    protected $rules = ["];
     assert_eq!(
         LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
         None
@@ -92,9 +88,7 @@ fn test_get_cast_type_context_not_in_casts() {
 #[test]
 fn test_get_cast_type_context_empty_prefix() {
     let line = "        'field' => '";
-    let surrounding = vec![
-        "    protected $casts = [",
-    ];
+    let surrounding = vec!["    protected $casts = ["];
     assert_eq!(
         LaravelLanguageServer::get_cast_type_context(line, line.len() as u32, &surrounding),
         Some("".to_string())

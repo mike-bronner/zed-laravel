@@ -62,7 +62,10 @@ fn locates_class_in_src_when_app_missing() {
 #[test]
 fn returns_none_for_missing_class() {
     let dir = TempDir::new().unwrap();
-    write(&dir.path().join("app/Models/Post.php"), "<?php class Post { }");
+    write(
+        &dir.path().join("app/Models/Post.php"),
+        "<?php class Post { }",
+    );
 
     assert_eq!(find_php_class_file("MissingClass", dir.path()), None);
 }
@@ -89,8 +92,7 @@ fn simplifies_fully_qualified_class_name() {
     let target = dir.path().join("app/Livewire/Forms/ContactForm.php");
     write(&target, "<?php class ContactForm { }");
 
-    let found =
-        find_php_class_file("\\App\\Livewire\\Forms\\ContactForm", dir.path()).unwrap();
+    let found = find_php_class_file("\\App\\Livewire\\Forms\\ContactForm", dir.path()).unwrap();
     assert_eq!(found, target);
 }
 

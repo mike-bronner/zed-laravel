@@ -27,6 +27,29 @@ jobs:
         with:
           workspaces: laravel-lsp
 
+      - name: Bootstrap test fixture .env
+        # `test-project/.env` is gitignored, but the integration tests
+        # under `laravel-lsp/tests/integration_tests.rs` need one to
+        # exercise env parsing + variable extraction.
+        working-directory: .
+        run: cp test-project/.env.example test-project/.env
+
+      - name: Setup PHP for test fixture
+        uses: shivammathur/setup-php@v2
+        with:
+          # 8.4 matches the actual minimum required by the locked
+          # vendor packages (symfony/* v8.0 requires >= 8.4).
+          php-version: '8.4'
+
+      - name: Install test-project Composer dependencies
+        # `test-project/vendor/` is gitignored. The route-discovery
+        # integration tests need real vendor packages (e.g. Fortify)
+        # to exercise package-priority routing. `--no-dev` skips Pest
+        # and PHPUnit (which require PHP 8.3) — we don't run PHP tests
+        # here, just exercise the on-disk vendor layout.
+        working-directory: test-project
+        run: composer install --no-interaction --prefer-dist --no-progress --no-dev
+
       - name: cargo fmt --check
         run: cargo fmt --check
 

@@ -39,12 +39,10 @@ pub fn find_php_class_file(class_name: &str, root: &Path) -> Option<PathBuf> {
         if !app_root.is_dir() {
             continue;
         }
-        let walker = WalkDir::new(&app_root)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                !matches!(name.as_ref(), "vendor" | "node_modules" | ".git")
-            });
+        let walker = WalkDir::new(&app_root).into_iter().filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !matches!(name.as_ref(), "vendor" | "node_modules" | ".git")
+        });
         for entry in walker.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;

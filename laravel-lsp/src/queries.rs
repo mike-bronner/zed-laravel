@@ -1911,6 +1911,46 @@ class RouteServiceProvider extends ServiceProvider
     }
 
     #[test]
+    fn test_container_variants_app_bound_and_is_shared() {
+        // Issue #13: App::bound() and App::isShared() are container
+        // introspection methods on the App facade. They take a string
+        // binding name, same as app() / resolve().
+        let php_code = r#"<?php
+$a = app('cache');
+$b = App::bound('auth');
+$c = App::isShared('App\Contracts\Mailer');
+$d = App::bound("queue");
+"#;
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        let names: Vec<&str> = patterns
+            .binding_calls
+            .iter()
+            .map(|b| b.binding_name)
+            .collect();
+
+        assert!(names.contains(&"cache"), "app() should still match; got {names:?}");
+        assert!(names.contains(&"auth"), "App::bound() should match; got {names:?}");
+        assert!(
+            names.contains(&"App\\Contracts\\Mailer"),
+            "App::isShared() should match; got {names:?}"
+        );
+        assert!(
+            names.contains(&"queue"),
+            "App::bound() with double-quoted string should match; got {names:?}"
+        );
+        assert_eq!(
+            patterns.binding_calls.len(),
+            4,
+            "Expected 4 binding captures, got {}",
+            patterns.binding_calls.len()
+        );
+    }
+
+    #[test]
     fn test_env_variant_facade_get() {
         // Issue #13: Env::get('KEY') should resolve like env('KEY'),
         // including correct fallback detection on the second argument.

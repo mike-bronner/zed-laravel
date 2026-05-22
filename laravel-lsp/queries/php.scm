@@ -889,6 +889,65 @@
   (#eq? @constant_name "class"))
 
 ; ============================================================================
+; Pattern 17b: App::bound('key') / App::isShared('key') - App facade lookups
+; ============================================================================
+; Matches: App::bound('cache')
+;          App::isShared('App\Contracts\SomeInterface')
+;          \App::bound("auth")
+;
+; These are the OO facade equivalents of the app() / resolve() helpers,
+; used to introspect the container by string binding name. Reuses the
+; @binding_name capture so the existing BindingMatch dispatch handles it.
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @binding_name)))
+  (#eq? @class_name "App")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @binding_name)))
+  (#eq? @class_name "App")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Fully qualified App class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @binding_name)))
+  (#match? @class_name ".*App$")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; Fully qualified App class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @binding_name)))
+  (#match? @class_name ".*App$")
+  (#match? @method_name "^(bound|isShared)$"))
+
+; ============================================================================
 ; Pattern 12b: Route::group(['middleware' => 'auth'], ...) - Group with middleware in options array
 ; ============================================================================
 ; Matches: Route::group(['middleware' => 'auth'], function() {...})

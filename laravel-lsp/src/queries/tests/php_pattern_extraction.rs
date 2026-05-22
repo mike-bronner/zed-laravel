@@ -15,8 +15,8 @@ fn test_extract_all_php_patterns_views() {
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     assert_eq!(patterns.views.len(), 3, "Should find 3 view calls");
 
@@ -25,11 +25,25 @@ fn test_extract_all_php_patterns_views() {
     assert!(view_names.contains(&"welcome"));
     assert!(view_names.contains(&"admin.dashboard"));
 
-    let welcome = patterns.views.iter().find(|v| v.view_name == "welcome").unwrap();
-    assert!(welcome.is_route_view, "Route::view() should set is_route_view=true");
+    let welcome = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "welcome")
+        .unwrap();
+    assert!(
+        welcome.is_route_view,
+        "Route::view() should set is_route_view=true"
+    );
 
-    let users = patterns.views.iter().find(|v| v.view_name == "users.profile").unwrap();
-    assert!(!users.is_route_view, "view() should set is_route_view=false");
+    let users = patterns
+        .views
+        .iter()
+        .find(|v| v.view_name == "users.profile")
+        .unwrap();
+    assert!(
+        !users.is_route_view,
+        "view() should set is_route_view=false"
+    );
 }
 
 #[test]
@@ -41,8 +55,8 @@ fn test_extract_all_php_patterns_env() {
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     assert_eq!(patterns.env_calls.len(), 2, "Should find 2 env calls");
     assert_eq!(patterns.env_calls[0].var_name, "APP_NAME");
@@ -58,8 +72,8 @@ fn test_extract_all_php_patterns_middleware() {
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     let middleware_names: Vec<&str> = patterns
         .middleware_calls
@@ -67,7 +81,10 @@ fn test_extract_all_php_patterns_middleware() {
         .map(|m| m.middleware_name)
         .collect();
 
-    assert!(middleware_names.contains(&"auth"), "Should find 'auth' middleware");
+    assert!(
+        middleware_names.contains(&"auth"),
+        "Should find 'auth' middleware"
+    );
     assert!(
         middleware_names.contains(&"verified"),
         "Should find 'verified' middleware"

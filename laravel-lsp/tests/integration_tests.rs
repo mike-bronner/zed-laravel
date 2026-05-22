@@ -12,24 +12,26 @@
 //! 3. File type detection routes to correct Salsa input
 //! 4. Debouncing behavior (single event after typing stops)
 
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 // Import the library crate for pattern extraction testing
-use laravel_lsp::queries::{extract_all_php_patterns, extract_all_blade_patterns};
-use laravel_lsp::parser::{parse_php, parse_blade, language_php, language_blade};
+use laravel_lsp::parser::{language_blade, language_php, parse_blade, parse_php};
+use laravel_lsp::queries::{extract_all_blade_patterns, extract_all_php_patterns};
 
 /// Path to the test Laravel project
 fn test_project_path() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir).parent().unwrap().join("test-project")
+    PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .join("test-project")
 }
 
 /// Helper to read a file from the test project
 fn read_test_file(relative_path: &str) -> String {
     let path = test_project_path().join(relative_path);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
 }
 
 /// Helper to check if a file exists in the test project
@@ -43,8 +45,14 @@ fn test_file_exists(relative_path: &str) -> bool {
 
 #[test]
 fn test_project_exists() {
-    assert!(test_project_path().exists(), "test-project directory must exist");
-    assert!(test_project_path().join("composer.json").exists(), "composer.json must exist");
+    assert!(
+        test_project_path().exists(),
+        "test-project directory must exist"
+    );
+    assert!(
+        test_project_path().join("composer.json").exists(),
+        "composer.json must exist"
+    );
     assert!(test_project_path().join(".env").exists(), ".env must exist");
 }
 
@@ -86,7 +94,10 @@ mod views {
     #[test]
     fn test_routes_contain_view_calls() {
         let routes = read_test_file("routes/web.php");
-        assert!(routes.contains("view('welcome')"), "routes should contain view('welcome')");
+        assert!(
+            routes.contains("view('welcome')"),
+            "routes should contain view('welcome')"
+        );
     }
 
     #[test]
@@ -96,16 +107,25 @@ mod views {
         let expected_path = test_project_path()
             .join("resources/views")
             .join(format!("{}.blade.php", view_name));
-        assert!(expected_path.exists(), "View '{}' should resolve to {:?}", view_name, expected_path);
+        assert!(
+            expected_path.exists(),
+            "View '{}' should resolve to {:?}",
+            view_name,
+            expected_path
+        );
     }
 
     #[test]
     fn test_nested_view_resolution() {
         // view('livewire.settings.profile') should resolve correctly
         // Note: In test-project, livewire views are in resources/views/livewire/
-        let nested_path = test_project_path()
-            .join("resources/views/livewire/settings/profile.blade.php");
-        assert!(nested_path.exists(), "Nested view path should exist: {:?}", nested_path);
+        let nested_path =
+            test_project_path().join("resources/views/livewire/settings/profile.blade.php");
+        assert!(
+            nested_path.exists(),
+            "Nested view path should exist: {:?}",
+            nested_path
+        );
     }
 }
 
@@ -118,7 +138,9 @@ mod blade_components {
 
     #[test]
     fn test_component_file_exists() {
-        assert!(test_file_exists("resources/views/components/button.blade.php"));
+        assert!(test_file_exists(
+            "resources/views/components/button.blade.php"
+        ));
     }
 
     #[test]
@@ -137,7 +159,12 @@ mod blade_components {
         let expected_path = test_project_path()
             .join("resources/views/components")
             .join(format!("{}.blade.php", component_name));
-        assert!(expected_path.exists(), "Component '{}' should resolve to {:?}", component_name, expected_path);
+        assert!(
+            expected_path.exists(),
+            "Component '{}' should resolve to {:?}",
+            component_name,
+            expected_path
+        );
     }
 }
 
@@ -160,8 +187,14 @@ mod blade_directives {
     #[test]
     fn test_vite_assets_exist() {
         // @vite('resources/css/app.css') target should exist
-        assert!(test_file_exists("resources/css/app.css"), "Vite CSS asset should exist");
-        assert!(test_file_exists("resources/js/app.js"), "Vite JS asset should exist");
+        assert!(
+            test_file_exists("resources/css/app.css"),
+            "Vite CSS asset should exist"
+        );
+        assert!(
+            test_file_exists("resources/js/app.js"),
+            "Vite JS asset should exist"
+        );
     }
 }
 
@@ -175,7 +208,9 @@ mod livewire {
     #[test]
     fn test_livewire_views_exist() {
         // Volt-based Livewire components
-        assert!(test_file_exists("resources/views/livewire/settings/profile.blade.php"));
+        assert!(test_file_exists(
+            "resources/views/livewire/settings/profile.blade.php"
+        ));
     }
 
     #[test]
@@ -193,8 +228,14 @@ mod translations {
 
     #[test]
     fn test_translation_files_exist() {
-        assert!(test_file_exists("lang/en/messages.php"), "PHP translation file should exist");
-        assert!(test_file_exists("lang/en.json"), "JSON translation file should exist");
+        assert!(
+            test_file_exists("lang/en/messages.php"),
+            "PHP translation file should exist"
+        );
+        assert!(
+            test_file_exists("lang/en.json"),
+            "JSON translation file should exist"
+        );
     }
 
     #[test]
@@ -209,8 +250,14 @@ mod translations {
     #[test]
     fn test_translation_file_contains_keys() {
         let messages = read_test_file("lang/en/messages.php");
-        assert!(messages.contains("'welcome'"), "messages.php should contain 'welcome' key");
-        assert!(messages.contains("'greeting'"), "messages.php should contain 'greeting' key");
+        assert!(
+            messages.contains("'welcome'"),
+            "messages.php should contain 'welcome' key"
+        );
+        assert!(
+            messages.contains("'greeting'"),
+            "messages.php should contain 'greeting' key"
+        );
     }
 }
 
@@ -223,8 +270,11 @@ mod assets {
 
     #[test]
     fn test_public_assets_exist() {
-        assert!(test_file_exists("public/images/logo.png") || test_file_exists("public/images/favicon.ico"),
-            "At least one image asset should exist in public/images/");
+        assert!(
+            test_file_exists("public/images/logo.png")
+                || test_file_exists("public/images/favicon.ico"),
+            "At least one image asset should exist in public/images/"
+        );
     }
 
     #[test]
@@ -252,8 +302,10 @@ mod vite {
 
     #[test]
     fn test_vite_config_exists() {
-        assert!(test_file_exists("vite.config.js") || test_file_exists("vite.config.ts"),
-            "Vite config should exist");
+        assert!(
+            test_file_exists("vite.config.js") || test_file_exists("vite.config.ts"),
+            "Vite config should exist"
+        );
     }
 }
 
@@ -312,7 +364,9 @@ mod routes {
         // 'login' is defined by Fortify in vendor/laravel/fortify/routes/routes.php.
         // The legacy scan never looked there; the new discovery walks
         // vendor/*/routes/ and indexes it at PACKAGE priority.
-        use laravel_lsp::route_discovery::{build_route_index, discover_route_files, PRIORITY_PACKAGE};
+        use laravel_lsp::route_discovery::{
+            build_route_index, discover_route_files, PRIORITY_PACKAGE,
+        };
 
         let root = test_project_path();
         let files = discover_route_files(&root);
@@ -347,9 +401,14 @@ mod config {
     #[test]
     fn test_config_contains_keys() {
         let app_config = read_test_file("config/app.php");
-        assert!(app_config.contains("'name'"), "config/app.php should contain 'name' key");
-        assert!(app_config.contains("'debug'") || app_config.contains("'env'"),
-            "config/app.php should contain standard Laravel keys");
+        assert!(
+            app_config.contains("'name'"),
+            "config/app.php should contain 'name' key"
+        );
+        assert!(
+            app_config.contains("'debug'") || app_config.contains("'env'"),
+            "config/app.php should contain standard Laravel keys"
+        );
     }
 }
 
@@ -449,25 +508,46 @@ mod architecture {
     #[test]
     fn test_all_pattern_types_have_fixtures() {
         // Pattern Type 1: Views
-        assert!(test_file_exists("resources/views/welcome.blade.php"), "Views fixture missing");
+        assert!(
+            test_file_exists("resources/views/welcome.blade.php"),
+            "Views fixture missing"
+        );
 
         // Pattern Type 2: Blade Components
-        assert!(test_file_exists("resources/views/components/button.blade.php"), "Components fixture missing");
+        assert!(
+            test_file_exists("resources/views/components/button.blade.php"),
+            "Components fixture missing"
+        );
 
         // Pattern Type 3: Blade Directives (via Vite)
-        assert!(test_file_exists("resources/views/asset-test.blade.php"), "Directives fixture missing");
+        assert!(
+            test_file_exists("resources/views/asset-test.blade.php"),
+            "Directives fixture missing"
+        );
 
         // Pattern Type 4: Livewire
-        assert!(test_file_exists("resources/views/livewire/settings/profile.blade.php"), "Livewire fixture missing");
+        assert!(
+            test_file_exists("resources/views/livewire/settings/profile.blade.php"),
+            "Livewire fixture missing"
+        );
 
         // Pattern Type 5: Translations
-        assert!(test_file_exists("lang/en/messages.php"), "Translations fixture missing");
+        assert!(
+            test_file_exists("lang/en/messages.php"),
+            "Translations fixture missing"
+        );
 
         // Pattern Type 6: Assets
-        assert!(test_file_exists("resources/css/app.css"), "Assets fixture missing");
+        assert!(
+            test_file_exists("resources/css/app.css"),
+            "Assets fixture missing"
+        );
 
         // Pattern Type 7: Vite
-        assert!(test_file_exists("resources/js/app.js"), "Vite fixture missing");
+        assert!(
+            test_file_exists("resources/js/app.js"),
+            "Vite fixture missing"
+        );
 
         // Pattern Type 8: Routes
         assert!(test_file_exists("routes/web.php"), "Routes fixture missing");
@@ -479,10 +559,16 @@ mod architecture {
         assert!(test_file_exists(".env"), "Environment fixture missing");
 
         // Pattern Type 11: Middleware
-        assert!(test_file_exists("bootstrap/app.php"), "Middleware fixture missing");
+        assert!(
+            test_file_exists("bootstrap/app.php"),
+            "Middleware fixture missing"
+        );
 
         // Pattern Type 12: Bindings
-        assert!(test_file_exists("app/Providers/AppServiceProvider.php"), "Bindings fixture missing");
+        assert!(
+            test_file_exists("app/Providers/AppServiceProvider.php"),
+            "Bindings fixture missing"
+        );
     }
 
     /// Document the expected file type routing for future reference
@@ -524,10 +610,14 @@ mod pattern_extraction {
         let source = read_test_file("routes/web.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
-        assert!(!patterns.views.is_empty(),
-            "routes/web.php should contain view() calls - found: {:?}", patterns.views);
+        assert!(
+            !patterns.views.is_empty(),
+            "routes/web.php should contain view() calls - found: {:?}",
+            patterns.views
+        );
     }
 
     /// Test that PHP pattern extraction finds env() calls
@@ -536,10 +626,14 @@ mod pattern_extraction {
         let source = read_test_file("config/app.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
-        assert!(!patterns.env_calls.is_empty(),
-            "config/app.php should contain env() calls - found: {:?}", patterns.env_calls);
+        assert!(
+            !patterns.env_calls.is_empty(),
+            "config/app.php should contain env() calls - found: {:?}",
+            patterns.env_calls
+        );
     }
 
     /// Test that PHP pattern extraction finds config() calls
@@ -548,11 +642,15 @@ mod pattern_extraction {
         let source = read_test_file("routes/web.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
         // Config calls may or may not be in web.php, check if extraction works
         // The important thing is that the extraction runs without errors
-        println!("Found {} config calls in routes/web.php", patterns.config_calls.len());
+        println!(
+            "Found {} config calls in routes/web.php",
+            patterns.config_calls.len()
+        );
     }
 
     /// Test that PHP pattern extraction finds middleware patterns
@@ -561,10 +659,14 @@ mod pattern_extraction {
         let source = read_test_file("routes/web.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
-        assert!(!patterns.middleware_calls.is_empty(),
-            "routes/web.php should contain middleware patterns - found: {:?}", patterns.middleware_calls);
+        assert!(
+            !patterns.middleware_calls.is_empty(),
+            "routes/web.php should contain middleware patterns - found: {:?}",
+            patterns.middleware_calls
+        );
     }
 
     /// Test that PHP pattern extraction finds translation patterns
@@ -573,10 +675,14 @@ mod pattern_extraction {
         let source = read_test_file("routes/web.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
         // Check if __() or trans() calls are found
-        println!("Found {} translation calls in routes/web.php", patterns.translation_calls.len());
+        println!(
+            "Found {} translation calls in routes/web.php",
+            patterns.translation_calls.len()
+        );
     }
 
     /// Test that PHP pattern extraction finds asset patterns
@@ -585,10 +691,14 @@ mod pattern_extraction {
         let source = read_test_file("routes/asset-test.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
-        assert!(!patterns.asset_calls.is_empty(),
-            "routes/asset-test.php should contain asset() calls - found: {:?}", patterns.asset_calls);
+        assert!(
+            !patterns.asset_calls.is_empty(),
+            "routes/asset-test.php should contain asset() calls - found: {:?}",
+            patterns.asset_calls
+        );
     }
 
     /// Test that PHP pattern extraction finds app() binding patterns
@@ -597,10 +707,14 @@ mod pattern_extraction {
         let source = read_test_file("routes/web.php");
         let tree = parse_php(&source).expect("Failed to parse PHP");
         let lang = language_php();
-        let patterns = extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_php_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
         // Check for app() calls
-        println!("Found {} binding calls in routes/web.php", patterns.binding_calls.len());
+        println!(
+            "Found {} binding calls in routes/web.php",
+            patterns.binding_calls.len()
+        );
     }
 
     /// Test that Blade pattern extraction finds components
@@ -609,10 +723,14 @@ mod pattern_extraction {
         let source = read_test_file("resources/views/component-test.blade.php");
         let tree = parse_blade(&source).expect("Failed to parse Blade");
         let lang = language_blade();
-        let patterns = extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
-        assert!(!patterns.components.is_empty(),
-            "component-test.blade.php should contain Blade components - found: {:?}", patterns.components);
+        assert!(
+            !patterns.components.is_empty(),
+            "component-test.blade.php should contain Blade components - found: {:?}",
+            patterns.components
+        );
     }
 
     /// Test that Blade pattern extraction finds directives
@@ -621,12 +739,19 @@ mod pattern_extraction {
         let source = read_test_file("resources/views/asset-test.blade.php");
         let tree = parse_blade(&source).expect("Failed to parse Blade");
         let lang = language_blade();
-        let patterns = extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
         // Look for @vite directives
-        let has_vite = patterns.directives.iter().any(|d| d.directive_name == "vite");
-        assert!(has_vite,
-            "asset-test.blade.php should contain @vite directive - found: {:?}", patterns.directives);
+        let has_vite = patterns
+            .directives
+            .iter()
+            .any(|d| d.directive_name == "vite");
+        assert!(
+            has_vite,
+            "asset-test.blade.php should contain @vite directive - found: {:?}",
+            patterns.directives
+        );
     }
 
     /// Test that Blade pattern extraction finds Livewire components
@@ -636,10 +761,14 @@ mod pattern_extraction {
         let source = read_test_file("resources/views/dashboard.blade.php");
         let tree = parse_blade(&source).expect("Failed to parse Blade");
         let lang = language_blade();
-        let patterns = extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
+        let patterns =
+            extract_all_blade_patterns(&tree, &source, &lang).expect("Failed to extract patterns");
 
         // Livewire patterns may or may not be present
-        println!("Found {} livewire components in dashboard.blade.php", patterns.livewire.len());
+        println!(
+            "Found {} livewire components in dashboard.blade.php",
+            patterns.livewire.len()
+        );
     }
 }
 
@@ -673,8 +802,14 @@ mod architectural_enforcement {
         println!("  Views: {}", php_patterns.views.len());
         println!("  Env calls: {}", php_patterns.env_calls.len());
         println!("  Config calls: {}", php_patterns.config_calls.len());
-        println!("  Middleware calls: {}", php_patterns.middleware_calls.len());
-        println!("  Translation calls: {}", php_patterns.translation_calls.len());
+        println!(
+            "  Middleware calls: {}",
+            php_patterns.middleware_calls.len()
+        );
+        println!(
+            "  Translation calls: {}",
+            php_patterns.translation_calls.len()
+        );
         println!("  Asset calls: {}", php_patterns.asset_calls.len());
         println!("  Binding calls: {}", php_patterns.binding_calls.len());
         println!("  Route calls: {}", php_patterns.route_calls.len());
@@ -685,8 +820,10 @@ mod architectural_enforcement {
         println!("  Livewire: {}", blade_patterns.livewire.len());
 
         // Verify at least one view pattern is found (basic sanity check)
-        assert!(!php_patterns.views.is_empty(),
-            "At least one view() call should be found in routes/web.php");
+        assert!(
+            !php_patterns.views.is_empty(),
+            "At least one view() call should be found in routes/web.php"
+        );
     }
 
     /// Verify that pattern extraction is deterministic
@@ -697,19 +834,28 @@ mod architectural_enforcement {
         let lang = language_php();
 
         let tree1 = parse_php(&source).expect("Failed to parse PHP");
-        let patterns1 = extract_all_php_patterns(&tree1, &source, &lang)
-            .expect("Failed to extract patterns");
+        let patterns1 =
+            extract_all_php_patterns(&tree1, &source, &lang).expect("Failed to extract patterns");
 
         let tree2 = parse_php(&source).expect("Failed to parse PHP");
-        let patterns2 = extract_all_php_patterns(&tree2, &source, &lang)
-            .expect("Failed to extract patterns");
+        let patterns2 =
+            extract_all_php_patterns(&tree2, &source, &lang).expect("Failed to extract patterns");
 
-        assert_eq!(patterns1.views.len(), patterns2.views.len(),
-            "Pattern extraction should be deterministic");
-        assert_eq!(patterns1.env_calls.len(), patterns2.env_calls.len(),
-            "Pattern extraction should be deterministic");
-        assert_eq!(patterns1.middleware_calls.len(), patterns2.middleware_calls.len(),
-            "Pattern extraction should be deterministic");
+        assert_eq!(
+            patterns1.views.len(),
+            patterns2.views.len(),
+            "Pattern extraction should be deterministic"
+        );
+        assert_eq!(
+            patterns1.env_calls.len(),
+            patterns2.env_calls.len(),
+            "Pattern extraction should be deterministic"
+        );
+        assert_eq!(
+            patterns1.middleware_calls.len(),
+            patterns2.middleware_calls.len(),
+            "Pattern extraction should be deterministic"
+        );
     }
 
     /// Test that file type detection correctly identifies Salsa input types
@@ -740,9 +886,17 @@ mod architectural_enforcement {
         // Test cases: (filename, path, expected_type)
         let test_cases = [
             ("web.php", "routes/web.php", "SourceFile"),
-            ("welcome.blade.php", "resources/views/welcome.blade.php", "SourceFile"),
+            (
+                "welcome.blade.php",
+                "resources/views/welcome.blade.php",
+                "SourceFile",
+            ),
             ("app.php", "bootstrap/app.php", "ServiceProviderFile"),
-            ("AppServiceProvider.php", "app/Providers/AppServiceProvider.php", "ServiceProviderFile"),
+            (
+                "AppServiceProvider.php",
+                "app/Providers/AppServiceProvider.php",
+                "ServiceProviderFile",
+            ),
             (".env", ".env", "EnvFile"),
             (".env.local", ".env.local", "EnvFile"),
             (".env.example", ".env.example", "EnvFile"),
@@ -753,9 +907,11 @@ mod architectural_enforcement {
 
         for (filename, path, expected) in test_cases {
             let actual = expected_salsa_type(filename, path);
-            assert_eq!(actual, expected,
+            assert_eq!(
+                actual, expected,
                 "File '{}' at path '{}' should route to '{}' but got '{}'",
-                filename, path, expected, actual);
+                filename, path, expected, actual
+            );
         }
     }
 }
@@ -771,13 +927,15 @@ mod resolution {
     fn resolve_view_path(root: &PathBuf, view_name: &str) -> PathBuf {
         // Convert dots to path separators: "users.profile" -> "users/profile"
         let view_path = view_name.replace('.', "/");
-        root.join("resources/views").join(format!("{}.blade.php", view_path))
+        root.join("resources/views")
+            .join(format!("{}.blade.php", view_path))
     }
 
     /// Helper: Resolve component name to file path (matches LaravelConfigData::resolve_component_path)
     fn resolve_component_path(root: &PathBuf, component_name: &str) -> PathBuf {
         let component_path = component_name.replace('.', "/");
-        root.join("resources/views/components").join(format!("{}.blade.php", component_path))
+        root.join("resources/views/components")
+            .join(format!("{}.blade.php", component_path))
     }
 
     /// Helper: Resolve Livewire component to file path
@@ -854,14 +1012,22 @@ mod resolution {
     fn test_view_resolution_simple() {
         let root = test_project_path();
         let path = resolve_view_path(&root, "welcome");
-        assert!(path.exists(), "view('welcome') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "view('welcome') should resolve to {:?}",
+            path
+        );
     }
 
     #[test]
     fn test_view_resolution_nested() {
         let root = test_project_path();
         let path = resolve_view_path(&root, "livewire.settings.profile");
-        assert!(path.exists(), "view('livewire.settings.profile') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "view('livewire.settings.profile') should resolve to {:?}",
+            path
+        );
     }
 
     #[test]
@@ -893,7 +1059,11 @@ mod resolution {
     fn test_livewire_resolution_nested() {
         let root = test_project_path();
         let path = resolve_livewire_path(&root, "actions.logout");
-        assert!(path.exists(), "<livewire:actions.logout> should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "<livewire:actions.logout> should resolve to {:?}",
+            path
+        );
     }
 
     #[test]
@@ -901,8 +1071,11 @@ mod resolution {
         // Test that kebab-case converts to PascalCase correctly
         let root = test_project_path();
         let path = resolve_livewire_path(&root, "actions.logout");
-        assert!(path.to_string_lossy().contains("Actions/Logout.php"),
-            "Livewire path should use PascalCase: {:?}", path);
+        assert!(
+            path.to_string_lossy().contains("Actions/Logout.php"),
+            "Livewire path should use PascalCase: {:?}",
+            path
+        );
     }
 
     // === Asset Resolution Tests ===
@@ -913,8 +1086,10 @@ mod resolution {
         // Check if any image exists
         let logo = resolve_asset_path(&root, "images/logo.png");
         let favicon = resolve_asset_path(&root, "images/favicon.ico");
-        assert!(logo.exists() || favicon.exists(),
-            "At least one public asset should exist");
+        assert!(
+            logo.exists() || favicon.exists(),
+            "At least one public asset should exist"
+        );
     }
 
     // === Vite Resource Resolution Tests ===
@@ -923,14 +1098,22 @@ mod resolution {
     fn test_vite_resolution_css() {
         let root = test_project_path();
         let path = resolve_vite_path(&root, "resources/css/app.css");
-        assert!(path.exists(), "@vite('resources/css/app.css') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "@vite('resources/css/app.css') should resolve to {:?}",
+            path
+        );
     }
 
     #[test]
     fn test_vite_resolution_js() {
         let root = test_project_path();
         let path = resolve_vite_path(&root, "resources/js/app.js");
-        assert!(path.exists(), "@vite('resources/js/app.js') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "@vite('resources/js/app.js') should resolve to {:?}",
+            path
+        );
     }
 
     // === Translation Resolution Tests ===
@@ -939,7 +1122,11 @@ mod resolution {
     fn test_translation_resolution_dotted_key() {
         let root = test_project_path();
         let path = resolve_translation_path(&root, "messages.welcome");
-        assert!(path.exists(), "__('messages.welcome') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "__('messages.welcome') should resolve to {:?}",
+            path
+        );
     }
 
     // === Config Resolution Tests ===
@@ -948,14 +1135,22 @@ mod resolution {
     fn test_config_resolution_app() {
         let root = test_project_path();
         let path = resolve_config_path(&root, "app.name");
-        assert!(path.exists(), "config('app.name') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "config('app.name') should resolve to {:?}",
+            path
+        );
     }
 
     #[test]
     fn test_config_resolution_database() {
         let root = test_project_path();
         let path = resolve_config_path(&root, "database.default");
-        assert!(path.exists(), "config('database.default') should resolve to {:?}", path);
+        assert!(
+            path.exists(),
+            "config('database.default') should resolve to {:?}",
+            path
+        );
     }
 
     // === Middleware Resolution Tests ===
@@ -984,8 +1179,10 @@ mod service_provider_parsing {
     fn test_bootstrap_app_contains_middleware_config() {
         let source = read_test_file("bootstrap/app.php");
         // Laravel 11+ uses withMiddleware()
-        assert!(source.contains("withMiddleware") || source.contains("middleware"),
-            "bootstrap/app.php should configure middleware");
+        assert!(
+            source.contains("withMiddleware") || source.contains("middleware"),
+            "bootstrap/app.php should configure middleware"
+        );
     }
 
     #[test]
@@ -995,12 +1192,13 @@ mod service_provider_parsing {
 
         // Look for alias definitions like 'auth' => Class::class
         // or ->alias('auth', Class::class)
-        let has_alias_pattern = source.contains("alias") ||
-            source.contains("=>") ||
-            source.contains("Middleware");
+        let has_alias_pattern =
+            source.contains("alias") || source.contains("=>") || source.contains("Middleware");
 
-        assert!(has_alias_pattern,
-            "bootstrap/app.php should contain middleware alias definitions");
+        assert!(
+            has_alias_pattern,
+            "bootstrap/app.php should contain middleware alias definitions"
+        );
     }
 
     #[test]
@@ -1008,12 +1206,13 @@ mod service_provider_parsing {
         let root = test_project_path();
 
         // Test the actual middleware_parser function
-        let result = middleware_parser::resolve_class_to_file(
-            "App\\Livewire\\Actions\\Logout",
-            &root
-        );
+        let result =
+            middleware_parser::resolve_class_to_file("App\\Livewire\\Actions\\Logout", &root);
 
-        assert!(result.is_some(), "Should resolve App\\Livewire\\Actions\\Logout");
+        assert!(
+            result.is_some(),
+            "Should resolve App\\Livewire\\Actions\\Logout"
+        );
         let path = result.unwrap();
         assert!(path.exists(), "Resolved path should exist: {:?}", path);
     }
@@ -1023,8 +1222,10 @@ mod service_provider_parsing {
         let source = read_test_file("app/Providers/AppServiceProvider.php");
 
         // Service providers should have register() and boot() methods
-        assert!(source.contains("function register") || source.contains("function boot"),
-            "AppServiceProvider should have register() or boot() methods");
+        assert!(
+            source.contains("function register") || source.contains("function boot"),
+            "AppServiceProvider should have register() or boot() methods"
+        );
     }
 }
 
@@ -1084,11 +1285,17 @@ mod env_parsing {
 
         // Count env() usage
         let env_count = app_config.matches("env(").count();
-        assert!(env_count > 0, "config/app.php should use env() helper, found {} occurrences", env_count);
+        assert!(
+            env_count > 0,
+            "config/app.php should use env() helper, found {} occurrences",
+            env_count
+        );
 
         // Verify common env variable references
-        assert!(app_config.contains("env('APP_NAME'") || app_config.contains("env(\"APP_NAME\""),
-            "config/app.php should reference APP_NAME via env()");
+        assert!(
+            app_config.contains("env('APP_NAME'") || app_config.contains("env(\"APP_NAME\""),
+            "config/app.php should reference APP_NAME via env()"
+        );
     }
 }
 
@@ -1097,7 +1304,6 @@ mod env_parsing {
 // ============================================================================
 
 mod priority_merging {
-    
 
     /// Test that priority ordering is documented and followed
     /// Priority: app (2) > package (1) > framework (0)
@@ -1108,8 +1314,14 @@ mod priority_merging {
         const PACKAGE_PRIORITY: u8 = 1;
         const APP_PRIORITY: u8 = 2;
 
-        assert!(APP_PRIORITY > PACKAGE_PRIORITY, "App should have higher priority than package");
-        assert!(PACKAGE_PRIORITY > FRAMEWORK_PRIORITY, "Package should have higher priority than framework");
+        assert!(
+            APP_PRIORITY > PACKAGE_PRIORITY,
+            "App should have higher priority than package"
+        );
+        assert!(
+            PACKAGE_PRIORITY > FRAMEWORK_PRIORITY,
+            "Package should have higher priority than framework"
+        );
     }
 
     /// Test that env file priority is correct
@@ -1145,8 +1357,14 @@ mod priority_merging {
         }
 
         assert_eq!(provider_priority("app/Providers/AppServiceProvider.php"), 2);
-        assert_eq!(provider_priority("vendor/some-package/src/ServiceProvider.php"), 1);
-        assert_eq!(provider_priority("vendor/laravel/framework/src/Provider.php"), 0);
+        assert_eq!(
+            provider_priority("vendor/some-package/src/ServiceProvider.php"),
+            1
+        );
+        assert_eq!(
+            provider_priority("vendor/laravel/framework/src/Provider.php"),
+            0
+        );
     }
 }
 
@@ -1157,7 +1375,6 @@ mod priority_merging {
 mod debounce_behavior {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
-
 
     /// Test that documents the debounce contract
     /// This is a specification test - the actual async debounce is tested elsewhere
@@ -1173,7 +1390,10 @@ mod debounce_behavior {
         // 3. Only after the debounce delay of silence does the update fire
         // 4. Result: ONE update with final content
 
-        assert_eq!(DEFAULT_SALSA_DEBOUNCE_MS, 200, "Default Salsa debounce should be 200ms");
+        assert_eq!(
+            DEFAULT_SALSA_DEBOUNCE_MS, 200,
+            "Default Salsa debounce should be 200ms"
+        );
     }
 
     /// Test that debounce is configurable via settings
@@ -1216,8 +1436,11 @@ mod debounce_behavior {
             assert_eq!(final_version, 5, "Should have final version");
         }
 
-        assert_eq!(execution_count.load(Ordering::SeqCst), 1,
-            "Should execute exactly once with coalesced updates");
+        assert_eq!(
+            execution_count.load(Ordering::SeqCst),
+            1,
+            "Should execute exactly once with coalesced updates"
+        );
     }
 
     /// Test that debounce applies per-file

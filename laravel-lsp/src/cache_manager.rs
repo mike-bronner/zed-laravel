@@ -36,7 +36,9 @@ fn get_cache_dir(project_root: &Path) -> Option<PathBuf> {
     let cache_base = proj_dirs.cache_dir();
 
     // Create unique hash for this project based on its absolute path
-    let canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     let project_hash = format!("{:x}", hasher.finish());
@@ -239,7 +241,8 @@ impl CacheManager {
                                     path,
                                     cache.vendor_scan.middleware.len()
                                         + cache.app_scan.middleware.len(),
-                                    cache.vendor_scan.bindings.len() + cache.app_scan.bindings.len()
+                                    cache.vendor_scan.bindings.len()
+                                        + cache.app_scan.bindings.len()
                                 );
                                 manager.cache = Some(cache);
                             }
@@ -482,9 +485,7 @@ impl CacheManager {
         self.cache
             .as_ref()
             .map(|c| {
-                !c.vendor_scan.is_empty()
-                || !c.app_scan.is_empty()
-                || c.laravel_config.is_some()
+                !c.vendor_scan.is_empty() || !c.app_scan.is_empty() || c.laravel_config.is_some()
             })
             .unwrap_or(false)
     }
@@ -499,9 +500,7 @@ impl CacheManager {
         }
 
         // Check app providers and bootstrap for app rescan
-        if self.needs_rescan("bootstrap/app.php")
-            || self.needs_rescan_glob("app/Providers/*.php")
-        {
+        if self.needs_rescan("bootstrap/app.php") || self.needs_rescan_glob("app/Providers/*.php") {
             needed.push(RescanType::App);
         }
 

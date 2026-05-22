@@ -32,8 +32,8 @@ Route::group([
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     let middleware_names: Vec<&str> = patterns
         .middleware_calls
@@ -80,8 +80,8 @@ class Kernel {
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware alias definitions
     let alias_keys: Vec<&str> = patterns
@@ -97,7 +97,10 @@ class Kernel {
 
     assert!(alias_keys.contains(&"auth"), "Should find 'auth' alias");
     assert!(alias_keys.contains(&"guest"), "Should find 'guest' alias");
-    assert!(alias_keys.contains(&"verified"), "Should find 'verified' alias");
+    assert!(
+        alias_keys.contains(&"verified"),
+        "Should find 'verified' alias"
+    );
     assert!(
         alias_classes.contains(&"Authenticate"),
         "Should find Authenticate class"
@@ -163,8 +166,8 @@ class Kernel extends HttpKernel
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware group definitions
     let group_names: Vec<&str> = patterns
@@ -186,8 +189,14 @@ class Kernel extends HttpKernel
     assert!(alias_keys.contains(&"auth"), "Should find 'auth' alias");
     assert!(alias_keys.contains(&"guest"), "Should find 'guest' alias");
     assert!(alias_keys.contains(&"can"), "Should find 'can' alias");
-    assert!(alias_keys.contains(&"throttle"), "Should find 'throttle' alias");
-    assert!(alias_keys.contains(&"verified"), "Should find 'verified' alias");
+    assert!(
+        alias_keys.contains(&"throttle"),
+        "Should find 'throttle' alias"
+    );
+    assert!(
+        alias_keys.contains(&"verified"),
+        "Should find 'verified' alias"
+    );
 }
 
 #[test]
@@ -216,8 +225,8 @@ class Middleware
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware alias definitions from method body
     let alias_keys: Vec<&str> = patterns
@@ -230,9 +239,15 @@ class Middleware
         alias_keys.contains(&"auth"),
         "Should find 'auth' alias from $aliases assignment"
     );
-    assert!(alias_keys.contains(&"auth.basic"), "Should find 'auth.basic' alias");
+    assert!(
+        alias_keys.contains(&"auth.basic"),
+        "Should find 'auth.basic' alias"
+    );
     assert!(alias_keys.contains(&"guest"), "Should find 'guest' alias");
-    assert!(alias_keys.contains(&"verified"), "Should find 'verified' alias");
+    assert!(
+        alias_keys.contains(&"verified"),
+        "Should find 'verified' alias"
+    );
 }
 
 #[test]
@@ -262,8 +277,8 @@ class Middleware
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware group definitions from method body
     let group_names: Vec<&str> = patterns
@@ -299,8 +314,8 @@ return Application::configure(basePath: dirname(__DIR__))
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware alias definitions from ->alias() calls
     let alias_keys: Vec<&str> = patterns
@@ -335,8 +350,8 @@ return Application::configure(basePath: dirname(__DIR__))
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware alias definitions from ->alias([...]) call
     let alias_keys: Vec<&str> = patterns
@@ -371,8 +386,8 @@ return Application::configure(basePath: dirname(__DIR__))
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware group definitions from ->group() call
     let group_names: Vec<&str> = patterns
@@ -407,8 +422,8 @@ class RouteServiceProvider extends ServiceProvider
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check middleware alias definitions from $router->aliasMiddleware() calls
     let alias_keys: Vec<&str> = patterns

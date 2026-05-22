@@ -14,7 +14,10 @@ fn test_cache_round_trip() {
         "auth".to_string(),
         MiddlewareEntry {
             class: "Illuminate\\Auth\\Middleware\\Authenticate".to_string(),
-            class_file: Some("vendor/laravel/framework/src/Illuminate/Auth/Middleware/Authenticate.php".to_string()),
+            class_file: Some(
+                "vendor/laravel/framework/src/Illuminate/Auth/Middleware/Authenticate.php"
+                    .to_string(),
+            ),
             source_file: Some("bootstrap/app.php".to_string()),
             line: 10,
         },
@@ -59,7 +62,10 @@ fn test_xdg_cache_path() {
 
     // Verify we can get a cache path
     let cache_file = get_cache_file(project_root);
-    assert!(cache_file.is_some(), "Should be able to determine cache path");
+    assert!(
+        cache_file.is_some(),
+        "Should be able to determine cache path"
+    );
 
     let cache_path = cache_file.unwrap();
     println!("Cache path for {:?}: {:?}", project_root, cache_path);

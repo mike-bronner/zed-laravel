@@ -1,6 +1,6 @@
 use laravel_lsp::blade_loops::{
-    BladeLoopType, find_loop_blocks, get_enclosing_loops, parse_foreach_iterable,
-    parse_foreach_variables, parse_for_variables,
+    find_loop_blocks, get_enclosing_loops, parse_for_variables, parse_foreach_iterable,
+    parse_foreach_variables, BladeLoopType,
 };
 
 #[test]
@@ -12,10 +12,13 @@ fn test_parse_foreach_single_variable() {
 #[test]
 fn test_parse_foreach_key_value() {
     let vars = parse_foreach_variables("($items as $key => $value)");
-    assert_eq!(vars, vec![
-        ("key".to_string(), "mixed".to_string()),
-        ("value".to_string(), "mixed".to_string()),
-    ]);
+    assert_eq!(
+        vars,
+        vec![
+            ("key".to_string(), "mixed".to_string()),
+            ("value".to_string(), "mixed".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -46,7 +49,10 @@ fn test_find_loop_blocks_single_foreach() {
     let blocks = find_loop_blocks(content);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].loop_type, BladeLoopType::Foreach);
-    assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+    assert_eq!(
+        blocks[0].variables,
+        vec![("user".to_string(), "mixed".to_string())]
+    );
     assert_eq!(blocks[0].start_line, 1);
     assert_eq!(blocks[0].end_line, Some(3));
 }
@@ -64,12 +70,18 @@ fn test_find_loop_blocks_nested() {
     assert_eq!(blocks.len(), 2);
 
     // Inner loop ends first
-    let inner = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "item")).unwrap();
+    let inner = blocks
+        .iter()
+        .find(|b| b.variables.iter().any(|(n, _)| n == "item"))
+        .unwrap();
     assert_eq!(inner.start_line, 2);
     assert_eq!(inner.end_line, Some(4));
 
     // Outer loop
-    let outer = blocks.iter().find(|b| b.variables.iter().any(|(n, _)| n == "category")).unwrap();
+    let outer = blocks
+        .iter()
+        .find(|b| b.variables.iter().any(|(n, _)| n == "category"))
+        .unwrap();
     assert_eq!(outer.start_line, 1);
     assert_eq!(outer.end_line, Some(5));
 }
@@ -84,7 +96,10 @@ fn test_find_loop_blocks_for() {
     let blocks = find_loop_blocks(content);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].loop_type, BladeLoopType::For);
-    assert_eq!(blocks[0].variables, vec![("i".to_string(), "int".to_string())]);
+    assert_eq!(
+        blocks[0].variables,
+        vec![("i".to_string(), "int".to_string())]
+    );
 }
 
 #[test]
@@ -99,7 +114,10 @@ fn test_find_loop_blocks_forelse() {
     let blocks = find_loop_blocks(content);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].loop_type, BladeLoopType::Forelse);
-    assert_eq!(blocks[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+    assert_eq!(
+        blocks[0].variables,
+        vec![("user".to_string(), "mixed".to_string())]
+    );
 }
 
 #[test]
@@ -112,7 +130,10 @@ fn test_get_enclosing_loops_inside() {
     // Line 2 (0-indexed) is inside the loop
     let enclosing = get_enclosing_loops(content, 2);
     assert_eq!(enclosing.len(), 1);
-    assert_eq!(enclosing[0].variables, vec![("user".to_string(), "mixed".to_string())]);
+    assert_eq!(
+        enclosing[0].variables,
+        vec![("user".to_string(), "mixed".to_string())]
+    );
 }
 
 #[test]

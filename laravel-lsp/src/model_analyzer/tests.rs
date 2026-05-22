@@ -36,7 +36,10 @@ fn test_extract_casts_property() {
         }
     "#;
     let metadata = ModelMetadata::from_content(content);
-    assert_eq!(metadata.casts.get("email_verified_at"), Some(&"datetime".to_string()));
+    assert_eq!(
+        metadata.casts.get("email_verified_at"),
+        Some(&"datetime".to_string())
+    );
     assert_eq!(metadata.casts.get("is_admin"), Some(&"boolean".to_string()));
     assert_eq!(metadata.casts.get("settings"), Some(&"array".to_string()));
 }
@@ -56,7 +59,10 @@ fn test_extract_casts_method() {
         }
     "#;
     let metadata = ModelMetadata::from_content(content);
-    assert_eq!(metadata.casts.get("email_verified_at"), Some(&"datetime".to_string()));
+    assert_eq!(
+        metadata.casts.get("email_verified_at"),
+        Some(&"datetime".to_string())
+    );
     assert_eq!(metadata.casts.get("password"), Some(&"hashed".to_string()));
 }
 
@@ -74,7 +80,10 @@ fn test_extract_old_style_accessor() {
     let metadata = ModelMetadata::from_content(content);
     assert_eq!(metadata.accessors.len(), 1);
     assert_eq!(metadata.accessors[0].property_name, "full_name");
-    assert_eq!(metadata.accessors[0].return_type, Some("string".to_string()));
+    assert_eq!(
+        metadata.accessors[0].return_type,
+        Some("string".to_string())
+    );
 }
 
 #[test]
@@ -120,15 +129,27 @@ fn test_extract_relationships() {
     let metadata = ModelMetadata::from_content(content);
     assert_eq!(metadata.relationships.len(), 3);
 
-    let posts = metadata.relationships.iter().find(|r| r.method_name == "posts").unwrap();
+    let posts = metadata
+        .relationships
+        .iter()
+        .find(|r| r.method_name == "posts")
+        .unwrap();
     assert_eq!(posts.relationship_type, "hasMany");
     assert_eq!(posts.related_model, Some("Post".to_string()));
 
-    let profile = metadata.relationships.iter().find(|r| r.method_name == "profile").unwrap();
+    let profile = metadata
+        .relationships
+        .iter()
+        .find(|r| r.method_name == "profile")
+        .unwrap();
     assert_eq!(profile.relationship_type, "hasOne");
     assert_eq!(profile.related_model, Some("Profile".to_string()));
 
-    let roles = metadata.relationships.iter().find(|r| r.method_name == "roles").unwrap();
+    let roles = metadata
+        .relationships
+        .iter()
+        .find(|r| r.method_name == "roles")
+        .unwrap();
     assert_eq!(roles.relationship_type, "belongsToMany");
     assert_eq!(roles.related_model, Some("Role".to_string()));
 }
@@ -136,7 +157,10 @@ fn test_extract_relationships() {
 #[test]
 fn test_pascal_to_snake() {
     assert_eq!(ModelMetadata::pascal_to_snake("FirstName"), "first_name");
-    assert_eq!(ModelMetadata::pascal_to_snake("EmailVerifiedAt"), "email_verified_at");
+    assert_eq!(
+        ModelMetadata::pascal_to_snake("EmailVerifiedAt"),
+        "email_verified_at"
+    );
     assert_eq!(ModelMetadata::pascal_to_snake("ID"), "i_d");
     assert_eq!(ModelMetadata::pascal_to_snake("Name"), "name");
 }
@@ -153,8 +177,17 @@ fn test_map_cast_to_php_type() {
 
 #[test]
 fn test_relationship_to_php_type() {
-    assert_eq!(relationship_to_php_type("hasOne", Some("Profile")), "?Profile");
+    assert_eq!(
+        relationship_to_php_type("hasOne", Some("Profile")),
+        "?Profile"
+    );
     assert_eq!(relationship_to_php_type("belongsTo", Some("User")), "?User");
-    assert_eq!(relationship_to_php_type("hasMany", Some("Post")), "Collection<Post>");
-    assert_eq!(relationship_to_php_type("belongsToMany", Some("Role")), "Collection<Role>");
+    assert_eq!(
+        relationship_to_php_type("hasMany", Some("Post")),
+        "Collection<Post>"
+    );
+    assert_eq!(
+        relationship_to_php_type("belongsToMany", Some("Role")),
+        "Collection<Role>"
+    );
 }

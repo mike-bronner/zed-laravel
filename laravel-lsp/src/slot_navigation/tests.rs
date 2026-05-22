@@ -110,7 +110,10 @@ fn extract_name_attribute_rejects_substring_collisions() {
     // `wire:name="..."` shouldn't be misread as `name="..."`
     assert!(extract_name_attribute(" wire:name=\"x\"").is_none());
     // Real name attribute still works
-    assert_eq!(extract_name_attribute(" name=\"buttons\"").unwrap(), "buttons");
+    assert_eq!(
+        extract_name_attribute(" name=\"buttons\"").unwrap(),
+        "buttons"
+    );
 }
 
 #[test]
@@ -126,7 +129,10 @@ fn find_slot_at_position_returns_none_for_regular_component() {
     let source = "<x-card>\n    <x-button>Click</x-button>\n</x-card>\n";
     // Cursor inside <x-button>
     let slot = find_slot_at_position(source, 1, 7);
-    assert!(slot.is_none(), "regular component should not be matched as slot");
+    assert!(
+        slot.is_none(),
+        "regular component should not be matched as slot"
+    );
 }
 
 #[test]

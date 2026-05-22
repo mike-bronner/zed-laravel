@@ -65,10 +65,8 @@ pub fn find_slot_at_position(source: &str, line: u32, character: u32) -> Option<
             // whitespace, or end-of-line. Anything else means we matched a
             // prefix of a longer tag name (e.g., `<x-slotmachine>`).
             let next_char = line_content[after_prefix..].chars().next();
-            let is_slot_tag = matches!(
-                next_char,
-                Some(':') | Some('>') | Some('/') | None
-            ) || next_char.map_or(false, |c| c.is_whitespace());
+            let is_slot_tag = matches!(next_char, Some(':') | Some('>') | Some('/') | None)
+                || next_char.map_or(false, |c| c.is_whitespace());
 
             if !is_slot_tag {
                 search_from = after_prefix;
@@ -140,9 +138,7 @@ fn extract_name_attribute(tag_inner: &str) -> Option<&str> {
 
         // Reject substrings like `wirename=` — the char before must be a
         // boundary (whitespace or the start of the inner text).
-        let before_ok = pos == 0
-            || tag_inner.as_bytes()[pos - 1]
-                .is_ascii_whitespace();
+        let before_ok = pos == 0 || tag_inner.as_bytes()[pos - 1].is_ascii_whitespace();
         if !before_ok {
             search_from = pos + 4;
             continue;

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// Cached database schema with expiration
 #[derive(Debug, Clone)]
@@ -211,10 +211,11 @@ impl DatabaseSchemaProvider {
         };
 
         // Find all connection names: 'name' => [
-        let connection_name_regex = match Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+        let connection_name_regex =
+            match Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
 
         let remaining = &content[match_start..];
 
@@ -259,7 +260,8 @@ impl DatabaseSchemaProvider {
         let config = match self.get_database_config().await {
             Some(c) => c,
             None => {
-                self.set_error("unknown", "Database configuration not found in .env").await;
+                self.set_error("unknown", "Database configuration not found in .env")
+                    .await;
                 return None;
             }
         };
@@ -270,7 +272,11 @@ impl DatabaseSchemaProvider {
             "sqlite" => self.fetch_sqlite_schema(&config).await,
             "sqlsrv" => self.fetch_sqlserver_schema(&config).await,
             _ => {
-                self.set_error(&config.driver, &format!("Unsupported database driver: {}", config.driver)).await;
+                self.set_error(
+                    &config.driver,
+                    &format!("Unsupported database driver: {}", config.driver),
+                )
+                .await;
                 warn!("Unsupported database driver: {}", config.driver);
                 return None;
             }
@@ -326,22 +332,36 @@ impl DatabaseSchemaProvider {
 
         // Step 1: Parse 'default' => env('DB_CONNECTION', 'fallback')
         let default_regex = Regex::new(
-            r#"['"]default['"]\s*=>\s*env\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
-        ).ok()?;
+            r#"['"]default['"]\s*=>\s*env\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#,
+        )
+        .ok()?;
 
-        let (default_env_var, default_fallback) = default_regex.captures(&content)
+        let (default_env_var, default_fallback) = default_regex
+            .captures(&content)
             .map(|caps| {
-                let var = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_else(|| "DB_CONNECTION".to_string());
-                let fallback = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_else(|| "mysql".to_string());
+                let var = caps
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|| "DB_CONNECTION".to_string());
+                let fallback = caps
+                    .get(2)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|| "mysql".to_string());
                 (var, fallback)
             })
             .unwrap_or_else(|| ("DB_CONNECTION".to_string(), "mysql".to_string()));
 
-        info!("🗄️  default => env('{}', '{}')", default_env_var, default_fallback);
+        info!(
+            "🗄️  default => env('{}', '{}')",
+            default_env_var, default_fallback
+        );
 
         // Resolve the default connection name
-        let driver = self.resolve_env(&default_env_var).unwrap_or(default_fallback.clone());
-        info!("🗄️  Resolved driver: {} (from .env: {}, fallback: {})",
+        let driver = self
+            .resolve_env(&default_env_var)
+            .unwrap_or(default_fallback.clone());
+        info!(
+            "🗄️  Resolved driver: {} (from .env: {}, fallback: {})",
             driver,
             self.resolve_env(&default_env_var).is_some(),
             default_fallback
@@ -360,7 +380,8 @@ impl DatabaseSchemaProvider {
 
         // Step 3: Parse settings from the connection block
         let host = self.parse_env_setting(&block, "host", "127.0.0.1");
-        let port_str = self.parse_env_setting(&block, "port", &self.default_port(&driver).to_string());
+        let port_str =
+            self.parse_env_setting(&block, "port", &self.default_port(&driver).to_string());
         let port = port_str.parse().unwrap_or(self.default_port(&driver));
         let database = self.parse_env_setting(&block, "database", "laravel");
         let username = self.parse_env_setting(&block, "username", "root");
@@ -372,7 +393,14 @@ impl DatabaseSchemaProvider {
         info!("🗄️    port: {}", port);
         info!("🗄️    database: {}", database);
         info!("🗄️    username: {}", username);
-        info!("🗄️    password: {}", if password.is_empty() { "(empty)" } else { "(set)" });
+        info!(
+            "🗄️    password: {}",
+            if password.is_empty() {
+                "(empty)"
+            } else {
+                "(set)"
+            }
+        );
 
         // For SQLite, check if file exists
         if driver == "sqlite" {
@@ -381,7 +409,11 @@ impl DatabaseSchemaProvider {
             } else {
                 self.project_root.join(&database)
             };
-            info!("🗄️    SQLite path resolved to: {:?} (exists: {})", db_path, db_path.exists());
+            info!(
+                "🗄️    SQLite path resolved to: {:?} (exists: {})",
+                db_path,
+                db_path.exists()
+            );
         }
 
         Some(DatabaseConfig {
@@ -450,14 +482,20 @@ impl DatabaseSchemaProvider {
 
                     // Fall back to the default from config
                     let resolved_default = self.resolve_php_value(&default_value);
-                    info!("🗄️      → using default: {} → {}", default_value, resolved_default);
+                    info!(
+                        "🗄️      → using default: {} → {}",
+                        default_value, resolved_default
+                    );
                     return resolved_default;
                 }
             }
         }
 
         // Key not found in block, return the fallback
-        info!("🗄️    {} not found in block, using fallback: {}", key, fallback);
+        info!(
+            "🗄️    {} not found in block, using fallback: {}",
+            key, fallback
+        );
         fallback.to_string()
     }
 
@@ -470,7 +508,10 @@ impl DatabaseSchemaProvider {
         let mut default_value = String::new();
 
         // Skip whitespace
-        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\n') || chars.peek() == Some(&'\t') {
+        while chars.peek() == Some(&' ')
+            || chars.peek() == Some(&'\n')
+            || chars.peek() == Some(&'\t')
+        {
             chars.next();
         }
 
@@ -531,9 +572,10 @@ impl DatabaseSchemaProvider {
         let trimmed = value.trim();
 
         // Handle string literals: 'value' or "value"
-        if (trimmed.starts_with('\'') && trimmed.ends_with('\'')) ||
-           (trimmed.starts_with('"') && trimmed.ends_with('"')) {
-            return trimmed[1..trimmed.len()-1].to_string();
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            return trimmed[1..trimmed.len() - 1].to_string();
         }
 
         // Handle database_path('file.sqlite') -> database/file.sqlite
@@ -555,11 +597,17 @@ impl DatabaseSchemaProvider {
         }
 
         // Handle boolean true/false
-        if trimmed == "true" { return "true".to_string(); }
-        if trimmed == "false" { return "false".to_string(); }
+        if trimmed == "true" {
+            return "true".to_string();
+        }
+        if trimmed == "false" {
+            return "false".to_string();
+        }
 
         // Handle null
-        if trimmed == "null" { return String::new(); }
+        if trimmed == "null" {
+            return String::new();
+        }
 
         // Handle numeric values
         if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
@@ -601,7 +649,8 @@ impl DatabaseSchemaProvider {
             }
         };
 
-        let result = regex.captures(&content)
+        let result = regex
+            .captures(&content)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().trim().to_string())
             .filter(|s| !s.is_empty());
@@ -706,14 +755,14 @@ impl DatabaseSchemaProvider {
 
         // Get tables from public schema
         let tables: Vec<String> = sqlx::query(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
         )
-            .fetch_all(&pool)
-            .await
-            .ok()?
-            .into_iter()
-            .filter_map(|row| row.try_get::<String, _>("table_name").ok())
-            .collect();
+        .fetch_all(&pool)
+        .await
+        .ok()?
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("table_name").ok())
+        .collect();
 
         // Get columns for each table (with types)
         let mut columns = HashMap::new();
@@ -766,7 +815,10 @@ impl DatabaseSchemaProvider {
         };
 
         if !db_path.exists() {
-            let msg = format!("SQLite database not found: {:?}. Check DB_DATABASE in .env", db_path);
+            let msg = format!(
+                "SQLite database not found: {:?}. Check DB_DATABASE in .env",
+                db_path
+            );
             warn!("{}", msg);
             self.set_error("sqlite", &msg).await;
             return None;
@@ -791,14 +843,14 @@ impl DatabaseSchemaProvider {
 
         // Get tables
         let tables: Vec<String> = sqlx::query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         )
-            .fetch_all(&pool)
-            .await
-            .ok()?
-            .into_iter()
-            .filter_map(|row| row.try_get::<String, _>("name").ok())
-            .collect();
+        .fetch_all(&pool)
+        .await
+        .ok()?
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
 
         // Get columns for each table (with types)
         let mut columns = HashMap::new();
@@ -837,7 +889,7 @@ impl DatabaseSchemaProvider {
 
     /// Fetch schema from SQL Server
     async fn fetch_sqlserver_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
-        use tiberius::{Client, Config, AuthMethod};
+        use tiberius::{AuthMethod, Client, Config};
         use tokio::net::TcpStream;
         use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -851,7 +903,10 @@ impl DatabaseSchemaProvider {
         let tcp = match TcpStream::connect(tib_config.get_addr()).await {
             Ok(t) => t,
             Err(e) => {
-                let msg = format!("SQL Server TCP connection failed: {}. Check DB_HOST, DB_PORT in .env", e);
+                let msg = format!(
+                    "SQL Server TCP connection failed: {}. Check DB_HOST, DB_PORT in .env",
+                    e
+                );
                 warn!("{}", msg);
                 self.set_error("sqlsrv", &msg).await;
                 return None;
@@ -871,10 +926,13 @@ impl DatabaseSchemaProvider {
         };
 
         // Get tables
-        let stream = client.query(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'",
-            &[]
-        ).await.ok()?;
+        let stream = client
+            .query(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'",
+                &[],
+            )
+            .await
+            .ok()?;
 
         let tables: Vec<String> = stream
             .into_first_result()
@@ -893,10 +951,7 @@ impl DatabaseSchemaProvider {
                 &[&table.as_str()]
             ).await.ok()?;
 
-            let rows = stream
-                .into_first_result()
-                .await
-                .ok()?;
+            let rows = stream.into_first_result().await.ok()?;
 
             let mut col_names = Vec::new();
             let mut col_types = Vec::new();

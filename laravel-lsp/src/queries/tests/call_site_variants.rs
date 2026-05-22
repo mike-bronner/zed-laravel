@@ -26,8 +26,8 @@ $d = URL::signedRoute('subscribe');
 "#;
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     let names: Vec<&str> = patterns.route_calls.iter().map(|r| r.route_name).collect();
 
@@ -71,29 +71,56 @@ $h = config()->array('app.providers');
 "#;
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     let keys: Vec<&str> = patterns.config_calls.iter().map(|c| c.config_key).collect();
 
     // Existing function call still works
-    assert!(keys.contains(&"app.name"), "config() should match; got {keys:?}");
+    assert!(
+        keys.contains(&"app.name"),
+        "config() should match; got {keys:?}"
+    );
 
     // Existing Config::get still works
-    assert!(keys.contains(&"database.default"), "Config::get should match; got {keys:?}");
+    assert!(
+        keys.contains(&"database.default"),
+        "Config::get should match; got {keys:?}"
+    );
 
     // Modern type aliases on the Config facade
-    assert!(keys.contains(&"app.timeout"), "Config::int should match; got {keys:?}");
-    assert!(keys.contains(&"app.debug"), "Config::bool should match; got {keys:?}");
-    assert!(keys.contains(&"app.weight"), "Config::float should match; got {keys:?}");
+    assert!(
+        keys.contains(&"app.timeout"),
+        "Config::int should match; got {keys:?}"
+    );
+    assert!(
+        keys.contains(&"app.debug"),
+        "Config::bool should match; got {keys:?}"
+    );
+    assert!(
+        keys.contains(&"app.weight"),
+        "Config::float should match; got {keys:?}"
+    );
 
     // Config::getMany array — both elements captured
-    assert!(keys.contains(&"mail.host"), "Config::getMany[0] should match; got {keys:?}");
-    assert!(keys.contains(&"mail.port"), "Config::getMany[1] should match; got {keys:?}");
+    assert!(
+        keys.contains(&"mail.host"),
+        "Config::getMany[0] should match; got {keys:?}"
+    );
+    assert!(
+        keys.contains(&"mail.port"),
+        "Config::getMany[1] should match; got {keys:?}"
+    );
 
     // config()->method fluent form
-    assert!(keys.contains(&"app.locale"), "config()->string should match; got {keys:?}");
-    assert!(keys.contains(&"app.providers"), "config()->array should match; got {keys:?}");
+    assert!(
+        keys.contains(&"app.locale"),
+        "config()->string should match; got {keys:?}"
+    );
+    assert!(
+        keys.contains(&"app.providers"),
+        "config()->array should match; got {keys:?}"
+    );
 
     // No accidental duplicates or extras
     assert_eq!(
@@ -115,19 +142,22 @@ $c = Env::get('APP_KEY', 'fallback');
 "#;
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
-    let by_name: HashMap<&str, &EnvMatch> = patterns
-        .env_calls
-        .iter()
-        .map(|e| (e.var_name, e))
-        .collect();
+    let by_name: HashMap<&str, &EnvMatch> =
+        patterns.env_calls.iter().map(|e| (e.var_name, e)).collect();
 
     assert_eq!(patterns.env_calls.len(), 3, "Expected 3 env captures");
     assert!(by_name.contains_key("APP_NAME"), "env() should match");
-    assert!(by_name.contains_key("DB_HOST"), "Env::get without fallback should match");
-    assert!(by_name.contains_key("APP_KEY"), "Env::get with fallback should match");
+    assert!(
+        by_name.contains_key("DB_HOST"),
+        "Env::get without fallback should match"
+    );
+    assert!(
+        by_name.contains_key("APP_KEY"),
+        "Env::get with fallback should match"
+    );
 
     assert!(
         !by_name["DB_HOST"].has_fallback,
@@ -152,8 +182,8 @@ $d = App::bound("queue");
 "#;
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     let names: Vec<&str> = patterns
         .binding_calls
@@ -161,8 +191,14 @@ $d = App::bound("queue");
         .map(|b| b.binding_name)
         .collect();
 
-    assert!(names.contains(&"cache"), "app() should still match; got {names:?}");
-    assert!(names.contains(&"auth"), "App::bound() should match; got {names:?}");
+    assert!(
+        names.contains(&"cache"),
+        "app() should still match; got {names:?}"
+    );
+    assert!(
+        names.contains(&"auth"),
+        "App::bound() should match; got {names:?}"
+    );
     assert!(
         names.contains(&"App\\Contracts\\Mailer"),
         "App::isShared() should match; got {names:?}"

@@ -36,20 +36,29 @@ pub fn find_project_root(file_path: &Path) -> Option<PathBuf> {
 
         // If we find composer.json + artisan, it's very likely a Laravel app
         if has_composer && has_artisan {
-            info!("Found Laravel project root at {:?} (composer.json + artisan)", current);
+            info!(
+                "Found Laravel project root at {:?} (composer.json + artisan)",
+                current
+            );
             return Some(current.to_path_buf());
         }
 
         // Or if we find composer.json + app/ + resources/ (Laravel app)
         if has_composer && has_app && has_resources {
-            info!("Found Laravel project root at {:?} (composer.json + app + resources)", current);
+            info!(
+                "Found Laravel project root at {:?} (composer.json + app + resources)",
+                current
+            );
             return Some(current.to_path_buf());
         }
 
         // Or if we find composer.json + src/ + vendor/ (Laravel package)
         // This pattern recognizes Laravel package development
         if has_composer && has_src && has_vendor {
-            info!("Found Laravel package root at {:?} (composer.json + src + vendor)", current);
+            info!(
+                "Found Laravel package root at {:?} (composer.json + src + vendor)",
+                current
+            );
             return Some(current.to_path_buf());
         }
 
@@ -96,7 +105,9 @@ pub fn load_component_aliases(root: &Path) -> HashMap<String, String> {
                 if path.extension().and_then(|s| s.to_str()) != Some("php") {
                     continue;
                 }
-                let Ok(source) = fs::read_to_string(&path) else { continue };
+                let Ok(source) = fs::read_to_string(&path) else {
+                    continue;
+                };
                 extract_provider_blade_aliases(&source, &mut aliases);
             }
         }
@@ -380,8 +391,8 @@ fn scan_vendor_uncached(root: &Path) -> HashMap<String, String> {
         // Content gate (cheap substring): must look like a Blade component
         // registration. Avoids parsing files that happen to be named
         // *ServiceProvider* but register middleware, bindings, etc.
-        let has_component_call = source.contains("Blade::component(")
-            || source.contains("->component(");
+        let has_component_call =
+            source.contains("Blade::component(") || source.contains("->component(");
         if !has_component_call {
             continue;
         }
@@ -413,7 +424,11 @@ fn vendor_cache_path(root: &Path) -> Option<PathBuf> {
     canonical.hash(&mut hasher);
     let project_hash = format!("{:x}", hasher.finish());
 
-    Some(cache_base.join(project_hash).join(VENDOR_ALIAS_CACHE_FILENAME))
+    Some(
+        cache_base
+            .join(project_hash)
+            .join(VENDOR_ALIAS_CACHE_FILENAME),
+    )
 }
 
 fn read_vendor_cache(root: &Path) -> Option<VendorAliasCache> {
@@ -472,7 +487,10 @@ fn extract_provider_blade_aliases(source: &str, aliases: &mut HashMap<String, St
 /// `Class::class` reference (those are PHP component classes, not view paths).
 fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) {
     // Find the start of the aliases block: 'aliases' => [
-    let Some(aliases_pos) = source.find("'aliases'").or_else(|| source.find("\"aliases\"")) else {
+    let Some(aliases_pos) = source
+        .find("'aliases'")
+        .or_else(|| source.find("\"aliases\""))
+    else {
         return;
     };
 
@@ -508,7 +526,11 @@ fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) 
 
     for raw_line in block.lines() {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') || line.starts_with("/*") {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+        {
             continue;
         }
 

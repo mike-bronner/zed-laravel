@@ -37,10 +37,7 @@ Route::get('/register')->name('register');
     let path = PathBuf::from("/fake/routes/auth.php");
     let results = extract_named_routes(src, &path, PRIORITY_APP);
 
-    let names: Vec<&str> = results
-        .iter()
-        .filter_map(|(n, _)| n.as_deref())
-        .collect();
+    let names: Vec<&str> = results.iter().filter_map(|(n, _)| n.as_deref()).collect();
     assert_eq!(names, vec!["login", "logout", "register"]);
 }
 
@@ -79,10 +76,7 @@ public function auth()
     let path = PathBuf::from("/fake/vendor/laravel/ui/src/AuthRouteMethods.php");
     let results = extract_named_routes(src, &path, PRIORITY_PACKAGE);
 
-    let names: Vec<&str> = results
-        .iter()
-        .filter_map(|(n, _)| n.as_deref())
-        .collect();
+    let names: Vec<&str> = results.iter().filter_map(|(n, _)| n.as_deref()).collect();
     assert_eq!(names, vec!["login", "logout"]);
 }
 
@@ -112,7 +106,10 @@ fn route_index_resolves_priority_collision() {
     );
 
     let def = idx.get("login").expect("should resolve");
-    assert!(def.file.ends_with("routes/auth.php"), "app should win over package");
+    assert!(
+        def.file.ends_with("routes/auth.php"),
+        "app should win over package"
+    );
     assert_eq!(def.priority, PRIORITY_APP);
 }
 
@@ -129,7 +126,9 @@ fn route_index_keeps_lower_when_higher_does_not_redefine() {
             priority: PRIORITY_PACKAGE,
         },
     );
-    let def = idx.get("horizon.index").expect("package route should index");
+    let def = idx
+        .get("horizon.index")
+        .expect("package route should index");
     assert_eq!(def.priority, PRIORITY_PACKAGE);
 }
 
@@ -208,7 +207,9 @@ fn priority_for_vendor_path_distinguishes_framework() {
         PRIORITY_FRAMEWORK
     );
     assert_eq!(
-        priority_for_vendor_path(Path::new("/project/vendor/laravel/fortify/routes/routes.php")),
+        priority_for_vendor_path(Path::new(
+            "/project/vendor/laravel/fortify/routes/routes.php"
+        )),
         PRIORITY_PACKAGE
     );
 }

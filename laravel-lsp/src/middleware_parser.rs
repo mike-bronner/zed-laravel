@@ -33,7 +33,10 @@ pub fn resolve_class_to_file(class_name: &str, root_path: &Path) -> Option<PathB
     for (namespace_prefix, path_prefix) in &mappings {
         if path_str.starts_with(namespace_prefix) {
             let relative = path_str.strip_prefix(namespace_prefix).unwrap();
-            let file_path = root_path.join(path_prefix).join(relative).with_extension("php");
+            let file_path = root_path
+                .join(path_prefix)
+                .join(relative)
+                .with_extension("php");
 
             // Return the expected path regardless of whether it exists
             // The caller will check existence and create appropriate diagnostics

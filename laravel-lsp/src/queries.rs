@@ -53,13 +53,15 @@ static BLADE_QUERY_CACHE: Lazy<Option<Query>> = Lazy::new(|| {
 
 /// Get the cached PHP query, or compile it if needed
 fn get_php_query(_language: &Language) -> Result<&'static Query> {
-    PHP_QUERY_CACHE.as_ref()
+    PHP_QUERY_CACHE
+        .as_ref()
         .ok_or_else(|| anyhow!("Failed to compile PHP query"))
 }
 
 /// Get the cached Blade query, or compile it if needed
 fn get_blade_query(_language: &Language) -> Result<&'static Query> {
-    BLADE_QUERY_CACHE.as_ref()
+    BLADE_QUERY_CACHE
+        .as_ref()
         .ok_or_else(|| anyhow!("Failed to compile Blade query"))
 }
 
@@ -486,25 +488,31 @@ pub fn extract_all_php_patterns<'a>(
             // Blade component alias registrations
             // ($blade->component('view.path', 'alias') or Blade::component(...))
             "blade_alias_name" => {
-                let view = query_match.captures.iter()
+                let view = query_match
+                    .captures
+                    .iter()
                     .find(|c| query.capture_names()[c.index as usize] == "blade_alias_view")
                     .and_then(|c| c.node.utf8_text(source_bytes).ok());
 
                 if let Some(view) = view {
-                    result.blade_component_aliases.push(BladeComponentAliasMatch {
-                        alias: text,
-                        view,
-                        byte_start: node.start_byte(),
-                        byte_end: node.end_byte(),
-                        row: node.start_position().row,
-                    });
+                    result
+                        .blade_component_aliases
+                        .push(BladeComponentAliasMatch {
+                            alias: text,
+                            view,
+                            byte_start: node.start_byte(),
+                            byte_end: node.end_byte(),
+                            row: node.start_position().row,
+                        });
                 }
             }
 
             // Middleware alias definitions (from $middlewareAliases property)
             "middleware_alias_key" => {
                 // Find the corresponding class capture in the same match
-                let class_name = query_match.captures.iter()
+                let class_name = query_match
+                    .captures
+                    .iter()
                     .find(|c| query.capture_names()[c.index as usize] == "middleware_alias_class")
                     .and_then(|c| c.node.utf8_text(source_bytes).ok());
 
@@ -732,8 +740,8 @@ pub fn extract_all_php_patterns<'a>(
             // Feature patterns (Laravel Pennant) - string-based feature names
             "feature_name" => {
                 // Get the method name from a sibling capture in the same match
-                let method_name = get_feature_method_name(&query_match, query, source_bytes)
-                    .unwrap_or("active");
+                let method_name =
+                    get_feature_method_name(&query_match, query, source_bytes).unwrap_or("active");
                 result.feature_calls.push(FeatureMatch {
                     feature_name: text,
                     method_name,
@@ -749,8 +757,8 @@ pub fn extract_all_php_patterns<'a>(
             // Feature patterns (Laravel Pennant) - class-based feature references
             "feature_class_name" => {
                 let clean_class = text.trim_start_matches('\\');
-                let method_name = get_feature_method_name(&query_match, query, source_bytes)
-                    .unwrap_or("active");
+                let method_name =
+                    get_feature_method_name(&query_match, query, source_bytes).unwrap_or("active");
                 result.feature_calls.push(FeatureMatch {
                     feature_name: clean_class,
                     method_name,
@@ -765,14 +773,16 @@ pub fn extract_all_php_patterns<'a>(
 
             // Feature class $name property - custom aliases
             "feature_name_value" => {
-                result.feature_name_properties.push(FeatureNamePropertyMatch {
-                    name_value: text,
-                    byte_start: node.start_byte(),
-                    byte_end: node.end_byte(),
-                    row: start_pos.row,
-                    column: start_pos.column,
-                    end_column: end_pos.column,
-                });
+                result
+                    .feature_name_properties
+                    .push(FeatureNamePropertyMatch {
+                        name_value: text,
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: start_pos.row,
+                        column: start_pos.column,
+                        end_column: end_pos.column,
+                    });
             }
 
             // Ignore other captures (function_name, class_name, etc. used for matching)
@@ -781,10 +791,18 @@ pub fn extract_all_php_patterns<'a>(
     }
 
     let total_time = start.elapsed();
-    let pattern_count = result.views.len() + result.env_calls.len() + result.config_calls.len()
-        + result.middleware_calls.len() + result.translation_calls.len() + result.asset_calls.len()
-        + result.binding_calls.len() + result.route_calls.len() + result.url_calls.len()
-        + result.action_calls.len() + result.feature_calls.len() + result.feature_name_properties.len();
+    let pattern_count = result.views.len()
+        + result.env_calls.len()
+        + result.config_calls.len()
+        + result.middleware_calls.len()
+        + result.translation_calls.len()
+        + result.asset_calls.len()
+        + result.binding_calls.len()
+        + result.route_calls.len()
+        + result.url_calls.len()
+        + result.action_calls.len()
+        + result.feature_calls.len()
+        + result.feature_name_properties.len();
     info!(
         "📊 PHP extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count
@@ -887,10 +905,12 @@ pub fn extract_all_blade_patterns<'a>(
                 // Calculate string column positions for view-referencing, translation, and feature directives
                 // Use the actual parameter column from tree-sitter for accurate positioning
                 let (string_column, string_end_column) = match (directive_name, &param_info) {
-                    ("extends" | "include" | "slot" | "component" | "lang" | "feature" | "livewire", Some(info)) => {
-                        calculate_string_column_range(info.column, info.text)
-                            .unwrap_or((directive_column, directive_end_column))
-                    }
+                    (
+                        "extends" | "include" | "slot" | "component" | "lang" | "feature"
+                        | "livewire",
+                        Some(info),
+                    ) => calculate_string_column_range(info.column, info.text)
+                        .unwrap_or((directive_column, directive_end_column)),
                     _ => (directive_column, directive_end_column),
                 };
 
@@ -968,15 +988,21 @@ pub fn extract_all_blade_patterns<'a>(
 
                 // Calculate string column positions for view-referencing directives
                 // For directive_attribute, calculate parameter column from paren position
-                let (string_column, string_end_column) = match (directive_name, &arguments, paren_pos) {
-                    ("extends" | "include" | "slot" | "component" | "lang" | "feature" | "livewire", Some(args), Some(pos)) => {
-                        // Parameter column = directive_column + @ + paren_pos
-                        let parameter_column = directive_column + 1 + pos;
-                        calculate_string_column_range(parameter_column, args)
-                            .unwrap_or((directive_column, directive_end_column))
-                    }
-                    _ => (directive_column, directive_end_column),
-                };
+                let (string_column, string_end_column) =
+                    match (directive_name, &arguments, paren_pos) {
+                        (
+                            "extends" | "include" | "slot" | "component" | "lang" | "feature"
+                            | "livewire",
+                            Some(args),
+                            Some(pos),
+                        ) => {
+                            // Parameter column = directive_column + @ + paren_pos
+                            let parameter_column = directive_column + 1 + pos;
+                            calculate_string_column_range(parameter_column, args)
+                                .unwrap_or((directive_column, directive_end_column))
+                        }
+                        _ => (directive_column, directive_end_column),
+                    };
 
                 result.directives.push(DirectiveMatch {
                     directive_name,
@@ -1013,7 +1039,11 @@ pub fn extract_all_blade_patterns<'a>(
     }
 
     let total_time = start.elapsed();
-    let pattern_count = result.components.len() + result.livewire.len() + result.directives.len() + result.echo_php.len() + result.slots.len();
+    let pattern_count = result.components.len()
+        + result.livewire.len()
+        + result.directives.len()
+        + result.echo_php.len()
+        + result.slots.len();
     info!(
         "📊 Blade extraction: {:?} total (query fetch: {:?}), {} patterns found",
         total_time, query_fetch_time, pattern_count
@@ -1159,4 +1189,3 @@ fn calculate_string_column_range(
 
 #[cfg(test)]
 mod tests;
-

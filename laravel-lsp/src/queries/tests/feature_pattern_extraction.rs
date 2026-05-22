@@ -21,11 +21,14 @@ fn extract_feature_patterns() {
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Check that we found feature calls
-    assert!(!patterns.feature_calls.is_empty(), "Should find feature calls");
+    assert!(
+        !patterns.feature_calls.is_empty(),
+        "Should find feature calls"
+    );
 
     // Get all feature names
     let feature_names: Vec<&str> = patterns
@@ -86,8 +89,8 @@ class NewApi
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     assert_eq!(
         patterns.feature_name_properties.len(),
@@ -120,8 +123,8 @@ class BetaMode
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     assert_eq!(
         patterns.feature_name_properties.len(),
@@ -149,8 +152,8 @@ class SomeClass
 
     let tree = parse_php(php_code).expect("Should parse PHP");
     let lang = language_php();
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     assert!(
         patterns.feature_name_properties.is_empty(),

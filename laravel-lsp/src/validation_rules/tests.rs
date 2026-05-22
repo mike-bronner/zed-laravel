@@ -3,8 +3,14 @@ use super::*;
 #[test]
 fn test_camel_to_snake() {
     assert_eq!(LaravelRulesParser::camel_to_snake("Required"), "required");
-    assert_eq!(LaravelRulesParser::camel_to_snake("AfterOrEqual"), "after_or_equal");
-    assert_eq!(LaravelRulesParser::camel_to_snake("RequiredIf"), "required_if");
+    assert_eq!(
+        LaravelRulesParser::camel_to_snake("AfterOrEqual"),
+        "after_or_equal"
+    );
+    assert_eq!(
+        LaravelRulesParser::camel_to_snake("RequiredIf"),
+        "required_if"
+    );
     assert_eq!(LaravelRulesParser::camel_to_snake("Gt"), "gt");
 }
 

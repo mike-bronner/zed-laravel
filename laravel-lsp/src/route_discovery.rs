@@ -114,7 +114,11 @@ pub fn discover_route_files(root: &Path) -> Vec<RouteFile> {
             // Anything under a vendor `routes/` subdirectory is a route file
             // by Laravel package convention.
             if is_under_routes_dir(path) {
-                promote(&mut seen, path.to_path_buf(), priority_for_vendor_path(path));
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
                 continue;
             }
 
@@ -124,7 +128,11 @@ pub fn discover_route_files(root: &Path) -> Vec<RouteFile> {
             // AuthRouteMethods), service-provider `boot()` registrations,
             // and Filament-style `Panel::routes(fn () => ...)` panels.
             if file_registers_named_routes(path) {
-                promote(&mut seen, path.to_path_buf(), priority_for_vendor_path(path));
+                promote(
+                    &mut seen,
+                    path.to_path_buf(),
+                    priority_for_vendor_path(path),
+                );
             }
         }
     }

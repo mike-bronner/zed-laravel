@@ -7,7 +7,10 @@ use laravel_lsp::php_class::{
 #[test]
 fn test_parse_generic_args_single() {
     let result = parse_generic_args("Collection<Audit>");
-    assert_eq!(result, Some(("Collection".to_string(), vec!["Audit".to_string()])));
+    assert_eq!(
+        result,
+        Some(("Collection".to_string(), vec!["Audit".to_string()]))
+    );
 }
 
 #[test]
@@ -15,7 +18,10 @@ fn test_parse_generic_args_pair() {
     let result = parse_generic_args("LengthAwarePaginator<int, Audit>");
     assert_eq!(
         result,
-        Some(("LengthAwarePaginator".to_string(), vec!["int".to_string(), "Audit".to_string()]))
+        Some((
+            "LengthAwarePaginator".to_string(),
+            vec!["int".to_string(), "Audit".to_string()]
+        ))
     );
 }
 
@@ -24,7 +30,10 @@ fn test_parse_generic_args_nested() {
     let result = parse_generic_args("Foo<Bar<Baz>, Qux>");
     assert_eq!(
         result,
-        Some(("Foo".to_string(), vec!["Bar<Baz>".to_string(), "Qux".to_string()]))
+        Some((
+            "Foo".to_string(),
+            vec!["Bar<Baz>".to_string(), "Qux".to_string()]
+        ))
     );
 }
 
@@ -82,8 +91,22 @@ class Foo {
 fn test_loop_var_properties_has_standard_members() {
     let props = LaravelLanguageServer::loop_var_properties();
     let names: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
-    for expected in &["index", "iteration", "first", "last", "even", "odd", "count", "depth", "parent"] {
-        assert!(names.contains(expected), "loop var props missing: {}", expected);
+    for expected in &[
+        "index",
+        "iteration",
+        "first",
+        "last",
+        "even",
+        "odd",
+        "count",
+        "depth",
+        "parent",
+    ] {
+        assert!(
+            names.contains(expected),
+            "loop var props missing: {}",
+            expected
+        );
     }
 }
 

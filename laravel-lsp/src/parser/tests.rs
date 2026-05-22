@@ -29,9 +29,7 @@ fn test_parse_simple_php() {
 
     // Should contain a function call (view)
     let source = php_code.as_bytes();
-    let has_function_call = root
-        .descendant_for_byte_range(0, source.len())
-        .is_some();
+    let has_function_call = root.descendant_for_byte_range(0, source.len()).is_some();
     assert!(has_function_call);
 }
 

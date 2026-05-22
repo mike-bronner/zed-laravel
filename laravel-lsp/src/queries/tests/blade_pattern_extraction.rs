@@ -19,8 +19,8 @@ fn extract_all_blade_patterns_components() {
 
     let tree = parse_blade(blade_code).expect("Should parse Blade");
     let lang = language_blade();
-    let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
 
     assert!(
         !patterns.components.is_empty(),
@@ -53,8 +53,8 @@ fn extract_all_blade_patterns_directives() {
 
     let tree = parse_blade(blade_code).expect("Should parse Blade");
     let lang = language_blade();
-    let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
 
     let directive_names: Vec<&str> = patterns
         .directives
@@ -93,8 +93,8 @@ fn extract_blade_feature_directive() {
 
     let tree = parse_blade(blade_code).expect("Should parse Blade");
     let lang = language_blade();
-    let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
 
     // Check that @feature directive is captured
     let feature_directives: Vec<_> = patterns
@@ -103,7 +103,11 @@ fn extract_blade_feature_directive() {
         .filter(|d| d.directive_name == "feature")
         .collect();
 
-    assert_eq!(feature_directives.len(), 2, "Should find 2 @feature directives");
+    assert_eq!(
+        feature_directives.len(),
+        2,
+        "Should find 2 @feature directives"
+    );
 
     // Verify first @feature directive
     let first = feature_directives[0];
@@ -147,8 +151,8 @@ fn blade_patterns_inside_html_attributes() {
 
     let tree = parse_blade(blade_code).expect("Should parse Blade");
     let lang = language_blade();
-    let patterns = extract_all_blade_patterns(&tree, blade_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
 
     // Check that echo statements in attributes are captured
     let has_config_echo = patterns
@@ -193,7 +197,11 @@ fn blade_patterns_inside_html_attributes() {
     assert!(
         has_disabled,
         "Should find @disabled directive: {:?}",
-        patterns.directives.iter().map(|d| &d.directive_name).collect::<Vec<_>>()
+        patterns
+            .directives
+            .iter()
+            .map(|d| &d.directive_name)
+            .collect::<Vec<_>>()
     );
 
     let has_checked = patterns
@@ -234,7 +242,10 @@ fn blade_translation_patterns() {
         .directives
         .iter()
         .any(|d| d.directive_name == "lang");
-    assert!(has_lang_directive, "@lang should be captured as a directive");
+    assert!(
+        has_lang_directive,
+        "@lang should be captured as a directive"
+    );
 
     // And we should have captured the {{ __() }} echo content
     let has_echo_php = !blade_patterns.echo_php.is_empty();

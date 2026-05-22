@@ -137,7 +137,9 @@ impl ModelMetadata {
     /// Extract casts from casts(): array method
     fn extract_casts_method(content: &str) -> Option<HashMap<String, String>> {
         // Find the casts() method and its return array
-        let re = Regex::new(r"(?s)function\s+casts\s*\(\s*\)\s*:\s*array\s*\{\s*return\s*\[([^\]]*)\]").ok()?;
+        let re =
+            Regex::new(r"(?s)function\s+casts\s*\(\s*\)\s*:\s*array\s*\{\s*return\s*\[([^\]]*)\]")
+                .ok()?;
         let caps = re.captures(content)?;
         let array_content = caps.get(1)?.as_str();
 
@@ -172,9 +174,9 @@ impl ModelMetadata {
         let mut accessors = Vec::new();
 
         // Old-style: getFirstNameAttribute(): string
-        let old_style_re = Regex::new(
-            r"(?:public\s+)?function\s+get(\w+)Attribute\s*\([^)]*\)\s*(?::\s*(\w+))?"
-        ).unwrap();
+        let old_style_re =
+            Regex::new(r"(?:public\s+)?function\s+get(\w+)Attribute\s*\([^)]*\)\s*(?::\s*(\w+))?")
+                .unwrap();
 
         for caps in old_style_re.captures_iter(content) {
             if let Some(name) = caps.get(1) {
@@ -189,9 +191,8 @@ impl ModelMetadata {
         }
 
         // New-style: firstName(): Attribute
-        let new_style_re = Regex::new(
-            r"(?:public\s+)?function\s+(\w+)\s*\([^)]*\)\s*:\s*Attribute"
-        ).unwrap();
+        let new_style_re =
+            Regex::new(r"(?:public\s+)?function\s+(\w+)\s*\([^)]*\)\s*:\s*Attribute").unwrap();
 
         for caps in new_style_re.captures_iter(content) {
             if let Some(name) = caps.get(1) {
@@ -215,9 +216,17 @@ impl ModelMetadata {
 
         // Common relationship types - ordered longest first to avoid partial matches
         let relationship_types = [
-            "belongsToMany", "belongsTo",  // belongsToMany before belongsTo
-            "hasManyThrough", "hasOneThrough", "hasMany", "hasOne",  // through variants first
-            "morphToMany", "morphedByMany", "morphMany", "morphOne", "morphTo",  // morph variants
+            "belongsToMany",
+            "belongsTo", // belongsToMany before belongsTo
+            "hasManyThrough",
+            "hasOneThrough",
+            "hasMany",
+            "hasOne", // through variants first
+            "morphToMany",
+            "morphedByMany",
+            "morphMany",
+            "morphOne",
+            "morphTo", // morph variants
         ];
 
         for rel_type in relationship_types {
@@ -232,8 +241,14 @@ impl ModelMetadata {
                     if let Some(method) = caps.get(1) {
                         let method_name = method.as_str().to_string();
                         // Don't add duplicates
-                        if !relationships.iter().any(|r: &RelationshipInfo| r.method_name == method_name) {
-                            let related_model = Self::extract_related_model_from_relationship(content, &method_name);
+                        if !relationships
+                            .iter()
+                            .any(|r: &RelationshipInfo| r.method_name == method_name)
+                        {
+                            let related_model = Self::extract_related_model_from_relationship(
+                                content,
+                                &method_name,
+                            );
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -255,8 +270,14 @@ impl ModelMetadata {
                     if let Some(method) = caps.get(1) {
                         let method_name = method.as_str().to_string();
                         // Don't add duplicates
-                        if !relationships.iter().any(|r: &RelationshipInfo| r.method_name == method_name) {
-                            let related_model = Self::extract_related_model_from_relationship(content, &method_name);
+                        if !relationships
+                            .iter()
+                            .any(|r: &RelationshipInfo| r.method_name == method_name)
+                        {
+                            let related_model = Self::extract_related_model_from_relationship(
+                                content,
+                                &method_name,
+                            );
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -278,9 +299,11 @@ impl ModelMetadata {
         let method_re = Regex::new(&format!(
             r"function\s+{}\s*\([^)]*\)[^{{]*\{{\s*return\s+\$this->\w+\(\s*(\w+)::class",
             regex::escape(method_name)
-        )).ok()?;
+        ))
+        .ok()?;
 
-        method_re.captures(content)
+        method_re
+            .captures(content)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     }
@@ -351,7 +374,8 @@ pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> 
             format!("?{}", model)
         }
         // Collection relationships
-        "hasMany" | "belongsToMany" | "morphMany" | "morphToMany" | "morphedByMany" | "hasManyThrough" => {
+        "hasMany" | "belongsToMany" | "morphMany" | "morphToMany" | "morphedByMany"
+        | "hasManyThrough" => {
             format!("Collection<{}>", model)
         }
         _ => "mixed".to_string(),

@@ -9,13 +9,12 @@ use super::*;
 
 // ─── Vite directive parsing ────────────────────────────────────────────
 
-
 #[test]
 fn test_vite_singular_syntax() {
     // @vite('resources/css/app.css') - args from tree-sitter
     let args = "('resources/css/app.css')";
     let results = parse_vite_directive_assets(args, 0, 0, 5);
-    
+
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "resources/css/app.css");
 }
@@ -25,7 +24,7 @@ fn test_vite_array_syntax() {
     // @vite(['resources/css/app.css', 'resources/js/app.js'])
     let args = "(['resources/css/app.css', 'resources/js/app.js'])";
     let results = parse_vite_directive_assets(args, 0, 0, 5);
-    
+
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].0, "resources/css/app.css");
     assert_eq!(results[1].0, "resources/js/app.js");
@@ -53,7 +52,10 @@ fn test_extract_translation_from_echo() {
     // Test with single quotes
     let content2 = "__('messages.welcome')";
     let result2 = super::extract_translation_from_echo(content2);
-    assert!(result2.is_some(), "Should extract translation from __() with single quotes");
+    assert!(
+        result2.is_some(),
+        "Should extract translation from __() with single quotes"
+    );
     let (key2, _, _) = result2.unwrap();
     assert_eq!(key2, "messages.welcome");
 
@@ -82,11 +84,14 @@ fn test_vite_column_positions() {
     // Column should point to 'r' (first char of path), adjusted for LSP
     assert_eq!(results[0].2, 8, "start column should be 8");
     // End column should be 8 + 21 = 29
-    assert_eq!(results[0].3, 8 + path.len() as u32, "end column should be start + path.len()");
+    assert_eq!(
+        results[0].3,
+        8 + path.len() as u32,
+        "end column should be start + path.len()"
+    );
 }
 
 // ─── Component alias parsing ────────────────────────────────────────────
-
 
 fn make_config_with_alias(alias: &str, view: &str) -> LaravelConfigData {
     let mut aliases = HashMap::new();
@@ -138,14 +143,13 @@ fn icon_tag_resolves_to_svg_path() {
 
 #[test]
 fn unregistered_icon_tag_falls_through() {
-    let config = make_config_with_icon(
-        "heroicon-o-clock",
-        "/abs/path/o-clock.svg",
-    );
+    let config = make_config_with_icon("heroicon-o-clock", "/abs/path/o-clock.svg");
     let paths = config.resolve_component_path("heroicon-o-bell");
     // Falls through to directory convention — no svg path returned.
     assert!(
-        paths.iter().all(|p| !p.to_string_lossy().ends_with("o-bell.svg")),
+        paths
+            .iter()
+            .all(|p| !p.to_string_lossy().ends_with("o-bell.svg")),
         "unregistered icon should not return a phantom svg path: {:?}",
         paths,
     );

@@ -28,15 +28,24 @@ fn single_pass_extracts_all_pattern_types() {
     let lang = language_php();
 
     // Should extract all patterns in one call
-    let patterns = extract_all_php_patterns(&tree, php_code, &lang)
-        .expect("Should extract patterns");
+    let patterns =
+        extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
     // Verify we found patterns of different types
     assert!(!patterns.views.is_empty(), "Should find views");
     assert!(!patterns.env_calls.is_empty(), "Should find env calls");
-    assert!(!patterns.config_calls.is_empty(), "Should find config calls");
-    assert!(!patterns.middleware_calls.is_empty(), "Should find middleware");
-    assert!(!patterns.translation_calls.is_empty(), "Should find translations");
+    assert!(
+        !patterns.config_calls.is_empty(),
+        "Should find config calls"
+    );
+    assert!(
+        !patterns.middleware_calls.is_empty(),
+        "Should find middleware"
+    );
+    assert!(
+        !patterns.translation_calls.is_empty(),
+        "Should find translations"
+    );
     assert!(!patterns.asset_calls.is_empty(), "Should find assets");
     assert!(!patterns.binding_calls.is_empty(), "Should find bindings");
     assert!(!patterns.route_calls.is_empty(), "Should find routes");

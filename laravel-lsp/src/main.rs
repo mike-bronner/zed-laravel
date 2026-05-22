@@ -4,28 +4,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
 use tokio::time::sleep;
 use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 // Use the library crate for all modules
+use laravel_lsp::cache_manager::{
+    BindingEntry, CacheManager, CachedEnvVars, CachedLaravelConfig, MiddlewareEntry, RescanType,
+    ScanResult,
+};
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
-use laravel_lsp::route_discovery::{
-    build_route_index, discover_route_files, RouteIndex,
-};
-use laravel_lsp::cache_manager::{CacheManager, RescanType, ScanResult, MiddlewareEntry, BindingEntry, CachedLaravelConfig, CachedEnvVars};
+use laravel_lsp::route_discovery::{build_route_index, discover_route_files, RouteIndex};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
 use laravel_lsp::salsa_impl::{
-    SalsaActor, SalsaHandle, PatternAtPosition, LaravelConfigData,
-    ViewReferenceData, ComponentReferenceData, DirectiveReferenceData,
-    EnvReferenceData, ConfigReferenceData, LivewireReferenceData,
-    MiddlewareReferenceData, TranslationReferenceData, AssetReferenceData, BindingReferenceData,
-    RouteReferenceData, UrlReferenceData, ActionReferenceData, FeatureReferenceData,
+    ActionReferenceData, AssetReferenceData, BindingReferenceData, ComponentReferenceData,
+    ConfigReferenceData, DirectiveReferenceData, EnvReferenceData, FeatureReferenceData,
+    LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData, PatternAtPosition,
+    RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData, UrlReferenceData,
+    ViewReferenceData,
 };
 
 // ============================================================================
@@ -38,8 +39,8 @@ use laravel_lsp::salsa_impl::{
 /// `Illuminate\Foundation\Configuration\Middleware`) and resolves them
 /// to file paths for scanning.
 fn extract_middleware_imports(content: &str, root: &Path) -> Vec<PathBuf> {
-    use regex::Regex;
     use lazy_static::lazy_static;
+    use regex::Regex;
 
     lazy_static! {
         // Match: use Illuminate\...\Middleware;
@@ -246,37 +247,170 @@ struct CastTypeInfo {
 fn get_laravel_cast_types() -> Vec<CastTypeInfo> {
     vec![
         // Primitive types
-        CastTypeInfo { name: "array".into(), description: "JSON to PHP array".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "boolean".into(), description: "Cast to boolean".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "collection".into(), description: "JSON to Laravel Collection".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "date".into(), description: "Cast to Carbon date (without time)".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "datetime".into(), description: "Cast to Carbon datetime".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "immutable_date".into(), description: "Cast to CarbonImmutable date".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "immutable_datetime".into(), description: "Cast to CarbonImmutable datetime".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "decimal".into(), description: "Cast to decimal with precision (e.g., decimal:2)".into(), has_params: true, source: "laravel".into() },
-        CastTypeInfo { name: "double".into(), description: "Cast to double/float".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "float".into(), description: "Cast to float".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "hashed".into(), description: "Hash value when setting (Laravel 10+)".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "integer".into(), description: "Cast to integer".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "object".into(), description: "JSON to PHP stdClass object".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "real".into(), description: "Cast to real/float".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "string".into(), description: "Cast to string".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "timestamp".into(), description: "Cast to Unix timestamp".into(), has_params: false, source: "laravel".into() },
-
+        CastTypeInfo {
+            name: "array".into(),
+            description: "JSON to PHP array".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "boolean".into(),
+            description: "Cast to boolean".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "collection".into(),
+            description: "JSON to Laravel Collection".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "date".into(),
+            description: "Cast to Carbon date (without time)".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "datetime".into(),
+            description: "Cast to Carbon datetime".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "immutable_date".into(),
+            description: "Cast to CarbonImmutable date".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "immutable_datetime".into(),
+            description: "Cast to CarbonImmutable datetime".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "decimal".into(),
+            description: "Cast to decimal with precision (e.g., decimal:2)".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "double".into(),
+            description: "Cast to double/float".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "float".into(),
+            description: "Cast to float".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "hashed".into(),
+            description: "Hash value when setting (Laravel 10+)".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "integer".into(),
+            description: "Cast to integer".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "object".into(),
+            description: "JSON to PHP stdClass object".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "real".into(),
+            description: "Cast to real/float".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "string".into(),
+            description: "Cast to string".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "timestamp".into(),
+            description: "Cast to Unix timestamp".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
         // Encrypted types
-        CastTypeInfo { name: "encrypted".into(), description: "Encrypt/decrypt value".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "encrypted:array".into(), description: "Encrypt/decrypt as array".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "encrypted:collection".into(), description: "Encrypt/decrypt as Collection".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "encrypted:object".into(), description: "Encrypt/decrypt as object".into(), has_params: false, source: "laravel".into() },
-
+        CastTypeInfo {
+            name: "encrypted".into(),
+            description: "Encrypt/decrypt value".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "encrypted:array".into(),
+            description: "Encrypt/decrypt as array".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "encrypted:collection".into(),
+            description: "Encrypt/decrypt as Collection".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "encrypted:object".into(),
+            description: "Encrypt/decrypt as object".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
         // Castable classes (common ones)
-        CastTypeInfo { name: "AsStringable::class".into(), description: "Cast to Stringable instance".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsArrayObject::class".into(), description: "Cast to ArrayObject instance".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsCollection::class".into(), description: "Cast to Collection instance".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsEncryptedArrayObject::class".into(), description: "Encrypted ArrayObject".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsEncryptedCollection::class".into(), description: "Encrypted Collection".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsEnumArrayObject::class".into(), description: "Cast to EnumArrayObject".into(), has_params: false, source: "laravel".into() },
-        CastTypeInfo { name: "AsEnumCollection::class".into(), description: "Cast to EnumCollection".into(), has_params: false, source: "laravel".into() },
+        CastTypeInfo {
+            name: "AsStringable::class".into(),
+            description: "Cast to Stringable instance".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsArrayObject::class".into(),
+            description: "Cast to ArrayObject instance".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsCollection::class".into(),
+            description: "Cast to Collection instance".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsEncryptedArrayObject::class".into(),
+            description: "Encrypted ArrayObject".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsEncryptedCollection::class".into(),
+            description: "Encrypted Collection".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsEnumArrayObject::class".into(),
+            description: "Cast to EnumArrayObject".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        CastTypeInfo {
+            name: "AsEnumCollection::class".into(),
+            description: "Cast to EnumCollection".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
     ]
 }
 
@@ -285,8 +419,8 @@ fn scan_all_casts(project_root: &Path) -> Vec<CastTypeInfo> {
     let mut casts = Vec::new();
 
     // 1. Scan Laravel framework's built-in casts
-    let laravel_casts_path = project_root
-        .join("vendor/laravel/framework/src/Illuminate/Database/Eloquent/Casts");
+    let laravel_casts_path =
+        project_root.join("vendor/laravel/framework/src/Illuminate/Database/Eloquent/Casts");
     if laravel_casts_path.exists() {
         casts.extend(scan_cast_directory(
             &laravel_casts_path,
@@ -298,8 +432,14 @@ fn scan_all_casts(project_root: &Path) -> Vec<CastTypeInfo> {
     // 2. Scan common package locations for casts
     let package_paths = [
         // Spatie packages
-        ("vendor/spatie/laravel-data/src/Casts", "Spatie\\LaravelData\\Casts"),
-        ("vendor/spatie/laravel-enum/src/Casts", "Spatie\\Enum\\Laravel\\Casts"),
+        (
+            "vendor/spatie/laravel-data/src/Casts",
+            "Spatie\\LaravelData\\Casts",
+        ),
+        (
+            "vendor/spatie/laravel-enum/src/Casts",
+            "Spatie\\Enum\\Laravel\\Casts",
+        ),
         // Add more common packages as needed
     ];
 
@@ -313,7 +453,11 @@ fn scan_all_casts(project_root: &Path) -> Vec<CastTypeInfo> {
     // 3. Scan app/Casts for custom casts
     let app_casts_path = project_root.join("app/Casts");
     if app_casts_path.exists() {
-        casts.extend(scan_cast_directory(&app_casts_path, "App\\Casts", "app/Casts"));
+        casts.extend(scan_cast_directory(
+            &app_casts_path,
+            "App\\Casts",
+            "app/Casts",
+        ));
     }
 
     casts
@@ -331,7 +475,10 @@ fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<Ca
         let path = entry.path();
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             // Skip interfaces, traits, and abstract classes by naming convention
-            if stem.ends_with("Interface") || stem.ends_with("Trait") || stem.starts_with("Abstract") {
+            if stem.ends_with("Interface")
+                || stem.ends_with("Trait")
+                || stem.starts_with("Abstract")
+            {
                 continue;
             }
 
@@ -369,7 +516,7 @@ fn feature_key_to_class_name(key: &str) -> String {
             let mut chars = s.chars();
             match chars.next() {
                 None => String::new(),
-                Some(c) => c.to_uppercase().chain(chars).collect()
+                Some(c) => c.to_uppercase().chain(chars).collect(),
             }
         })
         .collect()
@@ -422,7 +569,10 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
         let path = entry.path();
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             // Skip interfaces, traits, and abstract classes by naming convention
-            if stem.ends_with("Interface") || stem.ends_with("Trait") || stem.starts_with("Abstract") {
+            if stem.ends_with("Interface")
+                || stem.ends_with("Trait")
+                || stem.starts_with("Abstract")
+            {
                 continue;
             }
 
@@ -467,7 +617,8 @@ fn extract_feature_name_property(path: &Path) -> Option<String> {
     let patterns = extract_all_php_patterns(&tree, &content, &language).ok()?;
 
     // Return the first $name property value if found
-    patterns.feature_name_properties
+    patterns
+        .feature_name_properties
         .first()
         .map(|p| p.name_value.to_string())
 }
@@ -494,8 +645,8 @@ fn scan_laravel_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo>
     let mut directives = Vec::new();
 
     // Path to Laravel's Blade compiler concerns (traits)
-    let concerns_dir = project_root
-        .join("vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns");
+    let concerns_dir =
+        project_root.join("vendor/laravel/framework/src/Illuminate/View/Compilers/Concerns");
 
     if !concerns_dir.exists() {
         // Fallback: return minimal core directives
@@ -503,7 +654,8 @@ fn scan_laravel_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo>
     }
 
     // Regex to match compile* methods: protected function compileIf($expression)
-    let compile_method_re = Regex::new(r"protected\s+function\s+compile([A-Z][a-zA-Z]*)\s*\(").unwrap();
+    let compile_method_re =
+        Regex::new(r"protected\s+function\s+compile([A-Z][a-zA-Z]*)\s*\(").unwrap();
 
     // Scan all PHP files in the Concerns directory
     for entry in WalkDir::new(&concerns_dir)
@@ -531,11 +683,13 @@ fn scan_laravel_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo>
                     let closing = find_closing_directive(&directive_name, &content);
 
                     // Check if it has parameters (look for $expression in method signature)
-                    let has_params = content.contains(&format!("compile{}($", method_name)) ||
-                                    content.contains(&format!("compile{}( $", method_name));
+                    let has_params = content.contains(&format!("compile{}($", method_name))
+                        || content.contains(&format!("compile{}( $", method_name));
 
                     // Generate description from trait file name
-                    let source_file = entry.path().file_stem()
+                    let source_file = entry
+                        .path()
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown");
                     let description = generate_directive_description(&directive_name, source_file);
@@ -579,9 +733,12 @@ fn camel_to_directive(name: &str) -> String {
 /// Find if a directive has a closing directive
 fn find_closing_directive(directive: &str, content: &str) -> Option<String> {
     // Look for compileEnd{Directive} method
-    let pascal = directive.chars().next()
+    let pascal = directive
+        .chars()
+        .next()
         .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_default() + &directive[1..];
+        .unwrap_or_default()
+        + &directive[1..];
 
     let end_method = format!("compileEnd{}", pascal);
     if content.contains(&end_method) {
@@ -653,7 +810,8 @@ fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> 
     let mut directives = Vec::new();
 
     // Regex to match Blade::directive('name', ...) or $blade->directive('name', ...)
-    let directive_re = Regex::new(r#"(?:Blade::|->)directive\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]"#).unwrap();
+    let directive_re =
+        Regex::new(r#"(?:Blade::|->)directive\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]"#).unwrap();
 
     // Scan app service providers
     let app_providers = project_root.join("app/Providers");
@@ -681,8 +839,8 @@ fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> 
                     .into_iter()
                     .filter_map(|e| e.ok())
                     .filter(|e| {
-                        e.path().extension().map_or(false, |ext| ext == "php") &&
-                        e.path().to_string_lossy().contains("ServiceProvider")
+                        e.path().extension().map_or(false, |ext| ext == "php")
+                            && e.path().to_string_lossy().contains("ServiceProvider")
                     })
                 {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
@@ -755,29 +913,167 @@ fn get_all_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> {
 /// Fallback list of core Blade directives when Laravel framework isn't found
 fn get_fallback_blade_directives() -> Vec<BladeDirectiveInfo> {
     vec![
-        BladeDirectiveInfo { name: "if".into(), description: "Conditional statement".into(), has_params: true, closing: Some("endif".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "elseif".into(), description: "Else-if branch".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "else".into(), description: "Else branch".into(), has_params: false, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "unless".into(), description: "Negative conditional".into(), has_params: true, closing: Some("endunless".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "foreach".into(), description: "Loop through collection".into(), has_params: true, closing: Some("endforeach".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "forelse".into(), description: "Loop with empty fallback".into(), has_params: true, closing: Some("endforelse".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "for".into(), description: "For loop".into(), has_params: true, closing: Some("endfor".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "while".into(), description: "While loop".into(), has_params: true, closing: Some("endwhile".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "include".into(), description: "Include a view".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "extends".into(), description: "Extend a layout".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "section".into(), description: "Define section content".into(), has_params: true, closing: Some("endsection".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "yield".into(), description: "Yield section content".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "csrf".into(), description: "CSRF token field".into(), has_params: false, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "method".into(), description: "HTTP method field".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "auth".into(), description: "Authenticated user block".into(), has_params: true, closing: Some("endauth".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "guest".into(), description: "Guest user block".into(), has_params: true, closing: Some("endguest".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "php".into(), description: "Raw PHP block".into(), has_params: false, closing: Some("endphp".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "vite".into(), description: "Vite asset".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "props".into(), description: "Component props".into(), has_params: true, closing: None, source: "laravel".into() },
-        BladeDirectiveInfo { name: "slot".into(), description: "Component slot".into(), has_params: true, closing: Some("endslot".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "component".into(), description: "Render component".into(), has_params: true, closing: Some("endcomponent".into()), source: "laravel".into() },
-        BladeDirectiveInfo { name: "livewire".into(), description: "Livewire component".into(), has_params: true, closing: None, source: "livewire".into() },
-        BladeDirectiveInfo { name: "feature".into(), description: "Laravel Pennant feature flag".into(), has_params: true, closing: Some("endfeature".into()), source: "pennant".into() },
+        BladeDirectiveInfo {
+            name: "if".into(),
+            description: "Conditional statement".into(),
+            has_params: true,
+            closing: Some("endif".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "elseif".into(),
+            description: "Else-if branch".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "else".into(),
+            description: "Else branch".into(),
+            has_params: false,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "unless".into(),
+            description: "Negative conditional".into(),
+            has_params: true,
+            closing: Some("endunless".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "foreach".into(),
+            description: "Loop through collection".into(),
+            has_params: true,
+            closing: Some("endforeach".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "forelse".into(),
+            description: "Loop with empty fallback".into(),
+            has_params: true,
+            closing: Some("endforelse".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "for".into(),
+            description: "For loop".into(),
+            has_params: true,
+            closing: Some("endfor".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "while".into(),
+            description: "While loop".into(),
+            has_params: true,
+            closing: Some("endwhile".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "include".into(),
+            description: "Include a view".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "extends".into(),
+            description: "Extend a layout".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "section".into(),
+            description: "Define section content".into(),
+            has_params: true,
+            closing: Some("endsection".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "yield".into(),
+            description: "Yield section content".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "csrf".into(),
+            description: "CSRF token field".into(),
+            has_params: false,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "method".into(),
+            description: "HTTP method field".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "auth".into(),
+            description: "Authenticated user block".into(),
+            has_params: true,
+            closing: Some("endauth".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "guest".into(),
+            description: "Guest user block".into(),
+            has_params: true,
+            closing: Some("endguest".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "php".into(),
+            description: "Raw PHP block".into(),
+            has_params: false,
+            closing: Some("endphp".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "vite".into(),
+            description: "Vite asset".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "props".into(),
+            description: "Component props".into(),
+            has_params: true,
+            closing: None,
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "slot".into(),
+            description: "Component slot".into(),
+            has_params: true,
+            closing: Some("endslot".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "component".into(),
+            description: "Render component".into(),
+            has_params: true,
+            closing: Some("endcomponent".into()),
+            source: "laravel".into(),
+        },
+        BladeDirectiveInfo {
+            name: "livewire".into(),
+            description: "Livewire component".into(),
+            has_params: true,
+            closing: None,
+            source: "livewire".into(),
+        },
+        BladeDirectiveInfo {
+            name: "feature".into(),
+            description: "Laravel Pennant feature flag".into(),
+            has_params: true,
+            closing: Some("endfeature".into()),
+            source: "pennant".into(),
+        },
     ]
 }
 
@@ -786,127 +1082,655 @@ fn get_fallback_blade_directives() -> Vec<BladeDirectiveInfo> {
 fn get_laravel_validation_rules() -> Vec<ValidationRuleInfo> {
     vec![
         // Boolean/Acceptance Rules
-        ValidationRuleInfo { name: "accepted".into(), description: "Must be yes, on, 1, or true".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "accepted_if".into(), description: "Accepted if another field equals value".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "boolean".into(), description: "Must be boolean (true, false, 1, 0)".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "declined".into(), description: "Must be no, off, 0, or false".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "declined_if".into(), description: "Declined if another field equals value".into(), has_params: true, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "accepted".into(),
+            description: "Must be yes, on, 1, or true".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "accepted_if".into(),
+            description: "Accepted if another field equals value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "boolean".into(),
+            description: "Must be boolean (true, false, 1, 0)".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "declined".into(),
+            description: "Must be no, off, 0, or false".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "declined_if".into(),
+            description: "Declined if another field equals value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
         // String Rules
-        ValidationRuleInfo { name: "active_url".into(), description: "Valid URL with DNS record".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "alpha".into(), description: "Only alphabetic characters".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "alpha_dash".into(), description: "Alphanumeric, dashes, underscores".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "alpha_num".into(), description: "Only alphanumeric characters".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "ascii".into(), description: "Only 7-bit ASCII characters".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "confirmed".into(), description: "Must have matching _confirmation field".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "current_password".into(), description: "Must match user's password".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "different".into(), description: "Must differ from another field".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "doesnt_start_with".into(), description: "Must not start with given values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "doesnt_end_with".into(), description: "Must not end with given values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "email".into(), description: "Valid email address".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "ends_with".into(), description: "Must end with given values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "enum".into(), description: "Valid backed enum value".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "hex_color".into(), description: "Valid hexadecimal color".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "in".into(), description: "Must be in given list".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "ip".into(), description: "Valid IP address".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "ipv4".into(), description: "Valid IPv4 address".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "ipv6".into(), description: "Valid IPv6 address".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "json".into(), description: "Valid JSON string".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "lowercase".into(), description: "Must be lowercase".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "mac_address".into(), description: "Valid MAC address".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "not_in".into(), description: "Must not be in given list".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "not_regex".into(), description: "Must not match regex".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "regex".into(), description: "Must match regex pattern".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "same".into(), description: "Must match another field".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "starts_with".into(), description: "Must start with given values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "string".into(), description: "Must be a string".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "uppercase".into(), description: "Must be uppercase".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "url".into(), description: "Valid URL".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "ulid".into(), description: "Valid ULID".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "uuid".into(), description: "Valid UUID".into(), has_params: false, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "active_url".into(),
+            description: "Valid URL with DNS record".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "alpha".into(),
+            description: "Only alphabetic characters".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "alpha_dash".into(),
+            description: "Alphanumeric, dashes, underscores".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "alpha_num".into(),
+            description: "Only alphanumeric characters".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ascii".into(),
+            description: "Only 7-bit ASCII characters".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "confirmed".into(),
+            description: "Must have matching _confirmation field".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "current_password".into(),
+            description: "Must match user's password".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "different".into(),
+            description: "Must differ from another field".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "doesnt_start_with".into(),
+            description: "Must not start with given values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "doesnt_end_with".into(),
+            description: "Must not end with given values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "email".into(),
+            description: "Valid email address".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ends_with".into(),
+            description: "Must end with given values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "enum".into(),
+            description: "Valid backed enum value".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "hex_color".into(),
+            description: "Valid hexadecimal color".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "in".into(),
+            description: "Must be in given list".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ip".into(),
+            description: "Valid IP address".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ipv4".into(),
+            description: "Valid IPv4 address".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ipv6".into(),
+            description: "Valid IPv6 address".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "json".into(),
+            description: "Valid JSON string".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "lowercase".into(),
+            description: "Must be lowercase".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "mac_address".into(),
+            description: "Valid MAC address".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "not_in".into(),
+            description: "Must not be in given list".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "not_regex".into(),
+            description: "Must not match regex".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "regex".into(),
+            description: "Must match regex pattern".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "same".into(),
+            description: "Must match another field".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "starts_with".into(),
+            description: "Must start with given values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "string".into(),
+            description: "Must be a string".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "uppercase".into(),
+            description: "Must be uppercase".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "url".into(),
+            description: "Valid URL".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "ulid".into(),
+            description: "Valid ULID".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "uuid".into(),
+            description: "Valid UUID".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
         // Numeric Rules
-        ValidationRuleInfo { name: "between".into(), description: "Value between min and max".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "decimal".into(), description: "Numeric with decimal places".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "digits".into(), description: "Exact number of digits".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "digits_between".into(), description: "Digits between min and max".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "gt".into(), description: "Greater than field/value".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "gte".into(), description: "Greater than or equal".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "integer".into(), description: "Must be an integer".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "lt".into(), description: "Less than field/value".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "lte".into(), description: "Less than or equal".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "max".into(), description: "Maximum value/length/size".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "max_digits".into(), description: "Maximum number of digits".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "min".into(), description: "Minimum value/length/size".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "min_digits".into(), description: "Minimum number of digits".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "multiple_of".into(), description: "Must be multiple of value".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "numeric".into(), description: "Must be numeric".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "size".into(), description: "Exact size/length".into(), has_params: true, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "between".into(),
+            description: "Value between min and max".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "decimal".into(),
+            description: "Numeric with decimal places".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "digits".into(),
+            description: "Exact number of digits".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "digits_between".into(),
+            description: "Digits between min and max".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "gt".into(),
+            description: "Greater than field/value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "gte".into(),
+            description: "Greater than or equal".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "integer".into(),
+            description: "Must be an integer".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "lt".into(),
+            description: "Less than field/value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "lte".into(),
+            description: "Less than or equal".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "max".into(),
+            description: "Maximum value/length/size".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "max_digits".into(),
+            description: "Maximum number of digits".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "min".into(),
+            description: "Minimum value/length/size".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "min_digits".into(),
+            description: "Minimum number of digits".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "multiple_of".into(),
+            description: "Must be multiple of value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "numeric".into(),
+            description: "Must be numeric".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "size".into(),
+            description: "Exact size/length".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
         // Array Rules
-        ValidationRuleInfo { name: "array".into(), description: "Must be an array".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "contains".into(), description: "Array must contain values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "doesnt_contain".into(), description: "Array must not contain values".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "distinct".into(), description: "Array values must be unique".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "in_array".into(), description: "Must exist in another array field".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "list".into(), description: "Array with consecutive keys".into(), has_params: false, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "array".into(),
+            description: "Must be an array".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "contains".into(),
+            description: "Array must contain values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "doesnt_contain".into(),
+            description: "Array must not contain values".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "distinct".into(),
+            description: "Array values must be unique".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "in_array".into(),
+            description: "Must exist in another array field".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "list".into(),
+            description: "Array with consecutive keys".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
         // Date Rules
-        ValidationRuleInfo { name: "after".into(), description: "Date after given date".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "after_or_equal".into(), description: "Date after or equal".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "before".into(), description: "Date before given date".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "before_or_equal".into(), description: "Date before or equal".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "date".into(), description: "Valid date".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "date_equals".into(), description: "Date equals given date".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "date_format".into(), description: "Matches date format".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "timezone".into(), description: "Valid timezone".into(), has_params: false, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "after".into(),
+            description: "Date after given date".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "after_or_equal".into(),
+            description: "Date after or equal".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "before".into(),
+            description: "Date before given date".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "before_or_equal".into(),
+            description: "Date before or equal".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "date".into(),
+            description: "Valid date".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "date_equals".into(),
+            description: "Date equals given date".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "date_format".into(),
+            description: "Matches date format".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "timezone".into(),
+            description: "Valid timezone".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
         // File Rules
-        ValidationRuleInfo { name: "dimensions".into(), description: "Image dimension constraints".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "extensions".into(), description: "File extension".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "file".into(), description: "Successfully uploaded file".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "image".into(), description: "Image file".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "mimetypes".into(), description: "MIME type".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "mimes".into(), description: "File extension/MIME".into(), has_params: true, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "dimensions".into(),
+            description: "Image dimension constraints".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "extensions".into(),
+            description: "File extension".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "file".into(),
+            description: "Successfully uploaded file".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "image".into(),
+            description: "Image file".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "mimetypes".into(),
+            description: "MIME type".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "mimes".into(),
+            description: "File extension/MIME".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
         // Database Rules
-        ValidationRuleInfo { name: "exists".into(), description: "Record exists in database".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "unique".into(), description: "Unique in database table".into(), has_params: true, source: "laravel".into() },
-
+        ValidationRuleInfo {
+            name: "exists".into(),
+            description: "Record exists in database".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "unique".into(),
+            description: "Unique in database table".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
         // Presence/Required Rules
-        ValidationRuleInfo { name: "bail".into(), description: "Stop on first failure".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "exclude".into(), description: "Exclude from validated data".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "exclude_if".into(), description: "Exclude if field equals value".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "exclude_unless".into(), description: "Exclude unless field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "exclude_with".into(), description: "Exclude if field present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "exclude_without".into(), description: "Exclude if field absent".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "filled".into(), description: "Not empty when present".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "missing".into(), description: "Must not be present".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "missing_if".into(), description: "Missing if field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "missing_unless".into(), description: "Missing unless field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "missing_with".into(), description: "Missing if field present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "missing_with_all".into(), description: "Missing if all fields present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "nullable".into(), description: "May be null".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "present".into(), description: "Must be present".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "present_if".into(), description: "Present if field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "present_unless".into(), description: "Present unless field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "present_with".into(), description: "Present if field present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "present_with_all".into(), description: "Present if all fields present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "prohibited".into(), description: "Must not be present".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "prohibited_if".into(), description: "Prohibited if field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "prohibited_unless".into(), description: "Prohibited unless field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "prohibits".into(), description: "Prohibits other fields".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required".into(), description: "Field is required".into(), has_params: false, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_if".into(), description: "Required if field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_if_accepted".into(), description: "Required if field accepted".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_if_declined".into(), description: "Required if field declined".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_unless".into(), description: "Required unless field equals".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_with".into(), description: "Required if field present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_with_all".into(), description: "Required if all fields present".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_without".into(), description: "Required if field absent".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_without_all".into(), description: "Required if all fields absent".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "required_array_keys".into(), description: "Array must have keys".into(), has_params: true, source: "laravel".into() },
-        ValidationRuleInfo { name: "sometimes".into(), description: "Validate only when present".into(), has_params: false, source: "laravel".into() },
+        ValidationRuleInfo {
+            name: "bail".into(),
+            description: "Stop on first failure".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "exclude".into(),
+            description: "Exclude from validated data".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "exclude_if".into(),
+            description: "Exclude if field equals value".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "exclude_unless".into(),
+            description: "Exclude unless field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "exclude_with".into(),
+            description: "Exclude if field present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "exclude_without".into(),
+            description: "Exclude if field absent".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "filled".into(),
+            description: "Not empty when present".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "missing".into(),
+            description: "Must not be present".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "missing_if".into(),
+            description: "Missing if field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "missing_unless".into(),
+            description: "Missing unless field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "missing_with".into(),
+            description: "Missing if field present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "missing_with_all".into(),
+            description: "Missing if all fields present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "nullable".into(),
+            description: "May be null".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "present".into(),
+            description: "Must be present".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "present_if".into(),
+            description: "Present if field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "present_unless".into(),
+            description: "Present unless field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "present_with".into(),
+            description: "Present if field present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "present_with_all".into(),
+            description: "Present if all fields present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "prohibited".into(),
+            description: "Must not be present".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "prohibited_if".into(),
+            description: "Prohibited if field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "prohibited_unless".into(),
+            description: "Prohibited unless field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "prohibits".into(),
+            description: "Prohibits other fields".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required".into(),
+            description: "Field is required".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_if".into(),
+            description: "Required if field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_if_accepted".into(),
+            description: "Required if field accepted".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_if_declined".into(),
+            description: "Required if field declined".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_unless".into(),
+            description: "Required unless field equals".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_with".into(),
+            description: "Required if field present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_with_all".into(),
+            description: "Required if all fields present".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_without".into(),
+            description: "Required if field absent".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_without_all".into(),
+            description: "Required if all fields absent".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "required_array_keys".into(),
+            description: "Array must have keys".into(),
+            has_params: true,
+            source: "laravel".into(),
+        },
+        ValidationRuleInfo {
+            name: "sometimes".into(),
+            description: "Validate only when present".into(),
+            has_params: false,
+            source: "laravel".into(),
+        },
     ]
 }
 
@@ -1054,18 +1878,26 @@ impl FileAction {
         if message.starts_with("View file not found") {
             vec![FileAction {
                 action_type: FileActionType::View,
-                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "View file not found: '", "'")
-                    .unwrap_or("view")
-                    .to_string(),
+                name: LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "View file not found: '",
+                    "'",
+                )
+                .unwrap_or("view")
+                .to_string(),
                 target_path: PathBuf::from(target_path),
                 file_exists: false,
                 copy_from: None,
             }]
         } else if message.starts_with("Blade component not found") {
             // Offer two options: create view only OR create view with class
-            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Blade component not found: '", "'")
-                .unwrap_or("component")
-                .to_string();
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(
+                message,
+                "Blade component not found: '",
+                "'",
+            )
+            .unwrap_or("component")
+            .to_string();
             let path = PathBuf::from(target_path);
 
             vec![
@@ -1089,9 +1921,13 @@ impl FileAction {
         } else if message.starts_with("Livewire component not found") {
             vec![FileAction {
                 action_type: FileActionType::Livewire,
-                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "Livewire component not found: '", "'")
-                    .unwrap_or("component")
-                    .to_string(),
+                name: LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "Livewire component not found: '",
+                    "'",
+                )
+                .unwrap_or("component")
+                .to_string(),
                 target_path: PathBuf::from(target_path),
                 file_exists: false,
                 copy_from: None,
@@ -1099,18 +1935,26 @@ impl FileAction {
         } else if message.starts_with("Middleware") && message.contains("not found") {
             vec![FileAction {
                 action_type: FileActionType::Middleware,
-                name: LaravelLanguageServer::extract_name_from_diagnostic(message, "Middleware '", "'")
-                    .unwrap_or("middleware")
-                    .to_string(),
+                name: LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "Middleware '",
+                    "'",
+                )
+                .unwrap_or("middleware")
+                .to_string(),
                 target_path: PathBuf::from(target_path),
                 file_exists: false,
                 copy_from: None,
             }]
         } else if message.starts_with("Translation not found") {
             // Extract the translation key from the message
-            let key = LaravelLanguageServer::extract_name_from_diagnostic(message, "Translation not found: '", "'")
-                .unwrap_or("key")
-                .to_string();
+            let key = LaravelLanguageServer::extract_name_from_diagnostic(
+                message,
+                "Translation not found: '",
+                "'",
+            )
+            .unwrap_or("key")
+            .to_string();
 
             // Determine if it's PHP or JSON based on the file extension
             let path = PathBuf::from(target_path);
@@ -1120,7 +1964,11 @@ impl FileAction {
             let file_exists = message.contains("not found in file");
 
             vec![FileAction {
-                action_type: if is_php { FileActionType::TranslationPhp } else { FileActionType::TranslationJson },
+                action_type: if is_php {
+                    FileActionType::TranslationPhp
+                } else {
+                    FileActionType::TranslationJson
+                },
                 name: key,
                 target_path: path,
                 file_exists,
@@ -1128,9 +1976,13 @@ impl FileAction {
             }]
         } else if message.starts_with("Config not found") {
             // Extract the config key from the message
-            let key = LaravelLanguageServer::extract_name_from_diagnostic(message, "Config not found: '", "'")
-                .unwrap_or("key")
-                .to_string();
+            let key = LaravelLanguageServer::extract_name_from_diagnostic(
+                message,
+                "Config not found: '",
+                "'",
+            )
+            .unwrap_or("key")
+            .to_string();
 
             let path = PathBuf::from(target_path);
 
@@ -1146,9 +1998,13 @@ impl FileAction {
             }]
         } else if message.starts_with("Environment variable") {
             // Extract the env var name from the message
-            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Environment variable '", "'")
-                .unwrap_or("VAR")
-                .to_string();
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(
+                message,
+                "Environment variable '",
+                "'",
+            )
+            .unwrap_or("VAR")
+            .to_string();
 
             let path = PathBuf::from(target_path);
 
@@ -1167,12 +2023,24 @@ impl FileAction {
                 file_exists,
                 copy_from,
             }]
-        } else if message.starts_with("Feature not found") || message.starts_with("Feature class not found") {
+        } else if message.starts_with("Feature not found")
+            || message.starts_with("Feature class not found")
+        {
             // Extract the feature name from the message
-            let name = LaravelLanguageServer::extract_name_from_diagnostic(message, "Feature not found: '", "'")
-                .or_else(|| LaravelLanguageServer::extract_name_from_diagnostic(message, "Feature class not found: '", "'"))
-                .unwrap_or("feature")
-                .to_string();
+            let name = LaravelLanguageServer::extract_name_from_diagnostic(
+                message,
+                "Feature not found: '",
+                "'",
+            )
+            .or_else(|| {
+                LaravelLanguageServer::extract_name_from_diagnostic(
+                    message,
+                    "Feature class not found: '",
+                    "'",
+                )
+            })
+            .unwrap_or("feature")
+            .to_string();
 
             vec![FileAction {
                 action_type: FileActionType::Feature,
@@ -1191,7 +2059,9 @@ impl FileAction {
         match self.action_type {
             FileActionType::View => format!("Create view: {}", self.name),
             FileActionType::BladeComponent => format!("Create component: {}", self.name),
-            FileActionType::BladeComponentWithClass => format!("Create component with class: {}", self.name),
+            FileActionType::BladeComponentWithClass => {
+                format!("Create component with class: {}", self.name)
+            }
             FileActionType::Livewire => format!("Create Livewire: {}", self.name),
             FileActionType::Middleware => format!("Create middleware: {}", self.name),
             FileActionType::TranslationPhp | FileActionType::TranslationJson => {
@@ -1262,7 +2132,8 @@ impl FileAction {
         // - Class name: last segment in PascalCase ("Input")
         // - Namespace: App\View\Components + intermediate segments ("App\View\Components\Forms")
         let parts: Vec<&str> = self.name.split('.').collect();
-        let class_name = Self::kebab_to_pascal_case_static(parts.last().unwrap_or(&self.name.as_str()));
+        let class_name =
+            Self::kebab_to_pascal_case_static(parts.last().unwrap_or(&self.name.as_str()));
 
         let namespace = if parts.len() > 1 {
             let namespace_parts: Vec<String> = parts[..parts.len() - 1]
@@ -1360,8 +2231,14 @@ class {} extends Component
                         },
                         edits: vec![OneOf::Left(TextEdit {
                             range: Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
+                                start: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
                             },
                             new_text: template,
                         })],
@@ -1382,8 +2259,14 @@ class {} extends Component
                         },
                         edits: vec![OneOf::Left(TextEdit {
                             range: Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
+                                start: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
                             },
                             new_text: view_template,
                         })],
@@ -1418,8 +2301,14 @@ class {} extends Component
                         },
                         edits: vec![OneOf::Left(TextEdit {
                             range: Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
+                                start: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
                             },
                             new_text: view_template,
                         })],
@@ -1440,8 +2329,14 @@ class {} extends Component
                         },
                         edits: vec![OneOf::Left(TextEdit {
                             range: Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
+                                start: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
                             },
                             new_text: class_template,
                         })],
@@ -1477,8 +2372,14 @@ class {} extends Component
                             },
                             edits: vec![OneOf::Left(TextEdit {
                                 range: Range {
-                                    start: Position { line: 0, character: 0 },
-                                    end: Position { line: 0, character: 0 },
+                                    start: Position {
+                                        line: 0,
+                                        character: 0,
+                                    },
+                                    end: Position {
+                                        line: 0,
+                                        character: 0,
+                                    },
                                 },
                                 new_text: template,
                             })],
@@ -1487,7 +2388,14 @@ class {} extends Component
                     change_annotations: None,
                 }
             }
-        } else if self.file_exists && matches!(self.action_type, FileActionType::TranslationPhp | FileActionType::TranslationJson | FileActionType::ConfigPhp) {
+        } else if self.file_exists
+            && matches!(
+                self.action_type,
+                FileActionType::TranslationPhp
+                    | FileActionType::TranslationJson
+                    | FileActionType::ConfigPhp
+            )
+        {
             // For translations/config with existing files, we insert rather than create
             self.build_key_insert_edit(&file_uri)?
         } else {
@@ -1512,8 +2420,14 @@ class {} extends Component
                         },
                         edits: vec![OneOf::Left(TextEdit {
                             range: Range {
-                                start: Position { line: 0, character: 0 },
-                                end: Position { line: 0, character: 0 },
+                                start: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: 0,
+                                    character: 0,
+                                },
                             },
                             new_text: template,
                         })],
@@ -1636,11 +2550,7 @@ class {} extends Component
                 // Insert at end of file
                 let insert_line = line_count;
                 let prefix = if needs_newline { "\n" } else { "" };
-                (
-                    insert_line as u32,
-                    0,
-                    format!("{}{}=\n", prefix, self.name),
-                )
+                (insert_line as u32, 0, format!("{}{}=\n", prefix, self.name))
             }
             _ => return None,
         };
@@ -1655,8 +2565,14 @@ class {} extends Component
                     },
                     edits: vec![OneOf::Left(TextEdit {
                         range: Range {
-                            start: Position { line: insert_line, character: insert_char },
-                            end: Position { line: insert_line, character: insert_char },
+                            start: Position {
+                                line: insert_line,
+                                character: insert_char,
+                            },
+                            end: Position {
+                                line: insert_line,
+                                character: insert_char,
+                            },
                         },
                         new_text,
                     })],
@@ -1691,8 +2607,14 @@ class {} extends Component
                     },
                     edits: vec![OneOf::Left(TextEdit {
                         range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
+                            start: Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 0,
+                            },
                         },
                         new_text: content,
                     })],
@@ -1747,7 +2669,7 @@ impl LaravelLanguageServer {
             root_path: Arc::new(RwLock::new(None)),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
             pending_diagnostics: Arc::new(RwLock::new(HashMap::new())),
-            debounce_delay_ms: 200,  // 200ms for diagnostics
+            debounce_delay_ms: 200, // 200ms for diagnostics
             salsa: SalsaActor::spawn(),
             cache: Arc::new(RwLock::new(None)),
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
@@ -1774,7 +2696,10 @@ impl LaravelLanguageServer {
         let old_debounce = *self.auto_complete_debounce_ms.read().await;
 
         if new_debounce != old_debounce {
-            info!("⚙️  Updating autocomplete debounce: {}ms → {}ms", old_debounce, new_debounce);
+            info!(
+                "⚙️  Updating autocomplete debounce: {}ms → {}ms",
+                old_debounce, new_debounce
+            );
             *self.auto_complete_debounce_ms.write().await = new_debounce;
         }
 
@@ -1783,7 +2708,10 @@ impl LaravelLanguageServer {
         let old_spacing = *self.directive_spacing.read().await;
 
         if new_spacing != old_spacing {
-            info!("⚙️  Updating directive spacing: {} → {}", old_spacing, new_spacing);
+            info!(
+                "⚙️  Updating directive spacing: {} → {}",
+                old_spacing, new_spacing
+            );
             *self.directive_spacing.write().await = new_spacing;
         }
     }
@@ -1801,8 +2729,8 @@ impl LaravelLanguageServer {
     /// - token_type: 0 for FUNCTION
     /// - token_modifiers: 0 (no modifiers)
     fn extract_blade_directive_tokens(&self, content: &str) -> Vec<SemanticToken> {
-        use regex::Regex;
         use lazy_static::lazy_static;
+        use regex::Regex;
 
         lazy_static! {
             // Match Blade directives: @if, @foreach, @feature, @customDirective, etc.
@@ -1859,7 +2787,7 @@ impl LaravelLanguageServer {
                 delta_line,
                 delta_start,
                 length,
-                token_type: 0,       // FUNCTION (index 0 in our legend)
+                token_type: 0, // FUNCTION (index 0 in our legend)
                 token_modifiers_bitset: 0,
             });
 
@@ -1888,12 +2816,16 @@ impl LaravelLanguageServer {
         let livewire_config = fs::read_to_string(root_path.join("config/livewire.php")).ok();
 
         // Register with Salsa
-        if let Err(e) = self.salsa.register_config_files(
-            root_path.to_path_buf(),
-            composer_json,
-            view_config,
-            livewire_config,
-        ).await {
+        if let Err(e) = self
+            .salsa
+            .register_config_files(
+                root_path.to_path_buf(),
+                composer_json,
+                view_config,
+                livewire_config,
+            )
+            .await
+        {
             debug!("Failed to register config files with Salsa: {}", e);
         } else {
             info!("Laravel LSP: Config files registered with Salsa for incremental caching");
@@ -1921,13 +2853,17 @@ impl LaravelLanguageServer {
         let livewire_path = config.livewire_path.clone();
 
         // Register with Salsa
-        if let Err(e) = self.salsa.register_project_files(
-            root_path.to_path_buf(),
-            vec![PathBuf::from("app/Http/Controllers")], // Default controller path
-            view_paths,
-            livewire_path,
-            PathBuf::from("routes"),
-        ).await {
+        if let Err(e) = self
+            .salsa
+            .register_project_files(
+                root_path.to_path_buf(),
+                vec![PathBuf::from("app/Http/Controllers")], // Default controller path
+                view_paths,
+                livewire_path,
+                PathBuf::from("routes"),
+            )
+            .await
+        {
             debug!("Failed to register project files with Salsa: {}", e);
         } else {
             info!("Laravel LSP: Project files registered with Salsa for reference finding");
@@ -1974,12 +2910,15 @@ impl LaravelLanguageServer {
             };
 
             if let Some(text) = content {
-                if let Err(e) = self.salsa.register_env_source(
-                    env_path.clone(),
-                    text,
-                    priority,
-                ).await {
-                    debug!("Failed to register env file {:?} with Salsa: {}", env_path, e);
+                if let Err(e) = self
+                    .salsa
+                    .register_env_source(env_path.clone(), text, priority)
+                    .await
+                {
+                    debug!(
+                        "Failed to register env file {:?} with Salsa: {}",
+                        env_path, e
+                    );
                 } else {
                     registered_count += 1;
                 }
@@ -1987,7 +2926,10 @@ impl LaravelLanguageServer {
         }
 
         if registered_count > 0 {
-            info!("Laravel LSP: {} env files registered with Salsa", registered_count);
+            info!(
+                "Laravel LSP: {} env files registered with Salsa",
+                registered_count
+            );
         }
     }
 
@@ -1999,7 +2941,6 @@ impl LaravelLanguageServer {
     ///
     /// Priority: framework=0, packages=1, app=2 (higher wins)
     async fn register_service_provider_files_with_salsa(&self, root: &Path) {
-
         let documents = self.documents.read().await;
         let mut registered_count = 0;
 
@@ -2014,17 +2955,22 @@ impl LaravelLanguageServer {
                 let path = entry.path();
                 if path.is_file()
                     && path.extension().is_some_and(|ext| ext == "php")
-                    && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().ends_with("ServiceProvider.php")
-                    })
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with("ServiceProvider.php"))
                 {
                     if let Ok(content) = std::fs::read_to_string(path) {
-                        if self.salsa.register_service_provider_source(
-                            path.to_path_buf(),
-                            content,
-                            0, // framework priority
-                            root.to_path_buf(),
-                        ).await.is_ok() {
+                        if self
+                            .salsa
+                            .register_service_provider_source(
+                                path.to_path_buf(),
+                                content,
+                                0, // framework priority
+                                root.to_path_buf(),
+                            )
+                            .await
+                            .is_ok()
+                        {
                             registered_count += 1;
                         }
                     }
@@ -2034,7 +2980,11 @@ impl LaravelLanguageServer {
 
         // Priority 1: Package providers and Kernel files (for middleware definitions)
         let vendor_path = root.join("vendor");
-        debug!("🔍 Scanning vendor path: {:?} (exists={})", vendor_path, vendor_path.exists());
+        debug!(
+            "🔍 Scanning vendor path: {:?} (exists={})",
+            vendor_path,
+            vendor_path.exists()
+        );
         if vendor_path.exists() {
             for entry in WalkDir::new(&vendor_path)
                 .max_depth(6)
@@ -2046,10 +2996,9 @@ impl LaravelLanguageServer {
                 if path.starts_with(&framework_path) {
                     continue;
                 }
-                if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "php")
-                {
-                    let file_name = path.file_name()
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
+                    let file_name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     let path_str = path.to_string_lossy();
@@ -2061,14 +3010,22 @@ impl LaravelLanguageServer {
                         && (path_str.contains("/Http/") || path_str.contains("\\Http\\"));
 
                     if is_service_provider || is_http_kernel {
-                        debug!("📄 [init] Found vendor file: {} (SP={}, Kernel={})", path_str, is_service_provider, is_http_kernel);
+                        debug!(
+                            "📄 [init] Found vendor file: {} (SP={}, Kernel={})",
+                            path_str, is_service_provider, is_http_kernel
+                        );
                         if let Ok(content) = std::fs::read_to_string(path) {
-                            if self.salsa.register_service_provider_source(
-                                path.to_path_buf(),
-                                content,
-                                1, // package priority
-                                root.to_path_buf(),
-                            ).await.is_ok() {
+                            if self
+                                .salsa
+                                .register_service_provider_source(
+                                    path.to_path_buf(),
+                                    content,
+                                    1, // package priority
+                                    root.to_path_buf(),
+                                )
+                                .await
+                                .is_ok()
+                            {
                                 registered_count += 1;
                             }
                         }
@@ -2086,9 +3043,7 @@ impl LaravelLanguageServer {
                 .filter_map(|e| e.ok())
             {
                 let path = entry.path();
-                if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "php")
-                {
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
                     // Check if file is open in editor
                     let content = if let Ok(uri) = Url::from_file_path(path) {
                         if let Some((buffer_content, _)) = documents.get(&uri) {
@@ -2120,15 +3075,22 @@ impl LaravelLanguageServer {
 
         // Priority 0: Laravel framework's default middleware configuration (Laravel 11+)
         // This provides 'web', 'api', 'auth', 'guest', etc. from the framework
-        let framework_middleware_config = root.join("vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php");
+        let framework_middleware_config = root.join(
+            "vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php",
+        );
         if framework_middleware_config.exists() {
             if let Ok(content) = std::fs::read_to_string(&framework_middleware_config) {
-                if self.salsa.register_service_provider_source(
-                    framework_middleware_config,
-                    content,
-                    0, // framework priority (can be overridden by app)
-                    root.to_path_buf(),
-                ).await.is_ok() {
+                if self
+                    .salsa
+                    .register_service_provider_source(
+                        framework_middleware_config,
+                        content,
+                        0, // framework priority (can be overridden by app)
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+                {
                     registered_count += 1;
                 }
             }
@@ -2152,12 +3114,17 @@ impl LaravelLanguageServer {
                 // This handles Laravel's default middleware aliases (auth, guest, etc.)
                 for imported_file in extract_middleware_imports(&content, root) {
                     if let Ok(imported_content) = std::fs::read_to_string(&imported_file) {
-                        if self.salsa.register_service_provider_source(
-                            imported_file,
-                            imported_content,
-                            0, // framework priority (can be overridden by app)
-                            root.to_path_buf(),
-                        ).await.is_ok() {
+                        if self
+                            .salsa
+                            .register_service_provider_source(
+                                imported_file,
+                                imported_content,
+                                0, // framework priority (can be overridden by app)
+                                root.to_path_buf(),
+                            )
+                            .await
+                            .is_ok()
+                        {
                             registered_count += 1;
                         }
                     }
@@ -2210,7 +3177,10 @@ impl LaravelLanguageServer {
         }
 
         if registered_count > 0 {
-            info!("Laravel LSP: {} service provider files registered with Salsa", registered_count);
+            info!(
+                "Laravel LSP: {} service provider files registered with Salsa",
+                registered_count
+            );
         }
     }
 
@@ -2225,8 +3195,11 @@ impl LaravelLanguageServer {
         if cache.has_cached_data() {
             // 1. Store cached Laravel config directly in memory (bypasses Salsa)
             if let Some(cached_config) = cache.get_laravel_config() {
-                info!("📋 Loading cached Laravel config: {} view paths, root: {:?}",
-                    cached_config.view_paths.len(), cached_config.root);
+                info!(
+                    "📋 Loading cached Laravel config: {} view paths, root: {:?}",
+                    cached_config.view_paths.len(),
+                    cached_config.root
+                );
                 let config_data = LaravelConfigData {
                     root: cached_config.root.clone(),
                     view_paths: cached_config.view_paths.clone(),
@@ -2235,8 +3208,12 @@ impl LaravelLanguageServer {
                     has_livewire: cached_config.has_livewire,
                     view_namespaces: std::collections::HashMap::new(),
                     component_namespaces: std::collections::HashMap::new(),
-                    component_aliases: laravel_lsp::config::load_component_aliases(&cached_config.root),
-                    icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&cached_config.root),
+                    component_aliases: laravel_lsp::config::load_component_aliases(
+                        &cached_config.root,
+                    ),
+                    icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(
+                        &cached_config.root,
+                    ),
                 };
                 // Store directly in memory - no Salsa channel call!
                 *self.cached_config.write().await = Some(config_data);
@@ -2244,7 +3221,10 @@ impl LaravelLanguageServer {
                 // Update root_path to the cached config's root (the actual Laravel project)
                 // and mark it as initialized to prevent re-discovery on file open
                 let actual_root = cached_config.root.clone();
-                info!("📂 Setting actual Laravel root to {:?} from cache", actual_root);
+                info!(
+                    "📂 Setting actual Laravel root to {:?} from cache",
+                    actual_root
+                );
                 *self.root_path.write().await = Some(actual_root.clone());
                 *self.initialized_root.write().await = Some(actual_root);
             }
@@ -2254,18 +3234,39 @@ impl LaravelLanguageServer {
             let middleware_count = cache.get_all_middleware().len();
             let binding_count = cache.get_all_bindings().len();
             let env_count = cache.get_env_vars().map(|e| e.variables.len()).unwrap_or(0);
-            info!("📦 Queuing {} middleware, {} bindings, {} env vars for background registration",
-                middleware_count, binding_count, env_count);
+            info!(
+                "📦 Queuing {} middleware, {} bindings, {} env vars for background registration",
+                middleware_count, binding_count, env_count
+            );
 
             // Spawn background registration (doesn't block initialize)
             let salsa = self.salsa.clone();
-            let middleware_entries: Vec<_> = cache.get_all_middleware()
+            let middleware_entries: Vec<_> = cache
+                .get_all_middleware()
                 .into_iter()
-                .map(|(alias, entry)| (alias, entry.class, entry.class_file, entry.source_file, entry.line))
+                .map(|(alias, entry)| {
+                    (
+                        alias,
+                        entry.class,
+                        entry.class_file,
+                        entry.source_file,
+                        entry.line,
+                    )
+                })
                 .collect();
-            let binding_entries: Vec<_> = cache.get_all_bindings()
+            let binding_entries: Vec<_> = cache
+                .get_all_bindings()
                 .into_iter()
-                .map(|(name, entry)| (name, entry.class, entry.binding_type, entry.class_file, entry.source_file, entry.line))
+                .map(|(name, entry)| {
+                    (
+                        name,
+                        entry.class,
+                        entry.binding_type,
+                        entry.class_file,
+                        entry.source_file,
+                        entry.line,
+                    )
+                })
                 .collect();
             let env_vars = cache.get_env_vars().map(|e| e.variables.clone());
             let cached_config_for_salsa = cache.get_laravel_config().map(|c| LaravelConfigData {
@@ -2288,7 +3289,9 @@ impl LaravelLanguageServer {
                 if let Some(vars) = env_vars {
                     let _ = salsa.register_cached_env_vars(vars).await;
                 }
-                let _ = salsa.register_cached_middleware_batch(middleware_entries).await;
+                let _ = salsa
+                    .register_cached_middleware_batch(middleware_entries)
+                    .await;
                 let _ = salsa.register_cached_binding_batch(binding_entries).await;
                 info!("✅ Background Salsa registration complete");
             });
@@ -2342,17 +3345,22 @@ impl LaravelLanguageServer {
                 let path = entry.path();
                 if path.is_file()
                     && path.extension().is_some_and(|ext| ext == "php")
-                    && path.file_name().is_some_and(|name| {
-                        name.to_string_lossy().ends_with("ServiceProvider.php")
-                    })
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with("ServiceProvider.php"))
                 {
                     if let Ok(content) = std::fs::read_to_string(path) {
-                        if self.salsa.register_service_provider_source(
-                            path.to_path_buf(),
-                            content,
-                            0, // framework priority
-                            root.to_path_buf(),
-                        ).await.is_ok() {
+                        if self
+                            .salsa
+                            .register_service_provider_source(
+                                path.to_path_buf(),
+                                content,
+                                0, // framework priority
+                                root.to_path_buf(),
+                            )
+                            .await
+                            .is_ok()
+                        {
                             registered_count += 1;
                         }
                     }
@@ -2373,10 +3381,9 @@ impl LaravelLanguageServer {
                 if path.starts_with(&framework_path) {
                     continue;
                 }
-                if path.is_file()
-                    && path.extension().is_some_and(|ext| ext == "php")
-                {
-                    let file_name = path.file_name()
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "php") {
+                    let file_name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     let path_str = path.to_string_lossy();
@@ -2389,12 +3396,17 @@ impl LaravelLanguageServer {
 
                     if is_service_provider || is_http_kernel {
                         if let Ok(content) = std::fs::read_to_string(path) {
-                            if self.salsa.register_service_provider_source(
-                                path.to_path_buf(),
-                                content,
-                                1, // package priority
-                                root.to_path_buf(),
-                            ).await.is_ok() {
+                            if self
+                                .salsa
+                                .register_service_provider_source(
+                                    path.to_path_buf(),
+                                    content,
+                                    1, // package priority
+                                    root.to_path_buf(),
+                                )
+                                .await
+                                .is_ok()
+                            {
                                 registered_count += 1;
                             }
                         }
@@ -2420,8 +3432,10 @@ impl LaravelLanguageServer {
         }
 
         let duration = start.elapsed();
-        info!("✅ Vendor rescan complete: {} providers, {} middleware, {} bindings in {:?}",
-            registered_count, middleware_count, bindings_count, duration);
+        info!(
+            "✅ Vendor rescan complete: {} providers, {} middleware, {} bindings in {:?}",
+            registered_count, middleware_count, bindings_count, duration
+        );
     }
 
     /// Rescan app providers (app/Providers + bootstrap/app.php)
@@ -2452,12 +3466,18 @@ impl LaravelLanguageServer {
                         std::fs::read_to_string(path).unwrap_or_default()
                     };
 
-                    if !content.is_empty() && self.salsa.register_service_provider_source(
-                        path.to_path_buf(),
-                        content,
-                        2, // app priority
-                        root.to_path_buf(),
-                    ).await.is_ok() {
+                    if !content.is_empty()
+                        && self
+                            .salsa
+                            .register_service_provider_source(
+                                path.to_path_buf(),
+                                content,
+                                2, // app priority
+                                root.to_path_buf(),
+                            )
+                            .await
+                            .is_ok()
+                    {
                         registered_count += 1;
                     }
                 }
@@ -2465,15 +3485,22 @@ impl LaravelLanguageServer {
         }
 
         // Priority 0: Laravel framework's default middleware configuration (Laravel 11+)
-        let framework_middleware_config = root.join("vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php");
+        let framework_middleware_config = root.join(
+            "vendor/laravel/framework/src/Illuminate/Foundation/Configuration/Middleware.php",
+        );
         if framework_middleware_config.exists() {
             if let Ok(content) = std::fs::read_to_string(&framework_middleware_config) {
-                if self.salsa.register_service_provider_source(
-                    framework_middleware_config,
-                    content,
-                    0, // framework priority
-                    root.to_path_buf(),
-                ).await.is_ok() {
+                if self
+                    .salsa
+                    .register_service_provider_source(
+                        framework_middleware_config,
+                        content,
+                        0, // framework priority
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+                {
                     registered_count += 1;
                 }
             }
@@ -2496,24 +3523,34 @@ impl LaravelLanguageServer {
                 // First, extract and scan imported middleware configuration classes
                 for imported_file in extract_middleware_imports(&content, root) {
                     if let Ok(imported_content) = std::fs::read_to_string(&imported_file) {
-                        if self.salsa.register_service_provider_source(
-                            imported_file,
-                            imported_content,
-                            0, // framework priority
-                            root.to_path_buf(),
-                        ).await.is_ok() {
+                        if self
+                            .salsa
+                            .register_service_provider_source(
+                                imported_file,
+                                imported_content,
+                                0, // framework priority
+                                root.to_path_buf(),
+                            )
+                            .await
+                            .is_ok()
+                        {
                             registered_count += 1;
                         }
                     }
                 }
 
                 // Then scan bootstrap/app.php itself
-                if self.salsa.register_service_provider_source(
-                    bootstrap_app,
-                    content,
-                    2, // app priority
-                    root.to_path_buf(),
-                ).await.is_ok() {
+                if self
+                    .salsa
+                    .register_service_provider_source(
+                        bootstrap_app,
+                        content,
+                        2, // app priority
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+                {
                     registered_count += 1;
                 }
             }
@@ -2532,12 +3569,18 @@ impl LaravelLanguageServer {
                 std::fs::read_to_string(&kernel_path).unwrap_or_default()
             };
 
-            if !content.is_empty() && self.salsa.register_service_provider_source(
-                kernel_path,
-                content,
-                2, // app priority
-                root.to_path_buf(),
-            ).await.is_ok() {
+            if !content.is_empty()
+                && self
+                    .salsa
+                    .register_service_provider_source(
+                        kernel_path,
+                        content,
+                        2, // app priority
+                        root.to_path_buf(),
+                    )
+                    .await
+                    .is_ok()
+            {
                 registered_count += 1;
             }
         }
@@ -2552,7 +3595,10 @@ impl LaravelLanguageServer {
         }
 
         let duration = start.elapsed();
-        info!("✅ App rescan complete: {} providers in {:?}", registered_count, duration);
+        info!(
+            "✅ App rescan complete: {} providers in {:?}",
+            registered_count, duration
+        );
     }
 
     /// Rescan node_modules (for Flux, etc.)
@@ -2655,7 +3701,10 @@ impl LaravelLanguageServer {
                 livewire_path: config.livewire_path.clone(),
                 has_livewire: config.has_livewire,
             };
-            info!("📋 Caching Laravel config: {} view paths", config.view_paths.len());
+            info!(
+                "📋 Caching Laravel config: {} view paths",
+                config.view_paths.len()
+            );
             cache.set_laravel_config(cached_config);
         }
 
@@ -2673,12 +3722,18 @@ impl LaravelLanguageServer {
         if let Ok(all_mw) = self.salsa.get_all_parsed_middleware().await {
             let mut vendor_scan = ScanResult::default();
             for mw in &all_mw {
-                vendor_scan.middleware.insert(mw.alias.clone(), MiddlewareEntry {
-                    class: mw.class_name.clone(),
-                    class_file: mw.file_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    source_file: Some(mw.source_file.to_string_lossy().into_owned()),
-                    line: mw.source_line,
-                });
+                vendor_scan.middleware.insert(
+                    mw.alias.clone(),
+                    MiddlewareEntry {
+                        class: mw.class_name.clone(),
+                        class_file: mw
+                            .file_path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        source_file: Some(mw.source_file.to_string_lossy().into_owned()),
+                        line: mw.source_line,
+                    },
+                );
             }
             info!("📦 Caching {} middleware aliases", all_mw.len());
             cache.set_vendor_scan(vendor_scan);
@@ -2688,13 +3743,19 @@ impl LaravelLanguageServer {
         if let Ok(all_bindings) = self.salsa.get_all_parsed_bindings().await {
             let mut app_scan = ScanResult::default();
             for binding in &all_bindings {
-                app_scan.bindings.insert(binding.abstract_name.clone(), BindingEntry {
-                    class: binding.concrete_class.clone(),
-                    binding_type: format!("{:?}", binding.binding_type),
-                    class_file: binding.file_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    source_file: Some(binding.source_file.to_string_lossy().into_owned()),
-                    line: binding.source_line,
-                });
+                app_scan.bindings.insert(
+                    binding.abstract_name.clone(),
+                    BindingEntry {
+                        class: binding.concrete_class.clone(),
+                        binding_type: format!("{:?}", binding.binding_type),
+                        class_file: binding
+                            .file_path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        source_file: Some(binding.source_file.to_string_lossy().into_owned()),
+                        line: binding.source_line,
+                    },
+                );
             }
             info!("📦 Caching {} bindings", all_bindings.len());
             cache.set_app_scan(app_scan);
@@ -2723,7 +3784,10 @@ impl LaravelLanguageServer {
     async fn try_discover_from_file(&self, file_path: &Path) {
         // Always try to find the Laravel project root from this file
         let Some(discovered_root) = find_project_root(file_path) else {
-            debug!("Could not find Laravel project root from file: {:?}", file_path);
+            debug!(
+                "Could not find Laravel project root from file: {:?}",
+                file_path
+            );
             return;
         };
 
@@ -2732,7 +3796,10 @@ impl LaravelLanguageServer {
             let init_root = self.initialized_root.read().await;
             if let Some(ref init) = *init_root {
                 if init == &discovered_root {
-                    debug!("Already initialized for root {:?}, skipping", discovered_root);
+                    debug!(
+                        "Already initialized for root {:?}, skipping",
+                        discovered_root
+                    );
                     return;
                 }
             }
@@ -2746,7 +3813,10 @@ impl LaravelLanguageServer {
         let should_update = match current_root {
             None => {
                 // No current root, so always use discovered
-                debug!("No current root, using discovered root: {:?}", discovered_root);
+                debug!(
+                    "No current root, using discovered root: {:?}",
+                    discovered_root
+                );
                 true
             }
             Some(current) => {
@@ -2754,7 +3824,8 @@ impl LaravelLanguageServer {
                 let file_outside_root = !file_path.starts_with(current);
 
                 // Check if discovered root is more specific (nested within current root)
-                let more_specific = discovered_root.starts_with(current) && discovered_root != *current;
+                let more_specific =
+                    discovered_root.starts_with(current) && discovered_root != *current;
 
                 if file_outside_root {
                     info!(
@@ -2770,7 +3841,10 @@ impl LaravelLanguageServer {
                     true
                 } else {
                     // File is within current root and discovered isn't more specific
-                    debug!("Keeping current root {:?} for file {:?}", current, file_path);
+                    debug!(
+                        "Keeping current root {:?} for file {:?}",
+                        current, file_path
+                    );
                     false
                 }
             }
@@ -2793,16 +3867,21 @@ impl LaravelLanguageServer {
         // Verify config is available (checks memory cache first)
         match self.get_cached_config().await {
             Some(config) => {
-                info!("Laravel configuration available: {} view paths", config.view_paths.len());
+                info!(
+                    "Laravel configuration available: {} view paths",
+                    config.view_paths.len()
+                );
 
                 // Register project files with Salsa for reference finding
-                self.register_project_files_with_salsa(&discovered_root).await;
+                self.register_project_files_with_salsa(&discovered_root)
+                    .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
                 info!("Laravel LSP: Re-validating all open documents due to config change");
                 let documents = self.documents.read().await;
                 for (doc_uri, (doc_text, _version)) in documents.iter() {
-                    self.validate_and_publish_diagnostics(doc_uri, doc_text).await;
+                    self.validate_and_publish_diagnostics(doc_uri, doc_text)
+                        .await;
                 }
             }
             None => {
@@ -2812,9 +3891,13 @@ impl LaravelLanguageServer {
 
         // Initialize service provider registry with Salsa
         info!("========================================");
-        info!("🛡️  Initializing service provider registry from root: {:?}", discovered_root);
+        info!(
+            "🛡️  Initializing service provider registry from root: {:?}",
+            discovered_root
+        );
         info!("========================================");
-        self.register_service_provider_files_with_salsa(&discovered_root).await;
+        self.register_service_provider_files_with_salsa(&discovered_root)
+            .await;
 
         // Build route name index across project / packages / framework
         info!("========================================");
@@ -2830,7 +3913,10 @@ impl LaravelLanguageServer {
 
         // Cache validation rule names from Laravel framework
         info!("========================================");
-        info!("📋 Caching validation rules from root: {:?}", discovered_root);
+        info!(
+            "📋 Caching validation rules from root: {:?}",
+            discovered_root
+        );
         info!("========================================");
         self.cache_validation_rule_names(&discovered_root).await;
 
@@ -2856,7 +3942,10 @@ impl LaravelLanguageServer {
             .map(|r| format!("{}:", r.name))
             .collect();
 
-        info!("   📋 Cached {} validation rule names for context detection", rule_names.len());
+        info!(
+            "   📋 Cached {} validation rule names for context detection",
+            rule_names.len()
+        );
 
         *self.cached_validation_rule_names.write().await = rule_names;
     }
@@ -2876,17 +3965,14 @@ impl LaravelLanguageServer {
 
         // Get known validation rules
         let known_rules = self.get_all_validation_rules().await;
-        let known_rule_names: std::collections::HashSet<String> = known_rules
-            .iter()
-            .map(|r| r.name.to_lowercase())
-            .collect();
+        let known_rule_names: std::collections::HashSet<String> =
+            known_rules.iter().map(|r| r.name.to_lowercase()).collect();
 
         // Regex to find validation rule strings in arrays
         // Matches: 'field' => 'rule|rule:param' or "field" => "rule|rule:param"
         // Also matches array syntax in Form Requests, Validator::make, etc.
-        let rule_string_regex = Regex::new(
-            r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"]\s*=>\s*['"]([^'"]+)['"]"#
-        ).unwrap();
+        let rule_string_regex =
+            Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"]\s*=>\s*['"]([^'"]+)['"]"#).unwrap();
 
         // Track line positions
         let lines: Vec<&str> = source.lines().collect();
@@ -2917,8 +4003,8 @@ impl LaravelLanguageServer {
 
             // Skip if this doesn't look like validation rules (heuristic)
             // Must contain at least one known rule or a pipe
-            let looks_like_rules = rules_string.contains('|') ||
-                rules_string.split('|').any(|r| {
+            let looks_like_rules = rules_string.contains('|')
+                || rules_string.split('|').any(|r| {
                     let rule_name = r.split(':').next().unwrap_or("").to_lowercase();
                     known_rule_names.contains(&rule_name)
                 });
@@ -2932,8 +4018,14 @@ impl LaravelLanguageServer {
                 let (line, col) = byte_to_position(rules_start);
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position { line, character: col },
-                        end: Position { line, character: col + 1 },
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + 1,
+                        },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
@@ -2952,8 +4044,14 @@ impl LaravelLanguageServer {
                 let (line, col) = byte_to_position(pipe_offset);
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position { line, character: col },
-                        end: Position { line, character: col + 1 },
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + 1,
+                        },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: None,
@@ -2974,8 +4072,14 @@ impl LaravelLanguageServer {
                     let (line, col) = byte_to_position(pipe_offset);
                     diagnostics.push(Diagnostic {
                         range: Range {
-                            start: Position { line, character: col },
-                            end: Position { line, character: col + 2 },
+                            start: Position {
+                                line,
+                                character: col,
+                            },
+                            end: Position {
+                                line,
+                                character: col + 2,
+                            },
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
@@ -3014,8 +4118,14 @@ impl LaravelLanguageServer {
                     let (line, col) = byte_to_position(rule_offset);
                     diagnostics.push(Diagnostic {
                         range: Range {
-                            start: Position { line, character: col },
-                            end: Position { line, character: col + rule_name.len() as u32 },
+                            start: Position {
+                                line,
+                                character: col,
+                            },
+                            end: Position {
+                                line,
+                                character: col + rule_name.len() as u32,
+                            },
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
                         code: None,
@@ -3040,8 +4150,14 @@ impl LaravelLanguageServer {
                             let (line, col) = byte_to_position(rule_offset);
                             diagnostics.push(Diagnostic {
                                 range: Range {
-                                    start: Position { line, character: col },
-                                    end: Position { line, character: col + rule_part.len() as u32 },
+                                    start: Position {
+                                        line,
+                                        character: col,
+                                    },
+                                    end: Position {
+                                        line,
+                                        character: col + rule_part.len() as u32,
+                                    },
                                 },
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 code: None,
@@ -3056,17 +4172,24 @@ impl LaravelLanguageServer {
                         }
 
                         // Extract actual table name (handle connection.table and Model class)
-                        let table_name: String = if table_param.contains('.') && !table_param.contains('\\') {
-                            // connection.table syntax
-                            table_param.split('.').nth(1).unwrap_or(table_param).to_string()
-                        } else if table_param.contains('\\') {
-                            // Model class - infer table name
-                            table_param.rsplit('\\').next()
-                                .map(|class| format!("{}s", class.to_lowercase()))
-                                .unwrap_or_else(|| table_param.to_string())
-                        } else {
-                            table_param.to_string()
-                        };
+                        let table_name: String =
+                            if table_param.contains('.') && !table_param.contains('\\') {
+                                // connection.table syntax
+                                table_param
+                                    .split('.')
+                                    .nth(1)
+                                    .unwrap_or(table_param)
+                                    .to_string()
+                            } else if table_param.contains('\\') {
+                                // Model class - infer table name
+                                table_param
+                                    .rsplit('\\')
+                                    .next()
+                                    .map(|class| format!("{}s", class.to_lowercase()))
+                                    .unwrap_or_else(|| table_param.to_string())
+                            } else {
+                                table_param.to_string()
+                            };
 
                         // Check if table exists in database
                         let schema_guard = self.database_schema.read().await;
@@ -3084,20 +4207,32 @@ impl LaravelLanguageServer {
                                     table_param
                                 };
 
-                                if !tables.iter().any(|t| t.eq_ignore_ascii_case(table_name_ref)) {
+                                if !tables
+                                    .iter()
+                                    .any(|t| t.eq_ignore_ascii_case(table_name_ref))
+                                {
                                     let colon_offset = rule_offset + rule_name.len();
                                     let table_offset = colon_offset + 1; // +1 for colon
                                     let (line, col) = byte_to_position(table_offset);
 
                                     diagnostics.push(Diagnostic {
                                         range: Range {
-                                            start: Position { line, character: col },
-                                            end: Position { line, character: col + table_param.len() as u32 },
+                                            start: Position {
+                                                line,
+                                                character: col,
+                                            },
+                                            end: Position {
+                                                line,
+                                                character: col + table_param.len() as u32,
+                                            },
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         code: None,
                                         source: Some("laravel".to_string()),
-                                        message: format!("Table '{}' not found in database", table_name_ref),
+                                        message: format!(
+                                            "Table '{}' not found in database",
+                                            table_name_ref
+                                        ),
                                         related_information: None,
                                         tags: None,
                                         code_description: None,
@@ -3105,24 +4240,39 @@ impl LaravelLanguageServer {
                                     });
                                 } else if param_parts.len() > 1 {
                                     // Check column exists
-                                    let column_param = param_parts.get(1).map(|s| s.trim()).unwrap_or("");
+                                    let column_param =
+                                        param_parts.get(1).map(|s| s.trim()).unwrap_or("");
                                     if !column_param.is_empty() {
                                         let columns = provider.get_columns(table_name_ref).await;
 
-                                        if !columns.is_empty() && !columns.iter().any(|c| c.eq_ignore_ascii_case(column_param)) {
+                                        if !columns.is_empty()
+                                            && !columns
+                                                .iter()
+                                                .any(|c| c.eq_ignore_ascii_case(column_param))
+                                        {
                                             let colon_offset = rule_offset + rule_name.len();
-                                            let column_offset = colon_offset + 1 + table_param.len() + 1; // colon + table + comma
+                                            let column_offset =
+                                                colon_offset + 1 + table_param.len() + 1; // colon + table + comma
                                             let (line, col) = byte_to_position(column_offset);
 
                                             diagnostics.push(Diagnostic {
                                                 range: Range {
-                                                    start: Position { line, character: col },
-                                                    end: Position { line, character: col + column_param.len() as u32 },
+                                                    start: Position {
+                                                        line,
+                                                        character: col,
+                                                    },
+                                                    end: Position {
+                                                        line,
+                                                        character: col + column_param.len() as u32,
+                                                    },
                                                 },
                                                 severity: Some(DiagnosticSeverity::ERROR),
                                                 code: None,
                                                 source: Some("laravel".to_string()),
-                                                message: format!("Column '{}' not found in table '{}'", column_param, table_name_ref),
+                                                message: format!(
+                                                    "Column '{}' not found in table '{}'",
+                                                    column_param, table_name_ref
+                                                ),
                                                 related_information: None,
                                                 tags: None,
                                                 code_description: None,
@@ -3138,13 +4288,22 @@ impl LaravelLanguageServer {
                         let (line, col) = byte_to_position(rule_offset);
                         diagnostics.push(Diagnostic {
                             range: Range {
-                                start: Position { line, character: col },
-                                end: Position { line, character: col + rule_name.len() as u32 },
+                                start: Position {
+                                    line,
+                                    character: col,
+                                },
+                                end: Position {
+                                    line,
+                                    character: col + rule_name.len() as u32,
+                                },
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
                             code: None,
                             source: Some("laravel".to_string()),
-                            message: format!("Rule '{}' requires a table name parameter", rule_name),
+                            message: format!(
+                                "Rule '{}' requires a table name parameter",
+                                rule_name
+                            ),
                             related_information: None,
                             tags: None,
                             code_description: None,
@@ -3167,8 +4326,10 @@ impl LaravelLanguageServer {
         // Log config status but always store provider
         // Errors will be handled when completions are requested
         if let Some(config) = provider.get_database_config().await {
-            info!("   🗄️  Database config found: {} @ {}:{}",
-                config.driver, config.host, config.port);
+            info!(
+                "   🗄️  Database config found: {} @ {}:{}",
+                config.driver, config.host, config.port
+            );
         } else {
             info!("   ⚠️  Database config not found - will show diagnostic on first use");
         }
@@ -3208,7 +4369,10 @@ impl LaravelLanguageServer {
         let exists = tokio::fs::metadata(path).await.is_ok();
 
         // Update cache
-        self.file_exists_cache.write().await.insert(path.clone(), (exists, Instant::now()));
+        self.file_exists_cache
+            .write()
+            .await
+            .insert(path.clone(), (exists, Instant::now()));
 
         exists
     }
@@ -3248,7 +4412,10 @@ impl LaravelLanguageServer {
     /// middleware can be invoked as `auth:sanctum` or `throttle:60,1`, where
     /// the part after `:` is passed as parameters to the middleware's
     /// `handle()` method, not part of the alias.
-    async fn get_cached_middleware(&self, name: &str) -> Option<(String, Option<PathBuf>, Option<PathBuf>, Option<u32>)> {
+    async fn get_cached_middleware(
+        &self,
+        name: &str,
+    ) -> Option<(String, Option<PathBuf>, Option<PathBuf>, Option<u32>)> {
         let base_alias = middleware_base_alias(name);
 
         // First check disk cache (instant)
@@ -3265,7 +4432,11 @@ impl LaravelLanguageServer {
         }
 
         // Fall back to Salsa (may not be ready yet)
-        if let Ok(Some(mw_data)) = self.salsa.get_parsed_middleware(base_alias.to_string()).await {
+        if let Ok(Some(mw_data)) = self
+            .salsa
+            .get_parsed_middleware(base_alias.to_string())
+            .await
+        {
             return Some((
                 mw_data.class_name.clone(),
                 mw_data.file_path.clone(),
@@ -3281,7 +4452,10 @@ impl LaravelLanguageServer {
     /// Returns (class_name, class_file, source_file, source_line)
     /// - class_file: for checking if the concrete class exists
     /// - source_file + source_line: for navigation to binding declaration
-    async fn get_cached_binding(&self, name: &str) -> Option<(String, Option<PathBuf>, Option<PathBuf>, Option<u32>)> {
+    async fn get_cached_binding(
+        &self,
+        name: &str,
+    ) -> Option<(String, Option<PathBuf>, Option<PathBuf>, Option<u32>)> {
         // First check disk cache (instant)
         if let Some(ref cache) = *self.cache.read().await {
             let all_bindings = cache.get_all_bindings();
@@ -3339,10 +4513,15 @@ impl LaravelLanguageServer {
             // Wait for the debounce delay
             sleep(debounce_delay).await;
 
-            debug!("⏰ Salsa debounce expired for {} - updating Salsa", uri_for_spawn);
+            debug!(
+                "⏰ Salsa debounce expired for {} - updating Salsa",
+                uri_for_spawn
+            );
 
             // Execute the Salsa update based on file type
-            server.execute_salsa_update(&uri_for_spawn, &content, version).await;
+            server
+                .execute_salsa_update(&uri_for_spawn, &content, version)
+                .await;
         });
 
         // Store the task handle so we can cancel it if needed
@@ -3373,12 +4552,16 @@ impl LaravelLanguageServer {
             // bootstrap/app.php - Service provider file (middleware aliases)
             if let Some(root) = root_path {
                 debug!("📦 Updating Salsa: ServiceProviderFile (bootstrap/app.php)");
-                if let Err(e) = self.salsa.register_service_provider_source(
-                    path.clone(),
-                    content.to_string(),
-                    2, // priority: app = 2
-                    root,
-                ).await {
+                if let Err(e) = self
+                    .salsa
+                    .register_service_provider_source(
+                        path.clone(),
+                        content.to_string(),
+                        2, // priority: app = 2
+                        root,
+                    )
+                    .await
+                {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
@@ -3386,12 +4569,16 @@ impl LaravelLanguageServer {
             // App service provider - Service provider file
             if let Some(root) = root_path {
                 debug!("📦 Updating Salsa: ServiceProviderFile ({})", filename);
-                if let Err(e) = self.salsa.register_service_provider_source(
-                    path.clone(),
-                    content.to_string(),
-                    2, // priority: app = 2
-                    root,
-                ).await {
+                if let Err(e) = self
+                    .salsa
+                    .register_service_provider_source(
+                        path.clone(),
+                        content.to_string(),
+                        2, // priority: app = 2
+                        root,
+                    )
+                    .await
+                {
                     debug!("Failed to update service provider in Salsa: {}", e);
                 }
             }
@@ -3402,12 +4589,15 @@ impl LaravelLanguageServer {
                 ".env.local" => 1,
                 _ => 0, // .env.example
             };
-            debug!("📦 Updating Salsa: EnvFile ({}, priority={})", filename, priority);
-            if let Err(e) = self.salsa.register_env_source(
-                path.clone(),
-                content.to_string(),
-                priority,
-            ).await {
+            debug!(
+                "📦 Updating Salsa: EnvFile ({}, priority={})",
+                filename, priority
+            );
+            if let Err(e) = self
+                .salsa
+                .register_env_source(path.clone(), content.to_string(), priority)
+                .await
+            {
                 debug!("Failed to update env file in Salsa: {}", e);
             }
         } else if path_str.contains("/config/") && filename.ends_with(".php") {
@@ -3415,20 +4605,35 @@ impl LaravelLanguageServer {
             // ConfigFile: for config discovery (view paths, namespaces, etc.)
             // SourceFile: for pattern extraction (env() calls, etc.)
             debug!("📦 Updating Salsa: ConfigFile ({})", filename);
-            if let Err(e) = self.salsa.update_config_file(path.clone(), content.to_string()).await {
+            if let Err(e) = self
+                .salsa
+                .update_config_file(path.clone(), content.to_string())
+                .await
+            {
                 debug!("Failed to update config file in Salsa: {}", e);
             }
             // Also invalidate the cached config so next lookup refetches
             *self.cached_config.write().await = None;
             // Also update as SourceFile for pattern extraction (env() diagnostics)
-            debug!("📦 Updating Salsa: SourceFile ({}) for pattern extraction", filename);
-            if let Err(e) = self.salsa.update_file(path.clone(), version, content.to_string()).await {
+            debug!(
+                "📦 Updating Salsa: SourceFile ({}) for pattern extraction",
+                filename
+            );
+            if let Err(e) = self
+                .salsa
+                .update_file(path.clone(), version, content.to_string())
+                .await
+            {
                 debug!("Failed to update source file in Salsa: {}", e);
             }
         } else if filename == "composer.json" {
             // composer.json - Config file
             debug!("📦 Updating Salsa: ConfigFile (composer.json)");
-            if let Err(e) = self.salsa.update_config_file(path.clone(), content.to_string()).await {
+            if let Err(e) = self
+                .salsa
+                .update_config_file(path.clone(), content.to_string())
+                .await
+            {
                 debug!("Failed to update config file in Salsa: {}", e);
             }
             // Also invalidate the cached config so next lookup refetches
@@ -3436,7 +4641,11 @@ impl LaravelLanguageServer {
         } else if filename.ends_with(".php") || filename.ends_with(".blade.php") {
             // Source file (PHP or Blade) - pattern extraction
             debug!("📦 Updating Salsa: SourceFile ({})", filename);
-            if let Err(e) = self.salsa.update_file(path.clone(), version, content.to_string()).await {
+            if let Err(e) = self
+                .salsa
+                .update_file(path.clone(), version, content.to_string())
+                .await
+            {
                 debug!("Failed to update source file in Salsa: {}", e);
             }
         }
@@ -3512,7 +4721,11 @@ impl LaravelLanguageServer {
 
         let (start_pos, quote_char) = match (env_single, env_double) {
             (Some(s), Some(d)) => {
-                if s > d { (s + 5, '\'') } else { (d + 5, '"') }
+                if s > d {
+                    (s + 5, '\'')
+                } else {
+                    (d + 5, '"')
+                }
             }
             (Some(s), None) => (s + 5, '\''),
             (None, Some(d)) => (d + 5, '"'),
@@ -3591,7 +4804,11 @@ impl LaravelLanguageServer {
 
         let start_pos = match (env_pattern, server_pattern) {
             (Some(e), Some(s)) => {
-                if e > s { e + 11 } else { s + 14 } // "<env name=\"" = 11, "<server name=\"" = 14
+                if e > s {
+                    e + 11
+                } else {
+                    s + 14
+                } // "<env name=\"" = 11, "<server name=\"" = 14
             }
             (Some(e), None) => e + 11,
             (None, Some(s)) => s + 14,
@@ -3651,18 +4868,18 @@ impl LaravelLanguageServer {
 
         // Find the latest match and its corresponding quote character
         let matches: Vec<(usize, char, usize)> = vec![
-            (config_single.unwrap_or(0), '\'', 8),      // config('
-            (config_double.unwrap_or(0), '"', 8),       // config("
-            (facade_get_single.unwrap_or(0), '\'', 13), // Config::get('
-            (facade_get_double.unwrap_or(0), '"', 13),  // Config::get("
-            (facade_string_single.unwrap_or(0), '\'', 16), // Config::string('
-            (facade_string_double.unwrap_or(0), '"', 16),  // Config::string("
+            (config_single.unwrap_or(0), '\'', 8),          // config('
+            (config_double.unwrap_or(0), '"', 8),           // config("
+            (facade_get_single.unwrap_or(0), '\'', 13),     // Config::get('
+            (facade_get_double.unwrap_or(0), '"', 13),      // Config::get("
+            (facade_string_single.unwrap_or(0), '\'', 16),  // Config::string('
+            (facade_string_double.unwrap_or(0), '"', 16),   // Config::string("
             (facade_integer_single.unwrap_or(0), '\'', 17), // Config::integer('
             (facade_integer_double.unwrap_or(0), '"', 17),  // Config::integer("
             (facade_boolean_single.unwrap_or(0), '\'', 17), // Config::boolean('
             (facade_boolean_double.unwrap_or(0), '"', 17),  // Config::boolean("
-            (facade_array_single.unwrap_or(0), '\'', 15), // Config::array('
-            (facade_array_double.unwrap_or(0), '"', 15),  // Config::array("
+            (facade_array_single.unwrap_or(0), '\'', 15),   // Config::array('
+            (facade_array_double.unwrap_or(0), '"', 15),    // Config::array("
         ];
 
         // Filter to only actual matches (position > 0 or the pattern was actually found at 0)
@@ -3699,9 +4916,8 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match
-        let (pos, quote_char, pattern_len) = actual_matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) =
+            actual_matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -3783,9 +4999,7 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match (closest to cursor)
-        let (pos, quote_char, pattern_len) = matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -3890,9 +5104,7 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match (closest to cursor)
-        let (pos, quote_char, pattern_len) = matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -3914,7 +5126,7 @@ impl LaravelLanguageServer {
                 "withMiddleware([",
                 "->withoutMiddleware(",
                 "->withoutMiddleware([",
-                "'middleware' => [",  // Array-key syntax in Route::group config
+                "'middleware' => [",   // Array-key syntax in Route::group config
                 "\"middleware\" => [", // Double-quote version
             ];
 
@@ -3943,7 +5155,10 @@ impl LaravelLanguageServer {
                         }
 
                         // Check if this line has a middleware indicator
-                        if middleware_indicators.iter().any(|ind| prev_line.contains(ind)) {
+                        if middleware_indicators
+                            .iter()
+                            .any(|ind| prev_line.contains(ind))
+                        {
                             // Found middleware context, and we should still be inside it
                             // (bracket_depth > 0 means we haven't closed the array yet)
                             if bracket_depth > 0 {
@@ -4048,7 +5263,8 @@ impl LaravelLanguageServer {
                     if first_char == '\'' || first_char == '"' {
                         let quote_char = first_char;
                         let quote_pos_in_after_comma = after_comma.find(quote_char).unwrap();
-                        let start = route_view_pos + 12 + comma_pos + 1 + quote_pos_in_after_comma + 1;
+                        let start =
+                            route_view_pos + 12 + comma_pos + 1 + quote_pos_in_after_comma + 1;
                         if start <= cursor {
                             let content = &before_cursor[start..];
                             if !content.contains(quote_char) {
@@ -4065,9 +5281,7 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match (closest to cursor)
-        let (pos, quote_char, pattern_len) = matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -4114,12 +5328,18 @@ impl LaravelLanguageServer {
             // Check that we haven't closed the tag or hit a space (which would mean attributes)
             // Component names can contain: letters, numbers, dots, and hyphens
             // If we hit a space, >, or /, we're past the component name
-            if after_prefix.contains(' ') || after_prefix.contains('>') || after_prefix.contains('/') {
+            if after_prefix.contains(' ')
+                || after_prefix.contains('>')
+                || after_prefix.contains('/')
+            {
                 return None;
             }
 
             // Validate that after_prefix only contains valid component name characters
-            if after_prefix.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+            if after_prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
                 return Some(StringContext {
                     prefix: after_prefix.to_string(),
                     start_col: start_pos as u32,
@@ -4156,21 +5376,25 @@ impl LaravelLanguageServer {
 
             // Check that we haven't closed the tag or hit a space (which would mean attributes)
             // Component names can contain: letters, numbers, dots, and hyphens
-            if after_prefix.contains(' ') || after_prefix.contains('>') || after_prefix.contains('/') {
+            if after_prefix.contains(' ')
+                || after_prefix.contains('>')
+                || after_prefix.contains('/')
+            {
                 return None;
             }
 
             // Validate that after_prefix only contains valid component name characters
-            if after_prefix.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+            if after_prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+            {
                 return Some(after_prefix.to_string());
             }
         }
 
         // Check for @livewire(' pattern (Blade directive style)
-        let patterns: Vec<(&str, char, usize)> = vec![
-            ("@livewire('", '\'', 11),
-            ("@livewire(\"", '"', 11),
-        ];
+        let patterns: Vec<(&str, char, usize)> =
+            vec![("@livewire('", '\'', 11), ("@livewire(\"", '"', 11)];
 
         for (pattern, quote_char, pattern_len) in patterns {
             if let Some(pos) = before_cursor.rfind(pattern) {
@@ -4182,7 +5406,10 @@ impl LaravelLanguageServer {
                 // Check that we haven't hit the closing quote
                 if !after_quote.contains(quote_char) {
                     // Validate component name characters
-                    if after_quote.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                    if after_quote
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+                    {
                         return Some(after_quote.to_string());
                     }
                 }
@@ -4207,10 +5434,7 @@ impl LaravelLanguageServer {
 
         let before_cursor = &line_text[..cursor];
 
-        let patterns: Vec<(&str, char, usize)> = vec![
-            ("asset('", '\'', 7),
-            ("asset(\"", '"', 7),
-        ];
+        let patterns: Vec<(&str, char, usize)> = vec![("asset('", '\'', 7), ("asset(\"", '"', 7)];
 
         for (pattern, quote_char, pattern_len) in patterns {
             if let Some(pos) = before_cursor.rfind(pattern) {
@@ -4444,9 +5668,7 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match (closest to cursor)
-        let (pos, quote_char, pattern_len) = matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -4709,12 +5931,14 @@ impl LaravelLanguageServer {
         let blade_content = std::fs::read_to_string(path).ok();
 
         // Start with @props as the base (lowest priority)
-        let mut resolved_type = blade_content.as_ref()
+        let mut resolved_type = blade_content
+            .as_ref()
             .and_then(|content| Self::extract_props_type(content, var_without_dollar));
 
         // Check controllers (overrides @props)
         if let Some(ref vn) = view_name {
-            if let Some(class) = self.check_controller_view_variable(&root, vn, var_without_dollar) {
+            if let Some(class) = self.check_controller_view_variable(&root, vn, var_without_dollar)
+            {
                 resolved_type = Some(class);
             }
         }
@@ -4726,19 +5950,16 @@ impl LaravelLanguageServer {
 
         // Check Livewire component (highest priority - overrides all)
         if let Some(ref vn) = view_name {
-            if let Some(class) = self.check_livewire_component_variable(&root, vn, var_without_dollar) {
+            if let Some(class) =
+                self.check_livewire_component_variable(&root, vn, var_without_dollar)
+            {
                 resolved_type = Some(class);
             }
         }
 
         // Fetch loop blocks via Salsa (memoized). Use std::path::PathBuf to send to the actor.
         let path_buf = std::path::PathBuf::from(path);
-        let loops = self
-            .salsa
-            .get_loop_blocks(path_buf)
-            .await
-            .ok()
-            .flatten();
+        let loops = self.salsa.get_loop_blocks(path_buf).await.ok().flatten();
 
         // Check Blade loop variables (@foreach / @forelse / @for).
         // This runs LAST as a fallback so that earlier sources (props, controller, etc.)
@@ -4753,7 +5974,10 @@ impl LaravelLanguageServer {
 
                     // Try to derive the element type from the iterable expression.
                     if let Some(iter_expr) = &block.iterable {
-                        if let Some((elem_type, has_element)) = self.resolve_iterable_type_info(&root, path, iter_expr).await {
+                        if let Some((elem_type, has_element)) = self
+                            .resolve_iterable_type_info(&root, path, iter_expr)
+                            .await
+                        {
                             if has_element {
                                 // Genuine element type — enables hover/autocomplete on $audit->...
                                 resolved_type = Some(elem_type);
@@ -4820,11 +6044,20 @@ impl LaravelLanguageServer {
             r#"['"]{}['"]\s*=>\s*\\?([A-Za-z][A-Za-z0-9_\\]*)::class"#,
             regex::escape(prop_name)
         );
-        if let Some(caps) = regex::Regex::new(&class_pattern).ok()?.captures(props_content) {
+        if let Some(caps) = regex::Regex::new(&class_pattern)
+            .ok()?
+            .captures(props_content)
+        {
             if let Some(m) = caps.get(1) {
                 let full_type = m.as_str();
                 // Get just the class name (last part after \)
-                return Some(full_type.rsplit('\\').next().unwrap_or(full_type).to_string());
+                return Some(
+                    full_type
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(full_type)
+                        .to_string(),
+                );
             }
         }
 
@@ -4833,10 +6066,19 @@ impl LaravelLanguageServer {
             r#"['"]{}['"]\s*=>\s*['"]\\?([A-Za-z][A-Za-z0-9_\\]*)['"]"#,
             regex::escape(prop_name)
         );
-        if let Some(caps) = regex::Regex::new(&string_pattern).ok()?.captures(props_content) {
+        if let Some(caps) = regex::Regex::new(&string_pattern)
+            .ok()?
+            .captures(props_content)
+        {
             if let Some(m) = caps.get(1) {
                 let full_type = m.as_str();
-                return Some(full_type.rsplit('\\').next().unwrap_or(full_type).to_string());
+                return Some(
+                    full_type
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(full_type)
+                        .to_string(),
+                );
             }
         }
 
@@ -4874,7 +6116,10 @@ impl LaravelLanguageServer {
         let after_dollar = &before_cursor[dollar_pos + 1..];
 
         // Check it's a valid variable name prefix (only alphanumeric and _)
-        if !after_dollar.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !after_dollar
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+        {
             return None;
         }
 
@@ -4950,7 +6195,12 @@ impl LaravelLanguageServer {
 
     /// Get all available variables for a Blade file
     /// Collects variables from @props, controller, Livewire, view component, and loop directives
-    fn get_blade_available_variables(&self, uri: &Url, content: Option<&str>, cursor_line: Option<u32>) -> Vec<BladeVariableInfo> {
+    fn get_blade_available_variables(
+        &self,
+        uri: &Url,
+        content: Option<&str>,
+        cursor_line: Option<u32>,
+    ) -> Vec<BladeVariableInfo> {
         let path = uri.path();
 
         if !path.ends_with(".blade.php") {
@@ -5033,7 +6283,8 @@ impl LaravelLanguageServer {
 
         // 5. Extract loop variables from enclosing loop directives (scope-aware)
         if let (Some(content_str), Some(line)) = (blade_content, cursor_line) {
-            let enclosing_loops = laravel_lsp::blade_loops::get_enclosing_loops(content_str, line as usize);
+            let enclosing_loops =
+                laravel_lsp::blade_loops::get_enclosing_loops(content_str, line as usize);
 
             // Add variables from each enclosing loop
             for loop_block in &enclosing_loops {
@@ -5089,9 +6340,7 @@ impl LaravelLanguageServer {
                 ("component", "Component", "framework"),
             ]
         } else {
-            vec![
-                ("errors", "MessageBag", "framework"),
-            ]
+            vec![("errors", "MessageBag", "framework")]
         };
 
         for (name, php_type, source) in framework_vars {
@@ -5153,7 +6402,8 @@ impl LaravelLanguageServer {
         if let Some(re) = typed_re {
             for cap in re.captures_iter(props_str) {
                 if let Some(name) = cap.get(1) {
-                    let php_type = cap.get(2)
+                    let php_type = cap
+                        .get(2)
                         .or(cap.get(3))
                         .map(|m| {
                             let t = m.as_str();
@@ -5166,9 +6416,8 @@ impl LaravelLanguageServer {
         }
 
         // Pattern for untyped props: 'name' (not followed by =>)
-        let untyped_re = regex::Regex::new(
-            r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*(?:,|\]|$))"#
-        ).ok();
+        let untyped_re =
+            regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*(?:,|\]|$))"#).ok();
 
         if let Some(re) = untyped_re {
             for cap in re.captures_iter(props_str) {
@@ -5189,8 +6438,8 @@ impl LaravelLanguageServer {
     /// Looks for patterns like {{ $header }}, {{ $footer }}, $title->isEmpty(), etc.
     /// These are variables that should be provided via <x-slot:name>
     fn extract_slot_variable_usages(content: &str) -> Vec<(String, String)> {
-        use regex::Regex;
         use lazy_static::lazy_static;
+        use regex::Regex;
 
         lazy_static! {
             // Match variable usages in echo statements: {{ $varname }}
@@ -5211,12 +6460,18 @@ impl LaravelLanguageServer {
         // Known non-slot variables to exclude
         let exclude_vars: std::collections::HashSet<&str> = [
             // Framework variables
-            "errors", "slot", "attributes", "component",
+            "errors",
+            "slot",
+            "attributes",
+            "component",
             // Loop variables
             "loop",
             // Common non-slot variables
-            "this", "self",
-        ].into_iter().collect();
+            "this",
+            "self",
+        ]
+        .into_iter()
+        .collect();
 
         // Find all variable usages in echo statements
         for cap in ECHO_VAR_RE.captures_iter(content) {
@@ -5253,7 +6508,11 @@ impl LaravelLanguageServer {
     /// - view('name')->with('key', $value)
     /// - view('name')->with(['key' => $value])
     /// - View::make('name')->with(...)
-    fn extract_controller_variables(&self, root: &std::path::Path, view_name: &str) -> Vec<(String, String)> {
+    fn extract_controller_variables(
+        &self,
+        root: &std::path::Path,
+        view_name: &str,
+    ) -> Vec<(String, String)> {
         let mut vars = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -5338,10 +6597,7 @@ impl LaravelLanguageServer {
         }
 
         // Pattern 2: view('name', ['key' => ...])
-        let array_in_view = format!(
-            r#"view\s*\(\s*['"]{}['"]\s*,\s*\[([^\]]+)\]"#,
-            escaped_name
-        );
+        let array_in_view = format!(r#"view\s*\(\s*['"]{}['"]\s*,\s*\[([^\]]+)\]"#, escaped_name);
         if let Ok(re) = regex::Regex::new(&array_in_view) {
             for cap in re.captures_iter(content) {
                 if let Some(array_content) = cap.get(1) {
@@ -5405,7 +6661,12 @@ impl LaravelLanguageServer {
                             .and_then(|re| re.captures(arg_str))
                         {
                             if let Some(compact_args) = compact_match.get(1) {
-                                self.extract_vars_from_compact(content, compact_args.as_str(), vars, seen);
+                                self.extract_vars_from_compact(
+                                    content,
+                                    compact_args.as_str(),
+                                    vars,
+                                    seen,
+                                );
                             }
                         }
                     } else if arg_str.starts_with('[') || arg_str.contains("=>") {
@@ -5436,8 +6697,9 @@ impl LaravelLanguageServer {
                 if let Some(var_name) = var_cap.get(1) {
                     let name = var_name.as_str().to_string();
                     if seen.insert(name.clone()) {
-                        let var_type = Self::find_variable_type_in_content(content, var_name.as_str())
-                            .unwrap_or_else(|| "mixed".to_string());
+                        let var_type =
+                            Self::find_variable_type_in_content(content, var_name.as_str())
+                                .unwrap_or_else(|| "mixed".to_string());
                         vars.push((name, var_type));
                     }
                 }
@@ -5466,13 +6728,17 @@ impl LaravelLanguageServer {
                         // Check if it's $this->property (group 2) or $variable (group 3)
                         let var_type = if let Some(prop_match) = arr_cap.get(2) {
                             // It's $this->property
-                            laravel_lsp::php_class::find_property_type_in_content(content, prop_match.as_str())
+                            laravel_lsp::php_class::find_property_type_in_content(
+                                content,
+                                prop_match.as_str(),
+                            )
                         } else if let Some(var_match) = arr_cap.get(3) {
                             // It's $variable
                             Self::find_variable_type_in_content(content, var_match.as_str())
                         } else {
                             None
-                        }.unwrap_or_else(|| "mixed".to_string());
+                        }
+                        .unwrap_or_else(|| "mixed".to_string());
                         vars.push((name, var_type));
                     }
                 }
@@ -5480,7 +6746,8 @@ impl LaravelLanguageServer {
         }
 
         // Also handle keys without explicit value assignment (just the key name)
-        let key_only_re = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*,|\s*\])"#).ok();
+        let key_only_re =
+            regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"](?:\s*,|\s*\])"#).ok();
         if let Some(re) = key_only_re {
             for cap in re.captures_iter(array_content) {
                 if let Some(key) = cap.get(1) {
@@ -5514,13 +6781,17 @@ impl LaravelLanguageServer {
                         // Check if it's $this->property (group 3) or $variable (group 4)
                         let var_type = if let Some(prop_match) = cap.get(3) {
                             // It's $this->property - look up the property type
-                            laravel_lsp::php_class::find_property_type_in_content(content, prop_match.as_str())
+                            laravel_lsp::php_class::find_property_type_in_content(
+                                content,
+                                prop_match.as_str(),
+                            )
                         } else if let Some(var_match) = cap.get(4) {
                             // It's $variable - look up the variable type
                             Self::find_variable_type_in_content(content, var_match.as_str())
                         } else {
                             None
-                        }.unwrap_or_else(|| "mixed".to_string());
+                        }
+                        .unwrap_or_else(|| "mixed".to_string());
                         vars.push((name, var_type));
                     }
                 }
@@ -5538,7 +6809,8 @@ impl LaravelLanguageServer {
         }
 
         // Match ->with(compact('a', 'b')) pattern
-        let compact_with_re = regex::Regex::new(r#"->\s*with\s*\(\s*compact\s*\(([^)]+)\)\s*\)"#).ok();
+        let compact_with_re =
+            regex::Regex::new(r#"->\s*with\s*\(\s*compact\s*\(([^)]+)\)\s*\)"#).ok();
         if let Some(re) = compact_with_re {
             for cap in re.captures_iter(chain_str) {
                 if let Some(compact_args) = cap.get(1) {
@@ -5560,10 +6832,7 @@ impl LaravelLanguageServer {
         let escaped_var = regex::escape(var_name);
 
         // 1. PHPDoc @var annotation: /** @var User $user */
-        let phpdoc_var_pattern = format!(
-            r#"@var\s+\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#,
-            escaped_var
-        );
+        let phpdoc_var_pattern = format!(r#"@var\s+\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}"#, escaped_var);
         if let Some(caps) = regex::Regex::new(&phpdoc_var_pattern)
             .ok()
             .and_then(|re| re.captures(content))
@@ -5574,10 +6843,8 @@ impl LaravelLanguageServer {
         }
 
         // 2. Type-hinted variable declaration: User $user = ...
-        let type_hint_pattern = format!(
-            r#"(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*="#,
-            escaped_var
-        );
+        let type_hint_pattern =
+            format!(r#"(\?)?\\?([A-Z][a-zA-Z0-9_\\]*)\s+\${}\s*="#, escaped_var);
         if let Some(caps) = regex::Regex::new(&type_hint_pattern)
             .ok()
             .and_then(|re| re.captures(content))
@@ -5585,7 +6852,11 @@ impl LaravelLanguageServer {
             if let Some(type_match) = caps.get(2) {
                 let nullable = caps.get(1).is_some();
                 let type_name = laravel_lsp::php_class::simplify_type(type_match.as_str());
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+                return Some(if nullable {
+                    format!("?{}", type_name)
+                } else {
+                    type_name
+                });
             }
         }
 
@@ -5601,15 +6872,16 @@ impl LaravelLanguageServer {
             if let Some(type_match) = caps.get(2) {
                 let nullable = caps.get(1).is_some();
                 let type_name = laravel_lsp::php_class::simplify_type(type_match.as_str());
-                return Some(if nullable { format!("?{}", type_name) } else { type_name });
+                return Some(if nullable {
+                    format!("?{}", type_name)
+                } else {
+                    type_name
+                });
             }
         }
 
         // 4. New expression: $user = new User(...)
-        let new_pattern = format!(
-            r#"\${}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#,
-            escaped_var
-        );
+        let new_pattern = format!(r#"\${}\s*=\s*new\s+\\?([A-Z][a-zA-Z0-9_\\]*)"#, escaped_var);
         if let Some(caps) = regex::Regex::new(&new_pattern)
             .ok()
             .and_then(|re| re.captures(content))
@@ -5643,7 +6915,10 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(format!("Collection<{}>", laravel_lsp::php_class::simplify_type(model.as_str())));
+                return Some(format!(
+                    "Collection<{}>",
+                    laravel_lsp::php_class::simplify_type(model.as_str())
+                ));
             }
         }
 
@@ -5671,7 +6946,10 @@ impl LaravelLanguageServer {
             .and_then(|re| re.captures(content))
         {
             if let Some(model) = caps.get(1) {
-                return Some(format!("Collection<{}>", laravel_lsp::php_class::simplify_type(model.as_str())));
+                return Some(format!(
+                    "Collection<{}>",
+                    laravel_lsp::php_class::simplify_type(model.as_str())
+                ));
             }
         }
 
@@ -5702,7 +6980,11 @@ impl LaravelLanguageServer {
     // in `laravel_lsp::php_class` so the Salsa actor can call them.
 
     /// Extract variables from a View component class
-    fn extract_component_variables(&self, root: &std::path::Path, blade_path: &str) -> Vec<(String, String)> {
+    fn extract_component_variables(
+        &self,
+        root: &std::path::Path,
+        blade_path: &str,
+    ) -> Vec<(String, String)> {
         let vars = Vec::new();
 
         // Check if this is a component view (in resources/views/components/)
@@ -5726,15 +7008,25 @@ impl LaravelLanguageServer {
         let class_name = Self::path_to_class_name(without_ext);
 
         // Find the component class
-        let class_path = root.join("app").join("View").join("Components").join(format!("{}.php", class_name));
+        let class_path = root
+            .join("app")
+            .join("View")
+            .join("Components")
+            .join(format!("{}.php", class_name));
 
         if !class_path.exists() {
             // Try nested structure
             let parts: Vec<&str> = without_ext.split('/').collect();
             if parts.len() > 1 {
-                let nested_path = root.join("app").join("View").join("Components")
-                    .join(parts[..parts.len()-1].join("/"))
-                    .join(format!("{}.php", Self::kebab_to_pascal(parts[parts.len()-1])));
+                let nested_path = root
+                    .join("app")
+                    .join("View")
+                    .join("Components")
+                    .join(parts[..parts.len() - 1].join("/"))
+                    .join(format!(
+                        "{}.php",
+                        Self::kebab_to_pascal(parts[parts.len() - 1])
+                    ));
                 if nested_path.exists() {
                     return self.parse_component_class_vars(&nested_path);
                 }
@@ -5755,13 +7047,15 @@ impl LaravelLanguageServer {
 
         // Extract public properties
         let prop_re = regex::Regex::new(
-            r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
-        ).ok();
+            r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
+        )
+        .ok();
 
         if let Some(re) = prop_re {
             for cap in re.captures_iter(&content) {
                 if let Some(name) = cap.get(3) {
-                    let php_type = cap.get(2)
+                    let php_type = cap
+                        .get(2)
                         .map(|t| {
                             let type_str = t.as_str();
                             type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
@@ -5773,9 +7067,8 @@ impl LaravelLanguageServer {
         }
 
         // Extract constructor parameters (they become available in the view)
-        let constructor_re = regex::Regex::new(
-            r#"public\s+function\s+__construct\s*\(([^)]*)\)"#
-        ).ok();
+        let constructor_re =
+            regex::Regex::new(r#"public\s+function\s+__construct\s*\(([^)]*)\)"#).ok();
 
         if let Some(re) = constructor_re {
             if let Some(cap) = re.captures(&content) {
@@ -5787,7 +7080,8 @@ impl LaravelLanguageServer {
                     if let Some(pre) = param_re {
                         for pcap in pre.captures_iter(params.as_str()) {
                             if let Some(name) = pcap.get(3) {
-                                let php_type = pcap.get(2)
+                                let php_type = pcap
+                                    .get(2)
                                     .map(|t| {
                                         let type_str = t.as_str();
                                         type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
@@ -5817,7 +7111,11 @@ impl LaravelLanguageServer {
     }
 
     /// Extract variables from a Livewire component
-    fn extract_livewire_variables(&self, root: &std::path::Path, view_name: &str) -> Vec<(String, String)> {
+    fn extract_livewire_variables(
+        &self,
+        root: &std::path::Path,
+        view_name: &str,
+    ) -> Vec<(String, String)> {
         let mut vars = Vec::new();
 
         // Only for livewire views
@@ -5834,8 +7132,13 @@ impl LaravelLanguageServer {
 
         // Try both Livewire paths
         let paths = [
-            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
-            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
+            root.join("app")
+                .join("Livewire")
+                .join(format!("{}.php", class_name)),
+            root.join("app")
+                .join("Http")
+                .join("Livewire")
+                .join(format!("{}.php", class_name)),
         ];
 
         for path in paths {
@@ -5846,13 +7149,15 @@ impl LaravelLanguageServer {
 
                 // Extract public properties (they're automatically available in the view)
                 let prop_re = regex::Regex::new(
-                    r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#
-                ).ok();
+                    r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
+                )
+                .ok();
 
                 if let Some(re) = prop_re {
                     for cap in re.captures_iter(&content) {
                         if let Some(name) = cap.get(3) {
-                            let php_type = cap.get(2)
+                            let php_type = cap
+                                .get(2)
                                 .map(|t| {
                                     let type_str = t.as_str();
                                     type_str.rsplit('\\').next().unwrap_or(type_str).to_string()
@@ -5886,8 +7191,17 @@ impl LaravelLanguageServer {
 
                     // Skip common framework variables that don't need type resolution
                     let framework_vars = [
-                        "this", "loop", "errors", "slot", "component", "attributes",
-                        "__env", "__data", "obLevel", "app", "request",
+                        "this",
+                        "loop",
+                        "errors",
+                        "slot",
+                        "component",
+                        "attributes",
+                        "__env",
+                        "__data",
+                        "obLevel",
+                        "app",
+                        "request",
                     ];
                     if framework_vars.contains(&var_name.as_str()) {
                         continue;
@@ -5928,7 +7242,12 @@ impl LaravelLanguageServer {
     }
 
     /// Check if variable is defined in a Livewire component
-    fn check_livewire_component_variable(&self, root: &std::path::Path, view_name: &str, var_name: &str) -> Option<String> {
+    fn check_livewire_component_variable(
+        &self,
+        root: &std::path::Path,
+        view_name: &str,
+        var_name: &str,
+    ) -> Option<String> {
         // Livewire views are typically in resources/views/livewire/
         // and map to app/Livewire/ or app/Http/Livewire/
         if !view_name.starts_with("livewire.") {
@@ -5942,8 +7261,13 @@ impl LaravelLanguageServer {
 
         // Try both Livewire v3 and v2 paths
         let paths = [
-            root.join("app").join("Livewire").join(format!("{}.php", class_name)),
-            root.join("app").join("Http").join("Livewire").join(format!("{}.php", class_name)),
+            root.join("app")
+                .join("Livewire")
+                .join(format!("{}.php", class_name)),
+            root.join("app")
+                .join("Http")
+                .join("Livewire")
+                .join(format!("{}.php", class_name)),
         ];
 
         for class_path in paths {
@@ -5962,11 +7286,18 @@ impl LaravelLanguageServer {
     /// Map a Blade view path under `resources/views/livewire/` to its Livewire component PHP file.
     /// Handles nested namespaces: `resources/views/livewire/decision-cloud/audits/index.blade.php`
     /// -> `app/Livewire/DecisionCloud/Audits/Index.php` (or `app/Http/Livewire/...` for v2).
-    fn view_path_to_livewire_class_path(&self, root: &std::path::Path, view_path: &str) -> Option<std::path::PathBuf> {
+    fn view_path_to_livewire_class_path(
+        &self,
+        root: &std::path::Path,
+        view_path: &str,
+    ) -> Option<std::path::PathBuf> {
         let livewire_views = root.join("resources").join("views").join("livewire");
         let views_str = livewire_views.to_string_lossy();
 
-        let relative = view_path.strip_prefix(views_str.as_ref())?.trim_start_matches('/').trim_start_matches('\\');
+        let relative = view_path
+            .strip_prefix(views_str.as_ref())?
+            .trim_start_matches('/')
+            .trim_start_matches('\\');
         let without_ext = relative.strip_suffix(".blade.php")?;
 
         // Convert each path segment from kebab-case to PascalCase
@@ -5978,7 +7309,10 @@ impl LaravelLanguageServer {
 
         // Try Livewire v3 (app/Livewire) first, then v2 (app/Http/Livewire)
         for base in ["Livewire", "Http/Livewire"] {
-            let path = root.join("app").join(base).join(format!("{}.php", class_relative));
+            let path = root
+                .join("app")
+                .join(base)
+                .join(format!("{}.php", class_relative));
             if path.exists() {
                 return Some(path);
             }
@@ -6056,7 +7390,12 @@ impl LaravelLanguageServer {
     }
 
     /// Check if variable is defined in a View component class
-    fn check_view_component_variable(&self, root: &std::path::Path, blade_path: &str, var_name: &str) -> Option<String> {
+    fn check_view_component_variable(
+        &self,
+        root: &std::path::Path,
+        blade_path: &str,
+        var_name: &str,
+    ) -> Option<String> {
         // View components can be:
         // 1. Anonymous: resources/views/components/button.blade.php (no class)
         // 2. Class-based: app/View/Components/Button.php with resources/views/components/button.blade.php
@@ -6071,7 +7410,9 @@ impl LaravelLanguageServer {
         let views_components = root.join("resources").join("views").join("components");
         let views_str = views_components.to_string_lossy();
 
-        let relative = blade_path.strip_prefix(views_str.as_ref())?.trim_start_matches('/');
+        let relative = blade_path
+            .strip_prefix(views_str.as_ref())?
+            .trim_start_matches('/');
         let without_ext = relative.strip_suffix(".blade.php")?;
 
         // Convert to class path: forms/input -> Forms/Input
@@ -6081,7 +7422,11 @@ impl LaravelLanguageServer {
             .collect();
         let class_relative = class_path_parts.join("/");
 
-        let class_path = root.join("app").join("View").join("Components").join(format!("{}.php", class_relative));
+        let class_path = root
+            .join("app")
+            .join("View")
+            .join("Components")
+            .join(format!("{}.php", class_relative));
 
         if class_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&class_path) {
@@ -6099,7 +7444,12 @@ impl LaravelLanguageServer {
     }
 
     /// Check if variable is passed from a controller to this view
-    fn check_controller_view_variable(&self, root: &std::path::Path, view_name: &str, var_name: &str) -> Option<String> {
+    fn check_controller_view_variable(
+        &self,
+        root: &std::path::Path,
+        view_name: &str,
+        var_name: &str,
+    ) -> Option<String> {
         // Scan controllers for view() calls that match this view
         let controllers_dir = root.join("app").join("Http").join("Controllers");
         if !controllers_dir.exists() {
@@ -6111,10 +7461,17 @@ impl LaravelLanguageServer {
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "php").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "php")
+                    .unwrap_or(false)
+            })
         {
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if let Some(type_name) = Self::extract_view_variable_type(&content, view_name, var_name) {
+                if let Some(type_name) =
+                    Self::extract_view_variable_type(&content, view_name, var_name)
+                {
                     return Some(type_name);
                 }
             }
@@ -6138,7 +7495,11 @@ impl LaravelLanguageServer {
             .map(|m| {
                 let full_type = m.as_str();
                 // Get just the class name (last part after \)
-                full_type.rsplit('\\').next().unwrap_or(full_type).to_string()
+                full_type
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(full_type)
+                    .to_string()
             })
     }
 
@@ -6156,12 +7517,20 @@ impl LaravelLanguageServer {
             .and_then(|caps| caps.get(1))
             .map(|m| {
                 let full_type = m.as_str();
-                full_type.rsplit('\\').next().unwrap_or(full_type).to_string()
+                full_type
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(full_type)
+                    .to_string()
             })
     }
 
     /// Extract variable type from a controller method that renders a specific view
-    fn extract_view_variable_type(content: &str, view_name: &str, var_name: &str) -> Option<String> {
+    fn extract_view_variable_type(
+        content: &str,
+        view_name: &str,
+        var_name: &str,
+    ) -> Option<String> {
         // Look for view('view.name', [...]) or view('view.name')->with([...])
         // and extract the type of the variable being passed
 
@@ -6279,9 +7648,7 @@ impl LaravelLanguageServer {
         }
 
         // Find the latest match (closest to cursor)
-        let (pos, quote_char, pattern_len) = matches
-            .into_iter()
-            .max_by_key(|(p, _, _)| *p)?;
+        let (pos, quote_char, pattern_len) = matches.into_iter().max_by_key(|(p, _, _)| *p)?;
 
         let start_pos = pos + pattern_len;
 
@@ -6316,7 +7683,11 @@ impl LaravelLanguageServer {
     ) -> Option<ValidationParamContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
-            info!("      ⚠️  Cursor {} > line length {}", cursor, line_text.len());
+            info!(
+                "      ⚠️  Cursor {} > line length {}",
+                cursor,
+                line_text.len()
+            );
             return None;
         }
 
@@ -6339,8 +7710,9 @@ impl LaravelLanguageServer {
             // Unknown - fall back to pattern matching
             ArrayContext::Unknown => {
                 let line_has_context = Self::is_validation_context(line_text, cached_rules);
-                let surrounding_has_context =
-                    surrounding_lines.iter().any(|l| Self::is_validation_context(l, cached_rules));
+                let surrounding_has_context = surrounding_lines
+                    .iter()
+                    .any(|l| Self::is_validation_context(l, cached_rules));
                 line_has_context || surrounding_has_context
             }
         };
@@ -6353,7 +7725,10 @@ impl LaravelLanguageServer {
         // Find if we're inside a quoted string with a colon (rule parameter)
         // Look for pattern like: 'rule_name:param' or "rule_name:param"
         let result = Self::extract_param_context(before_cursor);
-        info!("      📋 extract_param_context result: {:?}", result.as_ref().map(|c| (&c.rule_name, &c.current_param)));
+        info!(
+            "      📋 extract_param_context result: {:?}",
+            result.as_ref().map(|c| (&c.rule_name, &c.current_param))
+        );
         result
     }
 
@@ -6416,16 +7791,28 @@ impl LaravelLanguageServer {
     /// Excludes the current field (the one being validated on cursor_line)
     fn extract_validation_fields(content: &str, cursor_line: usize) -> Vec<String> {
         let lines: Vec<&str> = content.lines().collect();
-        info!("      📄 extract_validation_fields: {} total lines, cursor at {}", lines.len(), cursor_line);
+        info!(
+            "      📄 extract_validation_fields: {} total lines, cursor at {}",
+            lines.len(),
+            cursor_line
+        );
         if cursor_line >= lines.len() {
-            info!("      ❌ cursor_line {} >= lines.len() {}", cursor_line, lines.len());
+            info!(
+                "      ❌ cursor_line {} >= lines.len() {}",
+                cursor_line,
+                lines.len()
+            );
             return Vec::new();
         }
 
         // Extract the current field name from the cursor line to exclude it
         let current_line = lines[cursor_line];
         let current_field = Self::extract_field_name_from_line(current_line);
-        info!("      📍 Current line: '{}', current_field: {:?}", current_line.trim(), current_field);
+        info!(
+            "      📍 Current line: '{}', current_field: {:?}",
+            current_line.trim(),
+            current_field
+        );
 
         // Search backwards to find array start
         let mut bracket_count = 0;
@@ -6455,7 +7842,10 @@ impl LaravelLanguageServer {
                 break;
             }
         }
-        info!("      🔍 Array boundaries: start={}, found={}", array_start, found_array_start);
+        info!(
+            "      🔍 Array boundaries: start={}, found={}",
+            array_start, found_array_start
+        );
 
         // Search forward to find array end
         bracket_count = 0;
@@ -6484,11 +7874,15 @@ impl LaravelLanguageServer {
                 break;
             }
         }
-        info!("      🔍 Array range: lines {} to {}", array_start, array_end);
+        info!(
+            "      🔍 Array range: lines {} to {}",
+            array_start, array_end
+        );
 
         // Extract field names from the array range
         let mut fields = Vec::new();
-        let field_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
+        let field_pattern =
+            regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
 
         for i in array_start..=array_end.min(lines.len() - 1) {
             let line = lines[i];
@@ -6524,7 +7918,8 @@ impl LaravelLanguageServer {
     /// Extract field name from a validation array line
     /// e.g., "'end_date' => 'after:'" returns Some("end_date")
     fn extract_field_name_from_line(line: &str) -> Option<String> {
-        let field_pattern = regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
+        let field_pattern =
+            regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
         if let Some(caps) = field_pattern.captures(line) {
             if let Some(field_match) = caps.get(1) {
                 return Some(field_match.as_str().to_string());
@@ -6564,13 +7959,19 @@ impl LaravelLanguageServer {
 
         let param_type = match rule_info {
             Some(info) => {
-                info!("   ✅ Found rule '{}' with param type {:?}", context.rule_name, info.param_type);
+                info!(
+                    "   ✅ Found rule '{}' with param type {:?}",
+                    context.rule_name, info.param_type
+                );
                 info.param_type.clone()
-            },
+            }
             None => {
                 // Unknown rule - check if it looks like a field reference rule
                 // (common pattern for custom rules)
-                info!("   ⚠️  Rule '{}' not found, defaulting to Custom", context.rule_name);
+                info!(
+                    "   ⚠️  Rule '{}' not found, defaulting to Custom",
+                    context.rule_name
+                );
                 ParamType::Custom
             }
         };
@@ -6586,17 +7987,36 @@ impl LaravelLanguageServer {
 
             ParamType::FieldRef => {
                 // Get fields from the validation array
-                info!("   🔍 Extracting fields from content ({} chars) at line {}", content.len(), cursor_line);
+                info!(
+                    "   🔍 Extracting fields from content ({} chars) at line {}",
+                    content.len(),
+                    cursor_line
+                );
                 let fields = Self::extract_validation_fields(content, cursor_line);
-                info!("   📋 Extracted {} fields from validation array", fields.len());
+                info!(
+                    "   📋 Extracted {} fields from validation array",
+                    fields.len()
+                );
                 if fields.is_empty() {
                     info!("   ⚠️  No fields found - check if cursor is inside a validation array");
                     // Show first few lines around cursor for debugging
                     let lines: Vec<&str> = content.lines().collect();
                     if cursor_line > 0 && cursor_line < lines.len() {
-                        info!("   📄 Line {}: '{}'", cursor_line - 1, lines.get(cursor_line - 1).unwrap_or(&""));
-                        info!("   📄 Line {}: '{}'", cursor_line, lines.get(cursor_line).unwrap_or(&""));
-                        info!("   📄 Line {}: '{}'", cursor_line + 1, lines.get(cursor_line + 1).unwrap_or(&""));
+                        info!(
+                            "   📄 Line {}: '{}'",
+                            cursor_line - 1,
+                            lines.get(cursor_line - 1).unwrap_or(&"")
+                        );
+                        info!(
+                            "   📄 Line {}: '{}'",
+                            cursor_line,
+                            lines.get(cursor_line).unwrap_or(&"")
+                        );
+                        info!(
+                            "   📄 Line {}: '{}'",
+                            cursor_line + 1,
+                            lines.get(cursor_line + 1).unwrap_or(&"")
+                        );
                     }
                 } else {
                     info!("   📋 Fields: {:?}", fields);
@@ -6675,7 +8095,9 @@ impl LaravelLanguageServer {
                                     data: None,
                                 };
 
-                                self.client.publish_diagnostics(uri.clone(), vec![diagnostic], None).await;
+                                self.client
+                                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
+                                    .await;
                             }
 
                             // Return empty - no completions available
@@ -6716,11 +8138,15 @@ impl LaravelLanguageServer {
                         0 => {
                             // First param: table name (or connection.table, or Model)
                             // Check if user is typing after a period (connection.█)
-                            if context.current_param.contains('.') && !context.current_param.contains('\\') {
+                            if context.current_param.contains('.')
+                                && !context.current_param.contains('\\')
+                            {
                                 // User typed "connection." - show tables for that connection
                                 // For now, we only support default connection, so show tables
-                                let parts: Vec<&str> = context.current_param.splitn(2, '.').collect();
-                                let table_prefix = parts.get(1).unwrap_or(&"").trim().to_lowercase();
+                                let parts: Vec<&str> =
+                                    context.current_param.splitn(2, '.').collect();
+                                let table_prefix =
+                                    parts.get(1).unwrap_or(&"").trim().to_lowercase();
 
                                 info!("   🗄️  Connection.table syntax: prefix='{}'", table_prefix);
 
@@ -6741,8 +8167,11 @@ impl LaravelLanguageServer {
                             } else {
                                 // Show both connection names and table names
                                 let connections = provider.get_connections();
-                                info!("   🗄️  Database connections: {} found, tables: {} found",
-                                    connections.len(), tables.len());
+                                info!(
+                                    "   🗄️  Database connections: {} found, tables: {} found",
+                                    connections.len(),
+                                    tables.len()
+                                );
 
                                 let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -6784,20 +8213,24 @@ impl LaravelLanguageServer {
                         1 | 3 => {
                             // Param 1: column name for the table
                             // Param 3 (unique only): ID column name
-                            let first_param = context.full_params
-                                .split(',')
-                                .next()
-                                .unwrap_or("")
-                                .trim();
+                            let first_param =
+                                context.full_params.split(',').next().unwrap_or("").trim();
 
                             let table_name = extract_table_name(first_param);
-                            info!("   🗄️  Column completion for table='{}', prefix='{}'", table_name, prefix);
+                            info!(
+                                "   🗄️  Column completion for table='{}', prefix='{}'",
+                                table_name, prefix
+                            );
 
                             if table_name.is_empty() {
                                 Vec::new()
                             } else {
                                 let columns = provider.get_columns(&table_name).await;
-                                info!("   🗄️  Columns for '{}': {} found", table_name, columns.len());
+                                info!(
+                                    "   🗄️  Columns for '{}': {} found",
+                                    table_name,
+                                    columns.len()
+                                );
 
                                 columns
                                     .into_iter()
@@ -6852,7 +8285,9 @@ impl LaravelLanguageServer {
                             data: None,
                         };
 
-                        self.client.publish_diagnostics(uri.clone(), vec![diagnostic], None).await;
+                        self.client
+                            .publish_diagnostics(uri.clone(), vec![diagnostic], None)
+                            .await;
                     }
 
                     // Return empty - no completions available
@@ -6887,7 +8322,8 @@ impl LaravelLanguageServer {
 
             ParamType::MimeExtensions => {
                 // Get MIME extensions from Symfony MimeTypes.php or fallback
-                let (extensions, _mime_types): (Vec<String>, Vec<String>) = parser.parse_mime_types();
+                let (extensions, _mime_types): (Vec<String>, Vec<String>) =
+                    parser.parse_mime_types();
 
                 extensions
                     .into_iter()
@@ -6907,7 +8343,8 @@ impl LaravelLanguageServer {
 
             ParamType::MimeTypes => {
                 // Get MIME types from Symfony MimeTypes.php or fallback
-                let (_extensions, mime_types): (Vec<String>, Vec<String>) = parser.parse_mime_types();
+                let (_extensions, mime_types): (Vec<String>, Vec<String>) =
+                    parser.parse_mime_types();
 
                 mime_types
                     .into_iter()
@@ -6965,18 +8402,31 @@ impl LaravelLanguageServer {
             .chain(surrounding_lines.iter().copied())
             .collect();
 
-        info!("      🔎 detect_array_context: checking {} lines", all_lines.len());
-        info!("         Current line: '{}'", current_line.chars().take(80).collect::<String>());
+        info!(
+            "      🔎 detect_array_context: checking {} lines",
+            all_lines.len()
+        );
+        info!(
+            "         Current line: '{}'",
+            current_line.chars().take(80).collect::<String>()
+        );
 
         // Scan all lines for context markers
         for line in &all_lines {
             if let Some(context) = Self::identify_array_context_from_line(line) {
-                info!("      ✅ Detected {:?} from line: '{}'", context, line.chars().take(60).collect::<String>());
+                info!(
+                    "      ✅ Detected {:?} from line: '{}'",
+                    context,
+                    line.chars().take(60).collect::<String>()
+                );
                 return context;
             }
         }
 
-        info!("      ⚠️  No specific context found in {} lines, returning ArrayContext::Unknown", all_lines.len());
+        info!(
+            "      ⚠️  No specific context found in {} lines, returning ArrayContext::Unknown",
+            all_lines.len()
+        );
         ArrayContext::Unknown
     }
 
@@ -6997,9 +8447,7 @@ impl LaravelLanguageServer {
         }
 
         // $rules property or variable
-        if line_lower.contains("$rules")
-            && (line_lower.contains("=") || line_lower.contains("["))
-        {
+        if line_lower.contains("$rules") && (line_lower.contains("=") || line_lower.contains("[")) {
             return Some(ArrayContext::Validation);
         }
 
@@ -7271,23 +8719,17 @@ impl LaravelLanguageServer {
         let line_trimmed = line_text.trim();
 
         // 1. Request validation: $request->validate(, $this->validate(, ->validateWithBag(
-        if line_lower.contains("->validate(")
-            || line_lower.contains("->validatewithbag(")
-        {
+        if line_lower.contains("->validate(") || line_lower.contains("->validatewithbag(") {
             return true;
         }
 
         // 2. Validator facade/helper: Validator::make(, validator(
-        if line_lower.contains("validator::make(")
-            || line_lower.contains("validator(")
-        {
+        if line_lower.contains("validator::make(") || line_lower.contains("validator(") {
             return true;
         }
 
         // 3. Rules variable: $rules = [...] or $rules[
-        if line_lower.contains("$rules")
-            && (line_lower.contains("=") || line_lower.contains("["))
-        {
+        if line_lower.contains("$rules") && (line_lower.contains("=") || line_lower.contains("[")) {
             return true;
         }
 
@@ -7303,9 +8745,7 @@ impl LaravelLanguageServer {
 
         // 5. Function rules() definition (Form Request pattern)
         //    Matches: function rules(), public function rules(): array
-        if line_lower.contains("function rules(")
-            || line_lower.contains("function rules (")
-        {
+        if line_lower.contains("function rules(") || line_lower.contains("function rules (") {
             return true;
         }
 
@@ -7338,8 +8778,19 @@ impl LaravelLanguageServer {
         // 9. Inside what looks like a rules array (has pipe-delimited rules)
         if line_text.contains("|") {
             let validation_rules = [
-                "required", "nullable", "string", "integer", "email", "max", "min",
-                "unique", "exists", "in", "between", "confirmed", "accepted",
+                "required",
+                "nullable",
+                "string",
+                "integer",
+                "email",
+                "max",
+                "min",
+                "unique",
+                "exists",
+                "in",
+                "between",
+                "confirmed",
+                "accepted",
             ];
             for rule in validation_rules {
                 if line_lower.contains(rule) {
@@ -7349,8 +8800,7 @@ impl LaravelLanguageServer {
         }
 
         // 10. Inside a validation messages or attributes method (related context)
-        if line_lower.contains("function messages(")
-            || line_lower.contains("function attributes(")
+        if line_lower.contains("function messages(") || line_lower.contains("function attributes(")
         {
             return true;
         }
@@ -7371,13 +8821,15 @@ impl LaravelLanguageServer {
         }
 
         // Get env vars for resolving env() references
-        let env_vars: std::collections::HashMap<String, String> = match self.salsa.get_all_parsed_env_vars().await {
-            Ok(vars) => vars.into_iter()
-                .filter(|v| !v.is_commented)
-                .map(|v| (v.name, v.value))
-                .collect(),
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let env_vars: std::collections::HashMap<String, String> =
+            match self.salsa.get_all_parsed_env_vars().await {
+                Ok(vars) => vars
+                    .into_iter()
+                    .filter(|v| !v.is_commented)
+                    .map(|v| (v.name, v.value))
+                    .collect(),
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         let mut completions = Vec::new();
 
@@ -7506,7 +8958,8 @@ impl LaravelLanguageServer {
                         };
 
                         // Convert path separators to dots and prefix with namespace::
-                        let view_name = format!("{}::{}", namespace, view_name.replace(['/', '\\'], "."));
+                        let view_name =
+                            format!("{}::{}", namespace, view_name.replace(['/', '\\'], "."));
 
                         let display_path = path.to_string_lossy().to_string();
 
@@ -7700,8 +9153,7 @@ impl LaravelLanguageServer {
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_type().is_file()
-                    && e.path().extension().map_or(false, |ext| ext == "php")
+                e.file_type().is_file() && e.path().extension().map_or(false, |ext| ext == "php")
             })
         {
             let path = entry.into_path();
@@ -7832,9 +9284,16 @@ impl LaravelLanguageServer {
 
     /// Find the model file path for a given class name
     /// Searches in app/Models/ directory
-    fn find_model_file(&self, root: &std::path::Path, class_name: &str) -> Option<std::path::PathBuf> {
+    fn find_model_file(
+        &self,
+        root: &std::path::Path,
+        class_name: &str,
+    ) -> Option<std::path::PathBuf> {
         // Try app/Models/ClassName.php first (Laravel 8+)
-        let model_path = root.join("app").join("Models").join(format!("{}.php", class_name));
+        let model_path = root
+            .join("app")
+            .join("Models")
+            .join(format!("{}.php", class_name));
         if model_path.exists() {
             return Some(model_path);
         }
@@ -7851,7 +9310,9 @@ impl LaravelLanguageServer {
     /// Get all properties for a model class
     /// Combines database columns, casts, accessors, and relationships
     async fn get_model_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
-        use laravel_lsp::model_analyzer::{ModelMetadata, map_cast_to_php_type, relationship_to_php_type};
+        use laravel_lsp::model_analyzer::{
+            map_cast_to_php_type, relationship_to_php_type, ModelMetadata,
+        };
 
         // Synthetic Blade types — short-circuit before any filesystem lookup so they
         // never collide with user-defined models of the same name.
@@ -7922,7 +9383,10 @@ impl LaravelLanguageServer {
         // 3. Add accessors (computed properties)
         for accessor in &metadata.accessors {
             if seen_names.insert(accessor.property_name.clone()) {
-                let php_type = accessor.return_type.clone().unwrap_or_else(|| "mixed".to_string());
+                let php_type = accessor
+                    .return_type
+                    .clone()
+                    .unwrap_or_else(|| "mixed".to_string());
                 properties.push(ModelPropertyCompletion {
                     name: accessor.property_name.clone(),
                     php_type,
@@ -7934,10 +9398,8 @@ impl LaravelLanguageServer {
         // 4. Add relationships
         for rel in &metadata.relationships {
             if seen_names.insert(rel.method_name.clone()) {
-                let php_type = relationship_to_php_type(
-                    &rel.relationship_type,
-                    rel.related_model.as_deref(),
-                );
+                let php_type =
+                    relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
                 properties.push(ModelPropertyCompletion {
                     name: rel.method_name.clone(),
                     php_type,
@@ -7971,27 +9433,25 @@ impl LaravelLanguageServer {
 
         // Regex to match Route::resource('name', Controller::class) with optional modifiers
         // Captures: 1=resource name, 2=rest of the chain (for only/except parsing)
-        let resource_pattern = regex::Regex::new(
-            r#"Route::resource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#
-        ).unwrap();
+        let resource_pattern =
+            regex::Regex::new(r#"Route::resource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#)
+                .unwrap();
 
         // Regex to match Route::apiResource('name', Controller::class) with optional modifiers
-        let api_resource_pattern = regex::Regex::new(
-            r#"Route::apiResource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#
-        ).unwrap();
+        let api_resource_pattern =
+            regex::Regex::new(r#"Route::apiResource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#)
+                .unwrap();
 
         // Regex to extract ->only([...]) actions
-        let only_pattern = regex::Regex::new(
-            r#"->only\s*\(\s*\[([^\]]*)\]"#
-        ).unwrap();
+        let only_pattern = regex::Regex::new(r#"->only\s*\(\s*\[([^\]]*)\]"#).unwrap();
 
         // Regex to extract ->except([...]) actions
-        let except_pattern = regex::Regex::new(
-            r#"->except\s*\(\s*\[([^\]]*)\]"#
-        ).unwrap();
+        let except_pattern = regex::Regex::new(r#"->except\s*\(\s*\[([^\]]*)\]"#).unwrap();
 
         // Standard resource actions
-        let resource_actions = ["index", "create", "store", "show", "edit", "update", "destroy"];
+        let resource_actions = [
+            "index", "create", "store", "show", "edit", "update", "destroy",
+        ];
         // API resource actions (no create/edit - those are for forms)
         let api_resource_actions = ["index", "store", "show", "update", "destroy"];
 
@@ -8118,10 +9578,7 @@ impl LaravelLanguageServer {
         };
 
         // Laravel 9+ uses lang/, older versions use resources/lang/
-        let lang_dirs = [
-            root.join("lang"),
-            root.join("resources").join("lang"),
-        ];
+        let lang_dirs = [root.join("lang"), root.join("resources").join("lang")];
 
         let lang_dir = lang_dirs.iter().find(|d| d.exists());
         let lang_dir = match lang_dir {
@@ -8137,21 +9594,22 @@ impl LaravelLanguageServer {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    let locale = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("en");
+                    let locale = path.file_name().and_then(|n| n.to_str()).unwrap_or("en");
 
                     // Read all PHP files in this locale directory
                     if let Ok(files) = std::fs::read_dir(&path) {
                         for file_entry in files.flatten() {
                             let file_path = file_entry.path();
                             if file_path.extension().map_or(false, |e| e == "php") {
-                                if let Some(file_name) = file_path.file_stem().and_then(|s| s.to_str()) {
+                                if let Some(file_name) =
+                                    file_path.file_stem().and_then(|s| s.to_str())
+                                {
                                     let base_key = file_name.to_string();
                                     let source = format!("lang/{}/{}.php", locale, file_name);
 
                                     if let Ok(content) = std::fs::read_to_string(&file_path) {
-                                        let keys = Self::parse_translation_keys(&content, &base_key);
+                                        let keys =
+                                            Self::parse_translation_keys(&content, &base_key);
                                         for (key, value) in keys {
                                             completions.push(TranslationKeyCompletion {
                                                 key,
@@ -8435,9 +9893,9 @@ impl LaravelLanguageServer {
         env_vars: &std::collections::HashMap<String, String>,
     ) -> String {
         // Match env('VAR_NAME') or env('VAR_NAME', default) or env("VAR_NAME", default)
-        let env_pattern = regex::Regex::new(
-            r#"env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#
-        ).unwrap();
+        let env_pattern =
+            regex::Regex::new(r#"env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#)
+                .unwrap();
 
         if let Some(caps) = env_pattern.captures(value) {
             let var_name = caps.get(1).unwrap().as_str();
@@ -8451,10 +9909,7 @@ impl LaravelLanguageServer {
             if let Some(default_match) = caps.get(2) {
                 let default = default_match.as_str().trim();
                 // Clean up quotes from default value
-                return default
-                    .trim_matches('\'')
-                    .trim_matches('"')
-                    .to_string();
+                return default.trim_matches('\'').trim_matches('"').to_string();
             }
 
             // No value found, return the var name as placeholder
@@ -8463,8 +9918,9 @@ impl LaravelLanguageServer {
 
         // Check for (bool) env(...) pattern
         let bool_env_pattern = regex::Regex::new(
-            r#"\(bool\)\s*env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#
-        ).unwrap();
+            r#"\(bool\)\s*env\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"](?:\s*,\s*(.+))?\s*\)"#,
+        )
+        .unwrap();
 
         if let Some(caps) = bool_env_pattern.captures(value) {
             let var_name = caps.get(1).unwrap().as_str();
@@ -8482,10 +9938,7 @@ impl LaravelLanguageServer {
         }
 
         // Not an env() call, clean up and return as-is
-        value
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string()
+        value.trim_matches('\'').trim_matches('"').to_string()
     }
 
     // ========================================================================
@@ -8511,7 +9964,11 @@ impl LaravelLanguageServer {
     /// Extract a name from a diagnostic message between prefix and suffix
     /// e.g., extract_name_from_diagnostic("View file not found: 'welcome'", "View file not found: '", "'")
     /// Returns: Some("welcome")
-    fn extract_name_from_diagnostic<'a>(message: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    fn extract_name_from_diagnostic<'a>(
+        message: &'a str,
+        prefix: &str,
+        suffix: &str,
+    ) -> Option<&'a str> {
         if let Some(start) = message.find(prefix) {
             let after_prefix = &message[start + prefix.len()..];
             if let Some(end) = after_prefix.find(suffix) {
@@ -8542,10 +9999,13 @@ impl LaravelLanguageServer {
     ///           3. Fallback template
     async fn get_stub_content(&self, action: &FileAction) -> String {
         // These types don't use stubs - they use simple templates or generate their own
-        if matches!(action.action_type,
-            FileActionType::TranslationPhp | FileActionType::TranslationJson |
-            FileActionType::ConfigPhp | FileActionType::EnvVar |
-            FileActionType::BladeComponentWithClass
+        if matches!(
+            action.action_type,
+            FileActionType::TranslationPhp
+                | FileActionType::TranslationJson
+                | FileActionType::ConfigPhp
+                | FileActionType::EnvVar
+                | FileActionType::BladeComponentWithClass
         ) {
             return Self::fallback_template(action);
         }
@@ -8568,16 +10028,20 @@ impl LaravelLanguageServer {
             ),
             FileActionType::Middleware => (
                 "stubs/middleware.stub",
-                Some("vendor/laravel/framework/src/Illuminate/Routing/Console/stubs/middleware.stub"),
+                Some(
+                    "vendor/laravel/framework/src/Illuminate/Routing/Console/stubs/middleware.stub",
+                ),
             ),
             FileActionType::Feature => (
                 "stubs/feature.stub",
                 Some("vendor/laravel/pennant/stubs/feature.stub"),
             ),
             // These types handled above (early return)
-            FileActionType::TranslationPhp | FileActionType::TranslationJson |
-            FileActionType::ConfigPhp | FileActionType::EnvVar |
-            FileActionType::BladeComponentWithClass => {
+            FileActionType::TranslationPhp
+            | FileActionType::TranslationJson
+            | FileActionType::ConfigPhp
+            | FileActionType::EnvVar
+            | FileActionType::BladeComponentWithClass => {
                 return Self::fallback_template(action);
             }
         };
@@ -8637,14 +10101,17 @@ impl LaravelLanguageServer {
     fn fallback_template(action: &FileAction) -> String {
         match action.action_type {
             FileActionType::View => "<div>\n    \n</div>\n".to_string(),
-            FileActionType::BladeComponent => "@props([])\n\n<div>\n    {{ $slot }}\n</div>\n".to_string(),
+            FileActionType::BladeComponent => {
+                "@props([])\n\n<div>\n    {{ $slot }}\n</div>\n".to_string()
+            }
             FileActionType::Livewire => {
                 // For nested components like "admin.dashboard" or "admin.user-profile":
                 // - Class name: last segment in PascalCase ("Dashboard", "UserProfile")
                 // - Namespace: App\Livewire + intermediate segments ("App\Livewire\Admin")
                 // - View: dots preserved ("livewire.admin.dashboard")
                 let parts: Vec<&str> = action.name.split('.').collect();
-                let class_name = Self::kebab_to_pascal_case(parts.last().unwrap_or(&action.name.as_str()));
+                let class_name =
+                    Self::kebab_to_pascal_case(parts.last().unwrap_or(&action.name.as_str()));
 
                 // Build namespace from intermediate segments
                 let namespace = if parts.len() > 1 {
@@ -8769,9 +10236,7 @@ return [
                 format!("{}=\n", action.name)
             }
             // This type generates its own template in build_code_action()
-            FileActionType::BladeComponentWithClass => {
-                String::new()
-            }
+            FileActionType::BladeComponentWithClass => String::new(),
         }
     }
 
@@ -8829,7 +10294,8 @@ return [
 
                 let php_paths = [
                     root.join("lang/en").join(format!("{}.php", file_name)),
-                    root.join("resources/lang/en").join(format!("{}.php", file_name)),
+                    root.join("resources/lang/en")
+                        .join(format!("{}.php", file_name)),
                 ];
 
                 // Set the expected path to the first option (preferred location)
@@ -8867,13 +10333,18 @@ return [
         end_column: u32,
         dotted_severity: DiagnosticSeverity,
     ) -> Diagnostic {
-        let expected_path_str = check.expected_path.as_ref()
+        let expected_path_str = check
+            .expected_path
+            .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
         let (severity, message) = if check.is_dotted_key {
             let action_hint = if check.file_exists {
-                format!("\nKey '{}' not found in file", check.nested_key.as_deref().unwrap_or(translation_key))
+                format!(
+                    "\nKey '{}' not found in file",
+                    check.nested_key.as_deref().unwrap_or(translation_key)
+                )
             } else {
                 "\nFile does not exist".to_string()
             };
@@ -8881,10 +10352,8 @@ return [
                 dotted_severity,
                 format!(
                     "Translation not found: '{}'\nExpected at: {}{}",
-                    translation_key,
-                    expected_path_str,
-                    action_hint
-                )
+                    translation_key, expected_path_str, action_hint
+                ),
             )
         } else {
             let action_hint = if check.file_exists {
@@ -8896,17 +10365,21 @@ return [
                 DiagnosticSeverity::INFORMATION,
                 format!(
                     "Translation not found: '{}'\nExpected at: {}{}",
-                    translation_key,
-                    expected_path_str,
-                    action_hint
-                )
+                    translation_key, expected_path_str, action_hint
+                ),
             )
         };
 
         Diagnostic {
             range: Range {
-                start: Position { line, character: column },
-                end: Position { line, character: end_column },
+                start: Position {
+                    line,
+                    character: column,
+                },
+                end: Position {
+                    line,
+                    character: end_column,
+                },
             },
             severity: Some(severity),
             code: None,
@@ -8967,27 +10440,36 @@ return [
         column: u32,
         end_column: u32,
     ) -> Diagnostic {
-        let expected_path_str = check.expected_path.as_ref()
+        let expected_path_str = check
+            .expected_path
+            .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
         let action_hint = if check.file_exists {
-            format!("\nKey '{}' not found in file", check.nested_key.as_deref().unwrap_or(config_key))
+            format!(
+                "\nKey '{}' not found in file",
+                check.nested_key.as_deref().unwrap_or(config_key)
+            )
         } else {
             "\nFile does not exist".to_string()
         };
 
         let message = format!(
             "Config not found: '{}'\nExpected at: {}{}",
-            config_key,
-            expected_path_str,
-            action_hint
+            config_key, expected_path_str, action_hint
         );
 
         Diagnostic {
             range: Range {
-                start: Position { line, character: column },
-                end: Position { line, character: end_column },
+                start: Position {
+                    line,
+                    character: column,
+                },
+                end: Position {
+                    line,
+                    character: end_column,
+                },
             },
             severity: Some(DiagnosticSeverity::WARNING),
             code: None,
@@ -9005,7 +10487,10 @@ return [
     // ========================================================================
 
     /// Create LocationLink for a view reference from Salsa data
-    async fn create_view_location_from_salsa(&self, view: &ViewReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_view_location_from_salsa(
+        &self,
+        view: &ViewReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let config = self.get_cached_config().await?;
         let possible_paths = config.resolve_view_path(&view.name);
 
@@ -9013,8 +10498,14 @@ return [
             if self.file_exists_cached(&path).await {
                 if let Ok(target_uri) = Url::from_file_path(&path) {
                     let origin_selection_range = Range {
-                        start: Position { line: view.line, character: view.column },
-                        end: Position { line: view.line, character: view.end_column },
+                        start: Position {
+                            line: view.line,
+                            character: view.column,
+                        },
+                        end: Position {
+                            line: view.line,
+                            character: view.end_column,
+                        },
                     };
                     return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                         origin_selection_range: Some(origin_selection_range),
@@ -9029,7 +10520,10 @@ return [
     }
 
     /// Create LocationLink for a component reference from Salsa data
-    async fn create_component_location_from_salsa(&self, comp: &ComponentReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_component_location_from_salsa(
+        &self,
+        comp: &ComponentReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let config = self.get_cached_config().await?;
         let possible_paths = config.resolve_component_path(&comp.name);
 
@@ -9037,8 +10531,14 @@ return [
             if self.file_exists_cached(&path).await {
                 if let Ok(target_uri) = Url::from_file_path(&path) {
                     let origin_selection_range = Range {
-                        start: Position { line: comp.line, character: comp.column },
-                        end: Position { line: comp.line, character: comp.end_column },
+                        start: Position {
+                            line: comp.line,
+                            character: comp.column,
+                        },
+                        end: Position {
+                            line: comp.line,
+                            character: comp.end_column,
+                        },
                     };
                     return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                         origin_selection_range: Some(origin_selection_range),
@@ -9070,9 +10570,7 @@ return [
         position: Position,
     ) -> Option<GotoDefinitionResponse> {
         use laravel_lsp::slot_navigation::{
-            find_enclosing_parent_component,
-            find_slot_at_position,
-            locate_slot_in_view,
+            find_enclosing_parent_component, find_slot_at_position, locate_slot_in_view,
         };
 
         let source = {
@@ -9095,11 +10593,14 @@ return [
                 continue;
             };
 
-            let (target_line, target_col) = locate_slot_in_view(&path, &slot.name)
-                .unwrap_or((0, 0));
+            let (target_line, target_col) =
+                locate_slot_in_view(&path, &slot.name).unwrap_or((0, 0));
 
             let target_range = Range {
-                start: Position { line: target_line, character: target_col },
+                start: Position {
+                    line: target_line,
+                    character: target_col,
+                },
                 end: Position {
                     line: target_line,
                     character: target_col + slot.name.len() as u32 + 1,
@@ -9118,15 +10619,24 @@ return [
     }
 
     /// Create LocationLink for a Livewire reference from Salsa data
-    async fn create_livewire_location_from_salsa(&self, lw: &LivewireReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_livewire_location_from_salsa(
+        &self,
+        lw: &LivewireReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let config = self.get_cached_config().await?;
         let path = config.resolve_livewire_path(&lw.name)?;
 
         if self.file_exists_cached(&path).await {
             if let Ok(target_uri) = Url::from_file_path(&path) {
                 let origin_selection_range = Range {
-                    start: Position { line: lw.line, character: lw.column },
-                    end: Position { line: lw.line, character: lw.end_column },
+                    start: Position {
+                        line: lw.line,
+                        character: lw.column,
+                    },
+                    end: Position {
+                        line: lw.line,
+                        character: lw.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9140,14 +10650,16 @@ return [
     }
 
     /// Create LocationLink for a directive reference from Salsa data
-    async fn create_directive_location_from_salsa(&self, dir: &DirectiveReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_directive_location_from_salsa(
+        &self,
+        dir: &DirectiveReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let arguments = dir.arguments.as_ref()?;
         let config = self.get_cached_config().await?;
 
         // Directives where first argument is a view name
-        let view_directives_first_arg = [
-            "extends", "include", "includeIf", "includeUnless", "each"
-        ];
+        let view_directives_first_arg =
+            ["extends", "include", "includeIf", "includeUnless", "each"];
 
         // Directives where second argument is a view name (after a condition)
         let view_directives_second_arg = ["includeWhen"];
@@ -9241,9 +10753,13 @@ return [
                 if let Some(root) = root.as_ref() {
                     // First check scanned features for custom $name property matches
                     let scanned_features = scan_feature_classes(root);
-                    let feature_path = if let Some(feature_info) = scanned_features.iter().find(|f| f.feature_key == feature_name) {
+                    let feature_path = if let Some(feature_info) = scanned_features
+                        .iter()
+                        .find(|f| f.feature_key == feature_name)
+                    {
                         // Found a feature class with matching $name property or derived key
-                        root.join("app/Features").join(format!("{}.php", feature_info.class_name))
+                        root.join("app/Features")
+                            .join(format!("{}.php", feature_info.class_name))
                     } else {
                         // Fallback: Convert feature key to class name and build path
                         let class_name = feature_key_to_class_name(&feature_name);
@@ -9262,11 +10778,21 @@ return [
     }
 
     /// Helper to create a LocationLink for a directive
-    fn create_location_link(&self, dir: &DirectiveReferenceData, path: &std::path::Path) -> Option<GotoDefinitionResponse> {
+    fn create_location_link(
+        &self,
+        dir: &DirectiveReferenceData,
+        path: &std::path::Path,
+    ) -> Option<GotoDefinitionResponse> {
         let target_uri = Url::from_file_path(path).ok()?;
         let origin_selection_range = Range {
-            start: Position { line: dir.line, character: dir.column },
-            end: Position { line: dir.line, character: dir.end_column },
+            start: Position {
+                line: dir.line,
+                character: dir.column,
+            },
+            end: Position {
+                line: dir.line,
+                character: dir.end_column,
+            },
         };
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: Some(origin_selection_range),
@@ -9278,11 +10804,21 @@ return [
 
     /// Helper to create a LocationLink using string_column/string_end_column range
     /// This highlights just the string content inside quotes, not the entire directive
-    fn create_location_link_with_string_range(&self, dir: &DirectiveReferenceData, path: &std::path::Path) -> Option<GotoDefinitionResponse> {
+    fn create_location_link_with_string_range(
+        &self,
+        dir: &DirectiveReferenceData,
+        path: &std::path::Path,
+    ) -> Option<GotoDefinitionResponse> {
         let target_uri = Url::from_file_path(path).ok()?;
         let origin_selection_range = Range {
-            start: Position { line: dir.line, character: dir.string_column },
-            end: Position { line: dir.line, character: dir.string_end_column },
+            start: Position {
+                line: dir.line,
+                character: dir.string_column,
+            },
+            end: Position {
+                line: dir.line,
+                character: dir.string_end_column,
+            },
         };
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: Some(origin_selection_range),
@@ -9361,29 +10897,57 @@ return [
     }
 
     /// Create LocationLink for an env reference using Salsa
-    async fn create_env_location_from_salsa(&self, env: &EnvReferenceData) -> Option<GotoDefinitionResponse> {
-        let env_var = self.salsa.get_parsed_env_var(env.name.clone()).await.ok()??;
+    async fn create_env_location_from_salsa(
+        &self,
+        env: &EnvReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
+        let env_var = self
+            .salsa
+            .get_parsed_env_var(env.name.clone())
+            .await
+            .ok()??;
         let target_uri = Url::from_file_path(&env_var.source_file).ok()?;
         let origin_selection_range = Range {
-            start: Position { line: env.line, character: env.column },
-            end: Position { line: env.line, character: env.end_column },
+            start: Position {
+                line: env.line,
+                character: env.column,
+            },
+            end: Position {
+                line: env.line,
+                character: env.end_column,
+            },
         };
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: Some(origin_selection_range),
             target_uri,
             target_range: Range {
-                start: Position { line: env_var.line, character: env_var.column },
-                end: Position { line: env_var.line, character: env_var.column + env_var.name.len() as u32 },
+                start: Position {
+                    line: env_var.line,
+                    character: env_var.column,
+                },
+                end: Position {
+                    line: env_var.line,
+                    character: env_var.column + env_var.name.len() as u32,
+                },
             },
             target_selection_range: Range {
-                start: Position { line: env_var.line, character: env_var.column },
-                end: Position { line: env_var.line, character: env_var.column + env_var.name.len() as u32 },
+                start: Position {
+                    line: env_var.line,
+                    character: env_var.column,
+                },
+                end: Position {
+                    line: env_var.line,
+                    character: env_var.column + env_var.name.len() as u32,
+                },
             },
         }]))
     }
 
     /// Create LocationLink for a config reference from Salsa data
-    async fn create_config_location_from_salsa(&self, config_ref: &ConfigReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_config_location_from_salsa(
+        &self,
+        config_ref: &ConfigReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let project_config = self.get_cached_config().await?;
 
         // Parse config key like "app.name" -> file: config/app.php
@@ -9393,13 +10957,22 @@ return [
         }
 
         let config_file = parts[0];
-        let config_path = project_config.root.join("config").join(format!("{}.php", config_file));
+        let config_path = project_config
+            .root
+            .join("config")
+            .join(format!("{}.php", config_file));
 
         if self.file_exists_cached(&config_path).await {
             if let Ok(target_uri) = Url::from_file_path(&config_path) {
                 let origin_selection_range = Range {
-                    start: Position { line: config_ref.line, character: config_ref.column },
-                    end: Position { line: config_ref.line, character: config_ref.end_column },
+                    start: Position {
+                        line: config_ref.line,
+                        character: config_ref.column,
+                    },
+                    end: Position {
+                        line: config_ref.line,
+                        character: config_ref.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9415,11 +10988,20 @@ return [
     /// Create LocationLink for a middleware reference
     /// Navigates to the alias declaration (e.g., in bootstrap/app.php)
     /// Uses cache-first lookup (disk cache → Salsa fallback)
-    async fn create_middleware_location_from_salsa(&self, mw: &MiddlewareReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_middleware_location_from_salsa(
+        &self,
+        mw: &MiddlewareReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         // Use unified cache-first lookup (same as diagnostics)
         // Returns (class_name, class_file, source_file, source_line) - we navigate to source_file
         let cached = self.get_cached_middleware(&mw.name).await;
-        info!("🔍 get_cached_middleware('{}') = {:?}", mw.name, cached.as_ref().map(|(c, cf, sf, sl)| (c, cf.is_some(), sf.is_some(), sl)));
+        info!(
+            "🔍 get_cached_middleware('{}') = {:?}",
+            mw.name,
+            cached
+                .as_ref()
+                .map(|(c, cf, sf, sl)| (c, cf.is_some(), sf.is_some(), sl))
+        );
 
         let (_class_name, _class_file, source_file, source_line) = cached?;
 
@@ -9441,14 +11023,26 @@ return [
         let target_line = source_line.unwrap_or(1).saturating_sub(1);
 
         let origin_selection_range = Range {
-            start: Position { line: mw.line, character: mw.column },
-            end: Position { line: mw.line, character: mw.end_column },
+            start: Position {
+                line: mw.line,
+                character: mw.column,
+            },
+            end: Position {
+                line: mw.line,
+                character: mw.end_column,
+            },
         };
 
         // Navigate to the specific line where the alias is declared
         let target_range = Range {
-            start: Position { line: target_line, character: 0 },
-            end: Position { line: target_line, character: 0 },
+            start: Position {
+                line: target_line,
+                character: 0,
+            },
+            end: Position {
+                line: target_line,
+                character: 0,
+            },
         };
 
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
@@ -9460,7 +11054,10 @@ return [
     }
 
     /// Create LocationLink for a translation reference from Salsa data
-    async fn create_translation_location_from_salsa(&self, trans: &TranslationReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_translation_location_from_salsa(
+        &self,
+        trans: &TranslationReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
@@ -9473,7 +11070,9 @@ return [
             if parts.is_empty() {
                 return None;
             }
-            root.join("lang").join("en").join(format!("{}.php", parts[0]))
+            root.join("lang")
+                .join("en")
+                .join(format!("{}.php", parts[0]))
         } else {
             // Text key: "Welcome to our app" -> lang/en.json
             root.join("lang").join("en.json")
@@ -9482,15 +11081,20 @@ return [
         if self.file_exists_cached(&translation_path).await {
             if let Ok(target_uri) = Url::from_file_path(&translation_path) {
                 let origin_selection_range = Range {
-                    start: Position { line: trans.line, character: trans.column },
-                    end: Position { line: trans.line, character: trans.end_column },
+                    start: Position {
+                        line: trans.line,
+                        character: trans.column,
+                    },
+                    end: Position {
+                        line: trans.line,
+                        character: trans.end_column,
+                    },
                 };
 
                 // Find the line number of the key in the file
                 let target_range = if !is_dotted_key {
                     // For JSON files, find the line where the key is defined
-                    Self::find_json_key_location(&translation_path, &trans.key)
-                        .unwrap_or_default()
+                    Self::find_json_key_location(&translation_path, &trans.key).unwrap_or_default()
                 } else {
                     // For PHP files, default to start (could be enhanced later)
                     Range::default()
@@ -9538,14 +11142,19 @@ return [
     }
 
     /// Create LocationLink for an asset reference from Salsa data
-    async fn create_asset_location_from_salsa(&self, asset: &AssetReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_asset_location_from_salsa(
+        &self,
+        asset: &AssetReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
         // Determine the base path based on helper type
         use laravel_lsp::salsa_impl::AssetHelperType;
         let base_path = match asset.helper_type {
-            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => root.join("public"),
+            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
+                root.join("public")
+            }
             AssetHelperType::BasePath => root.clone(),
             AssetHelperType::AppPath => root.join("app"),
             AssetHelperType::StoragePath => root.join("storage"),
@@ -9560,8 +11169,14 @@ return [
         if self.file_exists_cached(&asset_path).await {
             if let Ok(target_uri) = Url::from_file_path(&asset_path) {
                 let origin_selection_range = Range {
-                    start: Position { line: asset.line, character: asset.column },
-                    end: Position { line: asset.line, character: asset.end_column },
+                    start: Position {
+                        line: asset.line,
+                        character: asset.column,
+                    },
+                    end: Position {
+                        line: asset.line,
+                        character: asset.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9577,7 +11192,10 @@ return [
     /// Create LocationLink for a binding reference
     /// Navigates to the binding declaration (e.g., in AppServiceProvider.php)
     /// Uses cache-first lookup (disk cache → Salsa fallback)
-    async fn create_binding_location_from_salsa(&self, binding: &BindingReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_binding_location_from_salsa(
+        &self,
+        binding: &BindingReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
@@ -9587,8 +11205,14 @@ return [
                 if self.file_exists_cached(&path).await {
                     if let Ok(target_uri) = Url::from_file_path(&path) {
                         let origin_selection_range = Range {
-                            start: Position { line: binding.line, character: binding.column },
-                            end: Position { line: binding.line, character: binding.end_column },
+                            start: Position {
+                                line: binding.line,
+                                character: binding.column,
+                            },
+                            end: Position {
+                                line: binding.line,
+                                character: binding.end_column,
+                            },
                         };
                         return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                             origin_selection_range: Some(origin_selection_range),
@@ -9602,19 +11226,33 @@ return [
         }
 
         // For string bindings, navigate to the binding declaration
-        if let Some((_class_name, _class_file, source_file, source_line)) = self.get_cached_binding(&binding.name).await {
+        if let Some((_class_name, _class_file, source_file, source_line)) =
+            self.get_cached_binding(&binding.name).await
+        {
             if let Some(path) = source_file {
                 if self.file_exists_cached(&path).await {
                     if let Ok(target_uri) = Url::from_file_path(&path) {
                         // LSP uses 0-based line numbers, but we store 1-based
                         let target_line = source_line.unwrap_or(1).saturating_sub(1);
                         let origin_selection_range = Range {
-                            start: Position { line: binding.line, character: binding.column },
-                            end: Position { line: binding.line, character: binding.end_column },
+                            start: Position {
+                                line: binding.line,
+                                character: binding.column,
+                            },
+                            end: Position {
+                                line: binding.line,
+                                character: binding.end_column,
+                            },
                         };
                         let target_range = Range {
-                            start: Position { line: target_line, character: 0 },
-                            end: Position { line: target_line, character: 0 },
+                            start: Position {
+                                line: target_line,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: target_line,
+                                character: 0,
+                            },
                         };
                         return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                             origin_selection_range: Some(origin_selection_range),
@@ -9632,7 +11270,10 @@ return [
 
     /// Create a goto location for a route('name') call
     /// Navigates to the route definition in routes/*.php files
-    async fn create_route_location_from_salsa(&self, route: &RouteReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_route_location_from_salsa(
+        &self,
+        route: &RouteReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         // Look up directly in the pre-built index. The index is populated at
         // init time from `routes/**/*.php`, `vendor/*/routes/**/*.php`,
         // content-matched vendor PHP files (catches macro bodies like Laravel
@@ -9644,12 +11285,24 @@ return [
 
         let target_uri = Url::from_file_path(&def.file).ok()?;
         let origin_selection_range = Range {
-            start: Position { line: route.line, character: route.column },
-            end: Position { line: route.line, character: route.end_column },
+            start: Position {
+                line: route.line,
+                character: route.column,
+            },
+            end: Position {
+                line: route.line,
+                character: route.end_column,
+            },
         };
         let target_range = Range {
-            start: Position { line: def.line, character: def.column },
-            end: Position { line: def.line, character: def.end_column },
+            start: Position {
+                line: def.line,
+                character: def.column,
+            },
+            end: Position {
+                line: def.line,
+                character: def.end_column,
+            },
         };
         Some(GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: Some(origin_selection_range),
@@ -9689,7 +11342,10 @@ return [
 
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
-    async fn create_url_location_from_salsa(&self, url: &UrlReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_url_location_from_salsa(
+        &self,
+        url: &UrlReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
@@ -9700,8 +11356,14 @@ return [
         if self.file_exists_cached(&public_path).await {
             if let Ok(target_uri) = Url::from_file_path(&public_path) {
                 let origin_selection_range = Range {
-                    start: Position { line: url.line, character: url.column },
-                    end: Position { line: url.line, character: url.end_column },
+                    start: Position {
+                        line: url.line,
+                        character: url.column,
+                    },
+                    end: Position {
+                        line: url.line,
+                        character: url.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9717,7 +11379,10 @@ return [
 
     /// Create a goto location for an action('Controller@method') call
     /// Navigates to the controller file
-    async fn create_action_location_from_salsa(&self, action: &ActionReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_action_location_from_salsa(
+        &self,
+        action: &ActionReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
@@ -9731,8 +11396,14 @@ return [
         if self.file_exists_cached(&path).await {
             if let Ok(target_uri) = Url::from_file_path(&path) {
                 let origin_selection_range = Range {
-                    start: Position { line: action.line, character: action.column },
-                    end: Position { line: action.line, character: action.end_column },
+                    start: Position {
+                        line: action.line,
+                        character: action.column,
+                    },
+                    end: Position {
+                        line: action.line,
+                        character: action.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9748,7 +11419,10 @@ return [
 
     /// Create a goto location for a Feature::active('feature-name') call
     /// Navigates to the feature class file in app/Features/
-    async fn create_feature_location_from_salsa(&self, feature: &FeatureReferenceData) -> Option<GotoDefinitionResponse> {
+    async fn create_feature_location_from_salsa(
+        &self,
+        feature: &FeatureReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
@@ -9761,21 +11435,32 @@ return [
             // String-based: Feature::active('new-api')
             // First check scanned features for custom $name property matches
             let scanned_features = scan_feature_classes(root);
-            if let Some(feature_info) = scanned_features.iter().find(|f| f.feature_key == feature.feature_name) {
+            if let Some(feature_info) = scanned_features
+                .iter()
+                .find(|f| f.feature_key == feature.feature_name)
+            {
                 // Found a feature class with matching $name property or derived key
-                root.join("app/Features").join(format!("{}.php", feature_info.class_name))
+                root.join("app/Features")
+                    .join(format!("{}.php", feature_info.class_name))
             } else {
                 // Fallback: Convert kebab-case/snake_case to PascalCase
                 let class_name = feature_key_to_class_name(&feature.feature_name);
-                root.join("app/Features").join(format!("{}.php", class_name))
+                root.join("app/Features")
+                    .join(format!("{}.php", class_name))
             }
         };
 
         if self.file_exists_cached(&path).await {
             if let Ok(target_uri) = Url::from_file_path(&path) {
                 let origin_selection_range = Range {
-                    start: Position { line: feature.line, character: feature.column },
-                    end: Position { line: feature.line, character: feature.end_column },
+                    start: Position {
+                        line: feature.line,
+                        character: feature.column,
+                    },
+                    end: Position {
+                        line: feature.line,
+                        character: feature.end_column,
+                    },
                 };
                 return Some(GotoDefinitionResponse::Link(vec![LocationLink {
                     origin_selection_range: Some(origin_selection_range),
@@ -9948,7 +11633,10 @@ return [
                 info!("   ⚠️  No patterns found in Salsa for {}", uri);
                 // Fall back to empty patterns - file might not be in Salsa yet
                 // Ensure Salsa has the file before proceeding
-                let _ = self.salsa.update_file(file_path.clone(), 0, source.to_string()).await;
+                let _ = self
+                    .salsa
+                    .update_file(file_path.clone(), 0, source.to_string())
+                    .await;
                 match self.salsa.get_patterns(file_path.clone()).await {
                     Ok(Some(p)) => p,
                     _ => return,
@@ -9969,7 +11657,8 @@ return [
                 let exists = possible_paths.iter().any(|p| p.exists());
 
                 if !exists {
-                    let expected_path = possible_paths.first()
+                    let expected_path = possible_paths
+                        .first()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| "unknown".to_string());
 
@@ -9992,8 +11681,7 @@ return [
                         source: Some("laravel".to_string()),
                         message: format!(
                             "View file not found: '{}'\nExpected at: {}",
-                            view_ref.name,
-                            expected_path
+                            view_ref.name, expected_path
                         ),
                         related_information: None,
                         tags: None,
@@ -10007,7 +11695,10 @@ return [
             // Check env() calls using Salsa patterns - warn if variable not defined
             let root_for_env = self.root_path.read().await;
             for env_ref in &patterns.env_refs {
-                let env_exists = self.salsa.get_parsed_env_var(env_ref.name.clone()).await
+                let env_exists = self
+                    .salsa
+                    .get_parsed_env_var(env_ref.name.clone())
+                    .await
                     .ok()
                     .flatten()
                     .is_some();
@@ -10024,7 +11715,10 @@ return [
 
                     // Check file existence
                     let env_exists = env_path.as_ref().map(|p| p.exists()).unwrap_or(false);
-                    let env_example_exists = env_example_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+                    let env_example_exists = env_example_path
+                        .as_ref()
+                        .map(|p| p.exists())
+                        .unwrap_or(false);
 
                     // Build the message with Expected at: and optionally Copy from:
                     // Format varies based on whether .env file exists:
@@ -10149,12 +11843,24 @@ return [
                     let middleware_name = &mw_ref.name;
 
                     // Check if middleware exists in cache or Salsa registry
-                    debug!("Checking middleware '{}' in cache/registry", middleware_name);
-                    if let Some((class_name, class_file, _source_file, _source_line)) = self.get_cached_middleware(middleware_name).await {
-                        debug!("Middleware '{}' found, class: {}", middleware_name, class_name);
+                    debug!(
+                        "Checking middleware '{}' in cache/registry",
+                        middleware_name
+                    );
+                    if let Some((class_name, class_file, _source_file, _source_line)) =
+                        self.get_cached_middleware(middleware_name).await
+                    {
+                        debug!(
+                            "Middleware '{}' found, class: {}",
+                            middleware_name, class_name
+                        );
                         // Middleware is in registry - check if class file exists
                         if let Some(ref mw_class_path) = class_file {
-                            debug!("Checking class file: {:?}, exists: {}", mw_class_path, mw_class_path.exists());
+                            debug!(
+                                "Checking class file: {:?}, exists: {}",
+                                mw_class_path,
+                                mw_class_path.exists()
+                            );
                             if !mw_class_path.exists() {
                                 // ERROR - middleware defined but class file missing (will crash at runtime)
                                 debug!("Creating ERROR diagnostic for missing middleware class file: {}", middleware_name);
@@ -10185,7 +11891,10 @@ return [
                                 };
                                 diagnostics.push(diagnostic);
                             } else {
-                                debug!("Middleware '{}' class file exists at {:?}", middleware_name, mw_class_path);
+                                debug!(
+                                    "Middleware '{}' class file exists at {:?}",
+                                    middleware_name, mw_class_path
+                                );
                             }
                         } else {
                             debug!("Middleware '{}' in registry but no class_file resolved - skipping diagnostic", middleware_name);
@@ -10319,7 +12028,9 @@ return [
                         let binding_name = &binding_ref.name;
 
                         // Check if binding exists in Salsa registry
-                        if let Ok(Some(binding_data)) = self.salsa.get_parsed_binding(binding_name.clone()).await {
+                        if let Ok(Some(binding_data)) =
+                            self.salsa.get_parsed_binding(binding_name.clone()).await
+                        {
                             // Binding exists - check if the concrete class file exists
                             if let Some(ref bind_file_path) = binding_data.file_path {
                                 if !bind_file_path.exists() {
@@ -10334,11 +12045,20 @@ return [
                                     );
 
                                     // Add registration location
-                                    let registered_in = binding_data.source_file.file_name()
+                                    let registered_in = binding_data
+                                        .source_file
+                                        .file_name()
                                         .and_then(|n| n.to_str())
                                         .unwrap_or("service provider");
-                                    message.push_str(&format!("\n\nBound in: {}:{}", registered_in, binding_data.source_line + 1));
-                                    message.push_str(&format!("\nConcrete class: {}", binding_data.concrete_class));
+                                    message.push_str(&format!(
+                                        "\n\nBound in: {}:{}",
+                                        registered_in,
+                                        binding_data.source_line + 1
+                                    ));
+                                    message.push_str(&format!(
+                                        "\nConcrete class: {}",
+                                        binding_data.concrete_class
+                                    ));
 
                                     let diagnostic = Diagnostic {
                                         range: Range {
@@ -10366,16 +12086,41 @@ return [
                         } else {
                             // Binding not found - check if it's a known framework binding
                             let framework_bindings = [
-                                "app", "auth", "auth.driver", "blade.compiler", "cache", "cache.store",
-                                "config", "cookie", "db", "db.connection", "encrypter", "events",
-                                "files", "filesystem", "filesystem.disk", "hash", "log", "mailer",
-                                "queue", "queue.connection", "redirect", "redis", "request", "router",
-                                "session", "session.store", "url", "validator", "view",
+                                "app",
+                                "auth",
+                                "auth.driver",
+                                "blade.compiler",
+                                "cache",
+                                "cache.store",
+                                "config",
+                                "cookie",
+                                "db",
+                                "db.connection",
+                                "encrypter",
+                                "events",
+                                "files",
+                                "filesystem",
+                                "filesystem.disk",
+                                "hash",
+                                "log",
+                                "mailer",
+                                "queue",
+                                "queue.connection",
+                                "redirect",
+                                "redis",
+                                "request",
+                                "router",
+                                "session",
+                                "session.store",
+                                "url",
+                                "validator",
+                                "view",
                             ];
 
                             if !framework_bindings.contains(&binding_name.as_str()) {
                                 // Check if we can resolve the class by convention
-                                if let Some(class_path) = resolve_class_to_file(binding_name, root) {
+                                if let Some(class_path) = resolve_class_to_file(binding_name, root)
+                                {
                                     if class_path.exists() {
                                         // Class exists via convention - skip diagnostic
                                         continue;
@@ -10474,16 +12219,19 @@ return [
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
                 // Get all existing feature classes for comparison
-                let existing_features: std::collections::HashSet<String> = scan_feature_classes(root)
-                    .into_iter()
-                    .map(|f| f.feature_key)
-                    .collect();
+                let existing_features: std::collections::HashSet<String> =
+                    scan_feature_classes(root)
+                        .into_iter()
+                        .map(|f| f.feature_key)
+                        .collect();
 
                 for feature_ref in &patterns.feature_refs {
                     // Skip class references (they're resolved differently)
                     if feature_ref.is_class_reference {
                         // For class references, check if the class file exists
-                        if let Some(class_path) = resolve_class_to_file(&feature_ref.feature_name, root) {
+                        if let Some(class_path) =
+                            resolve_class_to_file(&feature_ref.feature_name, root)
+                        {
                             if !class_path.exists() {
                                 let diagnostic = Diagnostic {
                                     range: Range {
@@ -10515,8 +12263,11 @@ return [
                     } else {
                         // For string references, check if the feature key exists
                         if !existing_features.contains(&feature_ref.feature_name) {
-                            let expected_class = feature_key_to_class_name(&feature_ref.feature_name);
-                            let expected_path = root.join("app/Features").join(format!("{}.php", expected_class));
+                            let expected_class =
+                                feature_key_to_class_name(&feature_ref.feature_name);
+                            let expected_path = root
+                                .join("app/Features")
+                                .join(format!("{}.php", expected_class));
 
                             let diagnostic = Diagnostic {
                                 range: Range {
@@ -10554,8 +12305,13 @@ return [
             diagnostics.extend(validation_diagnostics);
 
             // Store and publish diagnostics for PHP files
-            self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
-            self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+            self.diagnostics
+                .write()
+                .await
+                .insert(uri.clone(), diagnostics.clone());
+            self.client
+                .publish_diagnostics(uri.clone(), diagnostics, None)
+                .await;
             return;
         }
 
@@ -10599,7 +12355,8 @@ return [
 
                         if !exists {
                             // Use the first path for the diagnostic message
-                            let expected_path = possible_paths.first()
+                            let expected_path = possible_paths
+                                .first()
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -10619,8 +12376,7 @@ return [
                                 source: Some("laravel".to_string()),
                                 message: format!(
                                     "View file not found: '{}'\nExpected at: {}",
-                                    view_name,
-                                    expected_path
+                                    view_name, expected_path
                                 ),
                                 related_information: None,
                                 tags: None,
@@ -10642,7 +12398,8 @@ return [
 
             if !view_exists {
                 // View not found - offer to create view (anonymous) or view+class
-                let expected_path = possible_paths.first()
+                let expected_path = possible_paths
+                    .first()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "unknown".to_string());
 
@@ -10662,8 +12419,7 @@ return [
                     source: Some("laravel".to_string()),
                     message: format!(
                         "Blade component not found: '{}'\nExpected at: {}",
-                        comp_ref.name,
-                        expected_path
+                        comp_ref.name, expected_path
                     ),
                     related_information: None,
                     tags: None,
@@ -10717,7 +12473,8 @@ return [
                 // Only validate @lang directives
                 if dir_ref.name == "lang" {
                     if let Some(ref args) = dir_ref.arguments {
-                        if let Some(translation_key) = Self::extract_view_from_directive_args(args) {
+                        if let Some(translation_key) = Self::extract_view_from_directive_args(args)
+                        {
                             let check = Self::check_translation_file(root, &translation_key);
                             if !check.exists {
                                 diagnostics.push(Self::create_translation_diagnostic(
@@ -10736,13 +12493,16 @@ return [
 
             // Check @feature directives for Laravel Pennant feature classes
             // Build a map of feature keys to their actual file paths (supports custom $name properties)
-            let feature_map: std::collections::HashMap<String, PathBuf> = scan_feature_classes(root)
-                .into_iter()
-                .map(|f| {
-                    let file_path = root.join("app/Features").join(format!("{}.php", f.class_name));
-                    (f.feature_key, file_path)
-                })
-                .collect();
+            let feature_map: std::collections::HashMap<String, PathBuf> =
+                scan_feature_classes(root)
+                    .into_iter()
+                    .map(|f| {
+                        let file_path = root
+                            .join("app/Features")
+                            .join(format!("{}.php", f.class_name));
+                        (f.feature_key, file_path)
+                    })
+                    .collect();
 
             for dir_ref in &patterns.directives {
                 if dir_ref.name == "feature" {
@@ -10752,7 +12512,8 @@ return [
                             if !feature_map.contains_key(&feature_name) {
                                 // Feature not found - show expected path based on derived class name
                                 let class_name = feature_key_to_class_name(&feature_name);
-                                let feature_path = root.join(format!("app/Features/{}.php", class_name));
+                                let feature_path =
+                                    root.join(format!("app/Features/{}.php", class_name));
 
                                 // Use pre-calculated string_column/string_end_column from Salsa
                                 // These point to the content INSIDE the quotes (the feature name)
@@ -10847,7 +12608,8 @@ return [
         // Check for unresolved variable property accesses in Blade files
         // This warns about variables like $user-> where the type cannot be determined
         let variable_accesses = Self::extract_blade_variable_accesses(source);
-        let mut seen_variables: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_variables: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for access in variable_accesses {
             // Only report once per variable name to avoid spam
@@ -10856,7 +12618,9 @@ return [
             }
 
             // Try to resolve the variable type
-            let resolved_type = self.resolve_blade_variable_type(uri, &access.variable_name).await;
+            let resolved_type = self
+                .resolve_blade_variable_type(uri, &access.variable_name)
+                .await;
 
             if resolved_type.is_none() {
                 seen_variables.insert(access.variable_name.clone());
@@ -10890,16 +12654,22 @@ return [
         }
 
         // Store diagnostics for hover filtering
-        self.diagnostics.write().await.insert(uri.clone(), diagnostics.clone());
+        self.diagnostics
+            .write()
+            .await
+            .insert(uri.clone(), diagnostics.clone());
 
         // Publish diagnostics
-        info!("   📤 Publishing {} diagnostics to client", diagnostics.len());
-        self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+        info!(
+            "   📤 Publishing {} diagnostics to client",
+            diagnostics.len()
+        );
+        self.client
+            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .await;
         info!("   ✅ Diagnostics published successfully");
     }
 }
-
-
 
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
@@ -10945,7 +12715,7 @@ impl LanguageServer for LaravelLanguageServer {
             capabilities: ServerCapabilities {
                 // We support go-to-definition
                 definition_provider: Some(OneOf::Left(true)),
-                
+
                 // We need to sync document content and receive save notifications
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
@@ -10956,9 +12726,9 @@ impl LanguageServer for LaravelLanguageServer {
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                             include_text: Some(false), // We get text from did_change
                         })),
-                    }
+                    },
                 )),
-                
+
                 // ❌ REMOVED: hover_provider
                 // We only support goto_definition (Option+click navigation).
                 // Hover popups are redundant - the underline already indicates navigability.
@@ -11003,15 +12773,15 @@ impl LanguageServer for LaravelLanguageServer {
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
                                 token_types: vec![
-                                    SemanticTokenType::FUNCTION,  // index 0 - @directive
+                                    SemanticTokenType::FUNCTION, // index 0 - @directive
                                 ],
                                 token_modifiers: vec![],
                             },
                             full: Some(SemanticTokensFullOptions::Bool(true)),
                             range: None,
                             ..Default::default()
-                        }
-                    )
+                        },
+                    ),
                 ),
 
                 ..Default::default()
@@ -11047,7 +12817,10 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Register project files with Salsa for reference finding (if config available)
             if let Some(config) = server.get_cached_config().await {
-                info!("Laravel config available: {} view paths", config.view_paths.len());
+                info!(
+                    "Laravel config available: {} view paths",
+                    config.view_paths.len()
+                );
                 server.register_project_files_with_salsa(&root).await;
             } else {
                 info!("Config not available for project file registration");
@@ -11062,7 +12835,11 @@ impl LanguageServer for LaravelLanguageServer {
             // Queue and execute initial vendor/app rescans
             // This registers middleware and bindings from Laravel framework and service providers
             info!("🔍 Queueing initial vendor and app rescans...");
-            server.pending_rescans.write().await.insert(RescanType::Vendor);
+            server
+                .pending_rescans
+                .write()
+                .await
+                .insert(RescanType::Vendor);
             server.pending_rescans.write().await.insert(RescanType::App);
 
             // Execute pending rescans (vendor, app, node_modules)
@@ -11137,8 +12914,14 @@ impl LanguageServer for LaravelLanguageServer {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        info!("📂 did_open: {}", uri.path().split('/').last().unwrap_or(""));
-        self.documents.write().await.insert(uri.clone(), (text.clone(), version));
+        info!(
+            "📂 did_open: {}",
+            uri.path().split('/').last().unwrap_or("")
+        );
+        self.documents
+            .write()
+            .await
+            .insert(uri.clone(), (text.clone(), version));
 
         // Try to discover Laravel config from this file if we don't have one yet
         if let Ok(file_path) = uri.to_file_path() {
@@ -11148,7 +12931,11 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Update Salsa database with new file content
             let t2 = std::time::Instant::now();
-            if let Err(e) = self.salsa.update_file(file_path.clone(), version, text.clone()).await {
+            if let Err(e) = self
+                .salsa
+                .update_file(file_path.clone(), version, text.clone())
+                .await
+            {
                 debug!("Failed to update Salsa database: {}", e);
             }
             info!("   ⏱️  salsa.update_file: {:?}", t2.elapsed());
@@ -11157,7 +12944,10 @@ impl LanguageServer for LaravelLanguageServer {
         // Validate and publish diagnostics for Blade files
         let t3 = std::time::Instant::now();
         self.validate_and_publish_diagnostics(&uri, &text).await;
-        info!("   ⏱️  validate_and_publish_diagnostics: {:?}", t3.elapsed());
+        info!(
+            "   ⏱️  validate_and_publish_diagnostics: {:?}",
+            t3.elapsed()
+        );
         info!("   ✅ did_open total: {:?}", total_start.elapsed());
     }
 
@@ -11166,10 +12956,16 @@ impl LanguageServer for LaravelLanguageServer {
         let version = params.text_document.version;
 
         if let Some(change) = params.content_changes.into_iter().next() {
-            debug!("Laravel LSP: Document changed: {} (version: {})", uri, version);
+            debug!(
+                "Laravel LSP: Document changed: {} (version: {})",
+                uri, version
+            );
 
             // Store in documents buffer immediately (for goto_definition during debounce)
-            self.documents.write().await.insert(uri.clone(), (change.text.clone(), version));
+            self.documents
+                .write()
+                .await
+                .insert(uri.clone(), (change.text.clone(), version));
 
             // Queue debounced Salsa update (250ms)
             // This handles all file types: SourceFile, ConfigFile, EnvFile, ServiceProviderFile
@@ -11217,7 +13013,11 @@ impl LanguageServer for LaravelLanguageServer {
                 }
                 Some("app.php") => {
                     // Check if it's bootstrap/app.php
-                    if path.parent().map(|p| p.ends_with("bootstrap")).unwrap_or(false) {
+                    if path
+                        .parent()
+                        .map(|p| p.ends_with("bootstrap"))
+                        .unwrap_or(false)
+                    {
                         info!("📦 bootstrap/app.php changed, queuing app rescan");
                         self.queue_background_rescan(RescanType::App).await;
                     }
@@ -11301,7 +13101,10 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        info!("🎯 goto_definition called: {}:{}:{}", uri, position.line, position.character);
+        info!(
+            "🎯 goto_definition called: {}:{}:{}",
+            uri, position.line, position.character
+        );
 
         // Coalescing window: skip duplicate requests within ~16ms (~60fps)
         const COALESCE_MS: u64 = 16;
@@ -11317,7 +13120,8 @@ impl LanguageServer for LaravelLanguageServer {
         {
             let last_requests = self.last_goto_request.read().await;
             if let Some((last_pos, last_time)) = last_requests.get(&uri) {
-                if *last_pos == position && last_time.elapsed() < Duration::from_millis(COALESCE_MS) {
+                if *last_pos == position && last_time.elapsed() < Duration::from_millis(COALESCE_MS)
+                {
                     // Same position, very recent request - skip to avoid redundant work
                     return Ok(None);
                 }
@@ -11325,7 +13129,10 @@ impl LanguageServer for LaravelLanguageServer {
         }
 
         // Update last request tracking
-        self.last_goto_request.write().await.insert(uri.clone(), (position, Instant::now()));
+        self.last_goto_request
+            .write()
+            .await
+            .insert(uri.clone(), (position, Instant::now()));
 
         // Early return: check if document exists in our cache
         // This avoids expensive Salsa lookups for files we haven't seen
@@ -11359,20 +13166,21 @@ impl LanguageServer for LaravelLanguageServer {
                 // Slot fallback: <x-slot:name> tags aren't components and aren't
                 // indexed in the position map. Check whether the cursor sits on
                 // one before declaring nothing-to-do.
-                if let Some(slot_location) = self
-                    .create_slot_location(&uri, position)
-                    .await
-                {
+                if let Some(slot_location) = self.create_slot_location(&uri, position).await {
                     return Ok(Some(slot_location));
                 }
 
                 // Debug: show what middleware patterns exist on this line
-                let mw_on_line: Vec<_> = patterns.middleware_refs.iter()
+                let mw_on_line: Vec<_> = patterns
+                    .middleware_refs
+                    .iter()
                     .filter(|m| m.line == position.line)
                     .map(|m| format!("'{}' col {}-{}", m.name, m.column, m.end_column))
                     .collect();
-                info!("🔍 No pattern at line {} col {} (middleware on line: {:?})",
-                    position.line, position.character, mw_on_line);
+                info!(
+                    "🔍 No pattern at line {} col {} (middleware on line: {:?})",
+                    position.line, position.character, mw_on_line
+                );
                 return Ok(None);
             }
         };
@@ -11392,8 +13200,10 @@ impl LanguageServer for LaravelLanguageServer {
                 self.create_livewire_location_from_salsa(&lw).await
             }
             PatternAtPosition::Directive(dir) => {
-                info!("🎯 Laravel LSP: Found directive: {} with args {:?} at {}:{}-{}",
-                    dir.name, dir.arguments, dir.line, dir.column, dir.end_column);
+                info!(
+                    "🎯 Laravel LSP: Found directive: {} with args {:?} at {}:{}-{}",
+                    dir.name, dir.arguments, dir.line, dir.column, dir.end_column
+                );
                 self.create_directive_location_from_salsa(&dir).await
             }
             PatternAtPosition::EnvRef(env) => {
@@ -11405,16 +13215,24 @@ impl LanguageServer for LaravelLanguageServer {
                 self.create_config_location_from_salsa(&config).await
             }
             PatternAtPosition::Middleware(mw) => {
-                info!("🎯 Found middleware pattern: '{}' at {}:{}-{}", mw.name, mw.line, mw.column, mw.end_column);
+                info!(
+                    "🎯 Found middleware pattern: '{}' at {}:{}-{}",
+                    mw.name, mw.line, mw.column, mw.end_column
+                );
                 let result = self.create_middleware_location_from_salsa(&mw).await;
                 if result.is_none() {
-                    info!("❌ Middleware location lookup returned None for '{}'", mw.name);
+                    info!(
+                        "❌ Middleware location lookup returned None for '{}'",
+                        mw.name
+                    );
                 }
                 result
             }
             PatternAtPosition::Translation(trans) => {
-                info!("🎯 Laravel LSP: Found translation pattern: '{}' at {}:{}-{}",
-                    trans.key, trans.line, trans.column, trans.end_column);
+                info!(
+                    "🎯 Laravel LSP: Found translation pattern: '{}' at {}:{}-{}",
+                    trans.key, trans.line, trans.column, trans.end_column
+                );
                 self.create_translation_location_from_salsa(&trans).await
             }
             PatternAtPosition::Asset(asset) => {
@@ -11454,8 +13272,6 @@ impl LanguageServer for LaravelLanguageServer {
     // We don't advertise hover capability, so this method is not needed.
     // Navigation is handled by goto_definition (Option+click).
 
-
-
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
 
     // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
@@ -11473,8 +13289,11 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        info!("🔧 code_action called for {} with {} diagnostics",
-            uri, context.diagnostics.len());
+        info!(
+            "🔧 code_action called for {} with {} diagnostics",
+            uri,
+            context.diagnostics.len()
+        );
 
         let mut actions = Vec::new();
 
@@ -11494,7 +13313,8 @@ impl LanguageServer for LaravelLanguageServer {
             for file_action in file_actions {
                 let template = self.get_stub_content(&file_action).await;
 
-                if let Some(code_action) = file_action.build_code_action(template, diagnostic, root) {
+                if let Some(code_action) = file_action.build_code_action(template, diagnostic, root)
+                {
                     actions.push(code_action);
                 }
             }
@@ -11516,7 +13336,10 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        info!("📝 completion called for {}:{}:{}", uri, position.line, position.character);
+        info!(
+            "📝 completion called for {}:{}:{}",
+            uri, position.line, position.character
+        );
 
         // Get document content
         let documents = self.documents.read().await;
@@ -11549,11 +13372,20 @@ impl LanguageServer for LaravelLanguageServer {
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {
-                if let Some(var_prefix) = Self::get_variable_name_context(line_text, position.character) {
-                    debug!("   Variable name context in Blade, prefix: '{}'", var_prefix);
+                if let Some(var_prefix) =
+                    Self::get_variable_name_context(line_text, position.character)
+                {
+                    debug!(
+                        "   Variable name context in Blade, prefix: '{}'",
+                        var_prefix
+                    );
 
                     // Get all available variables for this Blade file (with loop scope awareness)
-                    let variables = self.get_blade_available_variables(uri, Some(&content), Some(position.line));
+                    let variables = self.get_blade_available_variables(
+                        uri,
+                        Some(&content),
+                        Some(position.line),
+                    );
 
                     // Filter by prefix and build completion items
                     let prefix_lower = var_prefix.to_lowercase();
@@ -11583,7 +13415,9 @@ impl LanguageServer for LaravelLanguageServer {
                 }
 
                 // Check for Blade directive context (typing @if, @foreach, etc.)
-                if let Some(directive_prefix) = Self::get_blade_directive_context(line_text, position.character) {
+                if let Some(directive_prefix) =
+                    Self::get_blade_directive_context(line_text, position.character)
+                {
                     debug!("   Blade directive context, prefix: '{}'", directive_prefix);
 
                     // Get directive spacing preference
@@ -11608,7 +13442,9 @@ impl LanguageServer for LaravelLanguageServer {
                             // Use configured spacing: @if($1) or @if ($1)
                             let insert_text = match (d.has_params, &d.closing) {
                                 // Block directive with params: @if($1)\n\t$0\n@endif
-                                (true, Some(end)) => format!("{}{}$1)\n\t$0\n@{}", d.name, paren, end),
+                                (true, Some(end)) => {
+                                    format!("{}{}$1)\n\t$0\n@{}", d.name, paren, end)
+                                }
                                 // Block directive without params: @php\n\t$0\n@endphp
                                 (false, Some(end)) => format!("{}\n\t$0\n@{}", d.name, end),
                                 // Inline directive with params: @include($1)$0
@@ -11751,8 +13587,13 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for model property context ($user-> or User::find()->)
-            if let Some((class_hint, typed_prefix)) = Self::get_model_property_context(line_text, position.character) {
-                debug!("   Model property context, class hint: '{}', typed prefix: '{}'", class_hint, typed_prefix);
+            if let Some((class_hint, typed_prefix)) =
+                Self::get_model_property_context(line_text, position.character)
+            {
+                debug!(
+                    "   Model property context, class hint: '{}', typed prefix: '{}'",
+                    class_hint, typed_prefix
+                );
 
                 // Resolve the model class from the hint
                 let model_class = if class_hint.starts_with('$') {
@@ -11797,7 +13638,10 @@ impl LanguageServer for LaravelLanguageServer {
                         })
                         .collect();
 
-                    debug!("   Returning {} model property completion items", items.len());
+                    debug!(
+                        "   Returning {} model property completion items",
+                        items.len()
+                    );
 
                     if !items.is_empty() {
                         return Ok(Some(CompletionResponse::List(CompletionList {
@@ -11872,27 +13716,25 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = view_names
                     .into_iter()
                     .filter(|v| v.name.to_lowercase().starts_with(&prefix_lower))
-                    .map(|v| {
-                        CompletionItem {
-                            label: v.name.clone(),
-                            kind: Some(CompletionItemKind::FILE),
-                            detail: Some(v.path),
-                            documentation: None,
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: view_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: view_ctx.end_col,
-                                    },
+                    .map(|v| CompletionItem {
+                        label: v.name.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some(v.path),
+                        documentation: None,
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: view_ctx.start_col,
                                 },
-                                new_text: v.name.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: view_ctx.end_col,
+                                },
+                            },
+                            new_text: v.name.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
@@ -11909,8 +13751,13 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for Blade component context (<x-...)
-            if let Some(component_ctx) = Self::get_blade_component_context(line_text, position.character) {
-                debug!("   Blade component context, filter prefix: '{}'", component_ctx.prefix);
+            if let Some(component_ctx) =
+                Self::get_blade_component_context(line_text, position.character)
+            {
+                debug!(
+                    "   Blade component context, filter prefix: '{}'",
+                    component_ctx.prefix
+                );
 
                 // Get all Blade components
                 let components = self.get_all_blade_components().await;
@@ -11920,31 +13767,32 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = components
                     .into_iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
-                    .map(|c| {
-                        CompletionItem {
-                            label: c.name.clone(),
-                            kind: Some(CompletionItemKind::CLASS),
-                            detail: Some(c.path),
-                            documentation: None,
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: component_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: component_ctx.end_col,
-                                    },
+                    .map(|c| CompletionItem {
+                        label: c.name.clone(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some(c.path),
+                        documentation: None,
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: component_ctx.start_col,
                                 },
-                                new_text: c.name.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: component_ctx.end_col,
+                                },
+                            },
+                            new_text: c.name.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
-                debug!("   Returning {} Blade component completion items", items.len());
+                debug!(
+                    "   Returning {} Blade component completion items",
+                    items.len()
+                );
 
                 return if items.is_empty() {
                     Ok(None)
@@ -11957,8 +13805,13 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for Livewire component context (<livewire:... or @livewire('...'))
-            if let Some(livewire_prefix) = Self::get_livewire_component_context(line_text, position.character) {
-                debug!("   Livewire component context, filter prefix: '{}'", livewire_prefix);
+            if let Some(livewire_prefix) =
+                Self::get_livewire_component_context(line_text, position.character)
+            {
+                debug!(
+                    "   Livewire component context, filter prefix: '{}'",
+                    livewire_prefix
+                );
 
                 // Get all Livewire components
                 let components = self.get_all_livewire_components().await;
@@ -11968,18 +13821,19 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = components
                     .into_iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
-                    .map(|c| {
-                        CompletionItem {
-                            label: c.name.clone(),
-                            kind: Some(CompletionItemKind::CLASS),
-                            detail: Some(c.path),
-                            documentation: None,
-                            ..Default::default()
-                        }
+                    .map(|c| CompletionItem {
+                        label: c.name.clone(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some(c.path),
+                        documentation: None,
+                        ..Default::default()
                     })
                     .collect();
 
-                debug!("   Returning {} Livewire component completion items", items.len());
+                debug!(
+                    "   Returning {} Livewire component completion items",
+                    items.len()
+                );
 
                 return if items.is_empty() {
                     Ok(None)
@@ -12008,27 +13862,25 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = files
                     .into_iter()
                     .filter(|f| f.path.to_lowercase().starts_with(&prefix_lower))
-                    .map(|f| {
-                        CompletionItem {
-                            label: f.path.clone(),
-                            kind: Some(CompletionItemKind::FILE),
-                            detail: Some("public/".to_string() + &f.path),
-                            documentation: None,
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: asset_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: asset_ctx.end_col,
-                                    },
+                    .map(|f| CompletionItem {
+                        label: f.path.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some("public/".to_string() + &f.path),
+                        documentation: None,
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: asset_ctx.start_col,
                                 },
-                                new_text: f.path.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: asset_ctx.end_col,
+                                },
+                            },
+                            new_text: f.path.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
@@ -12055,8 +13907,12 @@ impl LanguageServer for LaravelLanguageServer {
 
                 // Vite assets are typically in resources/ directory
                 let resources_dir = root.join("resources");
-                let vite_extensions = &["js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte"];
-                let files = self.get_directory_files(&resources_dir, Some(vite_extensions)).await;
+                let vite_extensions = &[
+                    "js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
+                ];
+                let files = self
+                    .get_directory_files(&resources_dir, Some(vite_extensions))
+                    .await;
 
                 // Prefix paths with "resources/" for proper Vite resolution
                 let prefix_lower = vite_ctx.prefix.to_lowercase();
@@ -12064,27 +13920,25 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .map(|f| format!("resources/{}", f.path))
                     .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
-                    .map(|path| {
-                        CompletionItem {
-                            label: path.clone(),
-                            kind: Some(CompletionItemKind::FILE),
-                            detail: None,
-                            documentation: None,
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: vite_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: vite_ctx.end_col,
-                                    },
+                    .map(|path| CompletionItem {
+                        label: path.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: None,
+                        documentation: None,
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: vite_ctx.start_col,
                                 },
-                                new_text: path.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: vite_ctx.end_col,
+                                },
+                            },
+                            new_text: path.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
@@ -12101,8 +13955,13 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for path helper context (app_path, base_path, storage_path, etc.)
-            if let Some((helper, path_prefix)) = Self::get_path_helper_context(line_text, position.character) {
-                debug!("   Path helper context: {}, filter prefix: '{}'", helper, path_prefix);
+            if let Some((helper, path_prefix)) =
+                Self::get_path_helper_context(line_text, position.character)
+            {
+                debug!(
+                    "   Path helper context: {}, filter prefix: '{}'",
+                    helper, path_prefix
+                );
 
                 let root = match self.root_path.read().await.clone() {
                     Some(r) => r,
@@ -12117,14 +13976,12 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = files
                     .into_iter()
                     .filter(|f| f.path.to_lowercase().starts_with(&prefix_lower))
-                    .map(|f| {
-                        CompletionItem {
-                            label: f.path.clone(),
-                            kind: Some(CompletionItemKind::FILE),
-                            detail: None,
-                            documentation: None,
-                            ..Default::default()
-                        }
+                    .map(|f| CompletionItem {
+                        label: f.path.clone(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: None,
+                        documentation: None,
+                        ..Default::default()
                     })
                     .collect();
 
@@ -12141,8 +13998,12 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for container binding context (app('...'), resolve('...'))
-            if let Some(binding_ctx) = Self::get_binding_call_context(line_text, position.character) {
-                debug!("   Binding context, filter prefix: '{}'", binding_ctx.prefix);
+            if let Some(binding_ctx) = Self::get_binding_call_context(line_text, position.character)
+            {
+                debug!(
+                    "   Binding context, filter prefix: '{}'",
+                    binding_ctx.prefix
+                );
 
                 // Get all bindings from Salsa
                 let bindings = match self.salsa.get_all_parsed_bindings().await {
@@ -12159,7 +14020,8 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|b| b.abstract_name.to_lowercase().starts_with(&prefix_lower))
                     .map(|b| {
-                        let source = b.source_file
+                        let source = b
+                            .source_file
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
@@ -12210,27 +14072,25 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = route_names
                     .into_iter()
                     .filter(|r| r.name.starts_with(&route_ctx.prefix))
-                    .map(|r| {
-                        CompletionItem {
-                            label: r.name.clone(),
-                            kind: Some(CompletionItemKind::CONSTANT),
-                            detail: Some(format!("({})", r.source)),
-                            documentation: None,
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: route_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: route_ctx.end_col,
-                                    },
+                    .map(|r| CompletionItem {
+                        label: r.name.clone(),
+                        kind: Some(CompletionItemKind::CONSTANT),
+                        detail: Some(format!("({})", r.source)),
+                        documentation: None,
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: route_ctx.start_col,
                                 },
-                                new_text: r.name.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: route_ctx.end_col,
+                                },
+                            },
+                            new_text: r.name.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
@@ -12254,8 +14114,13 @@ impl LanguageServer for LaravelLanguageServer {
             } else {
                 Some(&previous_lines)
             };
-            if let Some(middleware_ctx) = Self::get_middleware_call_context(line_text, position.character, prev_lines_slice) {
-                debug!("   Middleware context, filter prefix: '{}'", middleware_ctx.prefix);
+            if let Some(middleware_ctx) =
+                Self::get_middleware_call_context(line_text, position.character, prev_lines_slice)
+            {
+                debug!(
+                    "   Middleware context, filter prefix: '{}'",
+                    middleware_ctx.prefix
+                );
 
                 // Get all middleware from Salsa
                 let middleware_list = match self.salsa.get_all_parsed_middleware().await {
@@ -12272,7 +14137,8 @@ impl LanguageServer for LaravelLanguageServer {
                     .into_iter()
                     .filter(|m| m.alias.to_lowercase().starts_with(&prefix_lower))
                     .map(|m| {
-                        let source = m.source_file
+                        let source = m
+                            .source_file
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
@@ -12314,8 +14180,12 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Check for feature context (Laravel Pennant)
             info!("   🔍 Checking feature context for line: '{}'", line_text);
-            if let Some(feature_ctx) = Self::get_feature_call_context(line_text, position.character) {
-                info!("   ✅ Feature context detected, filter prefix: '{}'", feature_ctx.prefix);
+            if let Some(feature_ctx) = Self::get_feature_call_context(line_text, position.character)
+            {
+                info!(
+                    "   ✅ Feature context detected, filter prefix: '{}'",
+                    feature_ctx.prefix
+                );
 
                 // Get project root
                 let features = {
@@ -12326,7 +14196,7 @@ impl LanguageServer for LaravelLanguageServer {
                             let found = scan_feature_classes(root);
                             info!("   📋 Found {} feature classes", found.len());
                             found
-                        },
+                        }
                         None => {
                             info!("   ⚠️ No root path available");
                             Vec::new()
@@ -12339,27 +14209,25 @@ impl LanguageServer for LaravelLanguageServer {
                 let items: Vec<CompletionItem> = features
                     .into_iter()
                     .filter(|f| f.feature_key.to_lowercase().starts_with(&prefix_lower))
-                    .map(|f| {
-                        CompletionItem {
-                            label: f.feature_key.clone(),
-                            kind: Some(CompletionItemKind::CLASS),
-                            detail: Some(format!("Feature: {}", f.class_name)),
-                            documentation: Some(Documentation::String(f.full_class.clone())),
-                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                                range: Range {
-                                    start: Position {
-                                        line: position.line,
-                                        character: feature_ctx.start_col,
-                                    },
-                                    end: Position {
-                                        line: position.line,
-                                        character: feature_ctx.end_col,
-                                    },
+                    .map(|f| CompletionItem {
+                        label: f.feature_key.clone(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        detail: Some(format!("Feature: {}", f.class_name)),
+                        documentation: Some(Documentation::String(f.full_class.clone())),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: position.line,
+                                    character: feature_ctx.start_col,
                                 },
-                                new_text: f.feature_key.clone(),
-                            })),
-                            ..Default::default()
-                        }
+                                end: Position {
+                                    line: position.line,
+                                    character: feature_ctx.end_col,
+                                },
+                            },
+                            new_text: f.feature_key.clone(),
+                        })),
+                        ..Default::default()
                     })
                     .collect();
 
@@ -12376,8 +14244,13 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for translation context
-            if let Some(trans_ctx) = Self::get_translation_call_context(line_text, position.character) {
-                debug!("   Translation context, filter prefix: '{}'", trans_ctx.prefix);
+            if let Some(trans_ctx) =
+                Self::get_translation_call_context(line_text, position.character)
+            {
+                debug!(
+                    "   Translation context, filter prefix: '{}'",
+                    trans_ctx.prefix
+                );
 
                 // Get all translation keys
                 let translation_keys = self.get_all_translation_keys().await;
@@ -12444,13 +14317,19 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Get cached validation rule names for context detection
             let cached_rules = self.cached_validation_rule_names.read().await.clone();
-            info!("   📋 Cached validation rules count: {}", cached_rules.len());
+            info!(
+                "   📋 Cached validation rules count: {}",
+                cached_rules.len()
+            );
             if cached_rules.is_empty() {
                 info!("   ⚠️  No cached rules - context detection will use fallback only");
             }
 
             // Check for validation rule PARAMETER context first (e.g., "exists:█" or "after:█")
-            info!("   🔍 Checking validation param context for line: '{}'", line_text);
+            info!(
+                "   🔍 Checking validation param context for line: '{}'",
+                line_text
+            );
             if let Some(param_context) = Self::get_validation_param_context(
                 line_text,
                 position.character,
@@ -12462,24 +14341,32 @@ impl LanguageServer for LaravelLanguageServer {
                     param_context.rule_name, param_context.current_param, param_context.param_index
                 );
 
-                let items = self.get_validation_param_completions(
-                    &param_context,
-                    &content,
-                    position.line as usize,
-                    uri,
-                    position,
-                ).await;
+                let items = self
+                    .get_validation_param_completions(
+                        &param_context,
+                        &content,
+                        position.line as usize,
+                        uri,
+                        position,
+                    )
+                    .await;
 
                 info!("   📋 Got {} param completion items", items.len());
 
                 if !items.is_empty() {
-                    info!("   ✅ Returning {} validation param completion items", items.len());
+                    info!(
+                        "   ✅ Returning {} validation param completion items",
+                        items.len()
+                    );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: false,
                         items,
                     })));
                 } else {
-                    info!("   ⚠️  No param completions available for rule '{}'", param_context.rule_name);
+                    info!(
+                        "   ⚠️  No param completions available for rule '{}'",
+                        param_context.rule_name
+                    );
                 }
             } else {
                 info!("   ℹ️  Not in validation param context");
@@ -12492,8 +14379,11 @@ impl LanguageServer for LaravelLanguageServer {
                 &surrounding_lines,
                 &cached_rules,
             ) {
-                info!("   🔵 VALIDATION RULE context detected, filter prefix: '{}', line: '{}'",
-                    rule_prefix, line_text.chars().take(60).collect::<String>());
+                info!(
+                    "   🔵 VALIDATION RULE context detected, filter prefix: '{}', line: '{}'",
+                    rule_prefix,
+                    line_text.chars().take(60).collect::<String>()
+                );
 
                 // Get all validation rules (built-in + custom)
                 let validation_rules = self.get_all_validation_rules().await;
@@ -12521,7 +14411,10 @@ impl LanguageServer for LaravelLanguageServer {
                     })
                     .collect();
 
-                debug!("   Returning {} validation rule completion items", items.len());
+                debug!(
+                    "   Returning {} validation rule completion items",
+                    items.len()
+                );
 
                 return if items.is_empty() {
                     Ok(None)
@@ -12534,13 +14427,14 @@ impl LanguageServer for LaravelLanguageServer {
             }
 
             // Check for cast type context ($casts array or casts() method)
-            if let Some(cast_prefix) = Self::get_cast_type_context(
-                line_text,
-                position.character,
-                &surrounding_lines,
-            ) {
-                info!("   🟢 CAST TYPE context detected, filter prefix: '{}', line: '{}'",
-                    cast_prefix, line_text.chars().take(60).collect::<String>());
+            if let Some(cast_prefix) =
+                Self::get_cast_type_context(line_text, position.character, &surrounding_lines)
+            {
+                info!(
+                    "   🟢 CAST TYPE context detected, filter prefix: '{}', line: '{}'",
+                    cast_prefix,
+                    line_text.chars().take(60).collect::<String>()
+                );
 
                 // Get all cast types (built-in primitives + scanned from vendor/app)
                 let mut cast_types = get_laravel_cast_types();
@@ -12645,7 +14539,8 @@ impl LanguageServer for LaravelLanguageServer {
             .filter(|v| v.name.to_uppercase().starts_with(&filter_upper))
             .map(|v| {
                 seen_names.insert(v.name.clone());
-                let source_file = v.source_file
+                let source_file = v
+                    .source_file
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(".env");
@@ -12740,7 +14635,6 @@ impl LanguageServer for LaravelLanguageServer {
 // ❌ REMOVED: code_lens helper methods (extract_view_name_from_path, find_all_references_to_view)
 // Zed doesn't support custom LSP commands, so code lens was not functional.
 
-
 #[cfg(test)]
 mod tests;
 
@@ -12751,8 +14645,7 @@ async fn main() -> Result<()> {
     // e.g., RUST_LOG=debug for verbose output during development
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -12762,19 +14655,17 @@ async fn main() -> Result<()> {
     info!("========================================");
     info!("🚀 Laravel Language Server STARTING 🚀");
     info!("========================================");
-    
+
     // Create the LSP service
     let (service, socket) = LspService::new(LaravelLanguageServer::new);
-    
+
     // Read from stdin and write to stdout (standard LSP communication)
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    
+
     // Run the server
-    Server::new(stdin, stdout, socket)
-        .serve(service)
-        .await;
-    
+    Server::new(stdin, stdout, socket).serve(service).await;
+
     info!("Laravel Language Server stopped");
     Ok(())
 }

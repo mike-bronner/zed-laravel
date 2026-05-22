@@ -184,17 +184,17 @@ public function boot($blade) {
     let mut aliases = HashMap::new();
     extract_provider_blade_aliases(php, &mut aliases);
 
-    assert!(aliases.is_empty(), "no literal pairs to extract from variable args");
+    assert!(
+        aliases.is_empty(),
+        "no literal pairs to extract from variable args"
+    );
 }
 
 #[test]
 fn test_scan_vendor_uncached_finds_provider_aliases() {
     use std::fs as std_fs;
 
-    let tmp = std::env::temp_dir().join(format!(
-        "laravel-lsp-test-vendor-{}",
-        std::process::id(),
-    ));
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-vendor-{}", std::process::id(),));
     let _ = std_fs::remove_dir_all(&tmp);
 
     let provider_dir = tmp.join("vendor/acme/widgets/src");
@@ -212,7 +212,11 @@ public function boot() {
 }
 }
 "#;
-    std_fs::write(provider_dir.join("WidgetsServiceProvider.php"), provider_php).unwrap();
+    std_fs::write(
+        provider_dir.join("WidgetsServiceProvider.php"),
+        provider_php,
+    )
+    .unwrap();
 
     // Non-provider file with no relevant calls — should be skipped.
     std_fs::write(
@@ -271,10 +275,7 @@ public function setup($blade) {
 fn test_scan_vendor_icons_finds_heroicon_style_set() {
     use std::fs as std_fs;
 
-    let tmp = std::env::temp_dir().join(format!(
-        "laravel-lsp-test-icons-{}",
-        std::process::id(),
-    ));
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-icons-{}", std::process::id(),));
     let _ = std_fs::remove_dir_all(&tmp);
 
     // Replicate the heroicons layout: flat SVG dir + blade-*.php config
@@ -372,25 +373,35 @@ fn test_scan_vendor_icons_skips_packages_without_prefix_config() {
     std_fs::write(svg_dir.join("icon.svg"), "<svg></svg>").unwrap();
 
     let icons = scan_vendor_icons_uncached(&tmp);
-    assert!(icons.is_empty(), "should not register icons without a declared prefix");
+    assert!(
+        icons.is_empty(),
+        "should not register icons without a declared prefix"
+    );
 
     let _ = std_fs::remove_dir_all(&tmp);
 }
 
 #[test]
 fn test_scan_prefix_string_handles_both_quote_styles() {
-    assert_eq!(scan_prefix_string("'prefix' => 'heroicon'"), Some("heroicon".into()));
-    assert_eq!(scan_prefix_string("\"prefix\" => \"heroicon\""), Some("heroicon".into()));
-    assert_eq!(scan_prefix_string("'prefix'=>'tight'"), Some("tight".into()));
+    assert_eq!(
+        scan_prefix_string("'prefix' => 'heroicon'"),
+        Some("heroicon".into())
+    );
+    assert_eq!(
+        scan_prefix_string("\"prefix\" => \"heroicon\""),
+        Some("heroicon".into())
+    );
+    assert_eq!(
+        scan_prefix_string("'prefix'=>'tight'"),
+        Some("tight".into())
+    );
     assert_eq!(scan_prefix_string("no prefix here"), None);
 }
 
 #[test]
 fn test_scan_vendor_uncached_returns_empty_when_no_vendor() {
-    let tmp = std::env::temp_dir().join(format!(
-        "laravel-lsp-test-no-vendor-{}",
-        std::process::id(),
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("laravel-lsp-test-no-vendor-{}", std::process::id(),));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 

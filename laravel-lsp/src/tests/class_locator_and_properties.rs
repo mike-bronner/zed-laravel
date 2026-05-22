@@ -1,6 +1,9 @@
 use laravel_lsp::class_locator::find_php_class_file;
 use laravel_lsp::livewire_resolver::extract_blade_variable_at_cursor;
-use laravel_lsp::php_class::{extract_class_properties, find_property_declaration_position};
+use laravel_lsp::php_class::{
+    extract_class_properties, extract_property_declaration, find_property_declaration_position,
+    find_property_definition_line,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -291,4 +294,210 @@ class ContactForm extends Form {
     let line = lines[pos.0 as usize];
     let col_range = &line[pos.1 as usize..pos.2 as usize];
     assert_eq!(col_range, "$name");
+}
+
+// ============================================================================
+// php_class::find_property_definition_line
+// ============================================================================
+
+#[test]
+fn finds_public_property_definition_line() {
+    let src = "<?php\nclass User {\n    public string $name;\n    public int $age;\n}\n";
+    // `name` is on line 2 (0-based: line 2 because <?php is line 0, blank is 1, no — let me count)
+    // Line 0: `<?php`
+    // Line 1: `class User {`
+    // Line 2: `    public string $name;`
+    let line = find_property_definition_line(src, "name").expect("should find name");
+    assert_eq!(line, 2);
+}
+
+#[test]
+fn finds_phpdoc_property_definition_line() {
+    let src = r#"<?php
+/**
+ * @property string $email
+ * @property int $age
+ */
+class User {}
+"#;
+    let line = find_property_definition_line(src, "email").expect("should find email");
+    // Line 0: <?php
+    // Line 1: /**
+    // Line 2:  * @property string $email
+    assert_eq!(line, 2);
+}
+
+#[test]
+fn finds_property_in_casts_array() {
+    let src = r#"<?php
+class User extends Model {
+    protected $casts = [
+        'email_verified_at' => 'datetime',
+        'is_admin' => 'boolean',
+    ];
+}
+"#;
+    let line = find_property_definition_line(src, "is_admin").expect("should find is_admin");
+    // Line 4: `        'is_admin' => 'boolean',`
+    assert_eq!(line, 4);
+}
+
+#[test]
+fn finds_relationship_method() {
+    let src = r#"<?php
+class User extends Model {
+    public function posts()
+    {
+        return $this->hasMany(Post::class);
+    }
+}
+"#;
+    let line = find_property_definition_line(src, "posts").expect("should find posts");
+    // Line 2: `    public function posts()`
+    assert_eq!(line, 2);
+}
+
+#[test]
+fn picks_earliest_match_when_multiple_shapes_present() {
+    // A model with the same column in BOTH @property AND $casts. The earlier
+    // occurrence (@property doc block) wins.
+    let src = r#"<?php
+/** @property string $email */
+class User extends Model {
+    protected $casts = [
+        'email' => 'string',
+    ];
+}
+"#;
+    let line = find_property_definition_line(src, "email").expect("should find email");
+    // The @property line (line 1) comes before the $casts entry (line 4).
+    assert_eq!(line, 1);
+}
+
+#[test]
+fn returns_none_when_property_not_declared_anywhere() {
+    let src = "<?php\nclass User { public $name; }\n";
+    assert_eq!(find_property_definition_line(src, "missing"), None);
+}
+
+#[test]
+fn does_not_falsely_match_substring_property_names() {
+    // `name_with_extra` should not match a search for `name`.
+    let src = "<?php\nclass User { public $name_with_extra; }\n";
+    assert_eq!(find_property_definition_line(src, "name"), None);
+}
+
+// ============================================================================
+// php_class::extract_property_declaration
+// ============================================================================
+
+#[test]
+fn extracts_declaration_text_for_typed_property() {
+    let src = "<?php\nclass User {\n    public string $email;\n}\n";
+    let decl = extract_property_declaration(src, "email").expect("should find");
+    assert_eq!(decl.declaration_text, "public string $email;");
+    assert_eq!(decl.line, 2);
+    assert!(decl.description.is_none());
+    assert!(decl.phpdoc_tags.is_empty());
+}
+
+#[test]
+fn extracts_phpdoc_description_above_property() {
+    let src = r#"<?php
+class User {
+    /**
+     * The user's email address.
+     */
+    public string $email;
+}
+"#;
+    let decl = extract_property_declaration(src, "email").expect("should find");
+    assert_eq!(
+        decl.description.as_deref(),
+        Some("The user's email address.")
+    );
+}
+
+#[test]
+fn extracts_phpdoc_tags() {
+    let src = r#"<?php
+class Controller {
+    /**
+     * Authorize a given action for the current user.
+     *
+     * @param mixed $ability
+     * @param mixed $arguments
+     * @return \Illuminate\Auth\Access\Response
+     * @throws \Illuminate\Auth\Access\AuthorizationException
+     */
+    public function authorize($ability, $arguments = []) {}
+}
+"#;
+    let decl = extract_property_declaration(src, "authorize").expect("should find");
+    assert_eq!(
+        decl.description.as_deref(),
+        Some("Authorize a given action for the current user.")
+    );
+    assert!(
+        decl.phpdoc_tags
+            .iter()
+            .any(|t| t == "@param mixed $ability"),
+        "got tags: {:?}",
+        decl.phpdoc_tags
+    );
+    assert!(decl
+        .phpdoc_tags
+        .iter()
+        .any(|t| t == "@return \\Illuminate\\Auth\\Access\\Response"));
+    assert!(decl
+        .phpdoc_tags
+        .iter()
+        .any(|t| t == "@throws \\Illuminate\\Auth\\Access\\AuthorizationException"));
+}
+
+#[test]
+fn description_joins_multiline_summary() {
+    let src = r#"<?php
+class User {
+    /**
+     * The user's email address.
+     * Used for password recovery and notifications.
+     */
+    public string $email;
+}
+"#;
+    let decl = extract_property_declaration(src, "email").expect("should find");
+    let desc = decl.description.unwrap();
+    assert!(desc.contains("The user's email address."));
+    assert!(desc.contains("Used for password recovery"));
+}
+
+#[test]
+fn no_phpdoc_above_returns_none_description() {
+    let src = "<?php\nclass User {\n    public string $email;\n}\n";
+    let decl = extract_property_declaration(src, "email").expect("should find");
+    assert!(decl.description.is_none());
+    assert!(decl.phpdoc_tags.is_empty());
+}
+
+#[test]
+fn ignores_phpdoc_separated_by_other_code() {
+    // A PHPDoc block with code BETWEEN it and the property — should not
+    // associate the docblock with the property.
+    let src = r#"<?php
+class User {
+    /**
+     * This describes something else.
+     */
+    public string $other;
+
+    public string $email;
+}
+"#;
+    let decl = extract_property_declaration(src, "email").expect("should find");
+    assert!(
+        decl.description.is_none(),
+        "got unexpected description: {:?}",
+        decl.description
+    );
 }

@@ -376,6 +376,170 @@ pub fn find_property_declaration_position(
     Some((line, start_col, end_col))
 }
 
+/// Find the 0-based line number where a property is first defined on a class.
+/// Used by the Blade-variable hover to render `Defined at: <file>:<line>`.
+///
+/// Recognises the following shapes (whichever matches earliest in the file
+/// wins — when an Eloquent model declares the same column in both `$casts`
+/// and `$fillable`, the cast usually appears first and is the more useful
+/// landing spot):
+///
+/// - **Visibility-modified property**: `public Type $foo`, `protected $foo`,
+///   `private static ?Foo $foo`.
+/// - **PHPDoc property tag**: `@property Type $foo`, `@property-read`,
+///   `@property-write`.
+/// - **Array key in a property block**: `'foo' =>` — captures `$casts`,
+///   `$fillable`, `$attributes`, and any other class-level array literal that
+///   uses the property as a key.
+/// - **Method**: `public function foo(...)` — catches Eloquent relationship
+///   methods accessed as properties (`$user->posts`).
+pub fn find_property_definition_line(content: &str, property: &str) -> Option<u32> {
+    let escaped = regex::escape(property);
+    let patterns = [
+        // (a) visibility-modified declaration
+        format!(
+            r"\b(?:public|private|protected)\s+(?:static\s+)?(?:\??\\?[A-Za-z_][A-Za-z0-9_\\|]*(?:<[^>]*>)?\s+)?\${}\b",
+            escaped
+        ),
+        // (b) @property PHPDoc
+        format!(r"@property(?:-read|-write)?\s+\S+\s+\${}\b", escaped),
+        // (c) array-key form — catches $casts, $fillable, $attributes
+        format!(r#"['"]{}['"]\s*=>"#, escaped),
+        // (d) method definition (matches relationship methods accessed as props)
+        format!(r"\bfunction\s+{}\s*\(", escaped),
+    ];
+
+    let mut best_offset: Option<usize> = None;
+    for pat in &patterns {
+        let Ok(re) = regex::Regex::new(pat) else {
+            continue;
+        };
+        if let Some(m) = re.find(content) {
+            best_offset = Some(best_offset.map_or(m.start(), |b| b.min(m.start())));
+        }
+    }
+
+    let offset = best_offset?;
+    let mut line = 0u32;
+    for (i, ch) in content.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+        }
+    }
+    Some(line)
+}
+
+/// Rich information about a property/method declaration extracted from a
+/// PHP class source — declaration text, PHPDoc summary, and tags. Used by
+/// the Blade-variable hover to render intelephense-style tooltips.
+#[derive(Debug, Clone)]
+pub struct PropertyDeclaration {
+    /// The single line of source containing the declaration, trimmed.
+    /// For methods, this is just the signature line (not the body).
+    pub declaration_text: String,
+    /// 0-based line number of the declaration.
+    pub line: u32,
+    /// Free-form description from any PHPDoc block immediately above the
+    /// declaration. `None` when there's no PHPDoc or it has only tags.
+    pub description: Option<String>,
+    /// Parsed PHPDoc tag lines in document order (e.g. `@param mixed $x`,
+    /// `@return Response`, `@throws AuthException`). Each entry is the
+    /// full tag text without the leading `*` decoration.
+    pub phpdoc_tags: Vec<String>,
+}
+
+/// Locate a property's declaration and parse the PHPDoc block above it.
+/// Builds on [`find_property_definition_line`] for the position lookup, then
+/// extracts the declaration line and any preceding `/** ... */` block.
+///
+/// The PHPDoc parser is intentionally loose: it strips leading `*` and
+/// concatenates description lines, then collects any `@tag` lines verbatim.
+/// Mirrors what intelephense's hover does — show the user the same prose the
+/// PHPDoc author wrote, without imposing a strict tag schema.
+pub fn extract_property_declaration(content: &str, property: &str) -> Option<PropertyDeclaration> {
+    let line = find_property_definition_line(content, property)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let declaration_text = lines.get(line as usize)?.trim().to_string();
+
+    // Walk backward looking for a PHPDoc block (`/** ... */`) immediately
+    // above. Skip blank lines, but anything else (other code, attributes)
+    // breaks the association.
+    let mut phpdoc_lines: Vec<&str> = Vec::new();
+    if (line as usize) > 0 {
+        let mut idx = line as usize;
+        // Skip blank lines between declaration and a potential PHPDoc close.
+        while idx > 0 {
+            idx -= 1;
+            let l = lines[idx].trim();
+            if l.is_empty() {
+                continue;
+            }
+            if l.ends_with("*/") {
+                // Walk back to the matching `/**` opener.
+                phpdoc_lines.push(l);
+                while idx > 0 {
+                    idx -= 1;
+                    let pl = lines[idx];
+                    phpdoc_lines.push(pl);
+                    if pl.trim_start().starts_with("/**") {
+                        break;
+                    }
+                }
+                phpdoc_lines.reverse();
+            }
+            break;
+        }
+    }
+    let (description, phpdoc_tags) = parse_phpdoc(&phpdoc_lines);
+
+    Some(PropertyDeclaration {
+        declaration_text,
+        line,
+        description,
+        phpdoc_tags,
+    })
+}
+
+/// Split a captured PHPDoc block into (description, tags). Strips
+/// `/**`, `*/`, and leading `*` decoration from each line. Description
+/// stops at the first `@tag` line.
+fn parse_phpdoc(lines: &[&str]) -> (Option<String>, Vec<String>) {
+    let mut description_parts: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut in_tags = false;
+
+    for raw in lines {
+        // Strip block delimiters and leading * decoration.
+        let cleaned = raw
+            .trim()
+            .trim_start_matches("/**")
+            .trim_end_matches("*/")
+            .trim()
+            .trim_start_matches('*')
+            .trim();
+
+        if cleaned.is_empty() {
+            continue;
+        }
+        if let Some(stripped) = cleaned.strip_prefix('@') {
+            in_tags = true;
+            tags.push(format!("@{}", stripped));
+        } else if !in_tags {
+            description_parts.push(cleaned.to_string());
+        }
+    }
+
+    let description = if description_parts.is_empty() {
+        None
+    } else {
+        Some(description_parts.join(" "))
+    };
+    (description, tags)
+}
+
 /// Iterate every typed parameter across all `function mount(...)` signatures
 /// in `content`. Untyped params are skipped (see `find_mount_param_type` for
 /// the rationale). Duplicates by name keep the first occurrence.

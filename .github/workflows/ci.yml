@@ -27,6 +27,13 @@ jobs:
         with:
           workspaces: laravel-lsp
 
+      - name: Bootstrap test fixture .env
+        # `test-project/.env` is gitignored, but the integration tests
+        # under `laravel-lsp/tests/integration_tests.rs` need one to
+        # exercise env parsing + variable extraction.
+        working-directory: .
+        run: cp test-project/.env.example test-project/.env
+
       - name: cargo fmt --check
         run: cargo fmt --check
 

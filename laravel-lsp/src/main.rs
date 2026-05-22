@@ -470,7 +470,7 @@ fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<Ca
     for entry in WalkDir::new(dir_path)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "php"))
     {
         let path = entry.path();
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -491,7 +491,7 @@ fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<Ca
 
             let full_class = format!("{}\\{}", namespace, class_path);
             let cast_name = format!("{}::class", class_path);
-            let description = format!("{}", full_class);
+            let description = full_class.to_string();
 
             casts.push(CastTypeInfo {
                 name: cast_name,
@@ -511,7 +511,7 @@ fn scan_cast_directory(dir_path: &Path, namespace: &str, source: &str) -> Vec<Ca
 ///   "purchase_button" -> "PurchaseButton"
 ///   "myFeature" -> "MyFeature"
 fn feature_key_to_class_name(key: &str) -> String {
-    key.split(|c| c == '-' || c == '_')
+    key.split(['-', '_'])
         .map(|s| {
             let mut chars = s.chars();
             match chars.next() {
@@ -564,7 +564,7 @@ fn scan_feature_classes(project_root: &Path) -> Vec<FeatureInfo> {
     for entry in WalkDir::new(&features_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "php"))
     {
         let path = entry.path();
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -661,7 +661,7 @@ fn scan_laravel_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo>
     for entry in WalkDir::new(&concerns_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "php"))
     {
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
             for cap in compile_method_re.captures_iter(&content) {
@@ -839,7 +839,7 @@ fn scan_custom_blade_directives(project_root: &Path) -> Vec<BladeDirectiveInfo> 
                     .into_iter()
                     .filter_map(|e| e.ok())
                     .filter(|e| {
-                        e.path().extension().map_or(false, |ext| ext == "php")
+                        e.path().extension().is_some_and(|ext| ext == "php")
                             && e.path().to_string_lossy().contains("ServiceProvider")
                     })
                 {
@@ -874,7 +874,7 @@ fn scan_directory_for_directives(
     for entry in WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "php"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "php"))
     {
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
             for cap in re.captures_iter(&content) {
@@ -2462,7 +2462,7 @@ class {} extends Component
         let key_for_insert = match self.action_type {
             FileActionType::TranslationPhp | FileActionType::ConfigPhp => {
                 // For PHP files, use the nested key (last part after the dot)
-                self.name.split('.').last().unwrap_or(&self.name)
+                self.name.split('.').next_back().unwrap_or(&self.name)
             }
             _ => &self.name,
         };
@@ -3929,10 +3929,10 @@ impl LaravelLanguageServer {
     }
 
     /// Cache validation rule names from Laravel framework for context detection
-    async fn cache_validation_rule_names(&self, root: &PathBuf) {
+    async fn cache_validation_rule_names(&self, root: &Path) {
         use laravel_lsp::validation_rules::LaravelRulesParser;
 
-        let parser = LaravelRulesParser::new(root.clone());
+        let parser = LaravelRulesParser::new(root.to_path_buf());
         let rules = parser.parse_validation_rules();
 
         // Extract rule names with colon suffix for context detection
@@ -4318,10 +4318,10 @@ impl LaravelLanguageServer {
     }
 
     /// Initialize the database schema provider for exists:/unique: validation rules
-    async fn init_database_schema_provider(&self, root: &PathBuf) {
+    async fn init_database_schema_provider(&self, root: &Path) {
         use laravel_lsp::database::DatabaseSchemaProvider;
 
-        let provider = DatabaseSchemaProvider::new(root.clone());
+        let provider = DatabaseSchemaProvider::new(root.to_path_buf());
 
         // Log config status but always store provider
         // Errors will be handled when completions are requested
@@ -5696,10 +5696,11 @@ impl LaravelLanguageServer {
         }
 
         // For chained patterns like ")->active(", verify Feature::for( appears earlier
-        if pattern_len <= 13 && before_cursor[..pos].contains(")->") {
-            if !before_cursor[..pos].contains("Feature::for(") {
-                return None;
-            }
+        if pattern_len <= 13
+            && before_cursor[..pos].contains(")->")
+            && !before_cursor[..pos].contains("Feature::for(")
+        {
+            return None;
         }
 
         // Find where the string ends (closing quote or end of line)
@@ -6651,14 +6652,17 @@ impl LaravelLanguageServer {
             escaped_name
         );
         if let Ok(re) = regex::Regex::new(&view_make_pattern) {
+            // Hoist the compact() inner regex out of the loop to avoid
+            // recompiling it on every iteration.
+            let compact_re = regex::Regex::new(r#"compact\s*\(([^)]+)\)"#).ok();
+
             for cap in re.captures_iter(content) {
                 // Check for second argument (array or compact)
                 if let Some(second_arg) = cap.get(1) {
                     let arg_str = second_arg.as_str();
                     if arg_str.contains("compact") {
-                        if let Some(compact_match) = regex::Regex::new(r#"compact\s*\(([^)]+)\)"#)
-                            .ok()
-                            .and_then(|re| re.captures(arg_str))
+                        if let Some(compact_match) =
+                            compact_re.as_ref().and_then(|re| re.captures(arg_str))
                         {
                             if let Some(compact_args) = compact_match.get(1) {
                                 self.extract_vars_from_compact(
@@ -7105,7 +7109,7 @@ impl LaravelLanguageServer {
     /// Convert path like "forms/input" to class name "Forms\Input"
     fn path_to_class_name(path: &str) -> String {
         path.split('/')
-            .map(|part| Self::kebab_to_pascal(part))
+            .map(Self::kebab_to_pascal)
             .collect::<Vec<_>>()
             .join("/")
     }
@@ -7141,6 +7145,12 @@ impl LaravelLanguageServer {
                 .join(format!("{}.php", class_name)),
         ];
 
+        // Hoist regex compilation out of the path-iteration loop.
+        let prop_re = regex::Regex::new(
+            r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
+        )
+        .ok();
+
         for path in paths {
             if path.exists() {
                 let Ok(content) = std::fs::read_to_string(&path) else {
@@ -7148,10 +7158,7 @@ impl LaravelLanguageServer {
                 };
 
                 // Extract public properties (they're automatically available in the view)
-                let prop_re = regex::Regex::new(
-                    r#"public\s+(?:(\?)?([A-Z][a-zA-Z0-9_\\]*)\s+)?\$([a-zA-Z_][a-zA-Z0-9_]*)"#,
-                )
-                .ok();
+                let prop_re = prop_re.as_ref();
 
                 if let Some(re) = prop_re {
                     for cap in re.captures_iter(&content) {
@@ -7301,10 +7308,7 @@ impl LaravelLanguageServer {
         let without_ext = relative.strip_suffix(".blade.php")?;
 
         // Convert each path segment from kebab-case to PascalCase
-        let class_parts: Vec<String> = without_ext
-            .split('/')
-            .map(|part| Self::kebab_to_pascal(part))
-            .collect();
+        let class_parts: Vec<String> = without_ext.split('/').map(Self::kebab_to_pascal).collect();
         let class_relative = class_parts.join("/");
 
         // Try Livewire v3 (app/Livewire) first, then v2 (app/Http/Livewire)
@@ -7416,10 +7420,8 @@ impl LaravelLanguageServer {
         let without_ext = relative.strip_suffix(".blade.php")?;
 
         // Convert to class path: forms/input -> Forms/Input
-        let class_path_parts: Vec<String> = without_ext
-            .split('/')
-            .map(|part| Self::kebab_to_pascal(part))
-            .collect();
+        let class_path_parts: Vec<String> =
+            without_ext.split('/').map(Self::kebab_to_pascal).collect();
         let class_relative = class_path_parts.join("/");
 
         let class_path = root
@@ -7852,8 +7854,7 @@ impl LaravelLanguageServer {
         let mut array_end = cursor_line;
         let mut started = false;
 
-        for i in array_start..lines.len() {
-            let line = lines[i];
+        for (i, line) in lines.iter().enumerate().skip(array_start) {
             for ch in line.chars() {
                 match ch {
                     '[' => {
@@ -7884,8 +7885,8 @@ impl LaravelLanguageServer {
         let field_pattern =
             regex::Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_.*]*)['"][ \t]*=>"#).unwrap();
 
-        for i in array_start..=array_end.min(lines.len() - 1) {
-            let line = lines[i];
+        let end = array_end.min(lines.len().saturating_sub(1));
+        for line in &lines[array_start..=end] {
             for caps in field_pattern.captures_iter(line) {
                 if let Some(field_match) = caps.get(1) {
                     let field_name = field_match.as_str().to_string();
@@ -8837,7 +8838,7 @@ impl LaravelLanguageServer {
         if let Ok(entries) = std::fs::read_dir(&config_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "php") {
+                if path.extension().is_some_and(|e| e == "php") {
                     if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
                         let base_key = file_name.to_string();
                         let source = format!("config/{}.php", file_name);
@@ -8892,8 +8893,7 @@ impl LaravelLanguageServer {
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().map_or(false, |ext| ext == "php")
+                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
                 })
             {
                 let path = entry.into_path();
@@ -8941,7 +8941,7 @@ impl LaravelLanguageServer {
                     .filter_map(|e| e.ok())
                     .filter(|e| {
                         e.file_type().is_file()
-                            && e.path().extension().map_or(false, |ext| ext == "php")
+                            && e.path().extension().is_some_and(|ext| ext == "php")
                     })
                 {
                     let path = entry.into_path();
@@ -9006,8 +9006,7 @@ impl LaravelLanguageServer {
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().map_or(false, |ext| ext == "php")
+                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
                 })
             {
                 let path = entry.into_path();
@@ -9068,7 +9067,7 @@ impl LaravelLanguageServer {
                     .filter_map(|e| e.ok())
                     .filter(|e| {
                         e.file_type().is_file()
-                            && e.path().extension().map_or(false, |ext| ext == "php")
+                            && e.path().extension().is_some_and(|ext| ext == "php")
                     })
                 {
                     let path = entry.into_path();
@@ -9153,7 +9152,7 @@ impl LaravelLanguageServer {
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_type().is_file() && e.path().extension().map_or(false, |ext| ext == "php")
+                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
             })
         {
             let path = entry.into_path();
@@ -9600,7 +9599,7 @@ impl LaravelLanguageServer {
                     if let Ok(files) = std::fs::read_dir(&path) {
                         for file_entry in files.flatten() {
                             let file_path = file_entry.path();
-                            if file_path.extension().map_or(false, |e| e == "php") {
+                            if file_path.extension().is_some_and(|e| e == "php") {
                                 if let Some(file_name) =
                                     file_path.file_stem().and_then(|s| s.to_str())
                                 {
@@ -9746,7 +9745,7 @@ impl LaravelLanguageServer {
             if let Ok(entries) = std::fs::read_dir(&rules_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "php") {
+                    if path.extension().is_some_and(|e| e == "php") {
                         if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
                             // Convert PascalCase to snake_case for the rule name
                             let rule_name = Self::pascal_to_snake_case(file_name);
@@ -10194,7 +10193,7 @@ class {}
             }
             FileActionType::TranslationPhp => {
                 // For PHP files, the key is the nested key (e.g., "welcome" from "messages.welcome")
-                let key = action.name.split('.').last().unwrap_or(&action.name);
+                let key = action.name.split('.').next_back().unwrap_or(&action.name);
                 let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
                 format!(
                     r#"<?php
@@ -10219,7 +10218,7 @@ return [
             }
             FileActionType::ConfigPhp => {
                 // For config files, use nested key with empty string value
-                let key = action.name.split('.').last().unwrap_or(&action.name);
+                let key = action.name.split('.').next_back().unwrap_or(&action.name);
                 let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
                 format!(
                     r#"<?php
@@ -10852,16 +10851,14 @@ return [
                         quote_char = ch;
                     }
                 }
-            } else {
-                if ch == quote_char {
-                    in_string = false;
-                    if capturing {
-                        return Some(result);
-                    }
-                    found_first = true;
-                } else if capturing {
-                    result.push(ch);
+            } else if ch == quote_char {
+                in_string = false;
+                if capturing {
+                    return Some(result);
                 }
+                found_first = true;
+            } else if capturing {
+                result.push(ch);
             }
         }
         None
@@ -10882,15 +10879,13 @@ return [
                     quote_char = ch;
                     current.clear();
                 }
-            } else {
-                if ch == quote_char {
-                    in_string = false;
-                    if !current.is_empty() {
-                        results.push(current.clone());
-                    }
-                } else {
-                    current.push(ch);
+            } else if ch == quote_char {
+                in_string = false;
+                if !current.is_empty() {
+                    results.push(current.clone());
                 }
+            } else {
+                current.push(ch);
             }
         }
         results
@@ -11226,41 +11221,39 @@ return [
         }
 
         // For string bindings, navigate to the binding declaration
-        if let Some((_class_name, _class_file, source_file, source_line)) =
+        if let Some((_class_name, _class_file, Some(path), source_line)) =
             self.get_cached_binding(&binding.name).await
         {
-            if let Some(path) = source_file {
-                if self.file_exists_cached(&path).await {
-                    if let Ok(target_uri) = Url::from_file_path(&path) {
-                        // LSP uses 0-based line numbers, but we store 1-based
-                        let target_line = source_line.unwrap_or(1).saturating_sub(1);
-                        let origin_selection_range = Range {
-                            start: Position {
-                                line: binding.line,
-                                character: binding.column,
-                            },
-                            end: Position {
-                                line: binding.line,
-                                character: binding.end_column,
-                            },
-                        };
-                        let target_range = Range {
-                            start: Position {
-                                line: target_line,
-                                character: 0,
-                            },
-                            end: Position {
-                                line: target_line,
-                                character: 0,
-                            },
-                        };
-                        return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                            origin_selection_range: Some(origin_selection_range),
-                            target_uri,
-                            target_range,
-                            target_selection_range: target_range,
-                        }]));
-                    }
+            if self.file_exists_cached(&path).await {
+                if let Ok(target_uri) = Url::from_file_path(&path) {
+                    // LSP uses 0-based line numbers, but we store 1-based
+                    let target_line = source_line.unwrap_or(1).saturating_sub(1);
+                    let origin_selection_range = Range {
+                        start: Position {
+                            line: binding.line,
+                            character: binding.column,
+                        },
+                        end: Position {
+                            line: binding.line,
+                            character: binding.end_column,
+                        },
+                    };
+                    let target_range = Range {
+                        start: Position {
+                            line: target_line,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: target_line,
+                            character: 0,
+                        },
+                    };
+                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
+                        origin_selection_range: Some(origin_selection_range),
+                        target_uri,
+                        target_range,
+                        target_selection_range: target_range,
+                    }]));
                 }
             }
         }
@@ -12916,7 +12909,7 @@ impl LanguageServer for LaravelLanguageServer {
 
         info!(
             "📂 did_open: {}",
-            uri.path().split('/').last().unwrap_or("")
+            uri.path().split('/').next_back().unwrap_or("")
         );
         self.documents
             .write()

@@ -3,6 +3,12 @@
 //! This library provides the core functionality for the Laravel LSP server,
 //! including pattern extraction, Salsa incremental computation, and file resolution.
 
+// Allow complex types crate-wide. Several Salsa caches and internal data
+// structures use deeply-nested generic types (e.g. `LruCache<PathBuf, (i32,
+// Arc<Vec<(String, String)>>)>`). Extracting type aliases for each is a
+// worthwhile follow-up refactor — tracked separately from CI hardening.
+#![allow(clippy::type_complexity)]
+
 // Core modules
 pub mod blade_loops;
 pub mod blade_php_block;

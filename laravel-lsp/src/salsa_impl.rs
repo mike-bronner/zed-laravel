@@ -742,7 +742,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         echo.php_content, echo.row, echo.column
                     );
                     if let Some((trans_key, start_offset, end_offset)) =
-                        extract_translation_from_echo(&echo.php_content)
+                        extract_translation_from_echo(echo.php_content)
                     {
                         info!(
                             "✅ Found translation '{}' at offsets {}-{}",
@@ -901,7 +901,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
 /// Parse composer.json to detect installed packages
 /// Returns (has_livewire, list of installed packages)
 #[salsa::tracked]
-pub fn parse_composer_json<'db>(db: &'db dyn Db, file: ConfigFile) -> (bool, Vec<String>) {
+pub fn parse_composer_json(db: &dyn Db, file: ConfigFile) -> (bool, Vec<String>) {
     let text = file.text(db);
 
     // Parse JSON to detect Livewire
@@ -930,7 +930,7 @@ pub fn parse_composer_json<'db>(db: &'db dyn Db, file: ConfigFile) -> (bool, Vec
 
 /// Parse config/view.php to extract view paths
 #[salsa::tracked]
-pub fn parse_view_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
+pub fn parse_view_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Vec<PathBuf> {
     let text = file.text(db);
     let mut paths = Vec::new();
 
@@ -971,8 +971,8 @@ pub fn parse_view_config<'db>(db: &'db dyn Db, file: ConfigFile, root: PathBuf) 
 /// Parse a Blade file's loop-block structure (@foreach / @forelse / @for / @while).
 /// Memoized: only re-runs when the file's text changes.
 #[salsa::tracked]
-pub fn parse_blade_loop_blocks<'db>(
-    db: &'db dyn Db,
+pub fn parse_blade_loop_blocks(
+    db: &dyn Db,
     file: SourceFile,
 ) -> Vec<crate::blade_loops::BladeLoopBlock> {
     let text = file.text(db);
@@ -982,10 +982,7 @@ pub fn parse_blade_loop_blocks<'db>(
 /// Parse simple `$name = ...;` assignments out of a Blade file's `@php ... @endphp` blocks.
 /// Memoized: only re-runs when the file's text changes.
 #[salsa::tracked]
-pub fn parse_blade_php_assignments<'db>(
-    db: &'db dyn Db,
-    file: SourceFile,
-) -> Vec<(String, String)> {
+pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String, String)> {
     let text = file.text(db);
     crate::blade_php_block::extract_php_block_assignments(text)
 }
@@ -993,8 +990,8 @@ pub fn parse_blade_php_assignments<'db>(
 /// Resolve a `$this->X` member access against a Livewire component's PHP file.
 /// Tries property type first, then method return type. Memoized per (file_version, member).
 #[salsa::tracked]
-pub fn resolve_livewire_member_type<'db>(
-    db: &'db dyn Db,
+pub fn resolve_livewire_member_type(
+    db: &dyn Db,
     file: SourceFile,
     member: String,
 ) -> Option<String> {
@@ -1004,11 +1001,7 @@ pub fn resolve_livewire_member_type<'db>(
 
 /// Parse config/livewire.php to extract Livewire component path
 #[salsa::tracked]
-pub fn parse_livewire_config<'db>(
-    db: &'db dyn Db,
-    file: ConfigFile,
-    root: PathBuf,
-) -> Option<PathBuf> {
+pub fn parse_livewire_config(db: &dyn Db, file: ConfigFile, root: PathBuf) -> Option<PathBuf> {
     let text = file.text(db);
 
     // Look for class_namespace patterns
@@ -1503,13 +1496,10 @@ pub fn parse_service_provider_source<'db>(
             let resolved_path = if view_path.exists() {
                 Some(view_path.canonicalize().unwrap_or(view_path))
             } else {
-                // Try normalizing the path without canonicalize (for non-existent paths)
-                let normalized = normalize_path(&view_path);
-                if normalized.exists() {
-                    Some(normalized)
-                } else {
-                    Some(normalized) // Still store the expected path
-                }
+                // For non-existent paths, store the normalized form so the
+                // diagnostic can show the expected location even if it
+                // doesn't resolve on disk yet.
+                Some(normalize_path(&view_path))
             };
 
             let pkg_namespace = PackageNamespace::new(db, namespace_str.to_string());

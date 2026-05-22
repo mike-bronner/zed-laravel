@@ -299,17 +299,13 @@ fn scan_prefix_string(source: &str) -> Option<String> {
                 continue;
             };
             let after_arrow = after_arrow.trim_start();
-            let Some(quote) = after_arrow.chars().next() else {
-                return None;
-            };
+            let quote = after_arrow.chars().next()?;
             if quote != '\'' && quote != '"' {
                 search_from = pos + key.len();
                 continue;
             }
             let body = &after_arrow[1..];
-            let Some(end) = body.find(quote) else {
-                return None;
-            };
+            let end = body.find(quote)?;
             return Some(body[..end].to_string());
         }
     }

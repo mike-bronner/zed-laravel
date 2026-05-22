@@ -741,7 +741,7 @@ pub fn extract_all_php_patterns<'a>(
             "feature_name" => {
                 // Get the method name from a sibling capture in the same match
                 let method_name =
-                    get_feature_method_name(&query_match, query, source_bytes).unwrap_or("active");
+                    get_feature_method_name(query_match, query, source_bytes).unwrap_or("active");
                 result.feature_calls.push(FeatureMatch {
                     feature_name: text,
                     method_name,
@@ -758,7 +758,7 @@ pub fn extract_all_php_patterns<'a>(
             "feature_class_name" => {
                 let clean_class = text.trim_start_matches('\\');
                 let method_name =
-                    get_feature_method_name(&query_match, query, source_bytes).unwrap_or("active");
+                    get_feature_method_name(query_match, query, source_bytes).unwrap_or("active");
                 result.feature_calls.push(FeatureMatch {
                     feature_name: clean_class,
                     method_name,
@@ -860,9 +860,9 @@ pub fn extract_all_blade_patterns<'a>(
                         end_column: end_pos.column,
                         resolved_path: None,
                     });
-                } else if text.starts_with("livewire:") {
+                } else if let Some(component_name) = text.strip_prefix("livewire:") {
                     // Livewire component tag syntax
-                    let component_name = &text[9..]; // Remove "livewire:" prefix
+                    // Remove "livewire:" prefix
                     result.livewire.push(LivewireMatch {
                         component_name,
                         byte_start: node.start_byte(),
@@ -1154,9 +1154,9 @@ fn calculate_string_column_range(
     // Key insight: parameter_column from tree-sitter points to where the parameter node STARTS:
     // - If args include '(': parameter_column points to '('
     // - If args don't include '(': parameter_column already points past '(' (to the quote)
-    let (paren_offset, content) = if trimmed.starts_with('(') {
+    let (paren_offset, content) = if let Some(rest) = trimmed.strip_prefix('(') {
         // Args include '(' - need to skip past it
-        (1, &trimmed[1..])
+        (1, rest)
     } else {
         // Args don't include '(' - we're already past it, no offset needed
         (0, trimmed)

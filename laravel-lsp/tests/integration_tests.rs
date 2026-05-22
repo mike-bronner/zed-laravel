@@ -13,7 +13,7 @@
 //! 4. Debouncing behavior (single event after typing stops)
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Import the library crate for pattern extraction testing
 use laravel_lsp::parser::{language_blade, language_php, parse_blade, parse_php};
@@ -865,9 +865,9 @@ mod architectural_enforcement {
         // Helper to determine expected Salsa input type
         // This MUST match the logic in execute_salsa_update() in main.rs
         fn expected_salsa_type(filename: &str, path: &str) -> &'static str {
-            if filename == "app.php" && path.contains("bootstrap") {
-                "ServiceProviderFile"
-            } else if path.contains("app/Providers") && filename.ends_with(".php") {
+            if (filename == "app.php" && path.contains("bootstrap"))
+                || (path.contains("app/Providers") && filename.ends_with(".php"))
+            {
                 "ServiceProviderFile"
             } else if filename.starts_with(".env") {
                 "EnvFile"
@@ -924,7 +924,7 @@ mod resolution {
     use super::*;
 
     /// Helper: Resolve view name to file path (matches LaravelConfigData::resolve_view_path)
-    fn resolve_view_path(root: &PathBuf, view_name: &str) -> PathBuf {
+    fn resolve_view_path(root: &Path, view_name: &str) -> PathBuf {
         // Convert dots to path separators: "users.profile" -> "users/profile"
         let view_path = view_name.replace('.', "/");
         root.join("resources/views")
@@ -932,14 +932,14 @@ mod resolution {
     }
 
     /// Helper: Resolve component name to file path (matches LaravelConfigData::resolve_component_path)
-    fn resolve_component_path(root: &PathBuf, component_name: &str) -> PathBuf {
+    fn resolve_component_path(root: &Path, component_name: &str) -> PathBuf {
         let component_path = component_name.replace('.', "/");
         root.join("resources/views/components")
             .join(format!("{}.blade.php", component_path))
     }
 
     /// Helper: Resolve Livewire component to file path
-    fn resolve_livewire_path(root: &PathBuf, component_name: &str) -> PathBuf {
+    fn resolve_livewire_path(root: &Path, component_name: &str) -> PathBuf {
         // Convert kebab-case to PascalCase: "user-profile" -> "UserProfile"
         fn kebab_to_pascal(s: &str) -> String {
             s.split('-')
@@ -968,24 +968,24 @@ mod resolution {
     }
 
     /// Helper: Resolve middleware class to file path
-    fn resolve_middleware_class_path(root: &PathBuf, class_name: &str) -> PathBuf {
+    fn resolve_middleware_class_path(root: &Path, class_name: &str) -> PathBuf {
         // App\Http\Middleware\Authenticate -> app/Http/Middleware/Authenticate.php
         let path = class_name.replace("App\\", "app/").replace('\\', "/");
         root.join(format!("{}.php", path))
     }
 
     /// Helper: Resolve asset path
-    fn resolve_asset_path(root: &PathBuf, asset_path: &str) -> PathBuf {
+    fn resolve_asset_path(root: &Path, asset_path: &str) -> PathBuf {
         root.join("public").join(asset_path)
     }
 
     /// Helper: Resolve Vite resource path
-    fn resolve_vite_path(root: &PathBuf, resource_path: &str) -> PathBuf {
+    fn resolve_vite_path(root: &Path, resource_path: &str) -> PathBuf {
         root.join(resource_path)
     }
 
     /// Helper: Resolve translation file path
-    fn resolve_translation_path(root: &PathBuf, translation_key: &str) -> PathBuf {
+    fn resolve_translation_path(root: &Path, translation_key: &str) -> PathBuf {
         // "messages.welcome" -> lang/en/messages.php
         let parts: Vec<&str> = translation_key.split('.').collect();
         if let Some(file) = parts.first() {
@@ -996,7 +996,7 @@ mod resolution {
     }
 
     /// Helper: Resolve config file path
-    fn resolve_config_path(root: &PathBuf, config_key: &str) -> PathBuf {
+    fn resolve_config_path(root: &Path, config_key: &str) -> PathBuf {
         // "app.name" -> config/app.php
         let parts: Vec<&str> = config_key.split('.').collect();
         if let Some(file) = parts.first() {
@@ -1314,11 +1314,11 @@ mod priority_merging {
         const PACKAGE_PRIORITY: u8 = 1;
         const APP_PRIORITY: u8 = 2;
 
-        assert!(
+        const _: () = assert!(
             APP_PRIORITY > PACKAGE_PRIORITY,
             "App should have higher priority than package"
         );
-        assert!(
+        const _: () = assert!(
             PACKAGE_PRIORITY > FRAMEWORK_PRIORITY,
             "Package should have higher priority than framework"
         );

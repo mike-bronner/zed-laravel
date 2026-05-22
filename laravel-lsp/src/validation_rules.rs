@@ -452,7 +452,7 @@ impl LaravelRulesParser {
         if let Ok(entries) = std::fs::read_dir(&rules_path) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "php") {
+                if path.extension().is_some_and(|e| e == "php") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         // Convert PascalCase to snake_case
                         let rule_name = Self::camel_to_snake(stem);

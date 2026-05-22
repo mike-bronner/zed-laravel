@@ -66,7 +66,7 @@ pub fn find_slot_at_position(source: &str, line: u32, character: u32) -> Option<
             // prefix of a longer tag name (e.g., `<x-slotmachine>`).
             let next_char = line_content[after_prefix..].chars().next();
             let is_slot_tag = matches!(next_char, Some(':') | Some('>') | Some('/') | None)
-                || next_char.map_or(false, |c| c.is_whitespace());
+                || next_char.is_some_and(|c| c.is_whitespace());
 
             if !is_slot_tag {
                 search_from = after_prefix;

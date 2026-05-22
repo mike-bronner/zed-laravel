@@ -311,6 +311,34 @@
   (#eq? @function_name "route"))
 
 ; ============================================================================
+; Pattern 7b: signed_route('route.name') function calls
+; ============================================================================
+; Matches: signed_route('verify.email')
+;          signed_route("password.reset", ['token' => $token])
+;
+; Same resolution as route() — looks up a named route. Captures route name.
+
+; Single-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @route_name)))
+  (#eq? @function_name "signed_route"))
+
+; Double-quoted strings
+(function_call_expression
+  function: (name) @function_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @route_name)))
+  (#eq? @function_name "signed_route"))
+
+; ============================================================================
 ; Pattern 8: Route::middleware('auth') - Static method calls with single middleware
 ; ============================================================================
 ; Matches: Route::middleware('auth')
@@ -1185,12 +1213,13 @@
   (#eq? @method_name "has"))
 
 ; ============================================================================
-; Pattern 23: URL::route('name') - Generate URL to named route
+; Pattern 23: URL::route('name') / URL::signedRoute('name') - Generate URL
 ; ============================================================================
 ; Matches: URL::route('home')
 ;          URL::route('user.profile', ['id' => 1])
+;          URL::signedRoute('verify.email')
 ;
-; Alternative to route() helper for generating URLs
+; Alternative to route() / signed_route() helpers for generating URLs
 
 ; Single-quoted strings
 (scoped_call_expression
@@ -1202,7 +1231,7 @@
       (string
         (string_content) @route_name)))
   (#eq? @class_name "URL")
-  (#eq? @method_name "route"))
+  (#match? @method_name "^(route|signedRoute)$"))
 
 ; Double-quoted strings
 (scoped_call_expression
@@ -1214,7 +1243,7 @@
       (encapsed_string
         (string_content) @route_name)))
   (#eq? @class_name "URL")
-  (#eq? @method_name "route"))
+  (#match? @method_name "^(route|signedRoute)$"))
 
 ; ============================================================================
 ; Pattern 24: Route::is('name') / Route::currentRouteNamed('name')

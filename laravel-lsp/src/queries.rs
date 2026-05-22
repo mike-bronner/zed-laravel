@@ -1911,6 +1911,44 @@ class RouteServiceProvider extends ServiceProvider
     }
 
     #[test]
+    fn test_route_variants_signed_route_and_url_facade() {
+        // Issue #13: signed_route() and URL::signedRoute() should resolve like route()
+        let php_code = r#"<?php
+$a = route('home');
+$b = signed_route('verify.email');
+$c = URL::route('users.show', ['id' => 1]);
+$d = URL::signedRoute('subscribe');
+"#;
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        let names: Vec<&str> = patterns.route_calls.iter().map(|r| r.route_name).collect();
+        assert!(
+            names.contains(&"home"),
+            "route() should be captured; got {names:?}"
+        );
+        assert!(
+            names.contains(&"verify.email"),
+            "signed_route() should be captured; got {names:?}"
+        );
+        assert!(
+            names.contains(&"users.show"),
+            "URL::route() should be captured; got {names:?}"
+        );
+        assert!(
+            names.contains(&"subscribe"),
+            "URL::signedRoute() should be captured; got {names:?}"
+        );
+        assert_eq!(
+            patterns.route_calls.len(),
+            4,
+            "All four route variants should be captured exactly once"
+        );
+    }
+
+    #[test]
     fn test_binding_column_positions() {
         // app('cache')
         // Position: 0         1

@@ -34,6 +34,18 @@ jobs:
         working-directory: .
         run: cp test-project/.env.example test-project/.env
 
+      - name: Setup PHP for test fixture
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+
+      - name: Install test-project Composer dependencies
+        # `test-project/vendor/` is gitignored. The route-discovery
+        # integration tests need real vendor packages (e.g. Fortify)
+        # to exercise package-priority routing.
+        working-directory: test-project
+        run: composer install --no-interaction --prefer-dist --no-progress
+
       - name: cargo fmt --check
         run: cargo fmt --check
 

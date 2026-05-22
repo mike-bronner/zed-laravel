@@ -5,8 +5,8 @@
 //! inline `mod tests` block in `src/queries.rs` so business logic and
 //! test logic don't share a file.
 
-use laravel_lsp::parser::{language_blade, language_php, parse_blade, parse_php};
-use laravel_lsp::queries::{extract_all_blade_patterns, extract_all_php_patterns};
+use super::super::*;
+use crate::parser::{language_blade, language_php, parse_blade, parse_php};
 
 #[test]
 fn extract_all_blade_patterns_components() {

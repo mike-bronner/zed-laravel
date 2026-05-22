@@ -1,15 +1,12 @@
-//! Integration tests for PHP pattern extraction.
-//!
-//! Covers the baseline `extract_all_php_patterns` flow across the canonical
-//! Laravel helpers (`view()`, `env()`, `config()`, `Route::middleware()`,
-//! etc.). Relocated from the inline `mod tests` block in `src/queries.rs`
-//! so business logic and test logic don't share a file.
+//! Tests for the baseline `extract_all_php_patterns` flow across the
+//! canonical Laravel helpers (`view()`, `env()`, `config()`,
+//! `Route::middleware()`, etc.).
 
-use laravel_lsp::parser::{language_php, parse_php};
-use laravel_lsp::queries::extract_all_php_patterns;
+use super::super::*;
+use crate::parser::{language_php, parse_php};
 
 #[test]
-fn extract_all_php_patterns_views() {
+fn test_extract_all_php_patterns_views() {
     let php_code = r#"<?php
     return view('users.profile');
     Route::view('/home', 'welcome');
@@ -28,7 +25,6 @@ fn extract_all_php_patterns_views() {
     assert!(view_names.contains(&"welcome"));
     assert!(view_names.contains(&"admin.dashboard"));
 
-    // Check is_route_view flag
     let welcome = patterns.views.iter().find(|v| v.view_name == "welcome").unwrap();
     assert!(welcome.is_route_view, "Route::view() should set is_route_view=true");
 
@@ -37,7 +33,7 @@ fn extract_all_php_patterns_views() {
 }
 
 #[test]
-fn extract_all_php_patterns_env() {
+fn test_extract_all_php_patterns_env() {
     let php_code = r#"<?php
     $name = env('APP_NAME', 'Laravel');
     $debug = env("APP_DEBUG");
@@ -54,7 +50,7 @@ fn extract_all_php_patterns_env() {
 }
 
 #[test]
-fn extract_all_php_patterns_middleware() {
+fn test_extract_all_php_patterns_middleware() {
     let php_code = r#"<?php
     Route::middleware('auth')->group(function () {});
     Route::middleware(['auth', 'verified'])->get('/dashboard');

@@ -1111,7 +1111,7 @@ fn find_next_parameter_sibling<'a>(
 ///
 /// For `@feature ('beta-mode')` with parameter at column 9:
 /// - Returns Some((11, 20)) - pointing to "beta-mode" content (accounts for space)
-pub fn calculate_string_column_range(
+fn calculate_string_column_range(
     parameter_column: usize,
     arguments: &str,
 ) -> Option<(usize, usize)> {
@@ -1156,4 +1156,7 @@ pub fn calculate_string_column_range(
 
     Some((string_start, string_end))
 }
+
+#[cfg(test)]
+mod tests;
 

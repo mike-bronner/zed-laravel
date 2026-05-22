@@ -10,10 +10,10 @@
 //! (`laravel_lsp::queries::extract_all_php_patterns`), matching the
 //! convention used by `tests/integration_tests.rs`.
 
+use super::super::*;
 use std::collections::HashMap;
 
-use laravel_lsp::parser::{language_php, parse_php};
-use laravel_lsp::queries::{extract_all_php_patterns, EnvMatch};
+use crate::parser::{language_php, parse_php};
 
 #[test]
 fn route_variants_signed_route_and_url_facade() {

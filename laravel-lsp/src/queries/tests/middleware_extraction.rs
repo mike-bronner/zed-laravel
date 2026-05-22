@@ -13,8 +13,8 @@
 //! Relocated from the inline `mod tests` block in `src/queries.rs` so
 //! business logic and test logic don't share a file.
 
-use laravel_lsp::parser::{language_php, parse_php};
-use laravel_lsp::queries::extract_all_php_patterns;
+use super::super::*;
+use crate::parser::{language_php, parse_php};
 
 #[test]
 fn from_route_group() {

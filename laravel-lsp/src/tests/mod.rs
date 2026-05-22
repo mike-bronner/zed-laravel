@@ -1,5 +1,8 @@
 mod array_context_detection;
 mod cast_type_context;
+mod class_locator_and_properties;
 mod generic_type_parsing;
+mod livewire_component_resolution;
 mod loop_variable_resolution;
+mod route_binding_resolution;
 mod slot_variable_resolution;

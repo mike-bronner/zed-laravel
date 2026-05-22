@@ -1322,9 +1322,32 @@ pub fn parse_service_provider_source<'db>(
     use regex::Regex;
 
     lazy_static! {
-        /// Matches $this->app->bind('name', ...) or ->singleton(...)
-        static ref BINDING_RE: Regex = Regex::new(
-            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*(?:function|\[)?[^)]*\\?([A-Za-z0-9_\\]+)(?:::class)?)?\s*\)"#
+        /// Matches `$this->app->bind('name', Class::class)` or
+        /// `$this->app->singleton('name', Class::class)` where the concrete
+        /// is given as a static class reference.
+        ///
+        /// Two earlier shapes — `..., function () { ... })` (closure concrete)
+        /// and `..., $variable` (variable concrete) — are matched separately
+        /// below so they can be classified rather than mis-extracted as a
+        /// class name. The original combined regex back-tracked into closure
+        /// parameter lists (e.g. `function ($app)`) and pulled `"p"` out of
+        /// `$app`, which is the bug being fixed here.
+        static ref BINDING_CLASS_RE: Regex = Regex::new(
+            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class"#
+        ).unwrap();
+
+        /// Matches `$this->app->bind('name', function ...)` or `fn (...) =>`.
+        /// The concrete in this case is a closure — we record `"Closure"`
+        /// rather than trying to derive a class name.
+        static ref BINDING_CLOSURE_RE: Regex = Regex::new(
+            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s*\(|fn\s*\()"#
+        ).unwrap();
+
+        /// Matches a bare `$this->app->bind('name')` or `->singleton('name')`
+        /// — no second argument. Falls back to abstract = concrete in the
+        /// handler.
+        static ref BINDING_BARE_RE: Regex = Regex::new(
+            r#"\$this->app->(bind|singleton)\s*\(\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
         /// Matches $this->app->alias('concrete', 'alias')
@@ -1425,29 +1448,84 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
-    // Parse bind/singleton registrations
-    for cap in BINDING_RE.captures_iter(text) {
-        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
+    // Parse bind/singleton registrations. Three regexes target the three
+    // forms a binding's concrete can take — explicit class, closure, or no
+    // second argument. Each abstract name is registered exactly once, with
+    // the class regex taking precedence over closure, which takes precedence
+    // over bare (no second arg). The earlier combined regex back-tracked
+    // into closure parameter lists and pulled garbage like `"p"` out of
+    // `function ($app)`; the three narrower regexes can't do that.
+    let mut bindings_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for cap in BINDING_CLASS_RE.captures_iter(text) {
+        if let (Some(method), Some(name), Some(concrete)) = (cap.get(1), cap.get(2), cap.get(3)) {
+            let abstract_name = name.as_str();
+            if !bindings_seen.insert(abstract_name.to_string()) {
+                continue;
+            }
+            let concrete_class = concrete.as_str().trim_start_matches('\\').to_string();
             let binding_type = match method.as_str() {
                 "singleton" => BindingTypeEnum::Singleton,
-                "bind" => BindingTypeEnum::Bind,
                 _ => BindingTypeEnum::Bind,
             };
-
-            let abstract_name = name.as_str();
-            let concrete_class = cap
-                .get(3)
-                .map(|m| m.as_str().trim_start_matches('\\'))
-                .unwrap_or(abstract_name);
-
             let line = text[..name.start()].lines().count() as u32;
-            let file_path = resolve_class_to_file_internal(concrete_class, &root);
-
+            let file_path = resolve_class_to_file_internal(&concrete_class, &root);
             let binding_name = BindingName::new(db, abstract_name.to_string());
             bindings.push(ParsedBindingReg::new(
                 db,
                 binding_name,
-                concrete_class.to_string(),
+                concrete_class,
+                file_path,
+                binding_type,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    for cap in BINDING_CLOSURE_RE.captures_iter(text) {
+        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
+            let abstract_name = name.as_str();
+            if !bindings_seen.insert(abstract_name.to_string()) {
+                continue;
+            }
+            let binding_type = match method.as_str() {
+                "singleton" => BindingTypeEnum::Singleton,
+                _ => BindingTypeEnum::Bind,
+            };
+            let line = text[..name.start()].lines().count() as u32;
+            let binding_name = BindingName::new(db, abstract_name.to_string());
+            bindings.push(ParsedBindingReg::new(
+                db,
+                binding_name,
+                "Closure".to_string(),
+                None,
+                binding_type,
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
+    for cap in BINDING_BARE_RE.captures_iter(text) {
+        if let (Some(method), Some(name)) = (cap.get(1), cap.get(2)) {
+            let abstract_name = name.as_str();
+            if !bindings_seen.insert(abstract_name.to_string()) {
+                continue;
+            }
+            let binding_type = match method.as_str() {
+                "singleton" => BindingTypeEnum::Singleton,
+                _ => BindingTypeEnum::Bind,
+            };
+            let line = text[..name.start()].lines().count() as u32;
+            let file_path = resolve_class_to_file_internal(abstract_name, &root);
+            let binding_name = BindingName::new(db, abstract_name.to_string());
+            bindings.push(ParsedBindingReg::new(
+                db,
+                binding_name,
+                abstract_name.to_string(),
                 file_path,
                 binding_type,
                 line,

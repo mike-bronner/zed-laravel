@@ -195,6 +195,64 @@
   (#eq? @function_name "env"))
 
 ; ============================================================================
+; Pattern 5b: Env::get('VAR_NAME') - Env facade
+; ============================================================================
+; Matches: Env::get('APP_NAME')
+;          Env::get("DB_HOST", 'localhost')
+;          \Env::get('APP_KEY')
+;
+; The Env facade is the OO equivalent of the env() helper. Uses the same
+; @env_var capture name so existing EnvMatch dispatch handles it.
+
+; Single-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @env_var)))
+  (#eq? @class_name "Env")
+  (#eq? @method_name "get"))
+
+; Double-quoted strings
+(scoped_call_expression
+  scope: (name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @env_var)))
+  (#eq? @class_name "Env")
+  (#eq? @method_name "get"))
+
+; Fully qualified Env class - single quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (string
+        (string_content) @env_var)))
+  (#match? @class_name ".*Env$")
+  (#eq? @method_name "get"))
+
+; Fully qualified Env class - double quotes
+(scoped_call_expression
+  scope: (qualified_name) @class_name
+  name: (name) @method_name
+  arguments: (arguments
+    .
+    (argument
+      (encapsed_string
+        (string_content) @env_var)))
+  (#match? @class_name ".*Env$")
+  (#eq? @method_name "get"))
+
+; ============================================================================
 ; Pattern 6: config('config.key') function calls
 ; ============================================================================
 ; Matches: config('app.name')

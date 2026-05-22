@@ -1911,6 +1911,41 @@ class RouteServiceProvider extends ServiceProvider
     }
 
     #[test]
+    fn test_env_variant_facade_get() {
+        // Issue #13: Env::get('KEY') should resolve like env('KEY'),
+        // including correct fallback detection on the second argument.
+        let php_code = r#"<?php
+$a = env('APP_NAME');
+$b = Env::get('DB_HOST');
+$c = Env::get('APP_KEY', 'fallback');
+"#;
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        let by_name: std::collections::HashMap<&str, &EnvMatch> = patterns
+            .env_calls
+            .iter()
+            .map(|e| (e.var_name, e))
+            .collect();
+
+        assert_eq!(patterns.env_calls.len(), 3, "Expected 3 env captures");
+        assert!(by_name.contains_key("APP_NAME"), "env() should match");
+        assert!(by_name.contains_key("DB_HOST"), "Env::get without fallback should match");
+        assert!(by_name.contains_key("APP_KEY"), "Env::get with fallback should match");
+
+        assert!(
+            !by_name["DB_HOST"].has_fallback,
+            "Env::get('DB_HOST') has no fallback argument"
+        );
+        assert!(
+            by_name["APP_KEY"].has_fallback,
+            "Env::get('APP_KEY', 'fallback') has a fallback argument"
+        );
+    }
+
+    #[test]
     fn test_config_variants_getmany_modern_aliases_and_fluent() {
         // Issue #13: Config::getMany, modern Config::int/bool/float aliases,
         // and the config()->method('key') fluent instance form should all

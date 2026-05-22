@@ -1911,6 +1911,56 @@ class RouteServiceProvider extends ServiceProvider
     }
 
     #[test]
+    fn test_config_variants_getmany_modern_aliases_and_fluent() {
+        // Issue #13: Config::getMany, modern Config::int/bool/float aliases,
+        // and the config()->method('key') fluent instance form should all
+        // resolve like config('key').
+        let php_code = r#"<?php
+$a = config('app.name');
+$b = Config::get('database.default');
+$c = Config::int('app.timeout');
+$d = Config::bool('app.debug');
+$e = Config::float('app.weight');
+$f = Config::getMany(['mail.host', 'mail.port']);
+$g = config()->string('app.locale');
+$h = config()->array('app.providers');
+"#;
+        let tree = parse_php(php_code).expect("Should parse PHP");
+        let lang = language_php();
+        let patterns = extract_all_php_patterns(&tree, php_code, &lang)
+            .expect("Should extract patterns");
+
+        let keys: Vec<&str> = patterns.config_calls.iter().map(|c| c.config_key).collect();
+
+        // Existing function call still works
+        assert!(keys.contains(&"app.name"), "config() should match; got {keys:?}");
+
+        // Existing Config::get still works
+        assert!(keys.contains(&"database.default"), "Config::get should match; got {keys:?}");
+
+        // Modern aliases on the Config facade
+        assert!(keys.contains(&"app.timeout"), "Config::int should match; got {keys:?}");
+        assert!(keys.contains(&"app.debug"), "Config::bool should match; got {keys:?}");
+        assert!(keys.contains(&"app.weight"), "Config::float should match; got {keys:?}");
+
+        // Config::getMany array — both elements captured
+        assert!(keys.contains(&"mail.host"), "Config::getMany[0] should match; got {keys:?}");
+        assert!(keys.contains(&"mail.port"), "Config::getMany[1] should match; got {keys:?}");
+
+        // config()->method fluent form
+        assert!(keys.contains(&"app.locale"), "config()->string should match; got {keys:?}");
+        assert!(keys.contains(&"app.providers"), "config()->array should match; got {keys:?}");
+
+        // No accidental duplicates or extras
+        assert_eq!(
+            patterns.config_calls.len(),
+            9,
+            "Expected exactly 9 config keys captured, got {}: {keys:?}",
+            patterns.config_calls.len()
+        );
+    }
+
+    #[test]
     fn test_route_variants_signed_route_and_url_facade() {
         // Issue #13: signed_route() and URL::signedRoute() should resolve like route()
         let php_code = r#"<?php

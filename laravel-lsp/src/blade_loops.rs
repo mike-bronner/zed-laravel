@@ -179,6 +179,6 @@ pub fn get_enclosing_loops(content: &str, cursor_line: usize) -> Vec<BladeLoopBl
         })
         .collect();
 
-    enclosing.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+    enclosing.sort_by_key(|b| std::cmp::Reverse(b.start_line));
     enclosing
 }

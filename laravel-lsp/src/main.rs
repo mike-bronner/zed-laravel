@@ -13202,23 +13202,13 @@ impl LanguageServer for LaravelLanguageServer {
                     info!("📦 Package lock changed, queuing node_modules rescan");
                     self.queue_background_rescan(RescanType::NodeModules).await;
                 }
-                Some(name) if name.ends_with(".php") => {
-                    // Check if it's in app/Providers/
-                    if path_str.contains("app/Providers/") {
-                        info!("📦 App provider changed, queuing app rescan");
-                        self.queue_background_rescan(RescanType::App).await;
-                    }
+                Some(name) if name.ends_with(".php") && path_str.contains("app/Providers/") => {
+                    info!("📦 App provider changed, queuing app rescan");
+                    self.queue_background_rescan(RescanType::App).await;
                 }
-                Some("app.php") => {
-                    // Check if it's bootstrap/app.php
-                    if path
-                        .parent()
-                        .map(|p| p.ends_with("bootstrap"))
-                        .unwrap_or(false)
-                    {
-                        info!("📦 bootstrap/app.php changed, queuing app rescan");
-                        self.queue_background_rescan(RescanType::App).await;
-                    }
+                Some("app.php") if path.parent().is_some_and(|p| p.ends_with("bootstrap")) => {
+                    info!("📦 bootstrap/app.php changed, queuing app rescan");
+                    self.queue_background_rescan(RescanType::App).await;
                 }
                 _ => {}
             }

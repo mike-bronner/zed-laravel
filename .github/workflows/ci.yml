@@ -37,7 +37,9 @@ jobs:
       - name: Setup PHP for test fixture
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.2'
+          # 8.4 matches the actual minimum required by the locked
+          # vendor packages (symfony/* v8.0 requires >= 8.4).
+          php-version: '8.4'
 
       - name: Install test-project Composer dependencies
         # `test-project/vendor/` is gitignored. The route-discovery

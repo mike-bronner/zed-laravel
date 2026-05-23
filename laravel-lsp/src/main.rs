@@ -13649,6 +13649,56 @@ return [
     }
 }
 
+/// Convert a `document_symbols::SymbolEntry` (LSP-agnostic) into a tower-lsp
+/// `DocumentSymbol`. Recurses into children. `selection_range` is set to the
+/// same range as `range` — clients use selection_range for the click target.
+#[allow(deprecated)]
+fn symbol_entry_to_lsp(entry: &laravel_lsp::document_symbols::SymbolEntry) -> DocumentSymbol {
+    let range = Range {
+        start: Position {
+            line: entry.start_line,
+            character: entry.start_column,
+        },
+        end: Position {
+            line: entry.end_line,
+            character: entry.end_column,
+        },
+    };
+
+    DocumentSymbol {
+        name: entry.name.clone(),
+        detail: entry.detail.clone(),
+        kind: symbol_entry_kind_to_lsp(entry.kind),
+        tags: None,
+        // `deprecated` is deprecated in the LSP spec in favour of `tags`,
+        // but the field is still required by tower-lsp's struct definition.
+        deprecated: None,
+        range,
+        selection_range: range,
+        children: if entry.children.is_empty() {
+            None
+        } else {
+            Some(entry.children.iter().map(symbol_entry_to_lsp).collect())
+        },
+    }
+}
+
+fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind) -> SymbolKind {
+    use laravel_lsp::document_symbols::SymbolEntryKind;
+    match kind {
+        SymbolEntryKind::Class => SymbolKind::CLASS,
+        SymbolEntryKind::Interface => SymbolKind::INTERFACE,
+        SymbolEntryKind::Trait => SymbolKind::STRUCT,
+        SymbolEntryKind::Enum => SymbolKind::ENUM,
+        SymbolEntryKind::Method => SymbolKind::METHOD,
+        SymbolEntryKind::Property => SymbolKind::PROPERTY,
+        SymbolEntryKind::Field => SymbolKind::FIELD,
+        SymbolEntryKind::Function => SymbolKind::FUNCTION,
+        SymbolEntryKind::Namespace => SymbolKind::NAMESPACE,
+        SymbolEntryKind::Variable => SymbolKind::VARIABLE,
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
@@ -13741,6 +13791,13 @@ impl LanguageServer for LaravelLanguageServer {
 
                 // ✅ Code actions for quick fixes (create missing views, etc.)
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+
+                // ✅ Document symbol provider — populates outline panels
+                // (Zed outline, Helix symbol picker, Neovim aerial, etc.) with
+                // Laravel-aware structure: route definitions, Blade section
+                // hierarchy, Livewire component members, Eloquent relationships
+                // and scopes.
+                document_symbol_provider: Some(OneOf::Left(true)),
 
                 // On-type formatting (currently unused, bracket expansion uses completions)
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
@@ -14342,6 +14399,44 @@ impl LanguageServer for LaravelLanguageServer {
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
 
     // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
+
+    /// Document-symbol request — returns Laravel-aware structure for outline
+    /// panels. Delegates the parsing to the Salsa actor which memoizes per file
+    /// version. Unknown / unsupported file kinds return an empty list rather
+    /// than `None` so clients render an empty outline instead of falling back
+    /// to no-LSP behaviour.
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
+        let uri = &params.text_document.uri;
+        info!("📚 document_symbol: requested for {}", uri);
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => {
+                info!("📚 document_symbol: URI did not convert to file path; returning None");
+                return Ok(None);
+            }
+        };
+
+        let entries = match self.salsa.get_document_symbols(file_path).await {
+            Ok(Some(arc)) => arc,
+            Ok(None) => {
+                info!("📚 document_symbol: Salsa returned None (file not registered?); empty list");
+                return Ok(Some(DocumentSymbolResponse::Nested(Vec::new())));
+            }
+            Err(e) => {
+                info!("📚 document_symbol: Salsa error '{}'; empty list", e);
+                return Ok(Some(DocumentSymbolResponse::Nested(Vec::new())));
+            }
+        };
+
+        info!("📚 document_symbol: {} symbols for {}", entries.len(), uri);
+
+        let symbols: Vec<DocumentSymbol> = entries.iter().map(symbol_entry_to_lsp).collect();
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
 
     /// Handle code action requests (quick fixes like "Create missing view")
     async fn code_action(

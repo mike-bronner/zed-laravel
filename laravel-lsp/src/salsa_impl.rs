@@ -987,6 +987,20 @@ pub fn parse_blade_php_assignments(db: &dyn Db, file: SourceFile) -> Vec<(String
     crate::blade_php_block::extract_php_block_assignments(text)
 }
 
+/// Extract the document-symbol tree for a file (route file, Blade template,
+/// Livewire component, or Eloquent model). Returns an empty vec for other file
+/// kinds. Memoized: only re-runs when the file's text changes.
+#[salsa::tracked]
+pub fn extract_document_symbols(
+    db: &dyn Db,
+    file: SourceFile,
+) -> Vec<crate::document_symbols::SymbolEntry> {
+    let path = file.path(db);
+    let text = file.text(db);
+    let kind = crate::document_symbols::classify_file(path);
+    crate::document_symbols::extract_symbols(text, kind)
+}
+
 /// Resolve a `$this->X` member access against a Livewire component's PHP file.
 /// Tries property type first, then method return type. Memoized per (file_version, member).
 #[salsa::tracked]
@@ -2505,6 +2519,11 @@ pub enum SalsaRequest {
         path: PathBuf,
         reply: oneshot::Sender<Option<Arc<Vec<(String, String)>>>>,
     },
+    /// Get the document-symbol tree for a file (drives textDocument/documentSymbol)
+    GetDocumentSymbols {
+        path: PathBuf,
+        reply: oneshot::Sender<Option<Arc<Vec<crate::document_symbols::SymbolEntry>>>>,
+    },
     /// Resolve a `$this->X` member access in a Livewire component PHP file
     /// (auto-registers the file as a Salsa input via mtime-based invalidation).
     ResolveLivewireMember {
@@ -2785,6 +2804,25 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::GetPhpAssignments {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Get the document-symbol tree for a file. Powers textDocument/documentSymbol.
+    /// Memoized — returns the same Arc on repeated calls until the file version changes.
+    pub async fn get_document_symbols(
+        &self,
+        path: PathBuf,
+    ) -> Result<Option<Arc<Vec<crate::document_symbols::SymbolEntry>>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::GetDocumentSymbols {
                 path,
                 reply: reply_tx,
             })
@@ -3447,6 +3485,11 @@ pub struct SalsaActor {
     loop_blocks_cache: LruCache<PathBuf, (i32, Arc<Vec<crate::blade_loops::BladeLoopBlock>>)>,
     /// LRU cache of parsed `@php ... @endphp` block assignments, keyed by file path + version.
     php_assignments_cache: LruCache<PathBuf, (i32, Arc<Vec<(String, String)>>)>,
+    /// LRU cache of document-symbol trees keyed by file path. Stores file
+    /// version alongside the cached Arc so a version mismatch triggers a
+    /// recompute via the memoized Salsa query.
+    document_symbols_cache:
+        LruCache<PathBuf, (i32, Arc<Vec<crate::document_symbols::SymbolEntry>>)>,
     /// Tracks the on-disk mtime of Livewire component PHP files registered as Salsa inputs.
     /// These files are not opened in the editor (no `did_open`/`did_change` events), so we
     /// invalidate by comparing filesystem mtime on each access.
@@ -3523,6 +3566,7 @@ impl SalsaActor {
                 pattern_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 livewire_mtimes: HashMap::with_capacity(64),
                 livewire_version_counter: 0,
                 // Config management
@@ -3591,6 +3635,10 @@ impl SalsaActor {
                     let result = self.handle_get_php_assignments(&path);
                     let _ = reply.send(result);
                 }
+                SalsaRequest::GetDocumentSymbols { path, reply } => {
+                    let result = self.handle_get_document_symbols(&path);
+                    let _ = reply.send(result);
+                }
                 SalsaRequest::ResolveLivewireMember {
                     path,
                     member,
@@ -3604,6 +3652,7 @@ impl SalsaActor {
                     self.pattern_cache.pop(&path);
                     self.loop_blocks_cache.pop(&path);
                     self.php_assignments_cache.pop(&path);
+                    self.document_symbols_cache.pop(&path);
                     let _ = reply.send(());
                 }
 
@@ -3866,6 +3915,7 @@ impl SalsaActor {
         self.pattern_cache.pop(&path);
         self.loop_blocks_cache.pop(&path);
         self.php_assignments_cache.pop(&path);
+        self.document_symbols_cache.pop(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -3950,6 +4000,27 @@ impl SalsaActor {
         let assignments = parse_blade_php_assignments(&self.db, *file);
         let arc = Arc::new(assignments);
         self.php_assignments_cache
+            .put(path.clone(), (version, Arc::clone(&arc)));
+        Some(arc)
+    }
+
+    /// Handle a document-symbol query. Memoized via Salsa + actor LRU.
+    fn handle_get_document_symbols(
+        &mut self,
+        path: &PathBuf,
+    ) -> Option<Arc<Vec<crate::document_symbols::SymbolEntry>>> {
+        let file = self.files.get(path)?;
+        let version = file.version(&self.db);
+
+        if let Some((cached_version, cached)) = self.document_symbols_cache.get(path) {
+            if *cached_version == version {
+                return Some(Arc::clone(cached));
+            }
+        }
+
+        let symbols = extract_document_symbols(&self.db, *file);
+        let arc = Arc::new(symbols);
+        self.document_symbols_cache
             .put(path.clone(), (version, Arc::clone(&arc)));
         Some(arc)
     }

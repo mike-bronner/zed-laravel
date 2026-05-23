@@ -86,15 +86,31 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 }
 ```
 
-**🗺️ Laravel-aware outline panel** populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server knows about: route definitions (`GET /users [name=users.index]`) in route files, and the `@section` / `@push` / `@yield` / component-tag hierarchy in Blade templates.
+**🗺️ Laravel-aware outline panel** populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server understands:
 
-PHP class outlines (controllers, models, Livewire components, jobs, services) come from whatever PHP language server you have installed — Intelephense, Phpactor, or PhpTools — because those servers have real semantic understanding of PHP that a tree-sitter walker can't match, and Zed merges document-symbol responses across all language servers serving a file. Anything we emit for `.php` files would render twice in the outline panel, so we don't.
+- **Route files** — every `Route::get/post/...` call labelled `METHOD URI [name=...]`, with nested `Route::group(...)` calls becoming hierarchical containers labelled `group [prefix=..., name=...]`. Prefix and name chains propagate to children. Covers all Route methods including `resource`, `apiResource`, `singleton`, `livewire`, `view`, `redirect`, `fallback`, etc.
+- **Blade templates** — `@extends`, `@section`, `@push`, `@yield`, `@stack`, `@include*`, `@props`, plus the modern tag syntax: `<x-component>`, `<livewire:counter>`, `<flux:icon>`, `<x-slot:name>`. Paired tags nest their children; self-closing tags appear as leaves.
 
-Zed defaults to tree-sitter outlines, which don't know about Laravel patterns — opt into LSP outlines for Blade to use this feature ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)):
+PHP class outlines (controllers, models, Livewire components, jobs, services) come from whatever PHP language server you have installed — those servers have real semantic understanding of PHP that a tree-sitter walker can't match. The official [**PHP**](https://github.com/zed-extensions/php) Zed extension registers Intelephense, Phpactor, and PhpTools; install it and pick whichever LSP you prefer.
+
+**Requirements**
+
+| Outline | Requires |
+|---|---|
+| Route files | This extension, plus `document_symbols: on` for `PHP` (route files use the `PHP` language). |
+| Blade templates | This extension, the [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension (for the `Blade` language definition), plus `document_symbols: on` for `Blade`. |
+| PHP class files | A PHP language server (the [PHP](https://github.com/zed-extensions/php) extension provides Intelephense / Phpactor / PhpTools), plus `document_symbols: on` for `PHP`. |
+
+**Configuration**
+
+Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP outlines per-language ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)):
 
 ```json
 {
   "languages": {
+    "PHP": {
+      "document_symbols": "on"
+    },
     "Blade": {
       "document_symbols": "on"
     }
@@ -102,7 +118,7 @@ Zed defaults to tree-sitter outlines, which don't know about Laravel patterns �
 }
 ```
 
-The same `document_symbols: on` switch also unlocks your PHP LSP's richer outline for `.php` files if you want it. Editors that call `textDocument/documentSymbol` unconditionally (Helix, Neovim, Sublime/LSP, Kate) need no opt-in.
+`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. Editors that call `textDocument/documentSymbol` unconditionally (Helix, Neovim, Sublime/LSP, Kate) need no opt-in.
 
 > **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
 
@@ -421,20 +437,24 @@ Cmd+Click works on both opening AND closing tags:
 
 ### 🗺️ Outline Panel
 
-When LSP outlines are enabled for Blade (see [Configuration](#️-configuration)), Zed's outline panel and breadcrumbs surface Laravel-aware structure that no PHP language server can see:
+When LSP outlines are enabled (see [Configuration](#️-configuration)), Zed's outline panel and breadcrumbs surface Laravel-aware structure that no PHP language server can see.
 
-**Route files** show each definition with HTTP verb, URI, and route name. Nested `Route::group(...)` calls become hierarchical containers labelled with the group's prefix and name:
+**Route files** show each definition with HTTP verb, URI, and route name. Nested `Route::group(...)` calls become hierarchical containers labelled with the group's prefix and name; prefix and route-name chains inherit from the enclosing group:
 
 ```
 routes/web.php
-├─ GET /                 [name=home]
-├─ POST /login           [name=login]
+├─ GET  /                       [name=home]
+├─ POST /login                  [name=login]
 └─ group [prefix=/admin, name=admin.]
-   ├─ GET /users         [name=admin.users.index]
-   └─ POST /users        [name=admin.users.store]
+   ├─ GET  /users               [name=admin.users.index]
+   ├─ POST /users               [name=admin.users.store]
+   └─ group [prefix=/settings, name=admin.settings.]
+      └─ GET /profile           [name=admin.settings.profile]
 ```
 
-**Blade templates** show the section / push / yield hierarchy, component-tag nesting, slots, props, and includes:
+Recognised Route methods: `get`, `post`, `put`, `patch`, `delete`, `options`, `any`, `match`, `view`, `redirect`, `permanentRedirect`, `fallback`, `livewire`, `resource`, `apiResource`, `singleton`, `apiSingleton`.
+
+**Blade templates** show the section / push / yield hierarchy alongside the modern tag-based component syntax. Paired tags nest their content; self-closing tags appear as leaves with ` />` so the source shape is visible at a glance:
 
 ```
 resources/views/components/card.blade.php
@@ -445,7 +465,24 @@ resources/views/components/card.blade.php
    └─ <livewire:card-footer />
 ```
 
-**PHP files** — controllers, models, Livewire components, jobs, services, helpers — get their outline from whatever PHP language server you have installed (Intelephense, Phpactor, PhpTools). Set `document_symbols: on` for the `PHP` language in your Zed settings to use that LSP outline instead of Zed's tree-sitter fallback.
+```
+resources/views/layouts/app.blade.php
+├─ @extends layouts.master
+├─ @include partials.nav
+├─ @section content
+│  ├─ @yield title
+│  └─ @push scripts
+└─ @section sidebar
+```
+
+Recognised constructs: `@extends`, `@section`/`@endsection`, `@push`/`@endpush`, `@prepend`/`@endprepend`, `@stack`, `@yield`, `@component`/`@endcomponent`, `@slot`/`@endslot`, `@props`, `@include`, `@includeIf`, `@includeWhen`, `@includeUnless`, `@includeFirst`, plus `<x-*>`, `<livewire:*>`, `<flux:*>`, `<x-slot:name>`, and `<x-slot name="...">`.
+
+**PHP class files** (controllers, models, Livewire components, jobs, services, helpers) get their outline from whichever PHP language server you have installed — Intelephense, Phpactor, or PhpTools. We deliberately don't emit symbols for these files because Zed merges document-symbol responses across all LSPs serving a file, so any output from us would render twice in the outline panel. The PHP LSPs already provide semantically-rich PHP outlines that a tree-sitter walker can't match.
+
+If your PHP class outline isn't appearing, make sure:
+
+1. The official [**PHP**](https://github.com/zed-extensions/php) Zed extension is installed and one of its LSPs (Intelephense, Phpactor, PhpTools) is active for the file.
+2. Your settings include `"document_symbols": "on"` under `languages.PHP` (see [Configuration](#️-configuration)).
 
 ## 🚧 Planned Features
 

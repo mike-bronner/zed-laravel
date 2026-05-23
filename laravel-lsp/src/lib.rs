@@ -29,6 +29,7 @@ pub mod php_outline;
 pub mod queries;
 pub mod route_binding;
 pub mod route_discovery;
+pub mod route_outline;
 pub mod slot_navigation;
 pub mod translation_lookup;
 pub mod validation_rules;

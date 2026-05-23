@@ -49,6 +49,7 @@ pub struct PhpMethodInfo {
     pub visibility: PhpVisibility,
     /// Simplified return type (final `\`-segment), if any.
     pub return_type: Option<String>,
+    pub parameters: Vec<PhpParameter>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -71,10 +72,20 @@ pub struct PhpPropertyInfo {
 pub struct PhpFunctionInfo {
     pub name: String,
     pub return_type: Option<String>,
+    pub parameters: Vec<PhpParameter>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+}
+
+/// A single parameter from a method or function signature. `name` is the
+/// variable name without the leading `$`. `param_type` is the simplified
+/// type annotation if present.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PhpParameter {
+    pub name: String,
+    pub param_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -212,6 +223,10 @@ fn parse_method(node: Node, source: &[u8]) -> Option<PhpMethodInfo> {
         .child_by_field_name("return_type")
         .and_then(|n| n.utf8_text(source).ok())
         .map(|s| simple_name(s.trim_start_matches([':', ' ']).trim()));
+    let parameters = node
+        .child_by_field_name("parameters")
+        .map(|p| parse_parameters(p, source))
+        .unwrap_or_default();
     let (start_line, start_column) = pos(node.start_position());
     let (end_line, end_column) = pos(node.end_position());
 
@@ -219,6 +234,7 @@ fn parse_method(node: Node, source: &[u8]) -> Option<PhpMethodInfo> {
         name,
         visibility,
         return_type,
+        parameters,
         start_line,
         start_column,
         end_line,
@@ -287,17 +303,67 @@ fn parse_function(node: Node, source: &[u8]) -> Option<PhpFunctionInfo> {
         .child_by_field_name("return_type")
         .and_then(|n| n.utf8_text(source).ok())
         .map(|s| simple_name(s.trim_start_matches([':', ' ']).trim()));
+    let parameters = node
+        .child_by_field_name("parameters")
+        .map(|p| parse_parameters(p, source))
+        .unwrap_or_default();
     let (start_line, start_column) = pos(node.start_position());
     let (end_line, end_column) = pos(node.end_position());
 
     Some(PhpFunctionInfo {
         name,
         return_type,
+        parameters,
         start_line,
         start_column,
         end_line,
         end_column,
     })
+}
+
+/// Walk a `formal_parameters` node and extract each parameter's name and
+/// type annotation. Skips defaults (the symbol label has finite room and
+/// defaults add noise without aiding navigation). Handles simple
+/// parameters, constructor property promotion, and variadic parameters
+/// uniformly — we just extract `(type, $name)` for each.
+fn parse_parameters(node: Node, source: &[u8]) -> Vec<PhpParameter> {
+    let mut params = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "simple_parameter" | "property_promotion_parameter" | "variadic_parameter" => {
+                if let Some(param) = parse_one_parameter(child, source) {
+                    params.push(param);
+                }
+            }
+            _ => {}
+        }
+    }
+    params
+}
+
+fn parse_one_parameter(node: Node, source: &[u8]) -> Option<PhpParameter> {
+    // Type may appear as a `type:` field or as a child node of various
+    // type-related kinds depending on the tree-sitter-php version.
+    let param_type = node
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|s| simple_name(s.trim()));
+
+    // Name comes from a `variable_name` child (or `name` field directly).
+    let mut name: Option<String> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "variable_name" {
+            if let Ok(text) = child.utf8_text(source) {
+                name = Some(text.trim_start_matches('$').to_string());
+                break;
+            }
+        }
+    }
+    let name = name?;
+
+    Some(PhpParameter { name, param_type })
 }
 
 fn field_text(node: Node, field: &str, source: &[u8]) -> Option<String> {

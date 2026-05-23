@@ -223,3 +223,73 @@ fn positions_are_zero_based() {
     assert_eq!(class.start_line, 1);
     assert_eq!(class.start_column, 0);
 }
+
+#[test]
+fn extracts_method_parameters_with_types() {
+    let content = r#"<?php
+class Foo
+{
+    public function bar(int $count, ?string $name, $untyped) {}
+}
+"#;
+    let s = extract_php_structure(content);
+    let method = &s.structures[0].methods[0];
+    assert_eq!(method.name, "bar");
+    let params: Vec<(&str, Option<&str>)> = method
+        .parameters
+        .iter()
+        .map(|p| (p.name.as_str(), p.param_type.as_deref()))
+        .collect();
+    assert_eq!(
+        params,
+        vec![
+            ("count", Some("int")),
+            ("name", Some("?string")),
+            ("untyped", None),
+        ]
+    );
+}
+
+#[test]
+fn extracts_constructor_property_promotion_parameters() {
+    let content = r#"<?php
+class Foo
+{
+    public function __construct(
+        private string $name,
+        protected readonly int $age,
+        public ?Logger $logger = null,
+    ) {}
+}
+"#;
+    let s = extract_php_structure(content);
+    let ctor = &s.structures[0].methods[0];
+    assert_eq!(ctor.name, "__construct");
+    let names: Vec<&str> = ctor.parameters.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["name", "age", "logger"]);
+}
+
+#[test]
+fn extracts_free_function_parameters() {
+    let content = r#"<?php
+function format_money(int $cents, string $currency = 'USD'): string {
+    return '';
+}
+"#;
+    let s = extract_php_structure(content);
+    let f = &s.functions[0];
+    assert_eq!(f.name, "format_money");
+    assert_eq!(f.parameters.len(), 2);
+    assert_eq!(f.parameters[0].name, "cents");
+    assert_eq!(f.parameters[0].param_type.as_deref(), Some("int"));
+    assert_eq!(f.parameters[1].name, "currency");
+    assert_eq!(f.parameters[1].param_type.as_deref(), Some("string"));
+}
+
+#[test]
+fn no_parameters_when_signature_is_empty() {
+    let content = "<?php\nclass Foo { public function bar() {} }\n";
+    let s = extract_php_structure(content);
+    let m = &s.structures[0].methods[0];
+    assert!(m.parameters.is_empty());
+}

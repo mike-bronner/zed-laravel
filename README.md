@@ -86,6 +86,26 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 }
 ```
 
+**🗺️ Laravel-aware outline panel** populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server knows about: route definitions (`GET /users [name=users.index]`) in route files, and the `@section` / `@push` / `@yield` / component-tag hierarchy in Blade templates.
+
+PHP class outlines (controllers, models, Livewire components, jobs, services) come from whatever PHP language server you have installed — Intelephense, Phpactor, or PhpTools — because those servers have real semantic understanding of PHP that a tree-sitter walker can't match, and Zed merges document-symbol responses across all language servers serving a file. Anything we emit for `.php` files would render twice in the outline panel, so we don't.
+
+Zed defaults to tree-sitter outlines, which don't know about Laravel patterns — opt into LSP outlines for Blade to use this feature ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)):
+
+```json
+{
+  "languages": {
+    "Blade": {
+      "document_symbols": "on"
+    }
+  }
+}
+```
+
+The same `document_symbols: on` switch also unlocks your PHP LSP's richer outline for `.php` files if you want it. Editors that call `textDocument/documentSymbol` unconditionally (Helix, Neovim, Sublime/LSP, Kate) need no opt-in.
+
+> **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
+
 ## ✨ Features
 
 ### 🔗 Go-to-Definition
@@ -398,6 +418,34 @@ Cmd+Click works on both opening AND closing tags:
 ```
 
 > **Note:** Blade syntax highlighting is provided by the separate [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) Zed extension. Install it alongside this extension for full Blade support. For enhanced directive highlighting — including correct coloring of custom directives that tree-sitter doesn't recognize — enable semantic tokens in your settings. See the [Configuration](#️-configuration) section above.
+
+### 🗺️ Outline Panel
+
+When LSP outlines are enabled for Blade (see [Configuration](#️-configuration)), Zed's outline panel and breadcrumbs surface Laravel-aware structure that no PHP language server can see:
+
+**Route files** show each definition with HTTP verb, URI, and route name. Nested `Route::group(...)` calls become hierarchical containers labelled with the group's prefix and name:
+
+```
+routes/web.php
+├─ GET /                 [name=home]
+├─ POST /login           [name=login]
+└─ group [prefix=/admin, name=admin.]
+   ├─ GET /users         [name=admin.users.index]
+   └─ POST /users        [name=admin.users.store]
+```
+
+**Blade templates** show the section / push / yield hierarchy, component-tag nesting, slots, props, and includes:
+
+```
+resources/views/components/card.blade.php
+├─ @props title
+└─ <x-card>
+   ├─ <x-slot:header>
+   ├─ <x-card-body>
+   └─ <livewire:card-footer />
+```
+
+**PHP files** — controllers, models, Livewire components, jobs, services, helpers — get their outline from whatever PHP language server you have installed (Intelephense, Phpactor, PhpTools). Set `document_symbols: on` for the `PHP` language in your Zed settings to use that LSP outline instead of Zed's tree-sitter fallback.
 
 ## 🚧 Planned Features
 

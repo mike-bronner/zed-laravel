@@ -14410,15 +14410,29 @@ impl LanguageServer for LaravelLanguageServer {
         params: DocumentSymbolParams,
     ) -> jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
+        info!("📚 document_symbol: requested for {}", uri);
+
         let file_path = match uri.to_file_path() {
             Ok(p) => p,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                info!("📚 document_symbol: URI did not convert to file path; returning None");
+                return Ok(None);
+            }
         };
 
         let entries = match self.salsa.get_document_symbols(file_path).await {
             Ok(Some(arc)) => arc,
-            _ => return Ok(Some(DocumentSymbolResponse::Nested(Vec::new()))),
+            Ok(None) => {
+                info!("📚 document_symbol: Salsa returned None (file not registered?); empty list");
+                return Ok(Some(DocumentSymbolResponse::Nested(Vec::new())));
+            }
+            Err(e) => {
+                info!("📚 document_symbol: Salsa error '{}'; empty list", e);
+                return Ok(Some(DocumentSymbolResponse::Nested(Vec::new())));
+            }
         };
+
+        info!("📚 document_symbol: {} symbols for {}", entries.len(), uri);
 
         let symbols: Vec<DocumentSymbol> = entries.iter().map(symbol_entry_to_lsp).collect();
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))

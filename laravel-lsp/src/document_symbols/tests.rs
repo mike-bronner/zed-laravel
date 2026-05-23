@@ -42,8 +42,10 @@ Route::get('/users', [UserController::class, 'index'])->name('users.index');
 "#;
     let symbols = extract_route_symbols(content);
     assert_eq!(symbols.len(), 1);
-    assert_eq!(symbols[0].name, "GET /users");
-    assert_eq!(symbols[0].detail.as_deref(), Some("[name=users.index]"));
+    // Route name goes in the label, not detail — Zed's outline panel
+    // doesn't render detail (zed-industries/zed#49095).
+    assert_eq!(symbols[0].name, "GET /users [name=users.index]");
+    assert!(symbols[0].detail.is_none());
 }
 
 #[test]
@@ -56,11 +58,11 @@ Route::delete('/d', fn () => 1);
 "#;
     let symbols = extract_route_symbols(content);
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["GET /a", "POST /b", "PUT /c", "DELETE /d"]);
-    assert_eq!(symbols[0].detail.as_deref(), Some("[name=a]"));
-    assert!(symbols[1].detail.is_none());
-    assert_eq!(symbols[2].detail.as_deref(), Some("[name=c]"));
-    assert!(symbols[3].detail.is_none());
+    assert_eq!(
+        names,
+        vec!["GET /a [name=a]", "POST /b", "PUT /c [name=c]", "DELETE /d",]
+    );
+    assert!(symbols.iter().all(|s| s.detail.is_none()));
 }
 
 #[test]
@@ -84,13 +86,10 @@ fn extracts_section_with_yield_child() {
 "#;
     let symbols = extract_blade_symbols(content);
     assert_eq!(symbols.len(), 2);
-    assert_eq!(symbols[0].name, "layouts.app");
-    assert_eq!(symbols[0].detail.as_deref(), Some("@extends"));
-    assert_eq!(symbols[1].name, "content");
-    assert_eq!(symbols[1].detail.as_deref(), Some("@section"));
+    assert_eq!(symbols[0].name, "@extends layouts.app");
+    assert_eq!(symbols[1].name, "@section content");
     assert_eq!(symbols[1].children.len(), 1);
-    assert_eq!(symbols[1].children[0].name, "title");
-    assert_eq!(symbols[1].children[0].detail.as_deref(), Some("@yield"));
+    assert_eq!(symbols[1].children[0].name, "@yield title");
 }
 
 #[test]
@@ -104,10 +103,9 @@ fn extracts_nested_push_inside_section() {
     let symbols = extract_blade_symbols(content);
     assert_eq!(symbols.len(), 1);
     let section = &symbols[0];
-    assert_eq!(section.name, "content");
+    assert_eq!(section.name, "@section content");
     assert_eq!(section.children.len(), 1);
-    assert_eq!(section.children[0].name, "scripts");
-    assert_eq!(section.children[0].detail.as_deref(), Some("@push"));
+    assert_eq!(section.children[0].name, "@push scripts");
 }
 
 #[test]
@@ -115,253 +113,208 @@ fn unclosed_section_still_emits() {
     let content = "@section('content')\n@yield('inner')\n";
     let symbols = extract_blade_symbols(content);
     assert_eq!(symbols.len(), 1);
-    assert_eq!(symbols[0].name, "content");
+    assert_eq!(symbols[0].name, "@section content");
     assert_eq!(symbols[0].children.len(), 1);
 }
 
-// ============================================================================
-// PHP — Livewire components (public-only filter)
-// ============================================================================
-
 #[test]
-fn livewire_component_shows_only_public_members() {
-    let content = r#"<?php
-
-namespace App\Livewire;
-
-use Livewire\Component;
-
-class Counter extends Component
-{
-    public int $count = 0;
-    public string $label = 'clicks';
-    private $internal;
-
-    public function increment(): void
-    {
-        $this->count++;
-    }
-
-    private function helper(): void
-    {
-        // private — should NOT appear in outline
-    }
-
-    public function render()
-    {
-        return view('livewire.counter');
-    }
-}
+fn extracts_blade_component_tags() {
+    let content = r#"<div>
+    <x-button>Click me</x-button>
+    <x-forms.input name="email" />
+    <livewire:counter />
+    <flux:icon name="search" />
+</div>
 "#;
-    let symbols = extract_php_symbols(content);
-    assert_eq!(symbols.len(), 1);
-    let class = &symbols[0];
-    assert_eq!(class.name, "Counter");
-    assert_eq!(class.kind, SymbolEntryKind::Class);
-    assert_eq!(class.detail.as_deref(), Some("extends Component"));
-
-    let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"$count"));
-    assert!(names.contains(&"$label"));
-    assert!(
-        !names.contains(&"$internal"),
-        "private props stay off the outline"
-    );
-    assert!(names.contains(&"increment"));
-    assert!(names.contains(&"render"));
-    assert!(
-        !names.contains(&"helper"),
-        "private methods stay off the outline"
-    );
-}
-
-// ============================================================================
-// PHP — Eloquent models (relationships + scopes only)
-// ============================================================================
-
-#[test]
-fn model_shows_only_relationships_and_scopes() {
-    let content = r#"<?php
-
-namespace App\Models;
-
-use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\Relations\BelongsTo;
-
-class Post extends Model
-{
-    public function author(): BelongsTo
-    {
-        return $this->belongsTo(User::class);
-    }
-
-    public function comments(): HasMany
-    {
-        return $this->hasMany(Comment::class);
-    }
-
-    public function scopePublished($query)
-    {
-        return $query->whereNotNull('published_at');
-    }
-
-    public function getTitleAttribute(): string
-    {
-        return $this->attributes['title'];
-    }
-
-    public function someUnrelatedMethod(): void
-    {
-        // Not a relationship, not a scope — stays off the outline.
-    }
-}
-"#;
-    let symbols = extract_php_symbols(content);
-    assert_eq!(symbols.len(), 1);
-    let class = &symbols[0];
-    assert_eq!(class.name, "Post");
-
-    let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"author"));
-    assert!(names.contains(&"comments"));
-    assert!(names.contains(&"scopePublished"));
-    assert!(
-        !names.contains(&"getTitleAttribute"),
-        "accessor without relationship return type is filtered"
-    );
-    assert!(
-        !names.contains(&"someUnrelatedMethod"),
-        "non-scope, non-relationship methods are filtered"
-    );
-}
-
-#[test]
-fn user_model_with_authenticatable_base_is_recognised() {
-    let content = r#"<?php
-class User extends Authenticatable
-{
-    public function posts(): HasMany
-    {
-        return $this->hasMany(Post::class);
-    }
-}
-"#;
-    let symbols = extract_php_symbols(content);
-    assert_eq!(symbols.len(), 1);
-    let names: Vec<&str> = symbols[0]
-        .children
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    assert_eq!(names, vec!["posts"]);
-}
-
-// ============================================================================
-// PHP — Generic (controllers, jobs, helpers, interfaces, etc.)
-// ============================================================================
-
-#[test]
-fn generic_php_class_shows_all_visibilities() {
-    let content = r#"<?php
-
-namespace App\Http\Controllers;
-
-class UserController
-{
-    public function __construct(private UserRepo $repo) {}
-
-    public function index() {
-        return view('users.index');
-    }
-
-    public function store(Request $request) {
-        // ...
-    }
-
-    protected function authorize(): void {}
-
-    private function buildQuery() {}
-}
-"#;
-    let symbols = extract_php_symbols(content);
-    assert_eq!(symbols.len(), 1);
-    let class = &symbols[0];
-    assert_eq!(class.name, "UserController");
-
-    let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
-    // All methods regardless of visibility — strict-upgrade behaviour vs.
-    // tree-sitter outline.
-    assert!(names.contains(&"__construct"));
-    assert!(names.contains(&"index"));
-    assert!(names.contains(&"store"));
-    assert!(names.contains(&"authorize"));
-    assert!(names.contains(&"buildQuery"));
-}
-
-#[test]
-fn generic_php_emits_multiple_top_level_structures() {
-    let content = r#"<?php
-class Foo {}
-interface Bar {}
-trait Baz {}
-enum Qux {}
-"#;
-    let symbols = extract_php_symbols(content);
-    assert_eq!(symbols.len(), 4);
-    assert_eq!(symbols[0].name, "Foo");
-    assert_eq!(symbols[0].kind, SymbolEntryKind::Class);
-    assert_eq!(symbols[1].name, "Bar");
-    assert_eq!(symbols[1].kind, SymbolEntryKind::Interface);
-    assert_eq!(symbols[2].name, "Baz");
-    assert_eq!(symbols[2].kind, SymbolEntryKind::Trait);
-    assert_eq!(symbols[3].name, "Qux");
-    assert_eq!(symbols[3].kind, SymbolEntryKind::Enum);
-}
-
-#[test]
-fn generic_php_emits_free_functions() {
-    let content = r#"<?php
-
-if (!function_exists('format_money')) {
-    function format_money(int $cents): string {
-        return '$' . number_format($cents / 100, 2);
-    }
-}
-
-function legacy_helper(): void {}
-"#;
-    let symbols = extract_php_symbols(content);
+    let symbols = extract_blade_symbols(content);
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"format_money"));
-    assert!(names.contains(&"legacy_helper"));
+    // `<x-button>` is a container (paired with `</x-button>`); the other
+    // three are self-closing leaves. Self-closing tags include the ` />`
+    // in their label so the source shape is visible at a glance.
+    assert_eq!(
+        names,
+        vec![
+            "<x-button>",
+            "<x-forms.input />",
+            "<livewire:counter />",
+            "<flux:icon />",
+        ]
+    );
+    assert!(
+        symbols[0].children.is_empty(),
+        "x-button has no nested component children in this test"
+    );
 }
 
 #[test]
-fn generic_php_class_without_extends_uses_generic_path() {
-    // No `extends Component` / `extends Model` — should go through generic
-    // path, not be misclassified as Livewire or Eloquent.
-    let content = r#"<?php
-class PlainOldClass {
-    public function hello(): string {
-        return 'hi';
-    }
-    private function secret() {}
-}
+fn paired_component_tag_nests_its_children() {
+    let content = r#"<x-card>
+    <x-card-header>Title</x-card-header>
+    <livewire:card-body />
+</x-card>
 "#;
-    let symbols = extract_php_symbols(content);
+    let symbols = extract_blade_symbols(content);
     assert_eq!(symbols.len(), 1);
-    let names: Vec<&str> = symbols[0]
+    let card = &symbols[0];
+    assert_eq!(card.name, "<x-card>");
+    let child_names: Vec<&str> = card.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        child_names,
+        vec!["<x-card-header>", "<livewire:card-body />"]
+    );
+}
+
+#[test]
+fn extracts_blade_slot_tags() {
+    let content = r#"<x-card>
+    <x-slot:header>Title</x-slot:header>
+    <x-slot name="footer">Footer</x-slot>
+    Body content
+</x-card>
+"#;
+    let symbols = extract_blade_symbols(content);
+    // `<x-card>` is now a paired container; the slot tags live inside it
+    // as children. Slot tags are rendered as `<x-slot:NAME>` regardless of
+    // which syntax form the source used.
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "<x-card>");
+    let child_names: Vec<&str> = symbols[0]
         .children
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    assert!(names.contains(&"hello"));
-    assert!(
-        names.contains(&"secret"),
-        "private members visible in generic outline"
+    assert!(child_names.contains(&"<x-slot:header>"));
+    assert!(child_names.contains(&"<x-slot:footer>"));
+}
+
+#[test]
+fn extracts_blade_props_declaration() {
+    let content = r#"@props(['title', 'count' => 0])
+
+<div class="card">{{ $title }} — {{ $count }}</div>
+"#;
+    let symbols = extract_blade_symbols(content);
+    assert_eq!(symbols.len(), 1);
+    // We capture the first string argument of @props, which for the
+    // common `['title', 'count' => 0]` shape is the first key.
+    assert_eq!(symbols[0].name, "@props title");
+}
+
+#[test]
+fn extracts_blade_includes() {
+    let content = r#"@include('partials.header')
+@includeIf('partials.banner', ['variant' => 'success'])
+@includeWhen($user->isAdmin(), 'partials.admin-nav')
+@includeUnless($guest, 'partials.user-nav')
+@includeFirst(['custom.layout', 'default.layout'])
+"#;
+    let symbols = extract_blade_symbols(content);
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "@include partials.header",
+            "@includeIf partials.banner",
+            "@includeWhen partials.admin-nav",
+            "@includeUnless partials.user-nav",
+            "@includeFirst custom.layout",
+        ]
     );
 }
+
+#[test]
+fn blade_outline_for_component_file() {
+    // A typical Blade component file: props + slot + child components.
+    let content = r#"@props(['title'])
+
+<div class="card">
+    <x-slot:header>
+        {{ $title }}
+    </x-slot:header>
+
+    <x-card-body>
+        {{ $slot }}
+    </x-card-body>
+
+    <livewire:card-footer :title="$title" />
+</div>
+"#;
+    let symbols = extract_blade_symbols(content);
+
+    // Walk the full tree — component containers nest their content as
+    // children, so the livewire tag below `<x-card-body>` is a sibling at
+    // the top level, while the slot inside `<x-card-body>`'s scope nests
+    // under it (because the close tag is delayed).
+    fn collect_names(entries: &[SymbolEntry], out: &mut Vec<String>) {
+        for e in entries {
+            out.push(e.name.clone());
+            collect_names(&e.children, out);
+        }
+    }
+    let mut names = Vec::new();
+    collect_names(&symbols, &mut names);
+
+    assert!(names.iter().any(|n| n == "@props title"));
+    assert!(names.iter().any(|n| n == "<x-slot:header>"));
+    assert!(names.iter().any(|n| n == "<x-card-body>"));
+    assert!(names.iter().any(|n| n == "<livewire:card-footer />"));
+}
+
+#[test]
+fn blade_outline_for_layout_file() {
+    // A typical Blade layout file: sections nesting yields and pushes.
+    let content = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>@yield('title', 'Default')</title>
+    @stack('head')
+</head>
+<body>
+    @include('partials.nav')
+
+    @section('content')
+        @yield('inner')
+    @show
+
+    @push('scripts')
+        <script>console.log('layout');</script>
+    @endpush
+</body>
+</html>
+"#;
+    let symbols = extract_blade_symbols(content);
+
+    // Collect names from the whole tree (Top + children) since the layout's
+    // `@section` is unclosed and ends up containing the `@push scripts`
+    // entry as a child.
+    fn collect_names(entries: &[SymbolEntry], out: &mut Vec<String>) {
+        for e in entries {
+            out.push(e.name.clone());
+            collect_names(&e.children, out);
+        }
+    }
+    let mut names = Vec::new();
+    collect_names(&symbols, &mut names);
+
+    assert!(names.iter().any(|n| n == "@yield title"));
+    assert!(names.iter().any(|n| n == "@stack head"));
+    assert!(names.iter().any(|n| n == "@include partials.nav"));
+    assert!(names.iter().any(|n| n.starts_with("@section")));
+    assert!(names.iter().any(|n| n == "@push scripts"));
+}
+
+// ============================================================================
+// PHP — intentionally returns empty
+// ============================================================================
+//
+// See module-level docs on document_symbols.rs: most users have a PHP LSP
+// (Intelephense / Phpactor / PhpTools) installed, and Zed merges document
+// symbol responses across LSPs. Anything we emit for `.php` files appears
+// twice in the outline panel. We cede PHP class bodies to the dedicated PHP
+// LSP and keep our contribution scoped to Laravel-specific shapes: route
+// declarations and Blade templates. PHP structural parsing still exists in
+// `crate::php_outline` for potential reuse elsewhere (hover, completions),
+// but it's not wired into `extract_symbols`.
 
 // ============================================================================
 // Dispatch
@@ -372,7 +325,7 @@ fn extract_symbols_dispatches_to_route_extractor() {
     let content = "<?php\nRoute::get('/x', fn () => 1)->name('x');\n";
     let symbols = extract_symbols(content, FileKind::RouteFile);
     assert_eq!(symbols.len(), 1);
-    assert_eq!(symbols[0].name, "GET /x");
+    assert_eq!(symbols[0].name, "GET /x [name=x]");
 }
 
 #[test]
@@ -382,21 +335,14 @@ fn extract_symbols_other_returns_empty() {
 }
 
 #[test]
-fn extract_symbols_php_dispatches_through_subclassification() {
-    // PHP file with Livewire component — should produce a class symbol with
-    // the public-only filter applied.
+fn extract_symbols_php_returns_empty() {
+    // We deliberately don't emit document symbols for `.php` files — see
+    // the module-level docs on document_symbols.rs. PHP outline is owned
+    // by whichever PHP LSP the user has installed (Intelephense / Phpactor
+    // / PhpTools) because Zed merges responses across LSPs and any output
+    // from us would render twice in the outline panel.
     let content =
         "<?php\nclass Foo extends Component {\n    public int $a = 0;\n    private $b;\n}\n";
     let symbols = extract_symbols(content, FileKind::Php);
-    assert_eq!(symbols.len(), 1);
-    let names: Vec<&str> = symbols[0]
-        .children
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        vec!["$a"],
-        "private $b filtered out by Livewire path"
-    );
+    assert!(symbols.is_empty());
 }

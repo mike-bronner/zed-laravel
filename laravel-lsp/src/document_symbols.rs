@@ -10,28 +10,33 @@
 //! |--------------|------------------------------------------------------------------------|
 //! | `RouteFile`  | `Route::get/post/...` calls labelled `METHOD URI [n=…]`                |
 //! | `Blade`      | `@section`, `@push`, `@yield`, `@stack`, `@component` with nesting     |
-//! | `Php`        | Classes / interfaces / traits / enums + members + free functions       |
+//! | `Php`        | Empty — see note below                                                 |
 //! | `Other`      | Empty                                                                  |
 //!
-//! For `Php` files, the extractor further specialises: Livewire components
-//! emit *public-only* properties and methods; Eloquent models emit *only*
-//! relationship methods and `scope*` methods; everything else emits full
-//! class structure (all visibility levels, all top-level structures, plus
-//! free functions).
+//! ## Why `Php` returns no symbols
 //!
-//! Structural parsing of PHP class bodies goes through [`crate::php_outline`]
-//! (tree-sitter); only routes and Blade still use regex. All positions are
-//! 0-based to match the LSP and the rest of this codebase (see `CLAUDE.md`
-//! § Position Indexing Convention).
+//! Most Zed users with Laravel projects have the `php` extension installed,
+//! which registers Intelephense / Phpactor / PhpTools as language servers
+//! for the `PHP` language. Those LSPs return their own `textDocument/document
+//! Symbol` responses, and Zed *merges* responses from all LSPs serving a
+//! file — which means anything we emit for `.php` files appears twice in
+//! the outline panel: once with our rich labels (`public function show(int
+//! $id): View`) and once with the PHP LSP's bare labels (`public function
+//! show` with locals/catches as children).
+//!
+//! We can't deduplicate from our side (Zed handles the merge), and our
+//! rich-labelled PHP outline doesn't add Laravel-specific information that
+//! Intelephense doesn't already cover at the class-member level. So we
+//! cede PHP class bodies to the dedicated PHP LSP and keep our own
+//! documentSymbol contribution focused on Laravel-specific shapes the PHP
+//! LSP doesn't understand: route declarations and Blade templates.
+//!
+//! All positions are 0-based to match the LSP and the rest of this codebase
+//! (see `CLAUDE.md` § Position Indexing Convention).
 
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::Path;
-
-use crate::php_outline::{
-    extract_php_structure, PhpFileStructure, PhpFunctionInfo, PhpMethodInfo, PhpPropertyInfo,
-    PhpStructure, PhpStructureKind, PhpVisibility,
-};
 
 /// A single entry in the document symbol tree. Plain data so it can cross the
 /// Salsa async boundary and be cached cheaply.
@@ -70,25 +75,26 @@ pub enum SymbolEntryKind {
     Variable,
 }
 
-/// Path-based file classification. PHP class files are all `Php` — the
-/// Livewire/Model/Generic subclassification happens inside extraction so we
-/// only parse PHP once per request.
+/// Path-based file classification. Plain PHP files (`Php`) are classified
+/// so that the dispatch knows to skip them — see the module-level docs on
+/// why we don't emit document symbols for plain PHP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
     /// A file under `routes/` (web.php, api.php, etc.).
     RouteFile,
     /// A `*.blade.php` file.
     Blade,
-    /// Any `.php` file outside `routes/` — Livewire / model / plain class /
-    /// helpers file. Differentiation happens in `extract_symbols`.
+    /// Any `.php` file outside `routes/` — Livewire component, model,
+    /// controller, helpers file, etc. Dispatched to an empty extractor;
+    /// see the module-level docs for why.
     Php,
     /// Anything else — no Laravel-aware symbols to emit.
     Other,
 }
 
 /// Classify a file by path. Path is sufficient for the top-level dispatch —
-/// PHP files are all routed to the `Php` extractor which then parses the
-/// content once with tree-sitter to pick the right shape.
+/// we don't peek into PHP file contents because the `Php` extractor returns
+/// empty regardless.
 pub fn classify_file(path: &Path) -> FileKind {
     let path_str = path.to_string_lossy();
 
@@ -107,13 +113,13 @@ pub fn classify_file(path: &Path) -> FileKind {
     FileKind::Php
 }
 
-/// Dispatch to the right extractor based on file kind.
+/// Dispatch to the right extractor based on file kind. `Php` returns
+/// empty — see module-level docs.
 pub fn extract_symbols(content: &str, kind: FileKind) -> Vec<SymbolEntry> {
     match kind {
         FileKind::RouteFile => extract_route_symbols(content),
         FileKind::Blade => extract_blade_symbols(content),
-        FileKind::Php => extract_php_symbols(content),
-        FileKind::Other => Vec::new(),
+        FileKind::Php | FileKind::Other => Vec::new(),
     }
 }
 
@@ -121,119 +127,344 @@ pub fn extract_symbols(content: &str, kind: FileKind) -> Vec<SymbolEntry> {
 // Routes
 // ============================================================================
 
-/// Extract `Route::verb('/uri', ...)` definitions and their `->name(...)`
-/// suffixes (when present). Each becomes a top-level symbol; route groups
-/// are flattened — we don't currently track `Route::prefix(...)->group(...)`
-/// nesting in the outline.
+/// Walk the route file's AST via [`crate::route_outline`] and convert the
+/// resulting `RouteOutline` tree into `SymbolEntry` form. Group containers
+/// become hierarchical `Namespace`-kind symbols with their child routes
+/// nested inside; leaf routes become `Function`-kind symbols with label
+/// `METHOD URI` and a `[name=…]` detail when named.
 fn extract_route_symbols(content: &str) -> Vec<SymbolEntry> {
-    lazy_static! {
-        // Match `Route::verb('uri'` or `Route::verb("uri"`. The verb capture
-        // covers the standard HTTP routing helpers we surface in the outline.
-        static ref ROUTE_RE: Regex = Regex::new(
-            r#"Route::(get|post|put|patch|delete|options|any|match|view|redirect|fallback)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]*)['"]"#,
-        )
-        .unwrap();
-        // Match `->name('foo')` or `->name("foo")` following the route. Captures
-        // only the name; the caller searches for this within the route's tail
-        // up to the next semicolon.
-        static ref NAME_RE: Regex = Regex::new(r#"->name\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
-    }
+    let outline = crate::route_outline::extract_route_outline(content);
+    outline.iter().map(route_outline_to_symbol).collect()
+}
 
-    let mut symbols = Vec::new();
-
-    for cap in ROUTE_RE.captures_iter(content) {
-        let full_match = cap.get(0).expect("regex match always has group 0");
-        let verb = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let uri = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-
-        // Look ahead for `->name(...)` up to the next semicolon — that
-        // captures the typical fluent-chain shape without consuming the next
-        // route call.
-        let tail_start = full_match.end();
-        let tail_end = content[tail_start..]
-            .find(';')
-            .map(|i| tail_start + i)
-            .unwrap_or(content.len());
-        let tail = &content[tail_start..tail_end];
-
-        let name = NAME_RE
-            .captures(tail)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-
-        let (start_line, start_column) = byte_to_line_col(content, full_match.start());
-        let (end_line, end_column) = byte_to_line_col(content, tail_end);
-
-        let detail = name.as_ref().map(|n| format!("[name={n}]"));
-        let label = format!("{} {}", verb.to_uppercase(), uri);
-
-        symbols.push(SymbolEntry {
-            name: label,
-            detail,
+fn route_outline_to_symbol(route: &crate::route_outline::RouteOutline) -> SymbolEntry {
+    if route.is_group {
+        // Group container labelled `group [prefix=/x, name=y.]` — the
+        // literal `group` is the primary type identifier; the bracket
+        // suffix lists whichever modifiers the group applies. Detail is
+        // not set because Zed's outline panel doesn't render it
+        // (zed-industries/zed#49095) — we keep everything in `name` for
+        // consistent rendering across editors. Upstream coloring tracked
+        // at zed#57576.
+        //
+        // `kind: Function` (not `Namespace`) and `range` taken from the
+        // closure expression (not the wider chain) together prevent Zed
+        // from overlaying tree-sitter `Closure` children inside our group.
+        SymbolEntry {
+            name: group_label(&route.uri, route.name.as_deref()),
+            detail: None,
             kind: SymbolEntryKind::Function,
-            start_line,
-            start_column,
-            end_line,
-            end_column,
+            start_line: route.start_line,
+            start_column: route.start_column,
+            end_line: route.end_line,
+            end_column: route.end_column,
+            children: route.children.iter().map(route_outline_to_symbol).collect(),
+        }
+    } else {
+        // Leaf route: `METHOD URI` with the route name appended in
+        // brackets when present.
+        SymbolEntry {
+            name: route_label(&route.method, &route.uri, route.name.as_deref()),
+            detail: None,
+            kind: SymbolEntryKind::Function,
+            start_line: route.start_line,
+            start_column: route.start_column,
+            end_line: route.end_line,
+            end_column: route.end_column,
             children: Vec::new(),
-        });
+        }
     }
+}
 
-    symbols
+/// Compose a group label. Examples:
+///   `group`
+///   `group [prefix=/api]`
+///   `group [name=api.]`
+///   `group [prefix=/api, name=api.]`
+fn group_label(uri: &str, name: Option<&str>) -> String {
+    let mut parts = Vec::with_capacity(2);
+    if !uri.is_empty() {
+        parts.push(format!("prefix={uri}"));
+    }
+    if let Some(n) = name {
+        parts.push(format!("name={n}"));
+    }
+    if parts.is_empty() {
+        "group".to_string()
+    } else {
+        format!("group [{}]", parts.join(", "))
+    }
+}
+
+/// Compose a leaf-route label. Examples:
+///   `GET /users`
+///   `GET /users [name=users.index]`
+fn route_label(method: &str, uri: &str, name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("{method} {uri} [name={n}]"),
+        None => format!("{method} {uri}"),
+    }
 }
 
 // ============================================================================
 // Blade
 // ============================================================================
 
-/// Extract structural Blade directives (`@section`, `@push`, `@stack`,
-/// `@yield`, `@component`) with parent/child nesting derived from the
-/// open/close pairs.
+/// Extract noteworthy structural elements from a Blade file: layout
+/// directives (`@extends`, `@section`, `@yield`, `@push`, `@stack`),
+/// declarative directives (`@props`, `@slot`, `@include*`), and the modern
+/// HTML-tag-based component usage (`<x-…>`, `<livewire:…>`, `<flux:…>`,
+/// `<x-slot:…>`).
+///
+/// Container directives that have `@end*` partners (`@section`, `@push`,
+/// `@prepend`, `@component`) form parent/child nesting via an open-block
+/// stack. Everything else — `@yield`, `@stack`, `@extends`, `@include`,
+/// `@props`, `@slot`, HTML component tags — emits as leaves of whatever
+/// container they live inside.
 fn extract_blade_symbols(content: &str) -> Vec<SymbolEntry> {
     lazy_static! {
-        // Match any of the structural directives we surface, optionally with
-        // an argument list. The directive name is captured for dispatch.
+        // Directives we surface — both block-style (with @end partners) and
+        // self-contained. Capture 1 = directive name. The argument list is
+        // parsed separately by `parse_directive_args` because real Blade
+        // code has nested parens (`@includeWhen($user->method(), 'partial')`)
+        // and array literals (`@props(['title', 'count' => 0])`) which a
+        // pure regex can't balance.
         static ref DIRECTIVE_RE: Regex = Regex::new(
-            r#"@(section|endsection|push|endpush|prepend|endprepend|stack|yield|component|endcomponent|extends)\b(?:\s*\(\s*['"]([^'"]*)['"]\s*(?:,[^)]*)?\))?"#,
+            r#"@(section|endsection|push|endpush|prepend|endprepend|stack|yield|component|endcomponent|extends|include|includeIf|includeWhen|includeUnless|includeFirst|slot|endslot|props)\b"#,
+        )
+        .unwrap();
+        // Opening / self-closing component tags. Capture 1 = full tag-name
+        // (e.g. `x-button`, `livewire:counter`, `flux:icon`). Capture 2 =
+        // any trailing `/` that makes the tag self-closing (`<x-icon />`).
+        // The Rust regex crate doesn't support look-ahead, so `<x-slot:…>`
+        // and `<x-slot name="…">` are filtered out in the loop below
+        // (handled by `SLOT_TAG_RE` separately so we can render them as
+        // slot declarations rather than generic component usage).
+        static ref COMPONENT_OPEN_TAG_RE: Regex = Regex::new(
+            r#"<((?:x-[a-z][a-z0-9._:-]*)|(?:livewire:[a-z][a-z0-9._-]*)|(?:flux:[a-z][a-z0-9._-]*))\b[^>]*?(/?)>"#,
+        )
+        .unwrap();
+        // Closing component tags — `</x-name>`, `</livewire:name>`,
+        // `</flux:name>`. Capture 1 = the tag name (must match the opening
+        // tag's name for the pair to nest).
+        static ref COMPONENT_CLOSE_TAG_RE: Regex = Regex::new(
+            r#"</((?:x-[a-z][a-z0-9._:-]*)|(?:livewire:[a-z][a-z0-9._-]*)|(?:flux:[a-z][a-z0-9._-]*))>"#,
+        )
+        .unwrap();
+        // Slot declarations — `<x-slot:name>` (Laravel 9+) and the legacy
+        // `<x-slot name="value">` form. Capture 1 = the slot name (modern
+        // syntax); capture 2 = the slot name (legacy syntax).
+        static ref SLOT_TAG_RE: Regex = Regex::new(
+            r#"<x-slot(?::([a-zA-Z_][a-zA-Z0-9_-]*)|\s+name=['"]([^'"]+)['"])"#,
         )
         .unwrap();
     }
 
-    let mut roots: Vec<SymbolEntry> = Vec::new();
-    let mut stack: Vec<BladeOpenBlock> = Vec::new();
+    // Collect every interesting match across all regexes, keyed by source
+    // byte offset. We process them in source order so the nesting stack
+    // assigns children to the right parent.
+    enum BladeMatch {
+        Directive {
+            directive: String,
+            arg: Option<String>,
+            start: usize,
+            end: usize,
+        },
+        /// `<x-button>` (opens a block that nests until `</x-button>`).
+        ComponentOpen {
+            tag: String,
+            start: usize,
+            end: usize,
+        },
+        /// `</x-button>` (closes the matching `ComponentOpen`).
+        ComponentClose {
+            tag: String,
+            start: usize,
+            end: usize,
+        },
+        /// `<x-icon />` (self-closing, emitted as a leaf without nesting).
+        ComponentSelfClose {
+            tag: String,
+            start: usize,
+            end: usize,
+        },
+        /// `<x-slot:name>` or `<x-slot name="…">` — emitted as a leaf for
+        /// now (slot pairing across the modern/legacy closing forms isn't
+        /// worth the complexity yet).
+        SlotTag {
+            name: String,
+            start: usize,
+            end: usize,
+        },
+    }
+
+    fn match_start(m: &BladeMatch) -> usize {
+        match m {
+            BladeMatch::Directive { start, .. }
+            | BladeMatch::ComponentOpen { start, .. }
+            | BladeMatch::ComponentClose { start, .. }
+            | BladeMatch::ComponentSelfClose { start, .. }
+            | BladeMatch::SlotTag { start, .. } => *start,
+        }
+    }
+
+    let mut matches: Vec<BladeMatch> = Vec::new();
 
     for cap in DIRECTIVE_RE.captures_iter(content) {
         let full = cap.get(0).expect("regex match always has group 0");
-        let directive = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let arg = cap.get(2).map(|m| m.as_str().to_string());
-
-        let (start_line, start_column) = byte_to_line_col(content, full.start());
-        let (end_line, end_column) = byte_to_line_col(content, full.end());
-
-        match directive {
-            // Closing directives pop the matching open block. If the stack
-            // head doesn't match (unbalanced source), we still pop to avoid
-            // runaway nesting — outlines tolerate inexact end positions better
-            // than missing blocks.
-            "endsection" => {
-                close_blade_block(&mut stack, &mut roots, "section", end_line, end_column)
+        let directive = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let (arg, end_pos) = parse_directive_args(content, full.end());
+        matches.push(BladeMatch::Directive {
+            directive,
+            arg,
+            start: full.start(),
+            end: end_pos,
+        });
+    }
+    for cap in COMPONENT_OPEN_TAG_RE.captures_iter(content) {
+        let full = cap.get(0).expect("regex match always has group 0");
+        let tag = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        // Skip slot tags — emitted as `SlotTag` below.
+        if tag == "x-slot" || tag.starts_with("x-slot:") {
+            continue;
+        }
+        let self_closing = cap.get(2).map(|m| m.as_str() == "/").unwrap_or(false);
+        let entry = if self_closing {
+            BladeMatch::ComponentSelfClose {
+                tag,
+                start: full.start(),
+                end: full.end(),
             }
-            "endpush" => close_blade_block(&mut stack, &mut roots, "push", end_line, end_column),
-            "endprepend" => {
-                close_blade_block(&mut stack, &mut roots, "prepend", end_line, end_column)
+        } else {
+            BladeMatch::ComponentOpen {
+                tag,
+                start: full.start(),
+                end: full.end(),
             }
-            "endcomponent" => {
-                close_blade_block(&mut stack, &mut roots, "component", end_line, end_column)
-            }
+        };
+        matches.push(entry);
+    }
+    for cap in COMPONENT_CLOSE_TAG_RE.captures_iter(content) {
+        let full = cap.get(0).expect("regex match always has group 0");
+        let tag = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        if tag == "x-slot" || tag.starts_with("x-slot:") {
+            continue;
+        }
+        matches.push(BladeMatch::ComponentClose {
+            tag,
+            start: full.start(),
+            end: full.end(),
+        });
+    }
+    for cap in SLOT_TAG_RE.captures_iter(content) {
+        let full = cap.get(0).expect("regex match always has group 0");
+        let name = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        matches.push(BladeMatch::SlotTag {
+            name,
+            start: full.start(),
+            end: full.end(),
+        });
+    }
 
-            // Opening directives push a new block onto the stack.
-            "section" | "push" | "prepend" | "component" => {
-                let name = arg.unwrap_or_else(|| format!("@{directive}"));
+    matches.sort_by_key(match_start);
+
+    let mut roots: Vec<SymbolEntry> = Vec::new();
+    let mut stack: Vec<BladeOpenBlock> = Vec::new();
+
+    for m in matches {
+        match m {
+            BladeMatch::Directive {
+                directive,
+                arg,
+                start,
+                end,
+            } => {
+                let (start_line, start_column) = byte_to_line_col(content, start);
+                let (end_line, end_column) = byte_to_line_col(content, end);
+
+                match directive.as_str() {
+                    // Closing directives pop the matching open block. If the
+                    // stack head doesn't match (unbalanced source), we still
+                    // pop to avoid runaway nesting.
+                    "endsection" => {
+                        close_blade_block(&mut stack, &mut roots, "section", end_line, end_column)
+                    }
+                    "endpush" => {
+                        close_blade_block(&mut stack, &mut roots, "push", end_line, end_column)
+                    }
+                    "endprepend" => {
+                        close_blade_block(&mut stack, &mut roots, "prepend", end_line, end_column)
+                    }
+                    "endcomponent" => {
+                        close_blade_block(&mut stack, &mut roots, "component", end_line, end_column)
+                    }
+                    "endslot" => {
+                        close_blade_block(&mut stack, &mut roots, "slot", end_line, end_column)
+                    }
+
+                    // Opening directives push a new block onto the stack.
+                    "section" | "push" | "prepend" | "component" | "slot" => {
+                        let label = blade_directive_label(&directive, arg.as_deref());
+                        stack.push(BladeOpenBlock {
+                            directive: directive.clone(),
+                            symbol: SymbolEntry {
+                                name: label,
+                                detail: None,
+                                kind: SymbolEntryKind::Namespace,
+                                start_line,
+                                start_column,
+                                end_line,
+                                end_column,
+                                children: Vec::new(),
+                            },
+                        });
+                    }
+
+                    // Self-contained directives.
+                    "stack" | "yield" | "extends" | "props" | "include" | "includeIf"
+                    | "includeWhen" | "includeUnless" | "includeFirst" => {
+                        let label = blade_directive_label(&directive, arg.as_deref());
+                        push_blade_entry(
+                            &mut stack,
+                            &mut roots,
+                            SymbolEntry {
+                                name: label,
+                                detail: None,
+                                kind: SymbolEntryKind::Field,
+                                start_line,
+                                start_column,
+                                end_line,
+                                end_column,
+                                children: Vec::new(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            BladeMatch::ComponentOpen { tag, start, end } => {
+                // Push as a container; children will be added until the
+                // matching `</tag>` arrives (or we flush on EOF).
+                let (start_line, start_column) = byte_to_line_col(content, start);
+                let (end_line, end_column) = byte_to_line_col(content, end);
                 stack.push(BladeOpenBlock {
-                    directive: directive.to_string(),
+                    directive: format!("tag:{tag}"),
                     symbol: SymbolEntry {
-                        name,
-                        detail: Some(format!("@{directive}")),
+                        name: format!("<{tag}>"),
+                        detail: None,
                         kind: SymbolEntryKind::Namespace,
                         start_line,
                         start_column,
@@ -243,17 +474,25 @@ fn extract_blade_symbols(content: &str) -> Vec<SymbolEntry> {
                     },
                 });
             }
-
-            // Self-contained directives — emit as leaves of the current parent
-            // (or root) without entering the stack.
-            "stack" | "yield" | "extends" => {
-                let name = arg.unwrap_or_else(|| format!("@{directive}"));
+            BladeMatch::ComponentClose { tag, start: _, end } => {
+                let (end_line, end_column) = byte_to_line_col(content, end);
+                close_blade_block(
+                    &mut stack,
+                    &mut roots,
+                    &format!("tag:{tag}"),
+                    end_line,
+                    end_column,
+                );
+            }
+            BladeMatch::ComponentSelfClose { tag, start, end } => {
+                let (start_line, start_column) = byte_to_line_col(content, start);
+                let (end_line, end_column) = byte_to_line_col(content, end);
                 push_blade_entry(
                     &mut stack,
                     &mut roots,
                     SymbolEntry {
-                        name,
-                        detail: Some(format!("@{directive}")),
+                        name: format!("<{tag} />"),
+                        detail: None,
                         kind: SymbolEntryKind::Field,
                         start_line,
                         start_column,
@@ -263,7 +502,24 @@ fn extract_blade_symbols(content: &str) -> Vec<SymbolEntry> {
                     },
                 );
             }
-            _ => {}
+            BladeMatch::SlotTag { name, start, end } => {
+                let (start_line, start_column) = byte_to_line_col(content, start);
+                let (end_line, end_column) = byte_to_line_col(content, end);
+                push_blade_entry(
+                    &mut stack,
+                    &mut roots,
+                    SymbolEntry {
+                        name: format!("<x-slot:{name}>"),
+                        detail: None,
+                        kind: SymbolEntryKind::Field,
+                        start_line,
+                        start_column,
+                        end_line,
+                        end_column,
+                        children: Vec::new(),
+                    },
+                );
+            }
         }
     }
 
@@ -273,6 +529,93 @@ fn extract_blade_symbols(content: &str) -> Vec<SymbolEntry> {
     }
 
     roots
+}
+
+/// Compose a Blade directive label. The directive is always present (used
+/// to identify the kind of entry); the argument is appended when supplied.
+/// Examples:
+///   `@extends layouts.app`
+///   `@section content`
+///   `@include partials.header`
+///   `@props title`      ← first array key when @props(['title', ...])
+fn blade_directive_label(directive: &str, arg: Option<&str>) -> String {
+    match arg {
+        Some(a) => format!("@{directive} {a}"),
+        None => format!("@{directive}"),
+    }
+}
+
+/// Scan a Blade directive's `(...)` argument list with brace-aware balanced
+/// paren tracking. Returns `(first_string, end_of_directive)`:
+///   - `first_string` is the first quoted string literal anywhere in the
+///     args (`'title'` from `@props(['title', ...])`, or
+///     `'partial'` from `@includeWhen($x->y(), 'partial')`).
+///   - `end_of_directive` is the byte offset just past the matching close
+///     paren, or `after_directive` if there are no parens. Used as the
+///     symbol's end position.
+///
+/// Handles nested parens (so `$user->method()` inside args doesn't truncate
+/// the search early) and quoted-string escape sequences.
+fn parse_directive_args(content: &str, after_directive: usize) -> (Option<String>, usize) {
+    let bytes = content.as_bytes();
+    let mut i = after_directive;
+
+    // Skip whitespace between the directive and its opening `(`. Stop at
+    // newlines — a directive without args on the same line has none.
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return (None, after_directive);
+    }
+    i += 1; // step past the `(`
+
+    let mut depth: u32 = 0;
+    let mut first_string: Option<String> = None;
+    let mut in_string = false;
+    let mut string_quote = b' ';
+    let mut string_start = 0usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        if in_string {
+            if c == b'\\' && i + 1 < bytes.len() {
+                // Skip the escaped char. We're only looking for the string
+                // closing quote; precise escape semantics don't matter here.
+                i += 2;
+                continue;
+            }
+            if c == string_quote {
+                if first_string.is_none() {
+                    if let Ok(s) = std::str::from_utf8(&bytes[string_start..i]) {
+                        first_string = Some(s.to_string());
+                    }
+                }
+                in_string = false;
+            }
+        } else {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    if depth == 0 {
+                        return (first_string, i + 1);
+                    }
+                    depth -= 1;
+                }
+                b'\'' | b'"' => {
+                    in_string = true;
+                    string_quote = c;
+                    string_start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    // Unclosed args — return whatever we found, ending at EOF.
+    (first_string, bytes.len())
 }
 
 /// One frame on the Blade open-block stack — the directive that opened it
@@ -312,235 +655,6 @@ fn push_blade_entry(
         parent.symbol.children.push(entry);
     } else {
         roots.push(entry);
-    }
-}
-
-// ============================================================================
-// PHP (Livewire / Eloquent / Generic) — single parse, content-based dispatch
-// ============================================================================
-
-/// Parse the PHP file once via tree-sitter, then dispatch by what the first
-/// class extends. Plain PHP files (no class, or class that doesn't extend a
-/// Laravel base) get a full structural outline.
-fn extract_php_symbols(content: &str) -> Vec<SymbolEntry> {
-    let structure = extract_php_structure(content);
-
-    let first_class_extends = structure
-        .structures
-        .iter()
-        .find(|s| s.kind == PhpStructureKind::Class)
-        .and_then(|c| c.extends.as_deref());
-
-    match first_class_extends {
-        Some(extends) if is_livewire_component(extends) => livewire_symbols(&structure),
-        Some(extends) if is_eloquent_model(extends) => model_symbols(&structure),
-        _ => generic_php_symbols(&structure),
-    }
-}
-
-/// `Component` (bare), `Livewire\Component`, or any class whose extends target
-/// resolves to `Component` after namespace-simplification. Conservative — a
-/// non-Livewire `Component` base would also match, but the generic path also
-/// produces sensible output, so the cost of a false positive is low.
-fn is_livewire_component(extends: &str) -> bool {
-    extends == "Component"
-}
-
-fn is_eloquent_model(extends: &str) -> bool {
-    matches!(
-        extends,
-        "Model" | "Authenticatable" | "Pivot" | "MorphPivot"
-    )
-}
-
-/// Livewire components: emit the class with *public* properties and methods
-/// only. Private/protected members are implementation details, not surface area.
-fn livewire_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
-    let Some(class) = structure
-        .structures
-        .iter()
-        .find(|s| s.kind == PhpStructureKind::Class)
-    else {
-        return Vec::new();
-    };
-
-    let mut entry = structure_to_symbol(class);
-
-    let mut children: Vec<SymbolEntry> = class
-        .properties
-        .iter()
-        .filter(|p| p.visibility == PhpVisibility::Public)
-        .map(property_to_symbol)
-        .chain(
-            class
-                .methods
-                .iter()
-                .filter(|m| m.visibility == PhpVisibility::Public)
-                .map(method_to_symbol),
-        )
-        .collect();
-    children.sort_by_key(|c| (c.start_line, c.start_column));
-    extend_class_end_to_last_child(&mut entry, &children);
-    entry.children = children;
-
-    vec![entry]
-}
-
-/// Eloquent models: emit the class with *only* relationship methods (return
-/// type matches a known Eloquent relation) and query scopes (`scope*`). Other
-/// methods are noise on the outline of a model.
-fn model_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
-    let Some(class) = structure
-        .structures
-        .iter()
-        .find(|s| s.kind == PhpStructureKind::Class)
-    else {
-        return Vec::new();
-    };
-
-    let mut entry = structure_to_symbol(class);
-
-    let mut children: Vec<SymbolEntry> = class
-        .methods
-        .iter()
-        .filter(|m| is_relationship(m) || is_scope(m))
-        .map(method_to_symbol)
-        .collect();
-    children.sort_by_key(|c| (c.start_line, c.start_column));
-    extend_class_end_to_last_child(&mut entry, &children);
-    entry.children = children;
-
-    vec![entry]
-}
-
-fn is_relationship(m: &PhpMethodInfo) -> bool {
-    m.return_type
-        .as_deref()
-        .is_some_and(is_relationship_return_type)
-}
-
-fn is_scope(m: &PhpMethodInfo) -> bool {
-    m.name.starts_with("scope")
-        && m.name
-            .chars()
-            .nth(5)
-            .is_some_and(|c| c.is_ascii_uppercase())
-}
-
-fn is_relationship_return_type(detail: &str) -> bool {
-    const RELATIONSHIPS: &[&str] = &[
-        "HasMany",
-        "HasOne",
-        "BelongsTo",
-        "BelongsToMany",
-        "HasManyThrough",
-        "HasOneThrough",
-        "MorphMany",
-        "MorphOne",
-        "MorphTo",
-        "MorphToMany",
-        "MorphedByMany",
-    ];
-    RELATIONSHIPS.iter().any(|r| detail.contains(r))
-}
-
-/// Plain PHP files (controllers, jobs, helpers, etc.) — emit every top-level
-/// class/interface/trait/enum with *all* properties and methods regardless of
-/// visibility, plus any free functions. This is the strict-upgrade path when
-/// a Zed user opts into LSP outlines: parity with tree-sitter outline.scm
-/// plus our Laravel-aware sugar.
-fn generic_php_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
-    let mut symbols = Vec::new();
-
-    for s in &structure.structures {
-        let mut entry = structure_to_symbol(s);
-
-        let mut children: Vec<SymbolEntry> = s
-            .properties
-            .iter()
-            .map(property_to_symbol)
-            .chain(s.methods.iter().map(method_to_symbol))
-            .collect();
-        children.sort_by_key(|c| (c.start_line, c.start_column));
-        extend_class_end_to_last_child(&mut entry, &children);
-        entry.children = children;
-
-        symbols.push(entry);
-    }
-
-    for f in &structure.functions {
-        symbols.push(function_to_symbol(f));
-    }
-
-    symbols
-}
-
-fn structure_to_symbol(s: &PhpStructure) -> SymbolEntry {
-    let kind = match s.kind {
-        PhpStructureKind::Class => SymbolEntryKind::Class,
-        PhpStructureKind::Interface => SymbolEntryKind::Interface,
-        PhpStructureKind::Trait => SymbolEntryKind::Trait,
-        PhpStructureKind::Enum => SymbolEntryKind::Enum,
-    };
-    let detail = s.extends.as_ref().map(|e| format!("extends {e}"));
-    SymbolEntry {
-        name: s.name.clone(),
-        detail,
-        kind,
-        start_line: s.start_line,
-        start_column: s.start_column,
-        end_line: s.end_line,
-        end_column: s.end_column,
-        children: Vec::new(),
-    }
-}
-
-fn method_to_symbol(m: &PhpMethodInfo) -> SymbolEntry {
-    SymbolEntry {
-        name: m.name.clone(),
-        detail: m.return_type.clone(),
-        kind: SymbolEntryKind::Method,
-        start_line: m.start_line,
-        start_column: m.start_column,
-        end_line: m.end_line,
-        end_column: m.end_column,
-        children: Vec::new(),
-    }
-}
-
-fn property_to_symbol(p: &PhpPropertyInfo) -> SymbolEntry {
-    SymbolEntry {
-        name: format!("${}", p.name),
-        detail: p.property_type.clone(),
-        kind: SymbolEntryKind::Property,
-        start_line: p.start_line,
-        start_column: p.start_column,
-        end_line: p.end_line,
-        end_column: p.end_column,
-        children: Vec::new(),
-    }
-}
-
-fn function_to_symbol(f: &PhpFunctionInfo) -> SymbolEntry {
-    SymbolEntry {
-        name: f.name.clone(),
-        detail: f.return_type.clone(),
-        kind: SymbolEntryKind::Function,
-        start_line: f.start_line,
-        start_column: f.start_column,
-        end_line: f.end_line,
-        end_column: f.end_column,
-        children: Vec::new(),
-    }
-}
-
-/// Tighten the class's `end_*` to the last child's end. tree-sitter already
-/// gives us the true class end, but for *filtered* outlines (Livewire/Model)
-/// shrinking to the visible children gives editors a tighter selection range.
-fn extend_class_end_to_last_child(entry: &mut SymbolEntry, children: &[SymbolEntry]) {
-    if let Some(last) = children.last() {
-        entry.end_line = last.end_line;
-        entry.end_column = last.end_column;
     }
 }
 

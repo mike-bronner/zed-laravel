@@ -6,23 +6,32 @@
 //!
 //! ## Supported file kinds
 //!
-//! | Kind                | Symbols                                                 |
-//! |---------------------|---------------------------------------------------------|
-//! | `RouteFile`         | `Route::get/post/...` calls labelled `METHOD URI [n=…]` |
-//! | `Blade`             | `@section`, `@push`, `@yield`, `@stack`, `@component`   |
-//! | `LivewireComponent` | Class + public properties + public methods              |
-//! | `EloquentModel`     | Class + relationship methods + `scope*` methods         |
+//! | Kind         | Symbols                                                                |
+//! |--------------|------------------------------------------------------------------------|
+//! | `RouteFile`  | `Route::get/post/...` calls labelled `METHOD URI [n=…]`                |
+//! | `Blade`      | `@section`, `@push`, `@yield`, `@stack`, `@component` with nesting     |
+//! | `Php`        | Classes / interfaces / traits / enums + members + free functions       |
+//! | `Other`      | Empty                                                                  |
 //!
-//! Each extractor returns plain `SymbolEntry` values; the LSP handler in
-//! `main.rs` converts these to `tower_lsp::lsp_types::DocumentSymbol` and the
-//! Salsa actor in `salsa_impl.rs` memoizes them per file version.
+//! For `Php` files, the extractor further specialises: Livewire components
+//! emit *public-only* properties and methods; Eloquent models emit *only*
+//! relationship methods and `scope*` methods; everything else emits full
+//! class structure (all visibility levels, all top-level structures, plus
+//! free functions).
 //!
-//! All positions are 0-based to match the LSP and the rest of this codebase
-//! (see `CLAUDE.md` § Position Indexing Convention).
+//! Structural parsing of PHP class bodies goes through [`crate::php_outline`]
+//! (tree-sitter); only routes and Blade still use regex. All positions are
+//! 0-based to match the LSP and the rest of this codebase (see `CLAUDE.md`
+//! § Position Indexing Convention).
 
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::Path;
+
+use crate::php_outline::{
+    extract_php_structure, PhpFileStructure, PhpFunctionInfo, PhpMethodInfo, PhpPropertyInfo,
+    PhpStructure, PhpStructureKind, PhpVisibility,
+};
 
 /// A single entry in the document symbol tree. Plain data so it can cross the
 /// Salsa async boundary and be cached cheaply.
@@ -45,12 +54,14 @@ pub struct SymbolEntry {
     pub children: Vec<SymbolEntry>,
 }
 
-/// LSP-aligned symbol kinds. Restricted to the variants this extension actually
-/// emits — wider mapping happens in `main.rs` where `tower_lsp` types are
-/// available.
+/// LSP-aligned symbol kinds we actually emit. Mapping to `tower_lsp::SymbolKind`
+/// happens in `main.rs` where the LSP types are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolEntryKind {
     Class,
+    Interface,
+    Trait,
+    Enum,
     Method,
     Property,
     Field,
@@ -59,54 +70,41 @@ pub enum SymbolEntryKind {
     Variable,
 }
 
-/// File classification — drives which extractor runs.
+/// Path-based file classification. PHP class files are all `Php` — the
+/// Livewire/Model/Generic subclassification happens inside extraction so we
+/// only parse PHP once per request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
     /// A file under `routes/` (web.php, api.php, etc.).
     RouteFile,
     /// A `*.blade.php` file.
     Blade,
-    /// A PHP class extending `Livewire\Component` (or aliased equivalent).
-    LivewireComponent,
-    /// A PHP class extending `Illuminate\Database\Eloquent\Model` (or aliased).
-    EloquentModel,
+    /// Any `.php` file outside `routes/` — Livewire / model / plain class /
+    /// helpers file. Differentiation happens in `extract_symbols`.
+    Php,
     /// Anything else — no Laravel-aware symbols to emit.
     Other,
 }
 
-/// Classify a file by path + content. Path is checked first because it's
-/// cheap; content is consulted only to disambiguate plain PHP files.
-pub fn classify_file(path: &Path, content: &str) -> FileKind {
+/// Classify a file by path. Path is sufficient for the top-level dispatch —
+/// PHP files are all routed to the `Php` extractor which then parses the
+/// content once with tree-sitter to pick the right shape.
+pub fn classify_file(path: &Path) -> FileKind {
     let path_str = path.to_string_lossy();
 
-    // Blade files — extension is authoritative.
     if path_str.ends_with(".blade.php") {
         return FileKind::Blade;
     }
-
-    // Non-PHP files: nothing to do here.
     if !path_str.ends_with(".php") {
         return FileKind::Other;
     }
-
-    // Files under any `routes/` directory are route files. Match the
-    // `is_under_routes_dir` heuristic from route_discovery.rs.
     if path
         .components()
         .any(|c| c.as_os_str().eq_ignore_ascii_case("routes"))
     {
         return FileKind::RouteFile;
     }
-
-    // PHP class files — disambiguate by what they extend.
-    if content_extends_livewire_component(content) {
-        return FileKind::LivewireComponent;
-    }
-    if content_extends_eloquent_model(content) {
-        return FileKind::EloquentModel;
-    }
-
-    FileKind::Other
+    FileKind::Php
 }
 
 /// Dispatch to the right extractor based on file kind.
@@ -114,8 +112,7 @@ pub fn extract_symbols(content: &str, kind: FileKind) -> Vec<SymbolEntry> {
     match kind {
         FileKind::RouteFile => extract_route_symbols(content),
         FileKind::Blade => extract_blade_symbols(content),
-        FileKind::LivewireComponent => extract_livewire_symbols(content),
-        FileKind::EloquentModel => extract_model_symbols(content),
+        FileKind::Php => extract_php_symbols(content),
         FileKind::Other => Vec::new(),
     }
 }
@@ -319,49 +316,115 @@ fn push_blade_entry(
 }
 
 // ============================================================================
-// Livewire components
+// PHP (Livewire / Eloquent / Generic) — single parse, content-based dispatch
 // ============================================================================
 
-/// Extract the component class + its public properties and methods.
-fn extract_livewire_symbols(content: &str) -> Vec<SymbolEntry> {
-    let Some(class) = extract_class_outline(content) else {
-        return Vec::new();
-    };
-    vec![class]
+/// Parse the PHP file once via tree-sitter, then dispatch by what the first
+/// class extends. Plain PHP files (no class, or class that doesn't extend a
+/// Laravel base) get a full structural outline.
+fn extract_php_symbols(content: &str) -> Vec<SymbolEntry> {
+    let structure = extract_php_structure(content);
+
+    let first_class_extends = structure
+        .structures
+        .iter()
+        .find(|s| s.kind == PhpStructureKind::Class)
+        .and_then(|c| c.extends.as_deref());
+
+    match first_class_extends {
+        Some(extends) if is_livewire_component(extends) => livewire_symbols(&structure),
+        Some(extends) if is_eloquent_model(extends) => model_symbols(&structure),
+        _ => generic_php_symbols(&structure),
+    }
 }
 
-// ============================================================================
-// Eloquent models
-// ============================================================================
+/// `Component` (bare), `Livewire\Component`, or any class whose extends target
+/// resolves to `Component` after namespace-simplification. Conservative — a
+/// non-Livewire `Component` base would also match, but the generic path also
+/// produces sensible output, so the cost of a false positive is low.
+fn is_livewire_component(extends: &str) -> bool {
+    extends == "Component"
+}
 
-/// Extract the model class + relationship methods + `scope*` methods. Other
-/// public methods are intentionally omitted — they're rarely what someone
-/// jumps to in a model.
-fn extract_model_symbols(content: &str) -> Vec<SymbolEntry> {
-    let Some(mut class) = extract_class_outline(content) else {
+fn is_eloquent_model(extends: &str) -> bool {
+    matches!(
+        extends,
+        "Model" | "Authenticatable" | "Pivot" | "MorphPivot"
+    )
+}
+
+/// Livewire components: emit the class with *public* properties and methods
+/// only. Private/protected members are implementation details, not surface area.
+fn livewire_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
+    let Some(class) = structure
+        .structures
+        .iter()
+        .find(|s| s.kind == PhpStructureKind::Class)
+    else {
         return Vec::new();
     };
 
-    // Filter the class's methods to relationships + scopes; keep everything
-    // else off the outline to avoid noise.
-    class.children.retain(|child| match child.kind {
-        SymbolEntryKind::Method => {
-            let is_scope = child.name.starts_with("scope")
-                && child
-                    .name
-                    .chars()
-                    .nth(5)
-                    .is_some_and(|c| c.is_ascii_uppercase());
-            let is_relationship = child
-                .detail
-                .as_deref()
-                .is_some_and(is_relationship_return_type);
-            is_scope || is_relationship
-        }
-        _ => false,
-    });
+    let mut entry = structure_to_symbol(class);
 
-    vec![class]
+    let mut children: Vec<SymbolEntry> = class
+        .properties
+        .iter()
+        .filter(|p| p.visibility == PhpVisibility::Public)
+        .map(property_to_symbol)
+        .chain(
+            class
+                .methods
+                .iter()
+                .filter(|m| m.visibility == PhpVisibility::Public)
+                .map(method_to_symbol),
+        )
+        .collect();
+    children.sort_by_key(|c| (c.start_line, c.start_column));
+    extend_class_end_to_last_child(&mut entry, &children);
+    entry.children = children;
+
+    vec![entry]
+}
+
+/// Eloquent models: emit the class with *only* relationship methods (return
+/// type matches a known Eloquent relation) and query scopes (`scope*`). Other
+/// methods are noise on the outline of a model.
+fn model_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
+    let Some(class) = structure
+        .structures
+        .iter()
+        .find(|s| s.kind == PhpStructureKind::Class)
+    else {
+        return Vec::new();
+    };
+
+    let mut entry = structure_to_symbol(class);
+
+    let mut children: Vec<SymbolEntry> = class
+        .methods
+        .iter()
+        .filter(|m| is_relationship(m) || is_scope(m))
+        .map(method_to_symbol)
+        .collect();
+    children.sort_by_key(|c| (c.start_line, c.start_column));
+    extend_class_end_to_last_child(&mut entry, &children);
+    entry.children = children;
+
+    vec![entry]
+}
+
+fn is_relationship(m: &PhpMethodInfo) -> bool {
+    m.return_type
+        .as_deref()
+        .is_some_and(is_relationship_return_type)
+}
+
+fn is_scope(m: &PhpMethodInfo) -> bool {
+    m.name.starts_with("scope")
+        && m.name
+            .chars()
+            .nth(5)
+            .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 fn is_relationship_return_type(detail: &str) -> bool {
@@ -381,127 +444,104 @@ fn is_relationship_return_type(detail: &str) -> bool {
     RELATIONSHIPS.iter().any(|r| detail.contains(r))
 }
 
-// ============================================================================
-// Shared PHP class outline parser (used by Livewire + Model extractors)
-// ============================================================================
+/// Plain PHP files (controllers, jobs, helpers, etc.) — emit every top-level
+/// class/interface/trait/enum with *all* properties and methods regardless of
+/// visibility, plus any free functions. This is the strict-upgrade path when
+/// a Zed user opts into LSP outlines: parity with tree-sitter outline.scm
+/// plus our Laravel-aware sugar.
+fn generic_php_symbols(structure: &PhpFileStructure) -> Vec<SymbolEntry> {
+    let mut symbols = Vec::new();
 
-/// Parse a PHP class declaration and emit a `Class` symbol with public
-/// properties (`Property`) and public methods (`Method`) as children. Method
-/// `detail` carries the declared return type, when present, so the model
-/// filter can recognise relationships.
-fn extract_class_outline(content: &str) -> Option<SymbolEntry> {
-    lazy_static! {
-        static ref CLASS_RE: Regex =
-            Regex::new(r#"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b(?:\s+extends\s+([A-Za-z_\\][A-Za-z0-9_\\]*))?"#)
-                .unwrap();
-        // public [readonly] [type] $name [= ...];
-        static ref PROPERTY_RE: Regex = Regex::new(
-            r#"(?m)^\s*public\s+(?:readonly\s+)?(?:(\??[\w\\]+)\s+)?\$([A-Za-z_][A-Za-z0-9_]*)"#,
-        )
-        .unwrap();
-        // public function name(...) [: Return]
-        static ref METHOD_RE: Regex = Regex::new(
-            r#"(?m)^\s*public\s+(?:static\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?::\s*(\??[\w\\|]+))?"#,
-        )
-        .unwrap();
+    for s in &structure.structures {
+        let mut entry = structure_to_symbol(s);
+
+        let mut children: Vec<SymbolEntry> = s
+            .properties
+            .iter()
+            .map(property_to_symbol)
+            .chain(s.methods.iter().map(method_to_symbol))
+            .collect();
+        children.sort_by_key(|c| (c.start_line, c.start_column));
+        extend_class_end_to_last_child(&mut entry, &children);
+        entry.children = children;
+
+        symbols.push(entry);
     }
 
-    let class_cap = CLASS_RE.captures(content)?;
-    let class_match = class_cap.get(0).expect("regex match always has group 0");
-    let class_name = class_cap.get(1)?.as_str().to_string();
-    let extends = class_cap.get(2).map(|m| simple_class_name(m.as_str()));
+    for f in &structure.functions {
+        symbols.push(function_to_symbol(f));
+    }
 
-    let (start_line, start_column) = byte_to_line_col(content, class_match.start());
+    symbols
+}
 
-    let mut class = SymbolEntry {
-        name: class_name,
-        detail: extends.map(|e| format!("extends {e}")),
-        kind: SymbolEntryKind::Class,
-        start_line,
-        start_column,
-        end_line: start_line,
-        end_column: start_column,
-        children: Vec::new(),
+fn structure_to_symbol(s: &PhpStructure) -> SymbolEntry {
+    let kind = match s.kind {
+        PhpStructureKind::Class => SymbolEntryKind::Class,
+        PhpStructureKind::Interface => SymbolEntryKind::Interface,
+        PhpStructureKind::Trait => SymbolEntryKind::Trait,
+        PhpStructureKind::Enum => SymbolEntryKind::Enum,
     };
-
-    for cap in PROPERTY_RE.captures_iter(content) {
-        let m = cap.get(0).expect("regex match always has group 0");
-        let type_hint = cap.get(1).map(|t| t.as_str().to_string());
-        let name = cap.get(2)?.as_str().to_string();
-        let (line, column) = byte_to_line_col(content, m.start());
-        let (end_line, end_column) = byte_to_line_col(content, m.end());
-
-        class.children.push(SymbolEntry {
-            name: format!("${name}"),
-            detail: type_hint,
-            kind: SymbolEntryKind::Property,
-            start_line: line,
-            start_column: column,
-            end_line,
-            end_column,
-            children: Vec::new(),
-        });
+    let detail = s.extends.as_ref().map(|e| format!("extends {e}"));
+    SymbolEntry {
+        name: s.name.clone(),
+        detail,
+        kind,
+        start_line: s.start_line,
+        start_column: s.start_column,
+        end_line: s.end_line,
+        end_column: s.end_column,
+        children: Vec::new(),
     }
-
-    for cap in METHOD_RE.captures_iter(content) {
-        let m = cap.get(0).expect("regex match always has group 0");
-        let name = cap.get(1)?.as_str().to_string();
-        let return_type = cap.get(2).map(|t| simple_class_name(t.as_str()));
-        let (line, column) = byte_to_line_col(content, m.start());
-        let (end_line, end_column) = byte_to_line_col(content, m.end());
-
-        class.children.push(SymbolEntry {
-            name,
-            detail: return_type,
-            kind: SymbolEntryKind::Method,
-            start_line: line,
-            start_column: column,
-            end_line,
-            end_column,
-            children: Vec::new(),
-        });
-    }
-
-    // Sort children by position so editors render them in source order.
-    class
-        .children
-        .sort_by_key(|c| (c.start_line, c.start_column));
-
-    // Approximate the class's end position with the last child's end (or the
-    // class declaration if the body has no children).
-    if let Some(last) = class.children.last() {
-        class.end_line = last.end_line;
-        class.end_column = last.end_column;
-    }
-
-    Some(class)
 }
 
-fn simple_class_name(fqn: &str) -> String {
-    fqn.rsplit('\\').next().unwrap_or(fqn).to_string()
+fn method_to_symbol(m: &PhpMethodInfo) -> SymbolEntry {
+    SymbolEntry {
+        name: m.name.clone(),
+        detail: m.return_type.clone(),
+        kind: SymbolEntryKind::Method,
+        start_line: m.start_line,
+        start_column: m.start_column,
+        end_line: m.end_line,
+        end_column: m.end_column,
+        children: Vec::new(),
+    }
 }
 
-fn content_extends_livewire_component(content: &str) -> bool {
-    // Match `extends Component`, `extends \Livewire\Component`, or
-    // `extends Livewire\Component`. False positives on plain PHP classes
-    // that happen to extend something else named "Component" are tolerable —
-    // the model extractor only fires when this returns false anyway.
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r#"extends\s+(?:\\?Livewire\\)?Component\b"#,).unwrap();
+fn property_to_symbol(p: &PhpPropertyInfo) -> SymbolEntry {
+    SymbolEntry {
+        name: format!("${}", p.name),
+        detail: p.property_type.clone(),
+        kind: SymbolEntryKind::Property,
+        start_line: p.start_line,
+        start_column: p.start_column,
+        end_line: p.end_line,
+        end_column: p.end_column,
+        children: Vec::new(),
     }
-    RE.is_match(content)
 }
 
-fn content_extends_eloquent_model(content: &str) -> bool {
-    // Match `extends Model`, `extends \Illuminate\Database\Eloquent\Model`,
-    // or `extends Authenticatable` (the User model's typical base).
-    lazy_static! {
-        static ref RE: Regex = Regex::new(
-            r#"extends\s+(?:\\?Illuminate\\Database\\Eloquent\\)?(?:Model|Authenticatable|Pivot|MorphPivot)\b"#,
-        )
-        .unwrap();
+fn function_to_symbol(f: &PhpFunctionInfo) -> SymbolEntry {
+    SymbolEntry {
+        name: f.name.clone(),
+        detail: f.return_type.clone(),
+        kind: SymbolEntryKind::Function,
+        start_line: f.start_line,
+        start_column: f.start_column,
+        end_line: f.end_line,
+        end_column: f.end_column,
+        children: Vec::new(),
     }
-    RE.is_match(content)
+}
+
+/// Tighten the class's `end_*` to the last child's end. tree-sitter already
+/// gives us the true class end, but for *filtered* outlines (Livewire/Model)
+/// shrinking to the visible children gives editors a tighter selection range.
+fn extend_class_end_to_last_child(entry: &mut SymbolEntry, children: &[SymbolEntry]) {
+    if let Some(last) = children.last() {
+        entry.end_line = last.end_line;
+        entry.end_column = last.end_column;
+    }
 }
 
 // ============================================================================

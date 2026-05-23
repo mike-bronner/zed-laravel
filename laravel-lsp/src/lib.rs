@@ -25,6 +25,7 @@ pub mod middleware_parser;
 pub mod model_analyzer;
 pub mod parser;
 pub mod php_class;
+pub mod php_outline;
 pub mod queries;
 pub mod route_binding;
 pub mod route_discovery;

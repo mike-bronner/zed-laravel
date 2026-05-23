@@ -4,47 +4,31 @@ use super::*;
 use std::path::PathBuf;
 
 // ============================================================================
-// File classification
+// File classification (path-only)
 // ============================================================================
 
 #[test]
 fn classify_blade_file_by_extension() {
     let path = PathBuf::from("/app/resources/views/users/show.blade.php");
-    assert_eq!(classify_file(&path, ""), FileKind::Blade);
+    assert_eq!(classify_file(&path), FileKind::Blade);
 }
 
 #[test]
 fn classify_route_file_by_directory() {
     let path = PathBuf::from("/app/routes/web.php");
-    assert_eq!(classify_file(&path, "<?php\n"), FileKind::RouteFile);
+    assert_eq!(classify_file(&path), FileKind::RouteFile);
 }
 
 #[test]
-fn classify_livewire_component_by_content() {
-    let path = PathBuf::from("/app/app/Livewire/Counter.php");
-    let content = "<?php\nclass Counter extends Component {}\n";
-    assert_eq!(classify_file(&path, content), FileKind::LivewireComponent);
-}
-
-#[test]
-fn classify_eloquent_model_by_content() {
-    let path = PathBuf::from("/app/app/Models/User.php");
-    let content = "<?php\nclass User extends Model {}\n";
-    assert_eq!(classify_file(&path, content), FileKind::EloquentModel);
-}
-
-#[test]
-fn classify_user_model_with_authenticatable_base() {
-    let path = PathBuf::from("/app/app/Models/User.php");
-    let content = "<?php\nclass User extends Authenticatable {}\n";
-    assert_eq!(classify_file(&path, content), FileKind::EloquentModel);
-}
-
-#[test]
-fn classify_plain_php_file_as_other() {
+fn classify_php_file_as_php_by_extension() {
     let path = PathBuf::from("/app/app/Helpers/Util.php");
-    let content = "<?php\nclass Util {}\n";
-    assert_eq!(classify_file(&path, content), FileKind::Other);
+    assert_eq!(classify_file(&path), FileKind::Php);
+}
+
+#[test]
+fn classify_non_php_file_as_other() {
+    let path = PathBuf::from("/app/README.md");
+    assert_eq!(classify_file(&path), FileKind::Other);
 }
 
 // ============================================================================
@@ -74,7 +58,7 @@ Route::delete('/d', fn () => 1);
     let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["GET /a", "POST /b", "PUT /c", "DELETE /d"]);
     assert_eq!(symbols[0].detail.as_deref(), Some("[name=a]"));
-    assert!(symbols[1].detail.is_none()); // unnamed POST
+    assert!(symbols[1].detail.is_none());
     assert_eq!(symbols[2].detail.as_deref(), Some("[name=c]"));
     assert!(symbols[3].detail.is_none());
 }
@@ -99,7 +83,6 @@ fn extracts_section_with_yield_child() {
 @endsection
 "#;
     let symbols = extract_blade_symbols(content);
-    // Roots: @extends, @section
     assert_eq!(symbols.len(), 2);
     assert_eq!(symbols[0].name, "layouts.app");
     assert_eq!(symbols[0].detail.as_deref(), Some("@extends"));
@@ -133,16 +116,15 @@ fn unclosed_section_still_emits() {
     let symbols = extract_blade_symbols(content);
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "content");
-    // @yield landed inside the open section before flush
     assert_eq!(symbols[0].children.len(), 1);
 }
 
 // ============================================================================
-// Livewire extraction
+// PHP — Livewire components (public-only filter)
 // ============================================================================
 
 #[test]
-fn extracts_livewire_class_with_props_and_methods() {
+fn livewire_component_shows_only_public_members() {
     let content = r#"<?php
 
 namespace App\Livewire;
@@ -153,6 +135,7 @@ class Counter extends Component
 {
     public int $count = 0;
     public string $label = 'clicks';
+    private $internal;
 
     public function increment(): void
     {
@@ -170,16 +153,20 @@ class Counter extends Component
     }
 }
 "#;
-    let symbols = extract_livewire_symbols(content);
+    let symbols = extract_php_symbols(content);
     assert_eq!(symbols.len(), 1);
     let class = &symbols[0];
     assert_eq!(class.name, "Counter");
+    assert_eq!(class.kind, SymbolEntryKind::Class);
     assert_eq!(class.detail.as_deref(), Some("extends Component"));
 
-    // Only the *public* members should appear.
     let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"$count"));
     assert!(names.contains(&"$label"));
+    assert!(
+        !names.contains(&"$internal"),
+        "private props stay off the outline"
+    );
     assert!(names.contains(&"increment"));
     assert!(names.contains(&"render"));
     assert!(
@@ -189,11 +176,11 @@ class Counter extends Component
 }
 
 // ============================================================================
-// Model extraction
+// PHP — Eloquent models (relationships + scopes only)
 // ============================================================================
 
 #[test]
-fn extracts_model_relationships_and_scopes() {
+fn model_shows_only_relationships_and_scopes() {
     let content = r#"<?php
 
 namespace App\Models;
@@ -230,15 +217,15 @@ class Post extends Model
     }
 }
 "#;
-    let symbols = extract_model_symbols(content);
+    let symbols = extract_php_symbols(content);
     assert_eq!(symbols.len(), 1);
     let class = &symbols[0];
     assert_eq!(class.name, "Post");
 
     let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"author"), "BelongsTo relationship surfaces");
-    assert!(names.contains(&"comments"), "HasMany relationship surfaces");
-    assert!(names.contains(&"scopePublished"), "scope method surfaces");
+    assert!(names.contains(&"author"));
+    assert!(names.contains(&"comments"));
+    assert!(names.contains(&"scopePublished"));
     assert!(
         !names.contains(&"getTitleAttribute"),
         "accessor without relationship return type is filtered"
@@ -249,8 +236,135 @@ class Post extends Model
     );
 }
 
+#[test]
+fn user_model_with_authenticatable_base_is_recognised() {
+    let content = r#"<?php
+class User extends Authenticatable
+{
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+}
+"#;
+    let symbols = extract_php_symbols(content);
+    assert_eq!(symbols.len(), 1);
+    let names: Vec<&str> = symbols[0]
+        .children
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["posts"]);
+}
+
 // ============================================================================
-// Dispatch via extract_symbols
+// PHP — Generic (controllers, jobs, helpers, interfaces, etc.)
+// ============================================================================
+
+#[test]
+fn generic_php_class_shows_all_visibilities() {
+    let content = r#"<?php
+
+namespace App\Http\Controllers;
+
+class UserController
+{
+    public function __construct(private UserRepo $repo) {}
+
+    public function index() {
+        return view('users.index');
+    }
+
+    public function store(Request $request) {
+        // ...
+    }
+
+    protected function authorize(): void {}
+
+    private function buildQuery() {}
+}
+"#;
+    let symbols = extract_php_symbols(content);
+    assert_eq!(symbols.len(), 1);
+    let class = &symbols[0];
+    assert_eq!(class.name, "UserController");
+
+    let names: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
+    // All methods regardless of visibility — strict-upgrade behaviour vs.
+    // tree-sitter outline.
+    assert!(names.contains(&"__construct"));
+    assert!(names.contains(&"index"));
+    assert!(names.contains(&"store"));
+    assert!(names.contains(&"authorize"));
+    assert!(names.contains(&"buildQuery"));
+}
+
+#[test]
+fn generic_php_emits_multiple_top_level_structures() {
+    let content = r#"<?php
+class Foo {}
+interface Bar {}
+trait Baz {}
+enum Qux {}
+"#;
+    let symbols = extract_php_symbols(content);
+    assert_eq!(symbols.len(), 4);
+    assert_eq!(symbols[0].name, "Foo");
+    assert_eq!(symbols[0].kind, SymbolEntryKind::Class);
+    assert_eq!(symbols[1].name, "Bar");
+    assert_eq!(symbols[1].kind, SymbolEntryKind::Interface);
+    assert_eq!(symbols[2].name, "Baz");
+    assert_eq!(symbols[2].kind, SymbolEntryKind::Trait);
+    assert_eq!(symbols[3].name, "Qux");
+    assert_eq!(symbols[3].kind, SymbolEntryKind::Enum);
+}
+
+#[test]
+fn generic_php_emits_free_functions() {
+    let content = r#"<?php
+
+if (!function_exists('format_money')) {
+    function format_money(int $cents): string {
+        return '$' . number_format($cents / 100, 2);
+    }
+}
+
+function legacy_helper(): void {}
+"#;
+    let symbols = extract_php_symbols(content);
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"format_money"));
+    assert!(names.contains(&"legacy_helper"));
+}
+
+#[test]
+fn generic_php_class_without_extends_uses_generic_path() {
+    // No `extends Component` / `extends Model` — should go through generic
+    // path, not be misclassified as Livewire or Eloquent.
+    let content = r#"<?php
+class PlainOldClass {
+    public function hello(): string {
+        return 'hi';
+    }
+    private function secret() {}
+}
+"#;
+    let symbols = extract_php_symbols(content);
+    assert_eq!(symbols.len(), 1);
+    let names: Vec<&str> = symbols[0]
+        .children
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert!(names.contains(&"hello"));
+    assert!(
+        names.contains(&"secret"),
+        "private members visible in generic outline"
+    );
+}
+
+// ============================================================================
+// Dispatch
 // ============================================================================
 
 #[test]
@@ -265,4 +379,24 @@ fn extract_symbols_dispatches_to_route_extractor() {
 fn extract_symbols_other_returns_empty() {
     let symbols = extract_symbols("any content", FileKind::Other);
     assert!(symbols.is_empty());
+}
+
+#[test]
+fn extract_symbols_php_dispatches_through_subclassification() {
+    // PHP file with Livewire component — should produce a class symbol with
+    // the public-only filter applied.
+    let content =
+        "<?php\nclass Foo extends Component {\n    public int $a = 0;\n    private $b;\n}\n";
+    let symbols = extract_symbols(content, FileKind::Php);
+    assert_eq!(symbols.len(), 1);
+    let names: Vec<&str> = symbols[0]
+        .children
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["$a"],
+        "private $b filtered out by Livewire path"
+    );
 }

@@ -997,7 +997,7 @@ pub fn extract_document_symbols(
 ) -> Vec<crate::document_symbols::SymbolEntry> {
     let path = file.path(db);
     let text = file.text(db);
-    let kind = crate::document_symbols::classify_file(path, text);
+    let kind = crate::document_symbols::classify_file(path);
     crate::document_symbols::extract_symbols(text, kind)
 }
 

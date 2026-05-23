@@ -13687,6 +13687,9 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
     use laravel_lsp::document_symbols::SymbolEntryKind;
     match kind {
         SymbolEntryKind::Class => SymbolKind::CLASS,
+        SymbolEntryKind::Interface => SymbolKind::INTERFACE,
+        SymbolEntryKind::Trait => SymbolKind::STRUCT,
+        SymbolEntryKind::Enum => SymbolKind::ENUM,
         SymbolEntryKind::Method => SymbolKind::METHOD,
         SymbolEntryKind::Property => SymbolKind::PROPERTY,
         SymbolEntryKind::Field => SymbolKind::FIELD,

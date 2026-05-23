@@ -1,8 +1,9 @@
 use laravel_lsp::class_locator::find_php_class_file;
 use laravel_lsp::livewire_resolver::extract_blade_variable_at_cursor;
 use laravel_lsp::php_class::{
-    extract_class_properties, extract_class_signature, extract_property_declaration,
-    find_property_declaration_position, find_property_definition_line, read_line_from_file,
+    extract_class_fqn, extract_class_properties, extract_class_signature,
+    extract_property_declaration, find_property_declaration_position,
+    find_property_definition_line, read_line_from_file,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -602,4 +603,86 @@ fn read_line_from_file_returns_none_for_out_of_range_line() {
 fn read_line_from_file_returns_none_for_missing_file() {
     let nonexistent = std::path::PathBuf::from("/nonexistent/file.php");
     assert_eq!(read_line_from_file(&nonexistent, 0), None);
+}
+
+// ============================================================================
+// php_class::extract_class_fqn
+// ============================================================================
+
+#[test]
+fn extract_class_fqn_combines_namespace_and_class() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Counter.php");
+    fs::write(
+        &path,
+        "<?php\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        extract_class_fqn(&path).as_deref(),
+        Some("App\\Livewire\\Counter")
+    );
+}
+
+#[test]
+fn extract_class_fqn_handles_namespaceless_class() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Plain.php");
+    fs::write(&path, "<?php\nclass Plain\n{\n}\n").unwrap();
+    assert_eq!(extract_class_fqn(&path).as_deref(), Some("Plain"));
+}
+
+#[test]
+fn extract_class_fqn_handles_modifiers_and_interfaces() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Repo.php");
+    fs::write(
+        &path,
+        "<?php\nnamespace App\\Services;\n\nfinal class UserRepo implements Repo\n{\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        extract_class_fqn(&path).as_deref(),
+        Some("App\\Services\\UserRepo")
+    );
+}
+
+#[test]
+fn extract_class_fqn_works_for_interfaces_and_traits() {
+    let dir = TempDir::new().unwrap();
+    let interface_path = dir.path().join("Lookup.php");
+    fs::write(
+        &interface_path,
+        "<?php\nnamespace App\\Contracts;\n\ninterface Lookup {}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        extract_class_fqn(&interface_path).as_deref(),
+        Some("App\\Contracts\\Lookup")
+    );
+
+    let trait_path = dir.path().join("Findable.php");
+    fs::write(
+        &trait_path,
+        "<?php\nnamespace App\\Concerns;\n\ntrait Findable {}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        extract_class_fqn(&trait_path).as_deref(),
+        Some("App\\Concerns\\Findable")
+    );
+}
+
+#[test]
+fn extract_class_fqn_returns_none_for_no_class() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("helpers.php");
+    fs::write(&path, "<?php\nfunction helper() {}\n").unwrap();
+    assert_eq!(extract_class_fqn(&path), None);
+}
+
+#[test]
+fn extract_class_fqn_returns_none_for_missing_file() {
+    let nonexistent = std::path::PathBuf::from("/nonexistent/Class.php");
+    assert_eq!(extract_class_fqn(&nonexistent), None);
 }

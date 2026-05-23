@@ -443,6 +443,41 @@ pub fn read_line_from_file(path: &std::path::Path, line: u32) -> Option<String> 
     Some(target.trim_end().to_string())
 }
 
+/// Extract the fully qualified class name from a PHP source file. Combines
+/// the `namespace ...;` declaration (when present) with the first `class
+/// Foo`/`interface Foo`/`trait Foo` declaration.
+///
+/// Returns `Some("App\\Livewire\\Counter")` or `None` when neither piece can
+/// be found. Used by hovers that want to surface the FQN as their bold
+/// header — gives the reader a fully-resolved type they don't see at the
+/// cursor (`<livewire:counter>` → `App\Livewire\Counter`).
+pub fn extract_class_fqn(path: &std::path::Path) -> Option<String> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+    lazy_static! {
+        static ref NS_RE: Regex =
+            Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_\\]*)\s*;").unwrap();
+        static ref CLASS_NAME_RE: Regex = Regex::new(
+            r"(?m)^\s*(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+(\w+)",
+        )
+        .unwrap();
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let class_name = CLASS_NAME_RE
+        .captures(&content)?
+        .get(1)?
+        .as_str()
+        .to_string();
+    let namespace = NS_RE
+        .captures(&content)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str());
+    Some(match namespace {
+        Some(ns) => format!("{}\\{}", ns, class_name),
+        None => class_name,
+    })
+}
+
 /// Extract the first `class Foo extends Bar` signature line from a PHP class
 /// file. Skips PHP attributes (`#[...]`), PHPDoc, `namespace`, and `use`
 /// statements that precede the class declaration. Returns the single line

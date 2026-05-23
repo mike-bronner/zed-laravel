@@ -12,10 +12,13 @@
 // Core modules
 pub mod blade_loops;
 pub mod blade_php_block;
+pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod config;
+pub mod config_lookup;
 pub mod database;
+pub mod hover;
 pub mod livewire_resolver;
 pub mod middleware_parser;
 pub mod model_analyzer;
@@ -25,7 +28,9 @@ pub mod queries;
 pub mod route_binding;
 pub mod route_discovery;
 pub mod slot_navigation;
+pub mod translation_lookup;
 pub mod validation_rules;
+pub mod vendor_translations;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

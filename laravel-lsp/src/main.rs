@@ -1,3 +1,9 @@
+// The LSP server holds a number of deeply-nested Arc/RwLock state fields
+// (caches, route indexes, vendor maps). Extracting type aliases for each
+// would be more noise than signal; allow the complex types crate-wide to
+// match the same opt-out already in place on the library at lib.rs:10.
+#![allow(clippy::type_complexity)]
+
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -66,6 +72,45 @@ fn extract_middleware_imports(content: &str, root: &Path) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Scan Blade source for `@props([..., 'var_name', ...])` and return the
+/// 0-based line where the declaration sits. Recognises both single- and
+/// double-quoted keys, both with and without `=> default` defaults.
+///
+/// Used by the hover handler as a fallback source location when a Blade
+/// variable's type can't be resolved to a class — at least point the user at
+/// `@props` so they know where the variable was declared in this template.
+fn find_props_declaration_line(content: &str, var_name: &str) -> Option<u32> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+    lazy_static! {
+        // `@props(` followed by anything up to `)` — captured greedily but
+        // bounded by `)` so we don't span past the directive.
+        static ref PROPS_RE: Regex = Regex::new(r"@props\s*\(([^)]*)\)").unwrap();
+    }
+    for cap in PROPS_RE.captures_iter(content) {
+        let body = cap.get(1)?.as_str();
+        // Check for `'var_name'` or `"var_name"` as either an array value
+        // (no `=>` after) or an array key (`=> default`).
+        let single = format!("'{}'", var_name);
+        let double = format!("\"{}\"", var_name);
+        if body.contains(&single) || body.contains(&double) {
+            // Compute the 0-based line of the match start.
+            let match_start = cap.get(0)?.start();
+            let mut line = 0u32;
+            for (i, ch) in content.char_indices() {
+                if i >= match_start {
+                    break;
+                }
+                if ch == '\n' {
+                    line += 1;
+                }
+            }
+            return Some(line);
+        }
+    }
+    None
 }
 
 /// Resolve a class name to a vendor file path using PSR-4 conventions
@@ -1789,6 +1834,15 @@ struct LaravelLanguageServer {
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
+
+    /// Cached map of translation `namespace → absolute lang directory` for
+    /// unpublished vendor packages. Lazily populated on the first translation
+    /// hover that needs it; subsequent hovers reuse the cached map. See
+    /// [`laravel_lsp::vendor_translations`] for the scan implementation.
+    /// `None` means "not yet scanned"; `Some(map)` means "scanned, here's
+    /// what we found" (the map can be empty if no packages register).
+    /// Wrapped in `Arc` so clones share memory across hover calls.
+    vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2690,6 +2744,7 @@ impl LaravelLanguageServer {
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
+            vendor_translation_namespaces: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -6171,6 +6226,11 @@ impl LaravelLanguageServer {
     /// locator to find the class file, then scans for `public Type $prop`.
     /// Returns `None` when the class can't be found or the property isn't
     /// declared with a recognizable type.
+    ///
+    /// Kept available even though the hover handler no longer calls it
+    /// directly — completion / diagnostic code may grow to use it, and the
+    /// resolution logic is non-trivial enough that I don't want to delete it.
+    #[allow(dead_code)]
     async fn resolve_property_type_on_class(
         &self,
         class_name: &str,
@@ -11770,6 +11830,7 @@ return [
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
+            vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
         }
     }
 
@@ -12862,6 +12923,730 @@ return [
             .await;
         info!("   ✅ Diagnostics published successfully");
     }
+
+    /// Resolve a [`HoverTarget`] into the markdown body that should appear in
+    /// the editor's hover tooltip. Each pattern branch performs its own data
+    /// resolution (file existence, cached config values, env vars, route
+    /// metadata, etc.) and then hands the resolved data to a pure formatter
+    /// in [`laravel_lsp::hover`].
+    ///
+    /// Returns `None` when neither the cursor's pattern nor the variable
+    /// fallback produced something worth displaying.
+    async fn build_hover_markdown(
+        &self,
+        target: laravel_lsp::hover::HoverTarget,
+        uri: &Url,
+    ) -> Option<String> {
+        use laravel_lsp::hover;
+        use laravel_lsp::salsa_impl::PatternAtPosition;
+
+        let root = self.root_path.read().await.clone();
+
+        let pattern = match target {
+            hover::HoverTarget::Pattern(p) => p,
+            hover::HoverTarget::BladeVariable { var_name, property } => {
+                return self
+                    .build_blade_variable_hover_content(uri, &var_name, property)
+                    .await;
+            }
+        };
+
+        // Each arm builds a HoverContent for the unified template. Per-pattern
+        // work is purely data fetching — the rendering is identical across
+        // all patterns and lives in `hover::render`.
+        let rendered = match pattern {
+            PatternAtPosition::View(view) => self.hover_for_view(&view.name).await,
+            // Pass `comp.name` (bare, without `x-` prefix) — `tag_name`
+            // includes the prefix which would break path resolution.
+            PatternAtPosition::Component(comp) => self.hover_for_component(&comp.name).await,
+            PatternAtPosition::Livewire(lw) => self.hover_for_livewire(&lw.name).await,
+            PatternAtPosition::Route(route) => self.hover_for_route(&route.name).await,
+            PatternAtPosition::ConfigRef(cfg) => {
+                self.hover_for_config(&cfg.key, root.as_deref()).await
+            }
+            PatternAtPosition::EnvRef(env) => self.hover_for_env(&env.name).await,
+            PatternAtPosition::Translation(trans) => {
+                self.hover_for_translation(&trans.key, root.as_deref())
+                    .await
+            }
+            PatternAtPosition::Middleware(mw) => self.hover_for_middleware(&mw.name).await,
+            PatternAtPosition::Binding(binding) => self.hover_for_binding(&binding.name).await,
+            PatternAtPosition::Asset(asset) => self.hover_for_asset(&asset).await,
+            PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
+            // Patterns we don't yet surface in hover — silently drop.
+            PatternAtPosition::Directive(_)
+            | PatternAtPosition::Action(_)
+            | PatternAtPosition::Feature(_) => return None,
+        };
+
+        if rendered.is_empty() {
+            None
+        } else {
+            Some(rendered)
+        }
+    }
+
+    /// View — `@props([...])` snippet + resolved file link.
+    async fn hover_for_view(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let path = self.resolve_view_file(name).await;
+        let link = match &path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let snippet = path
+            .as_deref()
+            .and_then(laravel_lsp::blade_props::extract_props_directive);
+        let trailer = if link.is_none() {
+            Some("*(file not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            code: snippet.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: s,
+            }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Blade component — distinguishes class-backed components (Laravel
+    /// renders these via an `app/View/Components/<Pascal>.php` class) from
+    /// anonymous Blade components (just a `.blade.php` template).
+    ///
+    /// - **Class-backed** → class FQN as header + `class Foo extends
+    ///   Component` signature snippet + link to the class file.
+    /// - **Anonymous** → no header + `@props([...])` snippet from the
+    ///   Blade file + link to that file.
+    ///
+    /// Class detection: look for `app/View/Components/<PascalCase(name)>.php`
+    /// on disk. Dots in the component name become path separators, kebab
+    /// segments get pascal-cased — `<x-forms.input-text>` →
+    /// `app/View/Components/Forms/InputText.php`.
+    async fn hover_for_component(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let class_path = self.resolve_component_class_file(name).await;
+        let blade_path = self.resolve_component_file(name).await;
+
+        // Class-backed wins when its file exists — Laravel resolves
+        // class-backed components first at runtime too.
+        if let Some(ref class_file) = class_path {
+            let class_fqn = laravel_lsp::php_class::extract_class_fqn(class_file);
+            let snippet = laravel_lsp::php_class::extract_class_signature(class_file);
+            let link = self.source_link(class_file, None).await;
+            return hover::render(&hover::HoverContent {
+                header: class_fqn.as_deref(),
+                code: snippet.as_deref().map(|s| hover::CodeBlock {
+                    language: hover::CodeLanguage::Php,
+                    content: s,
+                }),
+                source_link: Some(&link),
+                ..Default::default()
+            });
+        }
+
+        // Fall through to anonymous-component shape.
+        let link = match &blade_path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let snippet = blade_path
+            .as_deref()
+            .and_then(laravel_lsp::blade_props::extract_props_directive);
+        let trailer = if link.is_none() {
+            Some("*(file not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            code: snippet.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: s,
+            }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Look up the conventional class-backed component file for a tag name.
+    /// Returns `app/View/Components/<PascalCase(name)>.php` if it exists on
+    /// disk, otherwise `None`. Handles dotted names (`forms.input` →
+    /// `Forms/Input.php`) and kebab segments (`alert-box` → `AlertBox.php`).
+    async fn resolve_component_class_file(&self, name: &str) -> Option<PathBuf> {
+        let root = self.root_path.read().await.clone()?;
+        let class_path = name
+            .split('.')
+            .map(laravel_lsp::config::kebab_to_pascal_case)
+            .collect::<Vec<_>>()
+            .join("/");
+        let candidate = root
+            .join("app/View/Components")
+            .join(format!("{}.php", class_path));
+        if self.file_exists_cached(&candidate).await {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// Livewire — class FQN header, class signature snippet, file link.
+    async fn hover_for_livewire(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let path = self.resolve_livewire_file(name).await;
+        let link = match &path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let snippet = path
+            .as_deref()
+            .and_then(laravel_lsp::php_class::extract_class_signature);
+        let class_fqn = path
+            .as_deref()
+            .and_then(laravel_lsp::php_class::extract_class_fqn);
+        let trailer = if link.is_none() {
+            Some("*(file not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            header: class_fqn.as_deref(),
+            code: snippet.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: s,
+            }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Route — detail line (verb + URI + action) + the route registration
+    /// line from source + link to the `->name(` callsite.
+    async fn hover_for_route(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let idx_guard = self.route_index.read().await;
+        let def = idx_guard.as_ref().and_then(|idx| idx.get(name));
+        let Some(def) = def else {
+            return hover::render(&hover::HoverContent {
+                trailer: Some("*(route not found in index)*"),
+                ..Default::default()
+            });
+        };
+        let method = def
+            .method
+            .as_deref()
+            .map(|m| m.to_uppercase())
+            .unwrap_or_else(|| "?".to_string());
+        let uri = def.uri.as_deref().unwrap_or("?");
+        let action = def.action.as_deref().unwrap_or("?");
+        let detail = format!("`{} {}` → `{}`", method, uri, action);
+        let snippet = laravel_lsp::php_class::read_line_from_file(&def.file, def.line);
+        let link = self.source_link(&def.file, Some(def.line + 1)).await;
+        // Drop the lock on route_index before awaiting other things in render.
+        drop(idx_guard);
+        hover::render(&hover::HoverContent {
+            detail: Some(&detail),
+            code: snippet.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: s,
+            }),
+            source_link: Some(&link),
+            ..Default::default()
+        })
+    }
+
+    /// Config — resolved value as a `php` code block, link to the
+    /// `config/<group>.php` file.
+    async fn hover_for_config(&self, key: &str, root: Option<&Path>) -> String {
+        use laravel_lsp::hover;
+        let value = root.and_then(|r| laravel_lsp::config_lookup::resolve_value(r, key));
+        let link = match (root, key.split('.').next()) {
+            (Some(r), Some(group)) => {
+                let path = r.join("config").join(format!("{}.php", group));
+                Some(self.source_link(&path, None).await)
+            }
+            _ => None,
+        };
+        let truncated = value
+            .as_deref()
+            .map(|v| laravel_lsp::hover::truncate_for_display(v, 200));
+        let trailer = if value.is_none() {
+            Some("*(value not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            code: truncated.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: s,
+            }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Env — value as a plain code block, link to the `.env` file it was
+    /// read from. Commented-out entries render as a detail note.
+    async fn hover_for_env(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let var = self
+            .salsa
+            .get_parsed_env_var(name.to_string())
+            .await
+            .ok()
+            .flatten();
+        let Some(var) = var else {
+            return hover::render(&hover::HoverContent {
+                trailer: Some("*(not defined in .env)*"),
+                ..Default::default()
+            });
+        };
+        let link = self.source_link(&var.source_file, None).await;
+        if var.is_commented {
+            hover::render(&hover::HoverContent {
+                detail: Some("*(commented out)*"),
+                source_link: Some(&link),
+                ..Default::default()
+            })
+        } else {
+            hover::render(&hover::HoverContent {
+                code: Some(hover::CodeBlock {
+                    language: hover::CodeLanguage::Plain,
+                    content: &var.value,
+                }),
+                source_link: Some(&link),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Translation — resolved value (with outer quotes stripped) as a plain
+    /// code block, link to the lang file.
+    async fn hover_for_translation(&self, key: &str, root: Option<&Path>) -> String {
+        use laravel_lsp::hover;
+        let resolution = match root {
+            Some(r) => {
+                let vendor_map = self.vendor_translation_namespaces_for(r).await;
+                let map_ref = vendor_map.as_ref().map(|m| m.as_ref());
+                laravel_lsp::translation_lookup::resolve_translation_detailed(r, key, "en", map_ref)
+            }
+            None => None,
+        };
+        let link = match &resolution {
+            Some(res) => Some(self.source_link(&res.source_file, None).await),
+            None => None,
+        };
+        // Translation values are PHP literals (`'foo'`) — strip the outer
+        // quotes for nicer in-block display.
+        let unquoted = resolution.as_ref().map(|r| {
+            let v = r.value.trim();
+            v.strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                .unwrap_or(v)
+                .to_string()
+        });
+        let truncated = unquoted
+            .as_deref()
+            .map(|s| laravel_lsp::hover::truncate_for_display(s, 200));
+        let trailer = if resolution.is_none() {
+            Some("*(translation not found for default locale)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            code: truncated.as_deref().map(|s| hover::CodeBlock {
+                language: hover::CodeLanguage::Plain,
+                content: s,
+            }),
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Middleware — header is the alias's class FQN (the new info beyond
+    /// the cursor's `'auth'` string).
+    async fn hover_for_middleware(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let cached = self.get_cached_middleware(name).await;
+        let class_fqn = cached.as_ref().map(|(class, _, _, _)| class.as_str());
+        let source_path = cached
+            .as_ref()
+            .and_then(|(_, _, source_file, _)| source_file.as_ref());
+        let link = match source_path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let trailer = if class_fqn.is_none() {
+            Some("*(alias not registered)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            header: class_fqn,
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Container binding — header is the concrete class FQN bound to the
+    /// alias.
+    async fn hover_for_binding(&self, name: &str) -> String {
+        use laravel_lsp::hover;
+        let cached = self.get_cached_binding(name).await;
+        let class_fqn = cached.as_ref().map(|(class, _, _, _)| class.as_str());
+        let source_path = cached
+            .as_ref()
+            .and_then(|(_, _, source_file, _)| source_file.as_ref());
+        let link = match source_path {
+            Some(p) => Some(self.source_link(p, None).await),
+            None => None,
+        };
+        let trailer = if class_fqn.is_none() {
+            Some("*(binding not registered)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            header: class_fqn,
+            source_link: link.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Asset (`asset()`, `Vite::asset()`, `mix()`, `public_path()`, etc.) —
+    /// just the resolved file link.
+    async fn hover_for_asset(&self, asset: &laravel_lsp::salsa_impl::AssetReferenceData) -> String {
+        use laravel_lsp::hover;
+        let resolved = self.resolve_display_path_for_asset(asset).await;
+        let trailer = if resolved.is_none() {
+            Some("*(file not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            source_link: resolved.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// `url('/path')` — same shape as asset.
+    async fn hover_for_url(&self, url_path: &str) -> String {
+        use laravel_lsp::hover;
+        let resolved = self.resolve_display_path_for_url(url_path).await;
+        let trailer = if resolved.is_none() {
+            Some("*(file not found)*")
+        } else {
+            None
+        };
+        hover::render(&hover::HoverContent {
+            source_link: resolved.as_deref(),
+            trailer,
+            ..Default::default()
+        })
+    }
+
+    /// Map a Salsa `AssetHelperType` to the function-call form a developer
+    /// would have literally written. No current caller (asset hovers don't
+    /// surface the helper label anymore now that the unified template
+    /// dropped the call-form header) but kept available for future use —
+    /// e.g. a completion item that wants to render the helper name.
+    #[allow(dead_code)]
+    fn asset_helper_label(t: laravel_lsp::salsa_impl::AssetHelperType) -> &'static str {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        match t {
+            AssetHelperType::Asset => "asset",
+            AssetHelperType::PublicPath => "public_path",
+            AssetHelperType::Mix => "mix",
+            AssetHelperType::BasePath => "base_path",
+            AssetHelperType::AppPath => "app_path",
+            AssetHelperType::StoragePath => "storage_path",
+            AssetHelperType::DatabasePath => "database_path",
+            AssetHelperType::LangPath => "lang_path",
+            AssetHelperType::ConfigPath => "config_path",
+            AssetHelperType::ResourcePath => "resource_path",
+            AssetHelperType::ViteAsset => "Vite::asset",
+        }
+    }
+
+    /// Resolve an asset reference to its on-disk file path. Mirrors the
+    /// directory mapping used by `create_asset_location_from_salsa` for
+    /// goto-definition — `asset()`/`Vite::asset()` look under `public/` or
+    /// `resources/` depending on which helper produced the reference.
+    async fn resolve_display_path_for_asset(
+        &self,
+        asset: &laravel_lsp::salsa_impl::AssetReferenceData,
+    ) -> Option<String> {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        let root = self.root_path.read().await.clone()?;
+        let base = match asset.helper_type {
+            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
+                root.join("public")
+            }
+            AssetHelperType::BasePath => root.clone(),
+            AssetHelperType::AppPath => root.join("app"),
+            AssetHelperType::StoragePath => root.join("storage"),
+            AssetHelperType::DatabasePath => root.join("database"),
+            AssetHelperType::LangPath => root.join("lang"),
+            AssetHelperType::ConfigPath => root.join("config"),
+            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
+        };
+        let asset_path = base.join(&asset.path);
+        if self.file_exists_cached(&asset_path).await {
+            Some(self.source_link(&asset_path, None).await)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a `url('/path')` reference to a click-to-open link for the
+    /// matching file under `public/`. Returns `None` when nothing matches
+    /// (the URL might point to a dynamic route, not a static asset).
+    async fn resolve_display_path_for_url(&self, url_path: &str) -> Option<String> {
+        let root = self.root_path.read().await.clone()?;
+        let path = url_path.trim_start_matches('/');
+        let candidate = root.join("public").join(path);
+        if self.file_exists_cached(&candidate).await {
+            Some(self.source_link(&candidate, None).await)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a Blade variable hover into rendered markdown. Builds a
+    /// [`hover::HoverContent`] from:
+    ///
+    /// - **Variable type resolution** (existing `resolve_blade_variable_type`)
+    ///   — class FQN, primitive, or `None`.
+    /// - **Class file lookup** — `class_locator::find_php_class_file`.
+    /// - **Property declaration + PHPDoc** — pulled from the class source so
+    ///   the hover shows `public string $email;` plus any leading docblock.
+    ///
+    /// The bold header is set ONLY when we have a class-like FQN to qualify
+    /// the variable / property with (avoids echoing `$user` or
+    /// `$user->email` as a redundant header).
+    async fn build_blade_variable_hover_content(
+        &self,
+        uri: &Url,
+        var_name: &str,
+        property: Option<String>,
+    ) -> Option<String> {
+        use laravel_lsp::hover;
+        let var_dollar = format!("${}", var_name);
+        let resolved_var_type = self.resolve_blade_variable_type(uri, &var_dollar).await;
+
+        // `"mixed"` is a sentinel from the loop-variable resolver — calling
+        // `find_php_class_file("mixed")` always misses, throwing away any
+        // useful Blade-file fallback we could surface.
+        let class_fqn_for_lookup = resolved_var_type
+            .as_deref()
+            .filter(|t| hover::is_class_like_type(t));
+
+        let (class_source, class_path) = match class_fqn_for_lookup {
+            Some(class_fqn) => {
+                let root = self.root_path.read().await.clone();
+                let path = root
+                    .as_ref()
+                    .and_then(|r| laravel_lsp::class_locator::find_php_class_file(class_fqn, r));
+                let source = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+                (source, path)
+            }
+            None => (None, None),
+        };
+
+        let declaration = match (property.as_deref(), class_source.as_deref()) {
+            (Some(prop), Some(source)) => {
+                laravel_lsp::php_class::extract_property_declaration(source, prop)
+            }
+            _ => None,
+        };
+
+        // Source-link priority:
+        //   1. Class file + property line — best jump target
+        //   2. Class file alone — class found but no explicit property line
+        //      (Eloquent columns not in $casts/$fillable)
+        //   3. Blade-file origin (`@foreach`/`@props` line) — when type
+        //      didn't resolve to a class
+        let link = match (class_path.as_ref(), declaration.as_ref()) {
+            (Some(path), Some(decl)) => Some(self.source_link(path, Some(decl.line + 1)).await),
+            (Some(path), None) => Some(self.source_link(path, None).await),
+            _ => self.find_blade_variable_origin(uri, var_name).await,
+        };
+
+        // Bold header — only when we have a class FQN. Otherwise no header
+        // (echoing `$var` or `$var->prop` as bold adds no info beyond the
+        // cursor).
+        let header_owned = match (resolved_var_type.as_deref(), property.as_deref()) {
+            (Some(class), Some(prop)) if hover::is_class_like_type(class) => {
+                Some(format!("{}::${}", class, prop))
+            }
+            (Some(class), None) if hover::is_class_like_type(class) => {
+                Some(format!("${} : `{}`", var_name, class))
+            }
+            _ => None,
+        };
+
+        let description = declaration.as_ref().and_then(|d| d.description.clone());
+        let tags: Vec<String> = declaration
+            .as_ref()
+            .map(|d| d.phpdoc_tags.clone())
+            .unwrap_or_default();
+
+        let rendered = hover::render(&hover::HoverContent {
+            header: header_owned.as_deref(),
+            description: description.as_deref(),
+            code: declaration.as_ref().map(|d| hover::CodeBlock {
+                language: hover::CodeLanguage::Php,
+                content: &d.declaration_text,
+            }),
+            tags: &tags,
+            source_link: link.as_deref(),
+            ..Default::default()
+        });
+        if rendered.is_empty() {
+            None
+        } else {
+            Some(rendered)
+        }
+    }
+
+    /// Scan the current Blade file for where `var_name` was introduced —
+    /// either by a loop directive (`@foreach (... as $name)`) or by a
+    /// `@props([..., 'name'])` declaration. Returns a `path:line` string
+    /// suitable for the hover's bottom-line source reference.
+    ///
+    /// Used as a fallback when the variable's *type* doesn't resolve to a
+    /// findable class — e.g. loop variables with unresolved element types
+    /// (the `"mixed"` sentinel). Telling the user "this variable was
+    /// introduced by the `@foreach` on line 7" is more useful than an empty
+    /// hover.
+    async fn find_blade_variable_origin(&self, uri: &Url, var_name: &str) -> Option<String> {
+        let file_path = uri.to_file_path().ok()?;
+
+        // 1. Loop blocks (cheapest — Salsa already cached them for the resolver).
+        if let Ok(Some(blocks)) = self.salsa.get_loop_blocks(file_path.clone()).await {
+            for block in blocks.iter() {
+                if block.variables.iter().any(|(n, _)| n == var_name) {
+                    return Some(
+                        self.source_link(&file_path, Some(block.start_line as u32 + 1))
+                            .await,
+                    );
+                }
+            }
+        }
+
+        // 2. `@props([..., 'name' ...])` declaration in the Blade source.
+        let content = match self.documents.read().await.get(uri).cloned() {
+            Some((c, _)) => c,
+            None => std::fs::read_to_string(&file_path).unwrap_or_default(),
+        };
+        if let Some(line) = find_props_declaration_line(&content, var_name) {
+            return Some(self.source_link(&file_path, Some(line + 1)).await);
+        }
+
+        None
+    }
+
+    /// Resolve a view name to its on-disk file path. Returns `None` when no
+    /// candidate file exists on disk. The hover dispatch then builds the
+    /// `source_link` markdown AND the `@props(...)` source snippet from the
+    /// same path.
+    async fn resolve_view_file(&self, name: &str) -> Option<PathBuf> {
+        let config = self.get_cached_config().await?;
+        for path in config.resolve_view_path(name) {
+            if self.file_exists_cached(&path).await {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Same shape as [`Self::resolve_view_file`] but for Blade components.
+    async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
+        let config = self.get_cached_config().await?;
+        for path in config.resolve_component_path(name) {
+            if self.file_exists_cached(&path).await {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Same shape as [`Self::resolve_view_file`] but for Livewire components.
+    async fn resolve_livewire_file(&self, name: &str) -> Option<PathBuf> {
+        let config = self.get_cached_config().await?;
+        let path = config.resolve_livewire_path(name)?;
+        if self.file_exists_cached(&path).await {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    /// Render a path as a string relative to the project root when possible.
+    /// Falls back to the absolute path string when no root is set or when the
+    /// path lies outside the root (vendor/, package directories).
+    async fn relative_display_path(&self, path: &Path) -> String {
+        if let Some(root) = self.root_path.read().await.as_ref() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                return rel.to_string_lossy().to_string();
+            }
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    /// Build the bottom-of-hover `at <link>` markdown string for a resolved
+    /// file path and optional 1-based line. The link is a `file://` URL so
+    /// Zed (and other LSP clients with markdown link support) treat it as
+    /// click-to-open. Falls back to an unlinked monospace path when the
+    /// path can't be converted to a URL (extremely rare — only relative or
+    /// invalid UTF-8 paths fail).
+    async fn source_link(&self, abs_path: &Path, line: Option<u32>) -> String {
+        let display = self.relative_display_path(abs_path).await;
+        match Url::from_file_path(abs_path) {
+            Ok(url) => laravel_lsp::hover::source_link(&display, url.as_str(), line),
+            Err(_) => match line {
+                Some(l) => format!("`{}:{}`", display, l),
+                None => format!("`{}`", display),
+            },
+        }
+    }
+
+    /// Return the cached vendor translation-namespace map, building it on
+    /// first call. The scan walks `vendor/` for service providers calling
+    /// `loadTranslationsFrom(...)` — see [`laravel_lsp::vendor_translations`].
+    /// Subsequent hover calls reuse the cached Arc without re-scanning.
+    async fn vendor_translation_namespaces_for(
+        &self,
+        root: &Path,
+    ) -> Option<Arc<HashMap<String, PathBuf>>> {
+        {
+            let guard = self.vendor_translation_namespaces.read().await;
+            if let Some(ref existing) = *guard {
+                return Some(existing.clone());
+            }
+        }
+        // Cache miss — scan and store. Done under spawn_blocking so the
+        // walkdir traversal doesn't block the LSP event loop.
+        let root_clone = root.to_path_buf();
+        let scanned = tokio::task::spawn_blocking(move || {
+            laravel_lsp::vendor_translations::scan_vendor_translation_namespaces(&root_clone)
+        })
+        .await
+        .ok()?;
+        let arc = Arc::new(scanned);
+        *self.vendor_translation_namespaces.write().await = Some(arc.clone());
+        Some(arc)
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -13482,10 +14267,14 @@ impl LanguageServer for LaravelLanguageServer {
             Some(s) => s,
             None => return Ok(None),
         };
-        if !path.ends_with(".blade.php") {
+        let is_blade = path.ends_with(".blade.php");
+        let is_php = path.ends_with(".php");
+        if !is_blade && !is_php {
             return Ok(None);
         }
 
+        // Pull the current document for the line-text needed by the Blade
+        // variable fallback (also gives us the file as the LSP saw it last).
         let content = match self.documents.read().await.get(uri).cloned() {
             Some((c, _version)) => c,
             None => std::fs::read_to_string(path).unwrap_or_default(),
@@ -13496,42 +14285,55 @@ impl LanguageServer for LaravelLanguageServer {
             .unwrap_or("")
             .to_string();
 
-        let Some((var_name, property)) =
-            extract_blade_variable_at_cursor(&line_text, position.character)
-        else {
-            return Ok(None);
+        // Salsa pattern lookup. The target dispatch in `find_hover_target`
+        // tries patterns first and only falls back to Blade variables when
+        // nothing matched at the cursor.
+        let patterns = match self.salsa.get_patterns(file_path).await {
+            Ok(Some(p)) => p,
+            _ => {
+                // No cached patterns — Blade-variable hover can still fire on
+                // a .blade.php file when the cursor sits on a `$var` token.
+                if !is_blade {
+                    return Ok(None);
+                }
+                let Some((var_name, property)) =
+                    extract_blade_variable_at_cursor(&line_text, position.character)
+                else {
+                    return Ok(None);
+                };
+                let value = self
+                    .build_blade_variable_hover_content(uri, &var_name, property)
+                    .await;
+                return Ok(value.map(|v| Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: v,
+                    }),
+                    range: None,
+                }));
+            }
         };
 
-        let var_dollar = format!("${}", var_name);
-        let resolved_var_type = self.resolve_blade_variable_type(uri, &var_dollar).await;
+        let target = match laravel_lsp::hover::find_hover_target(
+            &patterns,
+            &line_text,
+            position.line,
+            position.character,
+            is_blade,
+        ) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
 
-        let hover_markdown = match (resolved_var_type, property) {
-            (Some(var_type), Some(prop_name)) => {
-                let prop_type = self
-                    .resolve_property_type_on_class(&var_type, &prop_name)
-                    .await;
-                let type_line = prop_type
-                    .clone()
-                    .unwrap_or_else(|| "undetermined".to_string());
-                format!(
-                    "**${}->{}**\n\n- Type: `{}`\n- Value: `undetermined`",
-                    var_name, prop_name, type_line
-                )
-            }
-            (Some(var_type), None) => format!(
-                "**${}**\n\n- Type: `{}`\n- Value: `undetermined`",
-                var_name, var_type
-            ),
-            (None, _) => format!(
-                "**${}**\n\n- Type: `undetermined`\n- Value: `undetermined`",
-                var_name
-            ),
+        let value = match self.build_hover_markdown(target, uri).await {
+            Some(v) => v,
+            None => return Ok(None),
         };
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: hover_markdown,
+                value,
             }),
             range: None,
         }))

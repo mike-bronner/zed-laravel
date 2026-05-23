@@ -319,7 +319,7 @@ pub fn format_blade_variable(input: &BladeVariableHover<'_>) -> String {
         out.push_str(&t);
     }
     if let Some(src) = input.defined_in {
-        out.push_str(&format!("\n\nat `{}`", src));
+        out.push_str(&format!("\n\nat {}", src));
     }
     out
 }
@@ -420,7 +420,7 @@ fn finish(
         out.push_str(&c);
     }
     if let Some(s) = source_display {
-        out.push_str(&format!("\n\nat `{}`", s));
+        out.push_str(&format!("\n\nat {}", s));
     }
     if let Some(t) = trailer {
         out.push_str("\n\n");
@@ -435,6 +435,21 @@ fn missing_file_note(resolved_display_path: Option<&str>) -> Option<&'static str
         Some("*(file not found)*")
     } else {
         None
+    }
+}
+
+/// Build the markdown link string used for the `at <link>` source-line at
+/// the bottom of every hover. The label is the display path (relative to the
+/// project root, optionally with `:line`); the URL is a `file://` URI that
+/// Zed and other LSP clients resolve to "open this file at this line".
+///
+/// Caller is expected to pre-resolve the absolute file URL via
+/// [`tower_lsp::lsp_types::Url::from_file_path`] so percent-encoding for
+/// spaces and other URL-unsafe path bytes is handled correctly.
+pub fn source_link(display: &str, file_url: &str, line: Option<u32>) -> String {
+    match line {
+        Some(l) => format!("[`{}:{}`]({}#L{})", display, l, file_url, l),
+        None => format!("[`{}`]({})", display, file_url),
     }
 }
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 //   **<bold header — call form>**
 //   [optional detail / description]
 //   [optional fenced code block — value or declaration]
-//   at `<source path>`
+//   at <source path>
 //   [optional *(trailer)*]
 //
 // Tests assert on user-visible substrings.
@@ -23,7 +23,7 @@ fn view_hover_uses_call_form_header() {
         Some("resources/views/users/profile.blade.php"),
     );
     assert!(out.contains("**view('users.profile')**"));
-    assert!(out.contains("at `resources/views/users/profile.blade.php`"));
+    assert!(out.contains("at resources/views/users/profile.blade.php"));
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn component_hover_does_not_double_prefix() {
 fn livewire_hover_uses_tag_form_header() {
     let out = format_livewire("counter", Some("app/Livewire/Counter.php"));
     assert!(out.contains("`<livewire:counter>`"));
-    assert!(out.contains("at `app/Livewire/Counter.php`"));
+    assert!(out.contains("at app/Livewire/Counter.php"));
 }
 
 // ============================================================================
@@ -74,7 +74,7 @@ fn route_hover_shows_method_uri_action() {
     assert!(out.contains("**route('users.show')**"));
     assert!(out.contains("`GET /users/{user}`"));
     assert!(out.contains("`UserController@show`"));
-    assert!(out.contains("at `routes/web.php:42`"));
+    assert!(out.contains("at routes/web.php:42"));
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn config_hover_shows_value_in_php_block() {
     assert!(out.contains("**config('app.name')**"));
     assert!(out.contains("```php"));
     assert!(out.contains("env('APP_NAME', 'Laravel')"));
-    assert!(out.contains("at `config/app.php`"));
+    assert!(out.contains("at config/app.php"));
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn env_hover_shows_value_in_plain_block() {
     assert!(out.contains("**env('APP_NAME')**"));
     // Plain ``` (no `php` lang) — env values aren't PHP code.
     assert!(out.contains("```\nLaravel\n```"));
-    assert!(out.contains("at `.env`"));
+    assert!(out.contains("at .env"));
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn translation_hover_strips_outer_quotes_in_block() {
     assert!(out.contains("**__('validation.required')**"));
     // Outer quotes stripped from the block.
     assert!(out.contains("```\nThe :attribute field is required.\n```"));
-    assert!(out.contains("at `lang/en/validation.php`"));
+    assert!(out.contains("at lang/en/validation.php"));
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn translation_hover_with_vendor_source() {
         Some("lang/vendor/filament-tables/en/table.php"),
     );
     assert!(out.contains("**__('filament-tables::table.actions.filter.label')**"));
-    assert!(out.contains("at `lang/vendor/filament-tables/en/table.php`"));
+    assert!(out.contains("at lang/vendor/filament-tables/en/table.php"));
 }
 
 #[test]
@@ -218,7 +218,7 @@ fn middleware_hover_with_class_and_source() {
     assert!(out.contains("**middleware('auth')**"));
     assert!(out.contains("```php"));
     assert!(out.contains("App\\Http\\Middleware\\Authenticate"));
-    assert!(out.contains("at `bootstrap/app.php`"));
+    assert!(out.contains("at bootstrap/app.php"));
 }
 
 #[test]
@@ -237,14 +237,14 @@ fn asset_hover_with_vite_helper_label() {
         Some("resources/js/app.js"),
     );
     assert!(out.contains("**Vite::asset('resources/js/app.js')**"));
-    assert!(out.contains("at `resources/js/app.js`"));
+    assert!(out.contains("at resources/js/app.js"));
 }
 
 #[test]
 fn asset_hover_with_plain_asset_helper() {
     let out = format_asset("css/app.css", "asset", Some("public/css/app.css"));
     assert!(out.contains("**asset('css/app.css')**"));
-    assert!(out.contains("at `public/css/app.css`"));
+    assert!(out.contains("at public/css/app.css"));
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn asset_hover_without_resolved_path() {
 fn url_hover_with_resolved_path() {
     let out = format_url("/favicon.ico", Some("public/favicon.ico"));
     assert!(out.contains("**url('/favicon.ico')**"));
-    assert!(out.contains("at `public/favicon.ico`"));
+    assert!(out.contains("at public/favicon.ico"));
 }
 
 #[test]
@@ -320,7 +320,7 @@ fn blade_variable_property_with_class_and_declaration() {
     );
     assert!(out.contains("The user's email address."));
     assert!(out.contains("```php\npublic string $email;\n```"));
-    assert!(out.contains("at `app/Models/User.php:42`"));
+    assert!(out.contains("at app/Models/User.php:42"));
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn blade_variable_root_with_class_type() {
         defined_in: Some("app/Livewire/ContactForm.php"),
     });
     assert!(out.contains("**$form** : `App\\Livewire\\ContactForm`"));
-    assert!(out.contains("at `app/Livewire/ContactForm.php`"));
+    assert!(out.contains("at app/Livewire/ContactForm.php"));
 }
 
 #[test]
@@ -387,8 +387,28 @@ fn blade_variable_unresolved() {
         defined_in: None,
     });
     assert!(out.contains("**$orphan**"));
-    assert!(!out.contains("at `"));
+    assert!(
+        !out.contains("\n\nat "),
+        "no source line when no defined_in info"
+    );
     assert!(!out.contains("Type:"));
+}
+
+#[test]
+fn at_line_renders_passed_string_verbatim() {
+    // The formatter renders `at <source_display>` verbatim — caller is
+    // responsible for wrapping in backticks, markdown links, etc. This is
+    // what enables the hover dispatcher (in main.rs) to pass full
+    // `file://`-clickable links straight through.
+    let link = "[`app/Models/User.php:42`](file:///Users/mike/project/app/Models/User.php#L42)";
+    let out = format_view("users.profile", Some(link));
+    assert!(
+        out.contains(&format!("at {}", link)),
+        "expected raw link, got: {}",
+        out
+    );
+    // The link contains a `file://` URL so Zed renders it as clickable.
+    assert!(out.contains("file:///"));
 }
 
 #[test]

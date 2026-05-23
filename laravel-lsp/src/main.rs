@@ -12968,34 +12968,37 @@ return [
             PatternAtPosition::Route(route) => {
                 let idx_guard = self.route_index.read().await;
                 let def = idx_guard.as_ref().and_then(|idx| idx.get(&route.name));
-                let source_display = match def {
-                    Some(d) => {
-                        let path_display = self.relative_display_path(&d.file).await;
-                        // Routes carry their `->name(` line in the definition;
-                        // render 1-based for humans.
-                        Some(format!("{}:{}", path_display, d.line + 1))
-                    }
+                let source_link = match def {
+                    // Routes carry the `->name(` line in the definition;
+                    // render 1-based for humans (LSP positions are 0-based
+                    // internally).
+                    Some(d) => Some(self.source_link(&d.file, Some(d.line + 1)).await),
                     None => None,
                 };
                 Some(hover::format_route(
                     &route.name,
                     def,
-                    source_display.as_deref(),
+                    source_link.as_deref(),
                 ))
             }
             PatternAtPosition::ConfigRef(cfg) => {
                 let value = root
                     .as_ref()
                     .and_then(|r| laravel_lsp::config_lookup::resolve_value(r, &cfg.key));
-                let source_file = cfg
-                    .key
-                    .split('.')
-                    .next()
-                    .map(|group| format!("config/{}.php", group));
+                // Config lookups resolve through `config/<group>.php` by
+                // convention — build the link by appending the group name
+                // to the project's config directory.
+                let source_link = match (root.as_ref(), cfg.key.split('.').next()) {
+                    (Some(r), Some(group)) => {
+                        let path = r.join("config").join(format!("{}.php", group));
+                        Some(self.source_link(&path, None).await)
+                    }
+                    _ => None,
+                };
                 Some(hover::format_config(
                     &cfg.key,
                     value.as_deref(),
-                    source_file.as_deref(),
+                    source_link.as_deref(),
                 ))
             }
             PatternAtPosition::EnvRef(env) => {
@@ -13005,17 +13008,14 @@ return [
                     .await
                     .ok()
                     .flatten();
-                let source_display = var
-                    .as_ref()
-                    .map(|v| self.relative_display_path(&v.source_file));
-                let source_display = match source_display {
-                    Some(fut) => Some(fut.await),
+                let source_link = match var.as_ref() {
+                    Some(v) => Some(self.source_link(&v.source_file, None).await),
                     None => None,
                 };
                 let input = var.as_ref().map(|v| hover::EnvHoverInput {
                     value: v.value.as_str(),
                     is_commented: v.is_commented,
-                    source_file: source_display.as_deref(),
+                    source_file: source_link.as_deref(),
                 });
                 Some(hover::format_env(&env.name, input))
             }
@@ -13033,14 +13033,14 @@ return [
                     }
                     None => None,
                 };
-                let source_file = match &resolution {
-                    Some(res) => Some(self.relative_display_path(&res.source_file).await),
+                let source_link = match &resolution {
+                    Some(res) => Some(self.source_link(&res.source_file, None).await),
                     None => None,
                 };
                 Some(hover::format_translation(
                     &trans.key,
                     resolution.as_ref().map(|r| r.value.as_str()),
-                    source_file.as_deref(),
+                    source_link.as_deref(),
                 ))
             }
             PatternAtPosition::Middleware(mw) => {
@@ -13049,14 +13049,14 @@ return [
                 let source_path = cached
                     .as_ref()
                     .and_then(|(_, _, source_file, _)| source_file.as_ref());
-                let source_display = match source_path {
-                    Some(p) => Some(self.relative_display_path(p).await),
+                let source_link = match source_path {
+                    Some(p) => Some(self.source_link(p, None).await),
                     None => None,
                 };
                 Some(hover::format_middleware(
                     &mw.name,
                     class_fqn,
-                    source_display.as_deref(),
+                    source_link.as_deref(),
                 ))
             }
             PatternAtPosition::Binding(binding) => {
@@ -13065,14 +13065,14 @@ return [
                 let source_path = cached
                     .as_ref()
                     .and_then(|(_, _, source_file, _)| source_file.as_ref());
-                let source_display = match source_path {
-                    Some(p) => Some(self.relative_display_path(p).await),
+                let source_link = match source_path {
+                    Some(p) => Some(self.source_link(p, None).await),
                     None => None,
                 };
                 Some(hover::format_binding(
                     &binding.name,
                     class_fqn,
-                    source_display.as_deref(),
+                    source_link.as_deref(),
                 ))
             }
             PatternAtPosition::Asset(asset) => {
@@ -13140,22 +13140,21 @@ return [
         };
         let asset_path = base.join(&asset.path);
         if self.file_exists_cached(&asset_path).await {
-            Some(self.relative_display_path(&asset_path).await)
+            Some(self.source_link(&asset_path, None).await)
         } else {
             None
         }
     }
 
-    /// Resolve a `url('/path')` reference to its on-disk file under `public/`.
-    /// Returns `None` when the file doesn't exist (the URL might point to a
-    /// dynamic route, not a static asset — that's fine, we just don't show
-    /// a source line).
+    /// Resolve a `url('/path')` reference to a click-to-open link for the
+    /// matching file under `public/`. Returns `None` when nothing matches
+    /// (the URL might point to a dynamic route, not a static asset).
     async fn resolve_display_path_for_url(&self, url_path: &str) -> Option<String> {
         let root = self.root_path.read().await.clone()?;
         let path = url_path.trim_start_matches('/');
         let candidate = root.join("public").join(path);
         if self.file_exists_cached(&candidate).await {
-            Some(self.relative_display_path(&candidate).await)
+            Some(self.source_link(&candidate, None).await)
         } else {
             None
         }
@@ -13214,20 +13213,16 @@ return [
             _ => None,
         };
 
-        // Source-line display priority:
-        //   1. Class file + property line (`app/Models/User.php:42`) — best
-        //   2. Class file alone (`app/Models/User.php`) — class found but no
-        //      explicit property declaration on it (common for Eloquent
-        //      columns that aren't in $casts/$fillable as keys)
-        //   3. Blade-file origin (`resources/views/foo.blade.php:7`) — when
-        //      the variable's type is unknown/`mixed`, surface where it was
-        //      introduced in the current Blade file: @foreach, @props, etc.
+        // Source-line link priority:
+        //   1. Class file + property line — most useful jump target
+        //   2. Class file alone — class found but no explicit property
+        //      declaration (Eloquent columns not in $casts/$fillable)
+        //   3. Blade-file origin — when the variable's type is unknown
+        //      (`mixed` sentinel), surface the @foreach / @props line that
+        //      introduced the variable in the current Blade file
         let defined_in_display = match (class_path.as_ref(), declaration.as_ref()) {
-            (Some(path), Some(decl)) => {
-                let p = self.relative_display_path(path).await;
-                Some(format!("{}:{}", p, decl.line + 1))
-            }
-            (Some(path), None) => Some(self.relative_display_path(path).await),
+            (Some(path), Some(decl)) => Some(self.source_link(path, Some(decl.line + 1)).await),
+            (Some(path), None) => Some(self.source_link(path, None).await),
             _ => self.find_blade_variable_origin(uri, var_name).await,
         };
 
@@ -13257,8 +13252,10 @@ return [
         if let Ok(Some(blocks)) = self.salsa.get_loop_blocks(file_path.clone()).await {
             for block in blocks.iter() {
                 if block.variables.iter().any(|(n, _)| n == var_name) {
-                    let display = self.relative_display_path(&file_path).await;
-                    return Some(format!("{}:{}", display, block.start_line + 1));
+                    return Some(
+                        self.source_link(&file_path, Some(block.start_line as u32 + 1))
+                            .await,
+                    );
                 }
             }
         }
@@ -13269,21 +13266,23 @@ return [
             None => std::fs::read_to_string(&file_path).unwrap_or_default(),
         };
         if let Some(line) = find_props_declaration_line(&content, var_name) {
-            let display = self.relative_display_path(&file_path).await;
-            return Some(format!("{}:{}", display, line + 1));
+            return Some(self.source_link(&file_path, Some(line + 1)).await);
         }
 
         None
     }
 
-    /// Resolve a view name to a display-friendly file path (relative to the
-    /// project root when possible, absolute otherwise). Returns `None` when
-    /// no candidate file exists on disk.
+    /// Resolve a view name to a click-to-open source link. Returns `None`
+    /// when no candidate file exists on disk.
+    ///
+    /// The returned string is full markdown link syntax —
+    /// `` [`resources/views/foo.blade.php`](file:///abs/path) `` — to be
+    /// embedded directly into the hover's bottom-line `at <link>` section.
     async fn resolve_display_path_for_view(&self, name: &str) -> Option<String> {
         let config = self.get_cached_config().await?;
         for path in config.resolve_view_path(name) {
             if self.file_exists_cached(&path).await {
-                return Some(self.relative_display_path(&path).await);
+                return Some(self.source_link(&path, None).await);
             }
         }
         None
@@ -13295,7 +13294,7 @@ return [
         let config = self.get_cached_config().await?;
         for path in config.resolve_component_path(name) {
             if self.file_exists_cached(&path).await {
-                return Some(self.relative_display_path(&path).await);
+                return Some(self.source_link(&path, None).await);
             }
         }
         None
@@ -13307,7 +13306,7 @@ return [
         let config = self.get_cached_config().await?;
         let path = config.resolve_livewire_path(name)?;
         if self.file_exists_cached(&path).await {
-            Some(self.relative_display_path(&path).await)
+            Some(self.source_link(&path, None).await)
         } else {
             None
         }
@@ -13323,6 +13322,23 @@ return [
             }
         }
         path.to_string_lossy().to_string()
+    }
+
+    /// Build the bottom-of-hover `at <link>` markdown string for a resolved
+    /// file path and optional 1-based line. The link is a `file://` URL so
+    /// Zed (and other LSP clients with markdown link support) treat it as
+    /// click-to-open. Falls back to an unlinked monospace path when the
+    /// path can't be converted to a URL (extremely rare — only relative or
+    /// invalid UTF-8 paths fail).
+    async fn source_link(&self, abs_path: &Path, line: Option<u32>) -> String {
+        let display = self.relative_display_path(abs_path).await;
+        match Url::from_file_path(abs_path) {
+            Ok(url) => laravel_lsp::hover::source_link(&display, url.as_str(), line),
+            Err(_) => match line {
+                Some(l) => format!("`{}:{}`", display, l),
+                None => format!("`{}`", display),
+            },
+        }
     }
 
     /// Return the cached vendor translation-namespace map, building it on

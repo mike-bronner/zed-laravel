@@ -21,14 +21,26 @@ fn view_hover_uses_call_form_header() {
     let out = format_view(
         "users.profile",
         Some("resources/views/users/profile.blade.php"),
+        None,
     );
     assert!(out.contains("**view('users.profile')**"));
     assert!(out.contains("at resources/views/users/profile.blade.php"));
 }
 
 #[test]
+fn view_hover_with_snippet_renders_php_block() {
+    let out = format_view(
+        "users.profile",
+        Some("resources/views/users/profile.blade.php"),
+        Some("@props(['user' => null])"),
+    );
+    assert!(out.contains("```php"));
+    assert!(out.contains("@props(['user' => null])"));
+}
+
+#[test]
 fn view_hover_without_path_shows_missing_trailer() {
-    let out = format_view("users.missing", None);
+    let out = format_view("users.missing", None, None);
     assert!(out.contains("**view('users.missing')**"));
     assert!(out.contains("*(file not found)*"));
 }
@@ -38,6 +50,7 @@ fn component_hover_does_not_double_prefix() {
     let out = format_component(
         "x-button",
         Some("resources/views/components/button.blade.php"),
+        None,
     );
     assert!(out.contains("`<x-button>`"));
     assert!(!out.contains("<x-x-"));
@@ -45,9 +58,20 @@ fn component_hover_does_not_double_prefix() {
 
 #[test]
 fn livewire_hover_uses_tag_form_header() {
-    let out = format_livewire("counter", Some("app/Livewire/Counter.php"));
+    let out = format_livewire("counter", Some("app/Livewire/Counter.php"), None);
     assert!(out.contains("`<livewire:counter>`"));
     assert!(out.contains("at app/Livewire/Counter.php"));
+}
+
+#[test]
+fn livewire_hover_renders_class_signature_snippet() {
+    let out = format_livewire(
+        "counter",
+        Some("app/Livewire/Counter.php"),
+        Some("class Counter extends Component"),
+    );
+    assert!(out.contains("```php"));
+    assert!(out.contains("class Counter extends Component"));
 }
 
 // ============================================================================
@@ -70,7 +94,7 @@ fn route_def(method: &str, uri: &str, action: &str) -> RouteDefinition {
 #[test]
 fn route_hover_shows_method_uri_action() {
     let def = route_def("get", "/users/{user}", "UserController@show");
-    let out = format_route("users.show", Some(&def), Some("routes/web.php:42"));
+    let out = format_route("users.show", Some(&def), Some("routes/web.php:42"), None);
     assert!(out.contains("**route('users.show')**"));
     assert!(out.contains("`GET /users/{user}`"));
     assert!(out.contains("`UserController@show`"));
@@ -78,8 +102,23 @@ fn route_hover_shows_method_uri_action() {
 }
 
 #[test]
+fn route_hover_renders_source_line_snippet() {
+    let def = route_def("get", "/users/{user}", "UserController@show");
+    let snippet =
+        "Route::get('/users/{user}', [UserController::class, 'show'])->name('users.show');";
+    let out = format_route(
+        "users.show",
+        Some(&def),
+        Some("routes/web.php:42"),
+        Some(snippet),
+    );
+    assert!(out.contains("```php"));
+    assert!(out.contains(snippet));
+}
+
+#[test]
 fn route_hover_handles_missing_index_entry() {
-    let out = format_route("orphan", None, None);
+    let out = format_route("orphan", None, None, None);
     assert!(out.contains("**route('orphan')**"));
     assert!(out.contains("*(route not found in index)*"));
 }
@@ -401,7 +440,7 @@ fn at_line_renders_passed_string_verbatim() {
     // what enables the hover dispatcher (in main.rs) to pass full
     // `file://`-clickable links straight through.
     let link = "[`app/Models/User.php:42`](file:///Users/mike/project/app/Models/User.php#L42)";
-    let out = format_view("users.profile", Some(link));
+    let out = format_view("users.profile", Some(link), None);
     assert!(
         out.contains(&format!("at {}", link)),
         "expected raw link, got: {}",

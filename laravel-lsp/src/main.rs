@@ -12954,16 +12954,53 @@ return [
 
         match pattern {
             PatternAtPosition::View(view) => {
-                let display = self.resolve_display_path_for_view(&view.name).await;
-                Some(hover::format_view(&view.name, display.as_deref()))
+                let path = self.resolve_view_file(&view.name).await;
+                let link = match &path {
+                    Some(p) => Some(self.source_link(p, None).await),
+                    None => None,
+                };
+                // `@props([...])` summarises what variables the view expects,
+                // which is the most useful at-a-glance snippet.
+                let snippet = path
+                    .as_deref()
+                    .and_then(laravel_lsp::blade_props::extract_props_directive);
+                Some(hover::format_view(
+                    &view.name,
+                    link.as_deref(),
+                    snippet.as_deref(),
+                ))
             }
             PatternAtPosition::Component(comp) => {
-                let display = self.resolve_display_path_for_component(&comp.name).await;
-                Some(hover::format_component(&comp.tag_name, display.as_deref()))
+                let path = self.resolve_component_file(&comp.name).await;
+                let link = match &path {
+                    Some(p) => Some(self.source_link(p, None).await),
+                    None => None,
+                };
+                let snippet = path
+                    .as_deref()
+                    .and_then(laravel_lsp::blade_props::extract_props_directive);
+                Some(hover::format_component(
+                    &comp.tag_name,
+                    link.as_deref(),
+                    snippet.as_deref(),
+                ))
             }
             PatternAtPosition::Livewire(lw) => {
-                let display = self.resolve_display_path_for_livewire(&lw.name).await;
-                Some(hover::format_livewire(&lw.name, display.as_deref()))
+                let path = self.resolve_livewire_file(&lw.name).await;
+                let link = match &path {
+                    Some(p) => Some(self.source_link(p, None).await),
+                    None => None,
+                };
+                // `class Foo extends Component` signature line — gives the
+                // reader the component class at a glance.
+                let snippet = path
+                    .as_deref()
+                    .and_then(laravel_lsp::php_class::extract_class_signature);
+                Some(hover::format_livewire(
+                    &lw.name,
+                    link.as_deref(),
+                    snippet.as_deref(),
+                ))
             }
             PatternAtPosition::Route(route) => {
                 let idx_guard = self.route_index.read().await;
@@ -12975,10 +13012,16 @@ return [
                     Some(d) => Some(self.source_link(&d.file, Some(d.line + 1)).await),
                     None => None,
                 };
+                // Pull the actual `Route::verb(...)->name(...)` line from
+                // source so the hover shows what the developer wrote, not
+                // just the parsed verb/URI/action.
+                let snippet =
+                    def.and_then(|d| laravel_lsp::php_class::read_line_from_file(&d.file, d.line));
                 Some(hover::format_route(
                     &route.name,
                     def,
                     source_link.as_deref(),
+                    snippet.as_deref(),
                 ))
             }
             PatternAtPosition::ConfigRef(cfg) => {
@@ -13272,41 +13315,37 @@ return [
         None
     }
 
-    /// Resolve a view name to a click-to-open source link. Returns `None`
-    /// when no candidate file exists on disk.
-    ///
-    /// The returned string is full markdown link syntax —
-    /// `` [`resources/views/foo.blade.php`](file:///abs/path) `` — to be
-    /// embedded directly into the hover's bottom-line `at <link>` section.
-    async fn resolve_display_path_for_view(&self, name: &str) -> Option<String> {
+    /// Resolve a view name to its on-disk file path. Returns `None` when no
+    /// candidate file exists on disk. The hover dispatch then builds the
+    /// `source_link` markdown AND the `@props(...)` source snippet from the
+    /// same path.
+    async fn resolve_view_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
         for path in config.resolve_view_path(name) {
             if self.file_exists_cached(&path).await {
-                return Some(self.source_link(&path, None).await);
+                return Some(path);
             }
         }
         None
     }
 
-    /// Same shape as [`Self::resolve_display_path_for_view`] but for Blade
-    /// component references.
-    async fn resolve_display_path_for_component(&self, name: &str) -> Option<String> {
+    /// Same shape as [`Self::resolve_view_file`] but for Blade components.
+    async fn resolve_component_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
         for path in config.resolve_component_path(name) {
             if self.file_exists_cached(&path).await {
-                return Some(self.source_link(&path, None).await);
+                return Some(path);
             }
         }
         None
     }
 
-    /// Same shape as [`Self::resolve_display_path_for_view`] but for Livewire
-    /// component references.
-    async fn resolve_display_path_for_livewire(&self, name: &str) -> Option<String> {
+    /// Same shape as [`Self::resolve_view_file`] but for Livewire components.
+    async fn resolve_livewire_file(&self, name: &str) -> Option<PathBuf> {
         let config = self.get_cached_config().await?;
         let path = config.resolve_livewire_path(name)?;
         if self.file_exists_cached(&path).await {
-            Some(self.source_link(&path, None).await)
+            Some(path)
         } else {
             None
         }

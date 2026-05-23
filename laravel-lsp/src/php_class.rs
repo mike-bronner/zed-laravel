@@ -432,6 +432,41 @@ pub fn find_property_definition_line(content: &str, property: &str) -> Option<u3
     Some(line)
 }
 
+/// Read a single line (0-based) from a file, with trailing whitespace
+/// trimmed but leading whitespace preserved (so indentation context is
+/// kept in hover snippets). Returns `None` on I/O failure or out-of-range
+/// line numbers. Used by the route hover to pull the
+/// `Route::verb(...)->name(...)` line straight from source.
+pub fn read_line_from_file(path: &std::path::Path, line: u32) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let target = content.lines().nth(line as usize)?;
+    Some(target.trim_end().to_string())
+}
+
+/// Extract the first `class Foo extends Bar` signature line from a PHP class
+/// file. Skips PHP attributes (`#[...]`), PHPDoc, `namespace`, and `use`
+/// statements that precede the class declaration. Returns the single line
+/// containing the `class` keyword, trimmed.
+///
+/// Used by the Livewire hover to show the component's class signature so
+/// the reader sees the type at a glance — same vibe as intelephense's
+/// hover showing a class signature line in a `php` code block.
+///
+/// Recognises `final class Foo`, `abstract class Foo`, `readonly class Foo`,
+/// and combinations. Anchored at start-of-line so `class` substrings inside
+/// string literals or comments don't trigger false matches.
+pub fn extract_class_signature(path: &std::path::Path) -> Option<String> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+    lazy_static! {
+        static ref CLASS_RE: Regex =
+            Regex::new(r"(?m)^\s*(?:(?:final|abstract|readonly)\s+)*class\s+\w+[^{\n]*").unwrap();
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let m = CLASS_RE.find(&content)?;
+    Some(m.as_str().trim().to_string())
+}
+
 /// Rich information about a property/method declaration extracted from a
 /// PHP class source — declaration text, PHPDoc summary, and tags. Used by
 /// the Blade-variable hover to render intelephense-style tooltips.

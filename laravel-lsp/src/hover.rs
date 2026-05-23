@@ -77,13 +77,21 @@ pub fn find_hover_target(
 // they're hovering, formatted the way they'd write it."
 // ============================================================================
 
-/// Hover for a view reference.
-pub fn format_view(name: &str, resolved_display_path: Option<&str>) -> String {
+/// Hover for a view reference. `snippet` is an optional excerpt from the
+/// resolved view file (typically the `@props([...])` declaration) — when
+/// provided, rendered as a ```php fenced block above the source line so the
+/// reader can see at-a-glance what variables the view expects.
+pub fn format_view(
+    name: &str,
+    resolved_display_path: Option<&str>,
+    snippet: Option<&str>,
+) -> String {
     let header = format!("**view('{}')**", name);
+    let code = snippet.map(php_block);
     finish(
         &header,
         None,
-        None,
+        code,
         resolved_display_path,
         missing_file_note(resolved_display_path),
     )
@@ -91,35 +99,51 @@ pub fn format_view(name: &str, resolved_display_path: Option<&str>) -> String {
 
 /// Hover for a Blade component reference. `tag_name` already carries the
 /// `x-` prefix as captured by the tree-sitter query — do not re-add it.
-pub fn format_component(tag_name: &str, resolved_display_path: Option<&str>) -> String {
+/// `snippet` mirrors [`format_view`]: typically the `@props([...])` line.
+pub fn format_component(
+    tag_name: &str,
+    resolved_display_path: Option<&str>,
+    snippet: Option<&str>,
+) -> String {
     let header = format!("**`<{}>`**", tag_name);
+    let code = snippet.map(php_block);
     finish(
         &header,
         None,
-        None,
+        code,
         resolved_display_path,
         missing_file_note(resolved_display_path),
     )
 }
 
-/// Hover for a Livewire component reference.
-pub fn format_livewire(name: &str, resolved_display_path: Option<&str>) -> String {
+/// Hover for a Livewire component reference. `snippet` is typically the
+/// `class Foo extends Component` signature line so the reader sees the
+/// component class without leaving the hover.
+pub fn format_livewire(
+    name: &str,
+    resolved_display_path: Option<&str>,
+    snippet: Option<&str>,
+) -> String {
     let header = format!("**`<livewire:{}>`**", name);
+    let code = snippet.map(php_block);
     finish(
         &header,
         None,
-        None,
+        code,
         resolved_display_path,
         missing_file_note(resolved_display_path),
     )
 }
 
-/// Hover for a route reference. `source_display` is the relative path of the
-/// file containing the `->name(...)` callsite, optionally `:line` suffix.
+/// Hover for a route reference. `source_display` is the markdown link for
+/// the file:line of the `->name(...)` callsite. `snippet` is typically the
+/// actual `Route::verb(...)->name(...)` source line — rendered as a ```php
+/// block above the source line.
 pub fn format_route(
     name: &str,
     def: Option<&RouteDefinition>,
     source_display: Option<&str>,
+    snippet: Option<&str>,
 ) -> String {
     let header = format!("**route('{}')**", name);
     let Some(d) = def else {
@@ -139,7 +163,8 @@ pub fn format_route(
     let uri = d.uri.as_deref().unwrap_or("?");
     let action = d.action.as_deref().unwrap_or("?");
     let detail = format!("`{} {}` → `{}`", method, uri, action);
-    finish(&header, Some(detail), None, source_display, None)
+    let code = snippet.map(php_block);
+    finish(&header, Some(detail), code, source_display, None)
 }
 
 /// Hover for a `config('app.name')` reference. Resolved value is shown as a

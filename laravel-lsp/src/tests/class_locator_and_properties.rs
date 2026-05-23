@@ -1,8 +1,8 @@
 use laravel_lsp::class_locator::find_php_class_file;
 use laravel_lsp::livewire_resolver::extract_blade_variable_at_cursor;
 use laravel_lsp::php_class::{
-    extract_class_properties, extract_property_declaration, find_property_declaration_position,
-    find_property_definition_line,
+    extract_class_properties, extract_class_signature, extract_property_declaration,
+    find_property_declaration_position, find_property_definition_line, read_line_from_file,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -500,4 +500,106 @@ class User {
         "got unexpected description: {:?}",
         decl.description
     );
+}
+
+// ============================================================================
+// php_class::extract_class_signature
+// ============================================================================
+
+#[test]
+fn extract_class_signature_returns_class_line() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Counter.php");
+    fs::write(
+        &path,
+        "<?php\nnamespace App\\Livewire;\n\nuse Livewire\\Component;\n\nclass Counter extends Component\n{\n    public int $count = 0;\n}\n",
+    )
+    .unwrap();
+    let got = extract_class_signature(&path).expect("should find class");
+    assert_eq!(got, "class Counter extends Component");
+}
+
+#[test]
+fn extract_class_signature_handles_final_and_abstract_modifiers() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Foo.php");
+    fs::write(
+        &path,
+        "<?php\nfinal class Foo extends Bar implements Baz\n{\n}\n",
+    )
+    .unwrap();
+    let got = extract_class_signature(&path).expect("should find class");
+    assert_eq!(got, "final class Foo extends Bar implements Baz");
+}
+
+#[test]
+fn extract_class_signature_ignores_class_keyword_in_strings() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Foo.php");
+    // The string `'class FakeClass'` must NOT trick the matcher — our
+    // regex anchors at start-of-line. Body braces (`{}`) are intentionally
+    // excluded from the captured signature — same shape intelephense uses.
+    fs::write(
+        &path,
+        "<?php\n$x = 'class FakeClass';\nclass Real extends Bar {}\n",
+    )
+    .unwrap();
+    let got = extract_class_signature(&path).expect("should find class");
+    assert_eq!(got, "class Real extends Bar");
+}
+
+#[test]
+fn extract_class_signature_returns_none_for_files_without_class() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("helpers.php");
+    fs::write(&path, "<?php\nfunction helper() {}\n").unwrap();
+    assert_eq!(extract_class_signature(&path), None);
+}
+
+// ============================================================================
+// php_class::read_line_from_file
+// ============================================================================
+
+#[test]
+fn read_line_from_file_returns_targeted_line() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("routes.php");
+    fs::write(
+        &path,
+        "<?php\nRoute::get('/users', [UserController::class, 'index'])->name('users.index');\nRoute::post('/users', [UserController::class, 'store'])->name('users.store');\n",
+    )
+    .unwrap();
+    assert_eq!(read_line_from_file(&path, 0).as_deref(), Some("<?php"));
+    assert!(read_line_from_file(&path, 1)
+        .unwrap()
+        .contains("Route::get"));
+    assert!(read_line_from_file(&path, 2)
+        .unwrap()
+        .contains("Route::post"));
+}
+
+#[test]
+fn read_line_from_file_preserves_leading_whitespace() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("x.php");
+    fs::write(&path, "first\n    indented line\n").unwrap();
+    assert_eq!(
+        read_line_from_file(&path, 1).as_deref(),
+        Some("    indented line"),
+        "leading whitespace should survive — hover snippets care about indentation context"
+    );
+}
+
+#[test]
+fn read_line_from_file_returns_none_for_out_of_range_line() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("short.php");
+    fs::write(&path, "one\ntwo\n").unwrap();
+    assert_eq!(read_line_from_file(&path, 99), None);
+}
+
+#[test]
+fn read_line_from_file_returns_none_for_missing_file() {
+    let nonexistent = std::path::PathBuf::from("/nonexistent/file.php");
+    assert_eq!(read_line_from_file(&nonexistent, 0), None);
 }

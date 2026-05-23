@@ -18,6 +18,7 @@ pub mod class_locator;
 pub mod config;
 pub mod config_lookup;
 pub mod database;
+pub mod document_symbols;
 pub mod hover;
 pub mod livewire_resolver;
 pub mod middleware_parser;

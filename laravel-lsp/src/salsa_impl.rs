@@ -492,7 +492,7 @@ fn extract_string_from_args(args: &str) -> Option<(String, usize, usize)> {
 /// - @lang("messages.welcome")
 ///
 /// Returns (translation_key, start_offset, end_offset) if found
-fn extract_translation_from_echo(php_content: &str) -> Option<(String, usize, usize)> {
+pub fn extract_translation_from_echo(php_content: &str) -> Option<(String, usize, usize)> {
     use regex::Regex;
 
     // Match translation function calls: __(), trans(), trans_choice()
@@ -2788,12 +2788,17 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Vec<ReferenceLocationData>>,
     },
     /// Return every project file path the actor currently has registered.
-    /// Drives the cache-warming task: instead of a single giant sweep that
-    /// blocks the actor for seconds, the task pulls the file list once and
-    /// fires one `GetPatterns` request per file, so warming interleaves
-    /// naturally with real user requests like `find_references`.
+    /// Used by the warming task to compute which files to parse out-of-band.
     ListProjectFiles {
         reply: oneshot::Sender<Vec<PathBuf>>,
+    },
+    /// Bulk-import a batch of pre-parsed `ParsedPatternsData` into the
+    /// actor's pattern cache. The warming task uses this to push the
+    /// results of parallel out-of-actor parsing back into the cache in
+    /// one shot, instead of paying the per-file actor round-trip cost.
+    BulkImportPatterns {
+        entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
+        reply: oneshot::Sender<usize>,
     },
 
     // === Service Provider Management ===
@@ -3226,12 +3231,30 @@ impl SalsaHandle {
     }
 
     /// Return every project file path the actor currently has registered.
-    /// The cache-warming task uses this to drive one `get_patterns` request
-    /// per file (rather than blocking the actor on a single giant sweep).
     pub async fn list_project_files(&self) -> Result<Vec<PathBuf>, &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::ListProjectFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Bulk-import pre-parsed patterns into the actor's cache. One actor
+    /// round-trip total, regardless of how many entries — the heavy parsing
+    /// happened in parallel on the blocking thread pool before this call.
+    pub async fn bulk_import_patterns(
+        &self,
+        entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BulkImportPatterns {
+                entries,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -3818,8 +3841,13 @@ impl SalsaActor {
                 receiver: rx,
                 // Pre-allocate with reasonable capacity to avoid early reallocations
                 files: HashMap::with_capacity(64),
-                // LRU cache with 256 entry limit to prevent unbounded memory growth
-                pattern_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
+                // Pattern cache holds parsed patterns for every project file.
+                // Cap at 8192 entries so full-project indexing on real-world
+                // Laravel apps (a few hundred to a few thousand PHP files)
+                // doesn't get evicted mid-session. ~10KB per entry × 8192 ≈
+                // 80MB worst case, which is reasonable for an LSP that's
+                // serving cross-file queries.
+                pattern_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
@@ -3977,6 +4005,20 @@ impl SalsaActor {
                         .cloned()
                         .collect();
                     let _ = reply.send(paths);
+                }
+                SalsaRequest::BulkImportPatterns { entries, reply } => {
+                    let mut imported = 0usize;
+                    for (path, data) in entries {
+                        // pattern_cache is keyed by path + version. New entries
+                        // come from the cold-start indexer, so version 0 is
+                        // correct — Salsa's `update_file` bumps the version
+                        // when the editor edits a file, which invalidates the
+                        // cache via the version check in handle_get_patterns.
+                        self.pattern_cache.put(path, (0, data));
+                        imported += 1;
+                    }
+                    info!("🔥 Bulk-imported {} entries into pattern cache", imported);
+                    let _ = reply.send(imported);
                 }
 
                 // === Service Provider Handlers ===

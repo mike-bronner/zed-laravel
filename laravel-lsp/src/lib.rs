@@ -26,6 +26,7 @@ pub mod livewire_resolver;
 pub mod middleware_parser;
 pub mod model_analyzer;
 pub mod parser;
+pub mod pattern_indexer;
 pub mod php_class;
 pub mod php_outline;
 pub mod queries;

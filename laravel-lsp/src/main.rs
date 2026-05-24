@@ -2947,19 +2947,26 @@ impl LaravelLanguageServer {
 
         info!("Laravel LSP: Project files registered with Salsa for reference finding");
 
-        // Pattern-cache warming on a detached task. Salsa creates inputs at
-        // registration but parsing is lazy until `get_patterns` is called for
-        // a file. Without warming, the first `textDocument/references` (or
-        // any cross-file query) blocks the actor while every project file
-        // gets parsed on-demand inside one request.
+        // Pattern-cache warming via parallel out-of-actor parsing.
         //
-        // Critical: drive warming as MANY small requests, not one big sweep.
-        // The actor is single-threaded; a giant inside-the-actor loop would
-        // freeze every other request for the entire duration. Sending one
-        // `get_patterns` per file lets the actor interleave real user
-        // requests (hover, goto-def, references) between cache fills.
+        // The Salsa actor is single-threaded by design. The previous
+        // implementation sent one `get_patterns` per file through the
+        // actor's channel, which serialised every parse and blocked
+        // interactive requests (hover, goto-def, find-references) for the
+        // duration. On a real Laravel project, that meant ~30 seconds of
+        // unresponsive LSP after workspace open.
+        //
+        // The new flow:
+        //   1. Pull the file list from the actor (single round-trip).
+        //   2. Parse + extract every file in parallel via tokio's blocking
+        //      thread pool (tree-sitter is CPU-bound).
+        //   3. Bulk-import all results into the actor's pattern cache in
+        //      ONE request.
+        //
+        // The user's first interactive request hits a fully-warm cache.
         let salsa = self.salsa.clone();
         tokio::spawn(async move {
+            let started_at = std::time::Instant::now();
             let paths = match salsa.list_project_files().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -2968,16 +2975,40 @@ impl LaravelLanguageServer {
                 }
             };
             let total = paths.len();
-            let mut warmed = 0usize;
+
+            // Step 2: parallel parse. spawn_blocking lets tokio run each
+            // file on its blocking thread pool (default = #CPUs × 512),
+            // and tree-sitter releases CPU naturally so other tokio tasks
+            // (e.g. inbound LSP requests) still progress.
+            let mut handles = Vec::with_capacity(total);
             for path in paths {
-                if salsa.get_patterns(path).await.is_ok() {
-                    warmed += 1;
+                handles.push(tokio::task::spawn_blocking(
+                    move || -> Option<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> {
+                        let text = std::fs::read_to_string(&path).ok()?;
+                        let data = laravel_lsp::pattern_indexer::parse_owned(&path, &text);
+                        Some((path, data))
+                    },
+                ));
+            }
+
+            let mut entries = Vec::with_capacity(total);
+            for h in handles {
+                if let Ok(Some(pair)) = h.await {
+                    entries.push(pair);
                 }
             }
+            let parsed = entries.len();
+
+            // Step 3: bulk-import. Single actor round-trip.
+            let imported = salsa.bulk_import_patterns(entries).await.unwrap_or(0);
+
             info!(
-                "🔥 Laravel LSP: pattern cache warmed ({}/{} files)",
-                warmed, total
+                "🔥 Laravel LSP: pattern cache warmed ({}/{} files imported, {:?})",
+                imported,
+                total,
+                started_at.elapsed()
             );
+            let _ = parsed;
         });
     }
 

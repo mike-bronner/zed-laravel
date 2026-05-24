@@ -27,15 +27,21 @@ use tower_lsp::lsp_types::{
 
 use crate::references::SymbolRef;
 
-/// One physical source position to be rewritten as part of a rename. Aggregated
-/// from call-site references (via Salsa) and declaration-site walks (via the
-/// per-kind locators).
+/// One physical source position to be rewritten as part of a rename, plus
+/// the exact text to write. Aggregated from call-site references (via Salsa)
+/// and declaration-site walks (via the per-kind locators).
+///
+/// `new_text` differs by site for some kinds. Renaming `app.name` →
+/// `app.label`, for instance, writes the *leaf segment* `label` at the
+/// declaration position in `config/app.php` but writes the *full dotted
+/// form* `app.label` at every `config('app.name')` call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditTarget {
     pub file_path: PathBuf,
     pub line: u32,
     pub start_column: u32,
     pub end_column: u32,
+    pub new_text: String,
 }
 
 /// Decide whether a classified symbol participates in rename right now.
@@ -44,20 +50,23 @@ pub struct EditTarget {
 /// A rename is enabled only after BOTH the call-site collector (already in
 /// place via `crate::references`) AND the declaration-site collector for the
 /// matching kind are wired up — never call-sites-only, since that leaves
-/// the declaration out of sync. Initial wave: routes (decl via
-/// [`crate::route_name_locator`]).
+/// the declaration out of sync.
+///
+/// Enabled kinds:
+/// - Route (decl via [`crate::route_name_locator`])
+/// - Config (decl via [`crate::config_key_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
-    matches!(symbol, SymbolRef::Route(_))
+    matches!(symbol, SymbolRef::Route(_) | SymbolRef::Config(_))
 }
 
-/// Build a single `WorkspaceEdit` that rewrites every `target` to `new_name`.
-/// Returns `None` if there is nothing to rewrite (defensive — a rename with
-/// zero edits is a no-op and editors generally treat the missing response as
-/// "cancelled").
+/// Build a single `WorkspaceEdit` that rewrites every `target` to its
+/// `new_text`. Returns `None` if there is nothing to rewrite (defensive —
+/// a rename with zero edits is a no-op and editors generally treat the
+/// missing response as "cancelled").
 ///
 /// Targets are grouped by file URI; clients that don't support the modern
 /// `documentChanges` form still receive a usable `changes` map.
-pub fn build_rename_edit(new_name: &str, targets: &[EditTarget]) -> Option<WorkspaceEdit> {
+pub fn build_rename_edit(targets: &[EditTarget]) -> Option<WorkspaceEdit> {
     if targets.is_empty() {
         return None;
     }
@@ -78,7 +87,7 @@ pub fn build_rename_edit(new_name: &str, targets: &[EditTarget]) -> Option<Works
                     character: t.end_column,
                 },
             },
-            new_text: new_name.to_string(),
+            new_text: t.new_text.clone(),
         };
         grouped.entry(uri).or_default().push(edit);
     }

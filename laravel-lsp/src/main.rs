@@ -13696,12 +13696,39 @@ fn pattern_range_at(
     })
 }
 
+/// Resolve the source position of a dotted config key's declaration in
+/// `config/<file>.php` and return an edit target. Wraps
+/// [`laravel_lsp::config_key_locator::locate_key`] so the rename handler
+/// stays terse.
+fn collect_config_declaration_target(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Option<laravel_lsp::rename::EditTarget> {
+    let pos = laravel_lsp::config_key_locator::locate_key(root, old_key)?;
+    let file_stem = old_key.split('.').next()?;
+    let file_path = root.join("config").join(format!("{file_stem}.php"));
+    // Decl text = leaf segment of the new dotted form. The file portion
+    // stays — it IS the config filename, which renames don't move.
+    let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
+    Some(laravel_lsp::rename::EditTarget {
+        file_path,
+        line: pos.line,
+        start_column: pos.start_column,
+        end_column: pos.end_column,
+        new_text: new_leaf,
+    })
+}
+
 /// Walk every `routes/*.php` under the project root and surface
-/// `->name(...)` declaration sites whose full name matches `target`. Returns
-/// edit targets ready to be merged with call-site references.
+/// `->name(...)` declaration sites whose full name matches `target`. Each
+/// emitted target writes `new_name` verbatim at the captured position. (For
+/// group-prefixed routes, the locator already emits one target per segment
+/// so the prefix composition stays intact.)
 async fn collect_route_declaration_targets(
     root: &Path,
     target: &str,
+    new_name: &str,
 ) -> Vec<laravel_lsp::rename::EditTarget> {
     let mut targets = Vec::new();
     let routes_dir = root.join("routes");
@@ -13730,6 +13757,7 @@ async fn collect_route_declaration_targets(
                 line: d.line,
                 start_column: d.start_column,
                 end_column: d.end_column,
+                new_text: new_name.to_string(),
             });
         }
     }
@@ -14719,6 +14747,8 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
+        // Call-site rewrite text: the full `new_name` as the user typed it.
+        // Decl-site rewrite text is computed per-kind below — it may differ.
         let mut targets: Vec<laravel_lsp::rename::EditTarget> = call_sites
             .into_iter()
             .map(|r| laravel_lsp::rename::EditTarget {
@@ -14726,6 +14756,7 @@ impl LanguageServer for LaravelLanguageServer {
                 line: r.line,
                 start_column: r.column,
                 end_column: r.end_column,
+                new_text: new_name.clone(),
             })
             .collect();
 
@@ -14734,13 +14765,30 @@ impl LanguageServer for LaravelLanguageServer {
         // declaration walker is implemented. New kinds extend both `can_rename`
         // and this match arm together.
         let root_path = self.root_path.read().await.clone();
-        if let laravel_lsp::references::SymbolRef::Route(name) = &symbol {
-            if let Some(root) = root_path.as_ref() {
-                targets.extend(collect_route_declaration_targets(root, name).await);
+        match &symbol {
+            laravel_lsp::references::SymbolRef::Route(name) => {
+                // Route names are written verbatim at every declaration site
+                // (the locator emits one target per `->name(...)` segment;
+                // group prefixes get their own segments).
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(collect_route_declaration_targets(root, name, &new_name).await);
+                }
             }
+            laravel_lsp::references::SymbolRef::Config(key) => {
+                // Config decl writes only the LEAF segment of the new dotted
+                // form (e.g. "app.name" → "app.label" writes "label" at the
+                // key position in config/app.php). The file portion can't
+                // change without moving the config file.
+                if let Some(root) = root_path.as_ref() {
+                    if let Some(t) = collect_config_declaration_target(root, key, &new_name) {
+                        targets.push(t);
+                    }
+                }
+            }
+            _ => {}
         }
 
-        Ok(laravel_lsp::rename::build_rename_edit(&new_name, &targets))
+        Ok(laravel_lsp::rename::build_rename_edit(&targets))
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")

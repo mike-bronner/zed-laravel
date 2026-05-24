@@ -16,6 +16,7 @@ pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod config;
+pub mod config_key_locator;
 pub mod config_lookup;
 pub mod database;
 pub mod document_symbols;

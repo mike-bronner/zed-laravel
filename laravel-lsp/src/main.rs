@@ -13720,6 +13720,107 @@ fn collect_config_declaration_target(
     })
 }
 
+/// Find every declaration-site `Location` for a classified symbol — the
+/// references-side companion to the rename helpers below. Walks the same
+/// tree-sitter locators but returns `Location` values directly. Kinds whose
+/// declaration is invisible to the parser (everything outside route/config/
+/// translation right now) contribute nothing.
+async fn collect_declaration_locations(
+    root: &Path,
+    symbol: &laravel_lsp::references::SymbolRef,
+) -> Vec<Location> {
+    use laravel_lsp::references::SymbolRef;
+    let mut out = Vec::new();
+    match symbol {
+        SymbolRef::Route(name) => {
+            let routes_dir = root.join("routes");
+            if !routes_dir.exists() {
+                return out;
+            }
+            for entry in WalkDir::new(&routes_dir)
+                .max_depth(6)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let decls =
+                    laravel_lsp::route_name_locator::find_declarations_named(&content, name);
+                for d in decls {
+                    if let Ok(uri) = Url::from_file_path(path) {
+                        out.push(Location {
+                            uri,
+                            range: Range {
+                                start: Position {
+                                    line: d.line,
+                                    character: d.start_column,
+                                },
+                                end: Position {
+                                    line: d.line,
+                                    character: d.end_column,
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        SymbolRef::Config(key) => {
+            if let Some(pos) = laravel_lsp::config_key_locator::locate_key(root, key) {
+                if let Some(file_stem) = key.split('.').next() {
+                    let path = root.join("config").join(format!("{file_stem}.php"));
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        out.push(Location {
+                            uri,
+                            range: Range {
+                                start: Position {
+                                    line: pos.line,
+                                    character: pos.start_column,
+                                },
+                                end: Position {
+                                    line: pos.line,
+                                    character: pos.end_column,
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        SymbolRef::Translation(key) => {
+            let locs = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, key);
+            for loc in locs {
+                if let Ok(uri) = Url::from_file_path(&loc.file_path) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line: loc.position.line,
+                                character: loc.position.start_column,
+                            },
+                            end: Position {
+                                line: loc.position.line,
+                                character: loc.position.end_column,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        // View, component, livewire, env, middleware, binding: their
+        // declarations either don't exist as a single point (env vars), or
+        // they involve a PHP class (deferred to Phase 3). No additional
+        // locations to surface for now.
+        _ => {}
+    }
+    out
+}
+
 /// Resolve translation-key declaration positions across every locale's lang
 /// file. The LEAF segment of the new dotted form is written at each
 /// declaration; the file portion is the lang filename and can't change
@@ -14657,7 +14758,8 @@ impl LanguageServer for LaravelLanguageServer {
 
         let include_declaration = params.context.include_declaration;
 
-        let locations = match self
+        // Call sites come from Salsa — every parser-classified position.
+        let call_sites = match self
             .salsa
             .find_references(symbol.to_data(), include_declaration)
             .await
@@ -14669,10 +14771,25 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
-        let lsp_locations: Vec<Location> = locations
+        let mut lsp_locations: Vec<Location> = call_sites
             .into_iter()
             .filter_map(|loc| reference_location_to_lsp(&loc))
             .collect();
+
+        // Declaration sites come from per-kind tree-sitter walkers (same
+        // walkers rename uses). The parser's php.scm captures call sites
+        // only — declaration sites like `->name('home')` in route files,
+        // array keys in `config/<file>.php`, and array keys in
+        // `lang/<locale>/<file>.php` aren't tagged as `route_refs` /
+        // `config_refs` / `translation_refs`, so they have to be found
+        // separately. Per the LSP spec (and Zed's default), we include them
+        // when `include_declaration` is set.
+        if include_declaration {
+            let root_path = self.root_path.read().await.clone();
+            if let Some(root) = root_path.as_ref() {
+                lsp_locations.extend(collect_declaration_locations(root, &symbol).await);
+            }
+        }
 
         Ok(Some(lsp_locations))
     }

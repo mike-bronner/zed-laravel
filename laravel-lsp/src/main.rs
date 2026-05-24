@@ -31,8 +31,8 @@ use laravel_lsp::salsa_impl::{
     ActionReferenceData, AssetReferenceData, BindingReferenceData, ComponentReferenceData,
     ConfigReferenceData, DirectiveReferenceData, EnvReferenceData, FeatureReferenceData,
     LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData, PatternAtPosition,
-    RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData, UrlReferenceData,
-    ViewReferenceData,
+    ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData,
+    UrlReferenceData, ViewReferenceData,
 };
 
 // ============================================================================
@@ -13649,6 +13649,26 @@ return [
     }
 }
 
+/// Convert a Salsa `ReferenceLocationData` into an LSP `Location`. Positions
+/// are 0-based throughout (matches `tree-sitter` and `lsp-types`). Returns
+/// `None` when the file path can't be expressed as a `file://` URL.
+fn reference_location_to_lsp(loc: &ReferenceLocationData) -> Option<Location> {
+    let uri = Url::from_file_path(&loc.file_path).ok()?;
+    Some(Location {
+        uri,
+        range: Range {
+            start: Position {
+                line: loc.line,
+                character: loc.column,
+            },
+            end: Position {
+                line: loc.line,
+                character: loc.end_column,
+            },
+        },
+    })
+}
+
 /// Convert a `document_symbols::SymbolEntry` (LSP-agnostic) into a tower-lsp
 /// `DocumentSymbol`. Recurses into children. `selection_range` is set to the
 /// same range as `range` — clients use selection_range for the click target.
@@ -13798,6 +13818,14 @@ impl LanguageServer for LaravelLanguageServer {
                 // hierarchy, Livewire component members, Eloquent relationships
                 // and scopes.
                 document_symbol_provider: Some(OneOf::Left(true)),
+
+                // ✅ References provider — `textDocument/references`. Finds
+                // every parser-classified call site for a Laravel pattern
+                // (view, route, config, translation, env, blade component,
+                // livewire, middleware, binding). Never matches raw string
+                // shape — only positions the parser tagged as the matching
+                // pattern kind are returned.
+                references_provider: Some(OneOf::Left(true)),
 
                 // On-type formatting (currently unused, bracket expansion uses completions)
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
@@ -14436,6 +14464,68 @@ impl LanguageServer for LaravelLanguageServer {
 
         let symbols: Vec<DocumentSymbol> = entries.iter().map(symbol_entry_to_lsp).collect();
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    /// `textDocument/references` — find every parser-classified call site for
+    /// the Laravel pattern under the cursor.
+    ///
+    /// The handler dispatches to [`laravel_lsp::references::
+    /// classify_pattern_at_cursor`] to identify which pattern kind + name the
+    /// cursor is on. We never raw-shape-match: positions the parser hasn't
+    /// classified as a Laravel pattern are not considered. The Salsa actor
+    /// then walks every registered project file and returns positions tagged
+    /// with the matching kind + name.
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
+            &patterns,
+            position.line,
+            position.character,
+        ) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let include_declaration = params.context.include_declaration;
+
+        let locations = match self
+            .salsa
+            .find_references(symbol.to_data(), include_declaration)
+            .await
+        {
+            Ok(locs) => locs,
+            Err(e) => {
+                debug!("references: Salsa error {:?}", e);
+                return Ok(None);
+            }
+        };
+
+        let lsp_locations: Vec<Location> = locations
+            .into_iter()
+            .filter_map(|loc| reference_location_to_lsp(&loc))
+            .collect();
+
+        Ok(Some(lsp_locations))
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")

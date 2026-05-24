@@ -203,3 +203,171 @@ fn namespaced_component_bypasses_alias_map() {
         paths,
     );
 }
+
+// ─── collect_matches_for_symbol (find-references engine) ───────────────
+
+use std::path::PathBuf;
+
+fn dummy_path() -> PathBuf {
+    PathBuf::from("/fixture/app.php")
+}
+
+#[test]
+fn collect_view_matches_only_named_classifications() {
+    let mut p = ParsedPatternsData::default();
+    p.views.push(Arc::new(ViewReferenceData {
+        name: "users.profile".into(),
+        line: 1,
+        column: 5,
+        end_column: 24,
+        is_route_view: false,
+    }));
+    p.views.push(Arc::new(ViewReferenceData {
+        name: "other.view".into(),
+        line: 2,
+        column: 5,
+        end_column: 20,
+        is_route_view: false,
+    }));
+    p.build_position_index();
+
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::View("users.profile".into()),
+        &mut out,
+    );
+
+    assert_eq!(out.len(), 1, "only matching view name should appear");
+    assert_eq!(out[0].line, 1);
+    assert_eq!(out[0].column, 5);
+}
+
+#[test]
+fn collect_view_also_picks_up_include_directives() {
+    let mut p = ParsedPatternsData::default();
+    p.directives.push(Arc::new(DirectiveReferenceData {
+        name: "include".into(),
+        arguments: Some("('users.profile')".into()),
+        line: 0,
+        column: 0,
+        end_column: 30,
+        string_column: 10,
+        string_end_column: 23,
+    }));
+    p.directives.push(Arc::new(DirectiveReferenceData {
+        name: "include".into(),
+        arguments: Some("('not.this.one')".into()),
+        line: 1,
+        column: 0,
+        end_column: 30,
+        string_column: 10,
+        string_end_column: 22,
+    }));
+    p.build_position_index();
+
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::View("users.profile".into()),
+        &mut out,
+    );
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].line, 0);
+}
+
+#[test]
+fn collect_route_matches() {
+    let mut p = ParsedPatternsData::default();
+    p.route_refs.push(Arc::new(RouteReferenceData {
+        name: "home".into(),
+        line: 0,
+        column: 6,
+        end_column: 10,
+    }));
+    p.route_refs.push(Arc::new(RouteReferenceData {
+        name: "home".into(),
+        line: 4,
+        column: 12,
+        end_column: 16,
+    }));
+    p.route_refs.push(Arc::new(RouteReferenceData {
+        name: "admin.users".into(),
+        line: 5,
+        column: 12,
+        end_column: 23,
+    }));
+    p.build_position_index();
+
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::Route("home".into()),
+        &mut out,
+    );
+
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|l| l.line == 0 || l.line == 4));
+}
+
+#[test]
+fn collect_config_matches_by_key() {
+    let mut p = ParsedPatternsData::default();
+    p.config_refs.push(Arc::new(ConfigReferenceData {
+        key: "app.name".into(),
+        line: 0,
+        column: 8,
+        end_column: 16,
+    }));
+    p.config_refs.push(Arc::new(ConfigReferenceData {
+        key: "different.key".into(),
+        line: 1,
+        column: 8,
+        end_column: 21,
+    }));
+    p.build_position_index();
+
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::Config("app.name".into()),
+        &mut out,
+    );
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].line, 0);
+}
+
+#[test]
+fn collect_returns_empty_for_no_matches() {
+    // Negative guarantee: same-shape strings present in other pattern kinds
+    // must NOT bleed across kinds.
+    let mut p = ParsedPatternsData::default();
+    p.views.push(Arc::new(ViewReferenceData {
+        name: "home".into(),
+        line: 0,
+        column: 5,
+        end_column: 9,
+        is_route_view: false,
+    }));
+    p.build_position_index();
+
+    // Asking for route "home" must NOT match the view "home".
+    let mut out = Vec::new();
+    collect_matches_for_symbol(
+        &dummy_path(),
+        &p,
+        &SymbolRefData::Route("home".into()),
+        &mut out,
+    );
+
+    assert!(
+        out.is_empty(),
+        "a view name must not satisfy a route reference query"
+    );
+}

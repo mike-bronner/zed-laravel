@@ -27,6 +27,7 @@ pub mod parser;
 pub mod php_class;
 pub mod php_outline;
 pub mod queries;
+pub mod references;
 pub mod route_binding;
 pub mod route_discovery;
 pub mod route_outline;

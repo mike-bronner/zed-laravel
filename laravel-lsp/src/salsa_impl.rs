@@ -2082,6 +2082,36 @@ pub enum FileReferenceType {
     Route,
 }
 
+/// Classified symbol under the cursor — the payload `Backend::references`
+/// (and later `Backend::rename`) hands across the Salsa actor boundary.
+///
+/// We never raw-shape-match: a position only counts as a reference to the
+/// requested symbol when (a) the parser tagged the position as that pattern
+/// kind AND (b) the carried name matches. Random PHP strings that happen to
+/// share the shape are not returned.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SymbolRefData {
+    View(String),
+    Route(String),
+    Config(String),
+    Translation(String),
+    Env(String),
+    Component(String),
+    Livewire(String),
+    Middleware(String),
+    Binding(String),
+}
+
+/// Location of a single parser-classified reference. Generic across pattern
+/// kinds — `Backend::references` converts these into LSP `Location`s.
+#[derive(Debug, Clone)]
+pub struct ReferenceLocationData {
+    pub file_path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// View reference location data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ViewReferenceLocationData {
@@ -2573,6 +2603,14 @@ pub enum SalsaRequest {
         view_name: String,
         reply: oneshot::Sender<Vec<ViewReferenceLocationData>>,
     },
+    /// Find all references to a classified symbol across the project.
+    /// Iterates `ProjectFiles` and filters parser-classified patterns by name —
+    /// never matches by raw string shape.
+    FindReferences {
+        symbol: SymbolRefData,
+        include_declaration: bool,
+        reply: oneshot::Sender<Vec<ReferenceLocationData>>,
+    },
 
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
@@ -2974,6 +3012,26 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::FindViewReferences {
                 view_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Find all parser-classified references to a symbol across the project.
+    pub async fn find_references(
+        &self,
+        symbol: SymbolRefData,
+        include_declaration: bool,
+    ) -> Result<Vec<ReferenceLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FindReferences {
+                symbol,
+                include_declaration,
                 reply: reply_tx,
             })
             .await
@@ -3701,6 +3759,14 @@ impl SalsaActor {
                 }
                 SalsaRequest::FindViewReferences { view_name, reply } => {
                     let result = self.handle_find_view_references(&view_name);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::FindReferences {
+                    symbol,
+                    include_declaration,
+                    reply,
+                } => {
+                    let result = self.handle_find_references(&symbol, include_declaration);
                     let _ = reply.send(result);
                 }
 
@@ -4669,6 +4735,39 @@ impl SalsaActor {
         references
     }
 
+    /// Generic find-references engine. Walks every registered project file and
+    /// pulls parser-classified patterns from Salsa for each — matching only
+    /// when both the kind and the name agree with `symbol`. The
+    /// `include_declaration` flag is honoured for kinds where the parser
+    /// distinguishes declaration from usage (currently a no-op since the
+    /// parser doesn't tag declarations; reserved for future use).
+    fn handle_find_references(
+        &mut self,
+        symbol: &SymbolRefData,
+        _include_declaration: bool,
+    ) -> Vec<ReferenceLocationData> {
+        let mut references = Vec::new();
+
+        // Walk every registered file. The filter inside the helper keeps the
+        // cost cheap — only the relevant pattern collection on each file's
+        // ParsedPatternsData is touched, and we never read non-cached files.
+        let mut all_files: Vec<PathBuf> = Vec::new();
+        all_files.extend(self.controller_files.iter().cloned());
+        all_files.extend(self.view_files.iter().cloned());
+        all_files.extend(self.livewire_files.iter().cloned());
+        all_files.extend(self.route_files.iter().cloned());
+
+        for path in &all_files {
+            let patterns = match self.handle_get_patterns(path) {
+                Some(p) => p,
+                None => continue,
+            };
+            collect_matches_for_symbol(path, &patterns, symbol, &mut references);
+        }
+
+        references
+    }
+
     // === Service Provider Handlers ===
 
     /// Handle service provider registry registration
@@ -5226,6 +5325,107 @@ fn extract_view_from_args(args: &str) -> Option<String> {
         Some(unquoted.to_string())
     } else {
         None
+    }
+}
+
+/// Append every parser-classified reference in `patterns` that matches `symbol`
+/// into `out`. Only the pattern collection corresponding to the symbol kind is
+/// scanned — a `SymbolRef::Route` never matches a coincidental config-key
+/// string, etc. This is the "instance chain" enforcement point.
+fn collect_matches_for_symbol(
+    path: &Path,
+    patterns: &ParsedPatternsData,
+    symbol: &SymbolRefData,
+    out: &mut Vec<ReferenceLocationData>,
+) {
+    let push = |out: &mut Vec<ReferenceLocationData>, line, column, end_column| {
+        out.push(ReferenceLocationData {
+            file_path: path.to_path_buf(),
+            line,
+            column,
+            end_column,
+        });
+    };
+
+    match symbol {
+        SymbolRefData::View(name) => {
+            for v in &patterns.views {
+                if v.name == *name {
+                    push(out, v.line, v.column, v.end_column);
+                }
+            }
+            // Blade directives can reference views too (@include, @extends,
+            // @component, @each). The parser stores the raw argument string;
+            // unwrap to the contained view name before comparing.
+            for d in &patterns.directives {
+                if matches!(
+                    d.name.as_str(),
+                    "include" | "extends" | "component" | "each" | "includeIf" | "includeWhen"
+                ) {
+                    if let Some(args) = d.arguments.as_deref() {
+                        if extract_view_from_args(args).as_deref() == Some(name.as_str()) {
+                            push(out, d.line, d.string_column, d.string_end_column);
+                        }
+                    }
+                }
+            }
+        }
+        SymbolRefData::Route(name) => {
+            for r in &patterns.route_refs {
+                if r.name == *name {
+                    push(out, r.line, r.column, r.end_column);
+                }
+            }
+        }
+        SymbolRefData::Config(key) => {
+            for c in &patterns.config_refs {
+                if c.key == *key {
+                    push(out, c.line, c.column, c.end_column);
+                }
+            }
+        }
+        SymbolRefData::Translation(key) => {
+            for t in &patterns.translation_refs {
+                if t.key == *key {
+                    push(out, t.line, t.column, t.end_column);
+                }
+            }
+        }
+        SymbolRefData::Env(name) => {
+            for e in &patterns.env_refs {
+                if e.name == *name {
+                    push(out, e.line, e.column, e.end_column);
+                }
+            }
+        }
+        SymbolRefData::Component(name) => {
+            for c in &patterns.components {
+                if c.name == *name {
+                    push(out, c.line, c.column, c.end_column);
+                }
+            }
+        }
+        SymbolRefData::Livewire(name) => {
+            for l in &patterns.livewire_refs {
+                if l.name == *name {
+                    push(out, l.line, l.column, l.end_column);
+                }
+            }
+        }
+        SymbolRefData::Middleware(name) => {
+            for m in &patterns.middleware_refs {
+                if m.name == *name {
+                    push(out, m.line, m.column, m.end_column);
+                }
+            }
+        }
+        SymbolRefData::Binding(name) => {
+            for b in &patterns.binding_refs {
+                if b.name == *name {
+                    push(out, b.line, b.column, b.end_column);
+                }
+            }
+        }
     }
 }
 

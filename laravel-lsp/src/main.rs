@@ -2929,23 +2929,37 @@ impl LaravelLanguageServer {
 
         info!("Laravel LSP: Project files registered with Salsa for reference finding");
 
-        // Kick off pattern-cache warming on a detached task. Registration
-        // only creates the Salsa `SourceFile` inputs; parsing is lazy until
-        // someone asks for patterns. Warming all project files in the
-        // background means by the time the user reaches for
-        // `textDocument/references` (which happens minutes into a session,
-        // not seconds), the cache is hot and the first call is instant
-        // instead of stalling on a project-wide parse.
+        // Pattern-cache warming on a detached task. Salsa creates inputs at
+        // registration but parsing is lazy until `get_patterns` is called for
+        // a file. Without warming, the first `textDocument/references` (or
+        // any cross-file query) blocks the actor while every project file
+        // gets parsed on-demand inside one request.
         //
-        // The actor processes requests sequentially, so warming requests
-        // interleave with whatever else the actor's busy with — including
-        // real user requests like hover and goto-definition.
+        // Critical: drive warming as MANY small requests, not one big sweep.
+        // The actor is single-threaded; a giant inside-the-actor loop would
+        // freeze every other request for the entire duration. Sending one
+        // `get_patterns` per file lets the actor interleave real user
+        // requests (hover, goto-def, references) between cache fills.
         let salsa = self.salsa.clone();
         tokio::spawn(async move {
-            match salsa.warm_pattern_cache().await {
-                Ok(n) => info!("🔥 Laravel LSP: pattern cache warmed ({} files)", n),
-                Err(e) => debug!("warm_pattern_cache failed: {}", e),
+            let paths = match salsa.list_project_files().await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("list_project_files failed: {}", e);
+                    return;
+                }
+            };
+            let total = paths.len();
+            let mut warmed = 0usize;
+            for path in paths {
+                if salsa.get_patterns(path).await.is_ok() {
+                    warmed += 1;
+                }
             }
+            info!(
+                "🔥 Laravel LSP: pattern cache warmed ({}/{} files)",
+                warmed, total
+            );
         });
     }
 

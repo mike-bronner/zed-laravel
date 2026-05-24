@@ -1843,6 +1843,23 @@ struct LaravelLanguageServer {
     /// what we found" (the map can be empty if no packages register).
     /// Wrapped in `Arc` so clones share memory across hover calls.
     vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
+
+    /// Per-route-file cache of [`route_name_locator`] output, keyed by
+    /// mtime. Find-references on a route runs route_name_locator on every
+    /// file in `routes/` — without this cache, every invocation re-parses
+    /// the routes/ directory from scratch. The cache turns subsequent
+    /// invocations into a stat + HashMap lookup.
+    route_decl_cache: Arc<
+        RwLock<
+            HashMap<
+                PathBuf,
+                (
+                    std::time::SystemTime,
+                    Arc<Vec<laravel_lsp::route_name_locator::RouteNameDeclaration>>,
+                ),
+            >,
+        >,
+    >,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2745,6 +2762,7 @@ impl LaravelLanguageServer {
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
+            route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2961,6 +2979,41 @@ impl LaravelLanguageServer {
                 warmed, total
             );
         });
+    }
+
+    /// Return the cached `route_name_locator` output for `path`. Re-parses
+    /// only when the file's mtime differs from the cached entry. Returns
+    /// `None` if the file can't be stat'd or read.
+    ///
+    /// Without this cache, every find-references / rename / prepare_rename
+    /// on a route triggers a fresh tree-sitter parse of every routes/*.php
+    /// file. With it, the first call per mtime parses; subsequent calls
+    /// are HashMap lookups.
+    async fn cached_route_decls(
+        &self,
+        path: &Path,
+    ) -> Option<Arc<Vec<laravel_lsp::route_name_locator::RouteNameDeclaration>>> {
+        let disk_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+
+        // Cache hit?
+        {
+            let cache = self.route_decl_cache.read().await;
+            if let Some((cached_mtime, decls)) = cache.get(path) {
+                if *cached_mtime == disk_mtime {
+                    return Some(decls.clone());
+                }
+            }
+        }
+
+        // Cache miss / stale — read + parse + store.
+        let content = tokio::fs::read_to_string(path).await.ok()?;
+        let decls =
+            Arc::new(laravel_lsp::route_name_locator::extract_route_name_declarations(&content));
+        self.route_decl_cache
+            .write()
+            .await
+            .insert(path.to_path_buf(), (disk_mtime, decls.clone()));
+        Some(decls)
     }
 
     /// Register environment files directly with Salsa for parsing
@@ -11865,6 +11918,7 @@ return [
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
+            route_decl_cache: self.route_decl_cache.clone(),
         }
     }
 
@@ -13698,6 +13752,7 @@ return [
 /// `->name(...)` argument range. If so, return a `Route` symbol carrying
 /// the locator's full route name.
 async fn classify_with_decl_fallback(
+    server: &LaravelLanguageServer,
     file_path: &Path,
     patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
     position: Position,
@@ -13712,19 +13767,20 @@ async fn classify_with_decl_fallback(
     }
 
     // Fallback path: route-name declarations live in `routes/*.php` and
-    // aren't tagged by php.scm. Read the file (cheap: route files are tiny)
-    // and check whether the cursor sits on a `->name(...)` / `->as(...)`
-    // argument range surfaced by the locator.
+    // aren't tagged by php.scm. Use the mtime-cached decl walker so
+    // subsequent invocations don't re-parse the file.
     if !is_in_routes_dir(file_path) {
         return None;
     }
-    let content = tokio::fs::read_to_string(file_path).await.ok()?;
-    for decl in laravel_lsp::route_name_locator::extract_route_name_declarations(&content) {
+    let decls = server.cached_route_decls(file_path).await?;
+    for decl in decls.iter() {
         if decl.line == position.line
             && position.character >= decl.start_column
             && position.character <= decl.end_column
         {
-            return Some(laravel_lsp::references::SymbolRef::Route(decl.full_name));
+            return Some(laravel_lsp::references::SymbolRef::Route(
+                decl.full_name.clone(),
+            ));
         }
     }
     None
@@ -13733,7 +13789,8 @@ async fn classify_with_decl_fallback(
 /// Look up the source-text range a `prepare_rename` should return when the
 /// cursor sat on a declaration-fallback site (parser saw nothing, but the
 /// locator did). Used for prepare_rename's editor-highlight range.
-fn decl_range_at(
+async fn decl_range_at(
+    server: &LaravelLanguageServer,
     file_path: &Path,
     position: Position,
     symbol: &laravel_lsp::references::SymbolRef,
@@ -13743,9 +13800,8 @@ fn decl_range_at(
     let laravel_lsp::references::SymbolRef::Route(name) = symbol else {
         return None;
     };
-    let content = std::fs::read_to_string(file_path).ok()?;
-    let decls = laravel_lsp::route_name_locator::find_declarations_named(&content, name);
-    for d in decls {
+    let decls = server.cached_route_decls(file_path).await?;
+    for d in decls.iter().filter(|d| d.full_name == *name) {
         if d.line == position.line
             && position.character >= d.start_column
             && position.character <= d.end_column
@@ -13850,6 +13906,7 @@ fn collect_config_declaration_target(
 /// declaration is invisible to the parser (everything outside route/config/
 /// translation right now) contribute nothing.
 async fn collect_declaration_locations(
+    server: &LaravelLanguageServer,
     root: &Path,
     symbol: &laravel_lsp::references::SymbolRef,
 ) -> Vec<Location> {
@@ -13870,12 +13927,10 @@ async fn collect_declaration_locations(
                 if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(path) else {
+                let Some(all_decls) = server.cached_route_decls(path).await else {
                     continue;
                 };
-                let decls =
-                    laravel_lsp::route_name_locator::find_declarations_named(&content, name);
-                for d in decls {
+                for d in all_decls.iter().filter(|d| d.full_name == *name) {
                     if let Ok(uri) = Url::from_file_path(path) {
                         out.push(Location {
                             uri,
@@ -13974,6 +14029,7 @@ fn collect_translation_declaration_targets(
 /// group-prefixed routes, the locator already emits one target per segment
 /// so the prefix composition stays intact.)
 async fn collect_route_declaration_targets(
+    server: &LaravelLanguageServer,
     root: &Path,
     target: &str,
     new_name: &str,
@@ -13989,17 +14045,16 @@ async fn collect_route_declaration_targets(
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
             continue;
         }
-        if path.extension().is_none_or(|ext| ext != "php") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(path) else {
+        // Mtime-cached: first invocation per file mtime parses the file
+        // with route_name_locator; subsequent invocations are a HashMap hit
+        // until the file changes on disk.
+        let Some(all_decls) = server.cached_route_decls(path).await else {
             continue;
         };
-        let decls = laravel_lsp::route_name_locator::find_declarations_named(&content, target);
-        for d in decls {
+        for d in all_decls.iter().filter(|d| d.full_name == target) {
             targets.push(laravel_lsp::rename::EditTarget {
                 file_path: path.to_path_buf(),
                 line: d.line,
@@ -14871,7 +14926,8 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -14907,7 +14963,7 @@ impl LanguageServer for LaravelLanguageServer {
         if include_declaration {
             let root_path = self.root_path.read().await.clone();
             if let Some(root) = root_path.as_ref() {
-                lsp_locations.extend(collect_declaration_locations(root, &symbol).await);
+                lsp_locations.extend(collect_declaration_locations(self, root, &symbol).await);
             }
         }
 
@@ -14942,7 +14998,8 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -14954,8 +15011,11 @@ impl LanguageServer for LaravelLanguageServer {
         // For declaration-cursor cases, the pattern range from
         // `pattern_range_at` is None (the parser didn't classify the
         // position). Fall back to the locator-reported decl range.
-        let range = pattern_range_at(&patterns, position.line, position.character)
-            .or_else(|| decl_range_at(&file_path, position, &symbol));
+        let pattern_range = pattern_range_at(&patterns, position.line, position.character);
+        let range = match pattern_range {
+            Some(r) => Some(r),
+            None => decl_range_at(self, &file_path, position, &symbol).await,
+        };
         Ok(range.map(PrepareRenameResponse::Range))
     }
 
@@ -14985,7 +15045,8 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -15027,7 +15088,9 @@ impl LanguageServer for LaravelLanguageServer {
                 // (the locator emits one target per `->name(...)` segment;
                 // group prefixes get their own segments).
                 if let Some(root) = root_path.as_ref() {
-                    targets.extend(collect_route_declaration_targets(root, name, &new_name).await);
+                    targets.extend(
+                        collect_route_declaration_targets(self, root, name, &new_name).await,
+                    );
                 }
             }
             laravel_lsp::references::SymbolRef::Config(key) => {

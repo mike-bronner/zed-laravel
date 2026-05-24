@@ -213,6 +213,70 @@ fn dummy_path() -> PathBuf {
 }
 
 #[test]
+fn parse_file_patterns_extracts_views_from_blade_echo() {
+    // Sanity check on the Salsa-cached side: `{{ view('partials.header') }}`
+    // in a Blade file must show up in ParsedPatterns.views. Regression test
+    // for the bug where tree-sitter-php couldn't see through Blade wrappers.
+    let db = LaravelDatabase::default();
+    let path = PathBuf::from("/fixture/layout.blade.php");
+    let source = "<div>{{ view('partials.header') }}</div>\n";
+    let file = SourceFile::new(&db, path, 0, source.to_string());
+    let patterns = parse_file_patterns(&db, file);
+    let names: Vec<String> = patterns
+        .views(&db)
+        .iter()
+        .map(|v| v.name(&db).name(&db).clone())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "partials.header"),
+        "expected 'partials.header' view extracted from Blade echo, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn parse_file_patterns_extracts_translations_from_blade_echo() {
+    let db = LaravelDatabase::default();
+    let path = PathBuf::from("/fixture/page.blade.php");
+    let source = "<p>{{ __('auth.failed') }}</p>\n";
+    let file = SourceFile::new(&db, path, 0, source.to_string());
+    let patterns = parse_file_patterns(&db, file);
+    let keys: Vec<String> = patterns
+        .translation_refs(&db)
+        .iter()
+        .map(|t| t.key(&db).key(&db).clone())
+        .collect();
+    assert!(
+        keys.iter().any(|k| k == "auth.failed"),
+        "expected 'auth.failed' translation, got {:?}",
+        keys
+    );
+}
+
+#[test]
+fn parse_file_patterns_extracts_views_from_blade_php_block() {
+    // `@php ... @endphp` content gets the same re-parse treatment.
+    let db = LaravelDatabase::default();
+    let path = PathBuf::from("/fixture/php-block.blade.php");
+    let source = r#"@php
+    $partial = view('partials.alert');
+@endphp
+"#;
+    let file = SourceFile::new(&db, path, 0, source.to_string());
+    let patterns = parse_file_patterns(&db, file);
+    let names: Vec<String> = patterns
+        .views(&db)
+        .iter()
+        .map(|v| v.name(&db).name(&db).clone())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "partials.alert"),
+        "expected 'partials.alert' view extracted from @php block, got {:?}",
+        names
+    );
+}
+
+#[test]
 fn collect_view_matches_only_named_classifications() {
     let mut p = ParsedPatternsData::default();
     p.views.push(Arc::new(ViewReferenceData {

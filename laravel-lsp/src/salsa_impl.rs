@@ -771,6 +771,182 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
         }
     }
 
+    // For Blade files: every `{{ }}` / `{!! !!}` / `@php` region carries
+    // PHP that tree-sitter-php can't recover when given the surrounding
+    // Blade syntax. Extract each region individually, re-parse as PHP, and
+    // accumulate its patterns into the same Salsa-tracked vectors that the
+    // PHP path below populates. Without this, route/view/config/env/...
+    // calls inside Blade `{{ }}` are invisible to find-references, hover,
+    // and goto-definition.
+    if is_blade {
+        use crate::blade_embedded_php::{adjust_inner_position, extract_php_regions};
+        let regions = extract_php_regions(text);
+        let lang_php = language_php();
+        for region in regions {
+            let wrapped = format!("<?php {}", region.content);
+            let Ok(snippet_tree) = parse_php(&wrapped) else {
+                continue;
+            };
+            let Ok(snippet_patterns) = extract_all_php_patterns(&snippet_tree, &wrapped, &lang_php)
+            else {
+                continue;
+            };
+            for view in snippet_patterns.views {
+                let (line, col) = adjust_inner_position(
+                    view.row as u32,
+                    view.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    view.row as u32,
+                    view.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let name = ViewName::new(db, view.view_name.to_string());
+                views.push(ViewReference::new(
+                    db,
+                    name,
+                    line,
+                    col,
+                    end_col,
+                    view.is_route_view,
+                ));
+            }
+            for env in snippet_patterns.env_calls {
+                let (line, col) = adjust_inner_position(
+                    env.row as u32,
+                    env.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    env.row as u32,
+                    env.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let name = EnvVarName::new(db, env.var_name.to_string());
+                env_refs.push(EnvReference::new(
+                    db,
+                    name,
+                    env.has_fallback,
+                    line,
+                    col,
+                    end_col,
+                ));
+            }
+            for config in snippet_patterns.config_calls {
+                let (line, col) = adjust_inner_position(
+                    config.row as u32,
+                    config.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    config.row as u32,
+                    config.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let key = ConfigKey::new(db, config.config_key.to_string());
+                config_refs.push(ConfigReference::new(db, key, line, col, end_col));
+            }
+            for mw in snippet_patterns.middleware_calls {
+                let (line, col) = adjust_inner_position(
+                    mw.row as u32,
+                    mw.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    mw.row as u32,
+                    mw.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let name = MiddlewareName::new(db, mw.middleware_name.to_string());
+                middleware_refs.push(MiddlewareReference::new(db, name, line, col, end_col));
+            }
+            for trans in snippet_patterns.translation_calls {
+                let (line, col) = adjust_inner_position(
+                    trans.row as u32,
+                    trans.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    trans.row as u32,
+                    trans.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let key = TranslationKey::new(db, trans.translation_key.to_string());
+                translation_refs.push(TranslationReference::new(db, key, line, col, end_col));
+            }
+            for asset in snippet_patterns.asset_calls {
+                let (line, col) = adjust_inner_position(
+                    asset.row as u32,
+                    asset.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    asset.row as u32,
+                    asset.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let path = AssetPath::new(db, asset.path.to_string());
+                let helper_type = match asset.helper_type {
+                    QueryAssetHelperType::Asset => AssetHelperType::Asset,
+                    QueryAssetHelperType::PublicPath => AssetHelperType::PublicPath,
+                    QueryAssetHelperType::BasePath => AssetHelperType::BasePath,
+                    QueryAssetHelperType::AppPath => AssetHelperType::AppPath,
+                    QueryAssetHelperType::StoragePath => AssetHelperType::StoragePath,
+                    QueryAssetHelperType::DatabasePath => AssetHelperType::DatabasePath,
+                    QueryAssetHelperType::LangPath => AssetHelperType::LangPath,
+                    QueryAssetHelperType::ConfigPath => AssetHelperType::ConfigPath,
+                    QueryAssetHelperType::ResourcePath => AssetHelperType::ResourcePath,
+                    QueryAssetHelperType::Mix => AssetHelperType::Mix,
+                    QueryAssetHelperType::ViteAsset => AssetHelperType::ViteAsset,
+                };
+                asset_refs.push(AssetReference::new(
+                    db,
+                    path,
+                    helper_type,
+                    line,
+                    col,
+                    end_col,
+                ));
+            }
+            for binding in snippet_patterns.binding_calls {
+                let (line, col) = adjust_inner_position(
+                    binding.row as u32,
+                    binding.column as u32,
+                    region.row,
+                    region.column,
+                );
+                let (_, end_col) = adjust_inner_position(
+                    binding.row as u32,
+                    binding.end_column as u32,
+                    region.row,
+                    region.column,
+                );
+                let name = BindingName::new(db, binding.binding_name.to_string());
+                binding_refs.push(BindingReference::new(
+                    db,
+                    name,
+                    binding.is_class_reference,
+                    line,
+                    col,
+                    end_col,
+                ));
+            }
+        }
+    }
+
     // Parse PHP (including Blade files for embedded PHP) - single pass extraction
     if let Ok(tree) = parse_php(text) {
         let lang = language_php();
@@ -4352,6 +4528,113 @@ impl SalsaActor {
                         line: f.row as u32,
                         column: f.column as u32,
                         end_column: f.end_column as u32,
+                    }));
+                }
+            }
+        }
+
+        // Blade-embedded PHP: extract route/url/action/feature from every
+        // `{{ }}` / `{!! !!}` / `@php` region. Mirrors the Salsa-cached
+        // extraction in parse_file_patterns for the kinds that aren't
+        // stored in ParsedPatterns. Without this, route('home') inside a
+        // Blade nav menu is invisible to find-references.
+        let is_blade = file
+            .path(&self.db)
+            .to_string_lossy()
+            .ends_with(".blade.php");
+        if is_blade {
+            use crate::blade_embedded_php::{adjust_inner_position, extract_php_regions};
+            let lang_php = language_php();
+            for region in extract_php_regions(text) {
+                let wrapped = format!("<?php {}", region.content);
+                let Ok(snippet_tree) = parse_php(&wrapped) else {
+                    continue;
+                };
+                let Ok(snippet_patterns) =
+                    extract_all_php_patterns(&snippet_tree, &wrapped, &lang_php)
+                else {
+                    continue;
+                };
+                for r in snippet_patterns.route_calls {
+                    let (line, col) = adjust_inner_position(
+                        r.row as u32,
+                        r.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        r.row as u32,
+                        r.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    route_refs.push(Arc::new(RouteReferenceData {
+                        name: r.route_name.to_string(),
+                        line,
+                        column: col,
+                        end_column: end_col,
+                    }));
+                }
+                for u in snippet_patterns.url_calls {
+                    let (line, col) = adjust_inner_position(
+                        u.row as u32,
+                        u.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        u.row as u32,
+                        u.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    url_refs.push(Arc::new(UrlReferenceData {
+                        path: u.url_path.to_string(),
+                        line,
+                        column: col,
+                        end_column: end_col,
+                    }));
+                }
+                for a in snippet_patterns.action_calls {
+                    let (line, col) = adjust_inner_position(
+                        a.row as u32,
+                        a.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        a.row as u32,
+                        a.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    action_refs.push(Arc::new(ActionReferenceData {
+                        action: a.action_name.to_string(),
+                        line,
+                        column: col,
+                        end_column: end_col,
+                    }));
+                }
+                for f in snippet_patterns.feature_calls {
+                    let (line, col) = adjust_inner_position(
+                        f.row as u32,
+                        f.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        f.row as u32,
+                        f.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    feature_refs.push(Arc::new(FeatureReferenceData {
+                        feature_name: f.feature_name.to_string(),
+                        method_name: f.method_name.to_string(),
+                        is_class_reference: f.is_class_reference,
+                        line,
+                        column: col,
+                        end_column: end_col,
                     }));
                 }
             }

@@ -13683,6 +13683,96 @@ return [
     }
 }
 
+/// Classify the symbol under the cursor, with a declaration-site fallback
+/// for files the parser doesn't fully cover.
+///
+/// The tree-sitter `php.scm` query captures every call-site shape for routes
+/// (`route('home')`, `URL::route('home')`, `signed_route('home')`, etc.) but
+/// has no rule for `->name('home')` declarations. When the cursor sits on a
+/// declaration, the primary classifier returns `None`, which would make
+/// references / rename silently no-op — confusing because the user is
+/// pointing right at the symbol's definition.
+///
+/// The fallback walks the file with `route_name_locator` (the same locator
+/// rename already uses) and checks whether the cursor falls inside any
+/// `->name(...)` argument range. If so, return a `Route` symbol carrying
+/// the locator's full route name.
+async fn classify_with_decl_fallback(
+    file_path: &Path,
+    patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
+    position: Position,
+) -> Option<laravel_lsp::references::SymbolRef> {
+    // Primary path: the parser already classified something here.
+    if let Some(sym) = laravel_lsp::references::classify_pattern_at_cursor(
+        patterns,
+        position.line,
+        position.character,
+    ) {
+        return Some(sym);
+    }
+
+    // Fallback path: route-name declarations live in `routes/*.php` and
+    // aren't tagged by php.scm. Read the file (cheap: route files are tiny)
+    // and check whether the cursor sits on a `->name(...)` / `->as(...)`
+    // argument range surfaced by the locator.
+    if !is_in_routes_dir(file_path) {
+        return None;
+    }
+    let content = tokio::fs::read_to_string(file_path).await.ok()?;
+    for decl in laravel_lsp::route_name_locator::extract_route_name_declarations(&content) {
+        if decl.line == position.line
+            && position.character >= decl.start_column
+            && position.character <= decl.end_column
+        {
+            return Some(laravel_lsp::references::SymbolRef::Route(decl.full_name));
+        }
+    }
+    None
+}
+
+/// Look up the source-text range a `prepare_rename` should return when the
+/// cursor sat on a declaration-fallback site (parser saw nothing, but the
+/// locator did). Used for prepare_rename's editor-highlight range.
+fn decl_range_at(
+    file_path: &Path,
+    position: Position,
+    symbol: &laravel_lsp::references::SymbolRef,
+) -> Option<Range> {
+    // Only route declarations are currently locator-discoverable; configs
+    // and translations are reachable only via call-site classification.
+    let laravel_lsp::references::SymbolRef::Route(name) = symbol else {
+        return None;
+    };
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let decls = laravel_lsp::route_name_locator::find_declarations_named(&content, name);
+    for d in decls {
+        if d.line == position.line
+            && position.character >= d.start_column
+            && position.character <= d.end_column
+        {
+            return Some(Range {
+                start: Position {
+                    line: d.line,
+                    character: d.start_column,
+                },
+                end: Position {
+                    line: d.line,
+                    character: d.end_column,
+                },
+            });
+        }
+    }
+    None
+}
+
+/// Heuristic: is this file under a `routes/` subdirectory anywhere in its
+/// path? Used to gate the declaration-fallback walk so we don't pay the
+/// parse cost on every PHP file.
+fn is_in_routes_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes"))
+}
+
 /// Return the column range of the classified pattern under the cursor.
 /// Used by `prepare_rename` so the editor highlights the right span.
 fn pattern_range_at(
@@ -14776,16 +14866,12 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
 
-        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
-            &patterns,
-            position.line,
-            position.character,
-        ) {
+        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -14851,16 +14937,12 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
 
-        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
-            &patterns,
-            position.line,
-            position.character,
-        ) {
+        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -14869,7 +14951,11 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        let range = pattern_range_at(&patterns, position.line, position.character);
+        // For declaration-cursor cases, the pattern range from
+        // `pattern_range_at` is None (the parser didn't classify the
+        // position). Fall back to the locator-reported decl range.
+        let range = pattern_range_at(&patterns, position.line, position.character)
+            .or_else(|| decl_range_at(&file_path, position, &symbol));
         Ok(range.map(PrepareRenameResponse::Range))
     }
 
@@ -14894,16 +14980,12 @@ impl LanguageServer for LaravelLanguageServer {
             return Ok(None);
         }
 
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
 
-        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
-            &patterns,
-            position.line,
-            position.character,
-        ) {
+        let symbol = match classify_with_decl_fallback(&file_path, &patterns, position).await {
             Some(s) => s,
             None => return Ok(None),
         };

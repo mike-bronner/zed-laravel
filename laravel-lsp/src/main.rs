@@ -2947,23 +2947,26 @@ impl LaravelLanguageServer {
 
         info!("Laravel LSP: Project files registered with Salsa for reference finding");
 
-        // Pattern-cache warming via parallel out-of-actor parsing.
+        // Pattern-cache warming via THROTTLED parallel parsing.
         //
-        // The Salsa actor is single-threaded by design. The previous
-        // implementation sent one `get_patterns` per file through the
-        // actor's channel, which serialised every parse and blocked
-        // interactive requests (hover, goto-def, find-references) for the
-        // duration. On a real Laravel project, that meant ~30 seconds of
-        // unresponsive LSP after workspace open.
+        // History: a previous revision of this code spawned an unbounded
+        // `tokio::task::spawn_blocking` per file. On real-world projects
+        // (hundreds-to-thousands of PHP files) this saturated the blocking
+        // thread pool, pinned every CPU core, and consumed enough RAM to
+        // hang the machine. Don't do that again.
         //
-        // The new flow:
-        //   1. Pull the file list from the actor (single round-trip).
-        //   2. Parse + extract every file in parallel via tokio's blocking
-        //      thread pool (tree-sitter is CPU-bound).
-        //   3. Bulk-import all results into the actor's pattern cache in
-        //      ONE request.
-        //
-        // The user's first interactive request hits a fully-warm cache.
+        // Throttle invariants:
+        //   * At most `MAX_CONCURRENT_PARSES` parses in flight at any time
+        //     (semaphore-gated). Memory and CPU stay bounded regardless of
+        //     project size.
+        //   * Per-file size cap. Tree-sitter on a 50MB PHP file is the
+        //     wrong tool for the wrong workload — skip + log.
+        //   * Bulk-import in chunks so the actor's pattern_cache.put loop
+        //     never holds the actor for too long on a giant project.
+        const MAX_CONCURRENT_PARSES: usize = 8;
+        const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024; // 4 MB
+        const BULK_IMPORT_CHUNK: usize = 256;
+
         let salsa = self.salsa.clone();
         tokio::spawn(async move {
             let started_at = std::time::Instant::now();
@@ -2975,32 +2978,67 @@ impl LaravelLanguageServer {
                 }
             };
             let total = paths.len();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
 
-            // Step 2: parallel parse. spawn_blocking lets tokio run each
-            // file on its blocking thread pool (default = #CPUs × 512),
-            // and tree-sitter releases CPU naturally so other tokio tasks
-            // (e.g. inbound LSP requests) still progress.
+            // Spawn one task per file, each gated by the semaphore. The
+            // semaphore ensures we never have more than N parses running
+            // (or holding parsed-tree memory) at once.
             let mut handles = Vec::with_capacity(total);
             for path in paths {
-                handles.push(tokio::task::spawn_blocking(
-                    move || -> Option<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> {
-                        let text = std::fs::read_to_string(&path).ok()?;
-                        let data = laravel_lsp::pattern_indexer::parse_owned(&path, &text);
-                        Some((path, data))
-                    },
-                ));
+                let permit_owner = semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = match permit_owner.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
+                    // Skip oversized files so a checked-in vendor blob or
+                    // accidental large file can't stall the indexer.
+                    let metadata = std::fs::metadata(&path).ok()?;
+                    if metadata.len() > MAX_FILE_SIZE_BYTES {
+                        debug!(
+                            "warming: skipping {} ({}B exceeds {}B cap)",
+                            path.display(),
+                            metadata.len(),
+                            MAX_FILE_SIZE_BYTES
+                        );
+                        return None;
+                    }
+                    // Actual parse on the blocking pool — tree-sitter is
+                    // CPU-bound and would block the async runtime if run
+                    // directly in a tokio task.
+                    let path_for_task = path.clone();
+                    let parsed: Option<Arc<laravel_lsp::salsa_impl::ParsedPatternsData>> =
+                        tokio::task::spawn_blocking(move || {
+                            let text = std::fs::read_to_string(&path_for_task).ok()?;
+                            Some(laravel_lsp::pattern_indexer::parse_owned(
+                                &path_for_task,
+                                &text,
+                            ))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    parsed.map(|data| (path, data))
+                }));
             }
 
-            let mut entries = Vec::with_capacity(total);
+            // Collect results as tasks finish. Bulk-import in chunks so the
+            // actor doesn't stall on a single 1000-entry insert loop.
+            let mut buffer: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+                Vec::with_capacity(BULK_IMPORT_CHUNK);
+            let mut imported = 0usize;
             for h in handles {
                 if let Ok(Some(pair)) = h.await {
-                    entries.push(pair);
+                    buffer.push(pair);
+                    if buffer.len() >= BULK_IMPORT_CHUNK {
+                        let chunk = std::mem::take(&mut buffer);
+                        imported += salsa.bulk_import_patterns(chunk).await.unwrap_or(0);
+                    }
                 }
             }
-            let parsed = entries.len();
-
-            // Step 3: bulk-import. Single actor round-trip.
-            let imported = salsa.bulk_import_patterns(entries).await.unwrap_or(0);
+            if !buffer.is_empty() {
+                imported += salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+            }
 
             info!(
                 "🔥 Laravel LSP: pattern cache warmed ({}/{} files imported, {:?})",
@@ -3008,7 +3046,6 @@ impl LaravelLanguageServer {
                 total,
                 started_at.elapsed()
             );
-            let _ = parsed;
         });
     }
 

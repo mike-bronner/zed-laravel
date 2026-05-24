@@ -2970,6 +2970,17 @@ impl LaravelLanguageServer {
         let salsa = self.salsa.clone();
         tokio::spawn(async move {
             let started_at = std::time::Instant::now();
+
+            // Defensively prewarm the global query cache on this thread
+            // before spawning parallel parses. The Salsa actor already
+            // prewarms during init, but if our warming task races ahead
+            // of that, one parse_owned call would pay the ~400ms one-time
+            // compilation cost. Doing it here once is free if already
+            // warm, prevents per-task surprises if not.
+            tokio::task::spawn_blocking(laravel_lsp::queries::prewarm_query_cache)
+                .await
+                .ok();
+
             let paths = match salsa.list_project_files().await {
                 Ok(p) => p,
                 Err(e) => {

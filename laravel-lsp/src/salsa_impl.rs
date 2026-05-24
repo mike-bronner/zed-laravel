@@ -947,116 +947,123 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
         }
     }
 
-    // Parse PHP (including Blade files for embedded PHP) - single pass extraction
-    if let Ok(tree) = parse_php(text) {
-        let lang = language_php();
+    // Full-file PHP parse — ONLY for .php files. See pattern_indexer.rs
+    // for the rationale: tree-sitter-php on Blade content produces an
+    // error tree that the PHP queries walk pathologically slowly on
+    // certain real-world inputs (Flux icon SVG path data hit 394ms for
+    // a 1.3KB file). All Blade-embedded PHP is extracted above via
+    // extract_php_regions + per-region <?php-wrapped parsing.
+    if !is_blade {
+        if let Ok(tree) = parse_php(text) {
+            let lang = language_php();
 
-        if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
-            // Process views
-            for view in php_patterns.views {
-                let name = ViewName::new(db, view.view_name.to_string());
-                views.push(ViewReference::new(
-                    db,
-                    name,
-                    view.row as u32,
-                    view.column as u32,
-                    view.end_column as u32,
-                    view.is_route_view,
-                ));
+            if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
+                // Process views
+                for view in php_patterns.views {
+                    let name = ViewName::new(db, view.view_name.to_string());
+                    views.push(ViewReference::new(
+                        db,
+                        name,
+                        view.row as u32,
+                        view.column as u32,
+                        view.end_column as u32,
+                        view.is_route_view,
+                    ));
+                }
+
+                // Process env calls
+                for env in php_patterns.env_calls {
+                    let name = EnvVarName::new(db, env.var_name.to_string());
+                    env_refs.push(EnvReference::new(
+                        db,
+                        name,
+                        env.has_fallback,
+                        env.row as u32,
+                        env.column as u32,
+                        env.end_column as u32,
+                    ));
+                }
+
+                // Process config calls
+                for config in php_patterns.config_calls {
+                    let key = ConfigKey::new(db, config.config_key.to_string());
+                    config_refs.push(ConfigReference::new(
+                        db,
+                        key,
+                        config.row as u32,
+                        config.column as u32,
+                        config.end_column as u32,
+                    ));
+                }
+
+                // Process middleware calls
+                for mw in php_patterns.middleware_calls {
+                    let name = MiddlewareName::new(db, mw.middleware_name.to_string());
+                    middleware_refs.push(MiddlewareReference::new(
+                        db,
+                        name,
+                        mw.row as u32,
+                        mw.column as u32,
+                        mw.end_column as u32,
+                    ));
+                }
+
+                // Process translation calls
+                for trans in php_patterns.translation_calls {
+                    let key = TranslationKey::new(db, trans.translation_key.to_string());
+                    translation_refs.push(TranslationReference::new(
+                        db,
+                        key,
+                        trans.row as u32,
+                        trans.column as u32,
+                        trans.end_column as u32,
+                    ));
+                }
+
+                // Process asset calls
+                for asset in php_patterns.asset_calls {
+                    let path = AssetPath::new(db, asset.path.to_string());
+                    let helper_type = match asset.helper_type {
+                        QueryAssetHelperType::Asset => AssetHelperType::Asset,
+                        QueryAssetHelperType::PublicPath => AssetHelperType::PublicPath,
+                        QueryAssetHelperType::BasePath => AssetHelperType::BasePath,
+                        QueryAssetHelperType::AppPath => AssetHelperType::AppPath,
+                        QueryAssetHelperType::StoragePath => AssetHelperType::StoragePath,
+                        QueryAssetHelperType::DatabasePath => AssetHelperType::DatabasePath,
+                        QueryAssetHelperType::LangPath => AssetHelperType::LangPath,
+                        QueryAssetHelperType::ConfigPath => AssetHelperType::ConfigPath,
+                        QueryAssetHelperType::ResourcePath => AssetHelperType::ResourcePath,
+                        QueryAssetHelperType::Mix => AssetHelperType::Mix,
+                        QueryAssetHelperType::ViteAsset => AssetHelperType::ViteAsset,
+                    };
+                    asset_refs.push(AssetReference::new(
+                        db,
+                        path,
+                        helper_type,
+                        asset.row as u32,
+                        asset.column as u32,
+                        asset.end_column as u32,
+                    ));
+                }
+
+                // Process binding calls
+                for binding in php_patterns.binding_calls {
+                    let name = BindingName::new(db, binding.binding_name.to_string());
+                    binding_refs.push(BindingReference::new(
+                        db,
+                        name,
+                        binding.is_class_reference,
+                        binding.row as u32,
+                        binding.column as u32,
+                        binding.end_column as u32,
+                    ));
+                }
+
+                // Note: route_refs, url_refs, action_refs are extracted in handle_get_patterns
+                // to keep ParsedPatterns field count under Salsa's 12-element limit
             }
-
-            // Process env calls
-            for env in php_patterns.env_calls {
-                let name = EnvVarName::new(db, env.var_name.to_string());
-                env_refs.push(EnvReference::new(
-                    db,
-                    name,
-                    env.has_fallback,
-                    env.row as u32,
-                    env.column as u32,
-                    env.end_column as u32,
-                ));
-            }
-
-            // Process config calls
-            for config in php_patterns.config_calls {
-                let key = ConfigKey::new(db, config.config_key.to_string());
-                config_refs.push(ConfigReference::new(
-                    db,
-                    key,
-                    config.row as u32,
-                    config.column as u32,
-                    config.end_column as u32,
-                ));
-            }
-
-            // Process middleware calls
-            for mw in php_patterns.middleware_calls {
-                let name = MiddlewareName::new(db, mw.middleware_name.to_string());
-                middleware_refs.push(MiddlewareReference::new(
-                    db,
-                    name,
-                    mw.row as u32,
-                    mw.column as u32,
-                    mw.end_column as u32,
-                ));
-            }
-
-            // Process translation calls
-            for trans in php_patterns.translation_calls {
-                let key = TranslationKey::new(db, trans.translation_key.to_string());
-                translation_refs.push(TranslationReference::new(
-                    db,
-                    key,
-                    trans.row as u32,
-                    trans.column as u32,
-                    trans.end_column as u32,
-                ));
-            }
-
-            // Process asset calls
-            for asset in php_patterns.asset_calls {
-                let path = AssetPath::new(db, asset.path.to_string());
-                let helper_type = match asset.helper_type {
-                    QueryAssetHelperType::Asset => AssetHelperType::Asset,
-                    QueryAssetHelperType::PublicPath => AssetHelperType::PublicPath,
-                    QueryAssetHelperType::BasePath => AssetHelperType::BasePath,
-                    QueryAssetHelperType::AppPath => AssetHelperType::AppPath,
-                    QueryAssetHelperType::StoragePath => AssetHelperType::StoragePath,
-                    QueryAssetHelperType::DatabasePath => AssetHelperType::DatabasePath,
-                    QueryAssetHelperType::LangPath => AssetHelperType::LangPath,
-                    QueryAssetHelperType::ConfigPath => AssetHelperType::ConfigPath,
-                    QueryAssetHelperType::ResourcePath => AssetHelperType::ResourcePath,
-                    QueryAssetHelperType::Mix => AssetHelperType::Mix,
-                    QueryAssetHelperType::ViteAsset => AssetHelperType::ViteAsset,
-                };
-                asset_refs.push(AssetReference::new(
-                    db,
-                    path,
-                    helper_type,
-                    asset.row as u32,
-                    asset.column as u32,
-                    asset.end_column as u32,
-                ));
-            }
-
-            // Process binding calls
-            for binding in php_patterns.binding_calls {
-                let name = BindingName::new(db, binding.binding_name.to_string());
-                binding_refs.push(BindingReference::new(
-                    db,
-                    name,
-                    binding.is_class_reference,
-                    binding.row as u32,
-                    binding.column as u32,
-                    binding.end_column as u32,
-                ));
-            }
-
-            // Note: route_refs, url_refs, action_refs are extracted in handle_get_patterns
-            // to keep ParsedPatterns field count under Salsa's 12-element limit
         }
-    }
+    } // end if !is_blade
 
     ParsedPatterns::new(
         db,
@@ -4531,60 +4538,65 @@ impl SalsaActor {
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
 
-        if let Ok(tree) = parse_php(text) {
-            let lang = language_php();
+        // Skip the full-file PHP parse for Blade files — same rationale as
+        // in parse_file_patterns above. Blade-embedded route/url/action/
+        // feature extraction is handled by the `is_blade` block below.
+        let path_is_blade = file
+            .path(&self.db)
+            .to_string_lossy()
+            .ends_with(".blade.php");
+        if !path_is_blade {
+            if let Ok(tree) = parse_php(text) {
+                let lang = language_php();
 
-            if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
-                for r in php_patterns.route_calls {
-                    route_refs.push(Arc::new(RouteReferenceData {
-                        name: r.route_name.to_string(),
-                        line: r.row as u32,
-                        column: r.column as u32,
-                        end_column: r.end_column as u32,
-                    }));
-                }
+                if let Ok(php_patterns) = extract_all_php_patterns(&tree, text, &lang) {
+                    for r in php_patterns.route_calls {
+                        route_refs.push(Arc::new(RouteReferenceData {
+                            name: r.route_name.to_string(),
+                            line: r.row as u32,
+                            column: r.column as u32,
+                            end_column: r.end_column as u32,
+                        }));
+                    }
 
-                for u in php_patterns.url_calls {
-                    url_refs.push(Arc::new(UrlReferenceData {
-                        path: u.url_path.to_string(),
-                        line: u.row as u32,
-                        column: u.column as u32,
-                        end_column: u.end_column as u32,
-                    }));
-                }
+                    for u in php_patterns.url_calls {
+                        url_refs.push(Arc::new(UrlReferenceData {
+                            path: u.url_path.to_string(),
+                            line: u.row as u32,
+                            column: u.column as u32,
+                            end_column: u.end_column as u32,
+                        }));
+                    }
 
-                for a in php_patterns.action_calls {
-                    action_refs.push(Arc::new(ActionReferenceData {
-                        action: a.action_name.to_string(),
-                        line: a.row as u32,
-                        column: a.column as u32,
-                        end_column: a.end_column as u32,
-                    }));
-                }
+                    for a in php_patterns.action_calls {
+                        action_refs.push(Arc::new(ActionReferenceData {
+                            action: a.action_name.to_string(),
+                            line: a.row as u32,
+                            column: a.column as u32,
+                            end_column: a.end_column as u32,
+                        }));
+                    }
 
-                for f in php_patterns.feature_calls {
-                    feature_refs.push(Arc::new(FeatureReferenceData {
-                        feature_name: f.feature_name.to_string(),
-                        method_name: f.method_name.to_string(),
-                        is_class_reference: f.is_class_reference,
-                        line: f.row as u32,
-                        column: f.column as u32,
-                        end_column: f.end_column as u32,
-                    }));
+                    for f in php_patterns.feature_calls {
+                        feature_refs.push(Arc::new(FeatureReferenceData {
+                            feature_name: f.feature_name.to_string(),
+                            method_name: f.method_name.to_string(),
+                            is_class_reference: f.is_class_reference,
+                            line: f.row as u32,
+                            column: f.column as u32,
+                            end_column: f.end_column as u32,
+                        }));
+                    }
                 }
             }
-        }
+        } // end if !path_is_blade
 
         // Blade-embedded PHP: extract route/url/action/feature from every
         // `{{ }}` / `{!! !!}` / `@php` region. Mirrors the Salsa-cached
         // extraction in parse_file_patterns for the kinds that aren't
         // stored in ParsedPatterns. Without this, route('home') inside a
         // Blade nav menu is invisible to find-references.
-        let is_blade = file
-            .path(&self.db)
-            .to_string_lossy()
-            .ends_with(".blade.php");
-        if is_blade {
+        if path_is_blade {
             use crate::blade_embedded_php::{adjust_inner_position, extract_php_regions};
             let lang_php = language_php();
             for region in extract_php_regions(text) {

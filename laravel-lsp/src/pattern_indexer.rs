@@ -107,13 +107,28 @@ pub fn parse_owned(path: &Path, text: &str) -> Arc<ParsedPatternsData> {
         }
     }
 
-    // Full-file PHP parse. For .php files this is the main pass; for Blade
-    // files tree-sitter-php can't see through the Blade syntax, so this
-    // usually returns nothing — but it's cheap to attempt.
-    let lang_php = language_php();
-    if let Ok(tree) = parse_php(text) {
-        if let Ok(patterns) = extract_all_php_patterns(&tree, text, &lang_php) {
-            push_php_patterns(&patterns, &mut data, None);
+    // Full-file PHP parse. ONLY for .php files.
+    //
+    // It is tempting to attempt this on Blade files too — "just in case
+    // tree-sitter-php picks something up". DO NOT. tree-sitter-php on
+    // a Blade source produces a giant error-recovery tree (Blade is not
+    // valid PHP). Walking the PHP queries over that error tree is
+    // pathologically slow on some real-world content: a single 1.3KB
+    // Flux icon file with SVG path data took 394ms vs 555µs for its
+    // siblings — 700× slower — for ZERO additional extracted patterns.
+    // Multiplied across 40k icon files in a real project, this single
+    // line was the dominant cost of cache warming (and previously hung
+    // the developer's machine).
+    //
+    // All Blade-embedded PHP extraction happens above via
+    // `extract_php_regions` + `<?php `-wrapped per-region parsing,
+    // which is fast and accurate.
+    if !is_blade {
+        let lang_php = language_php();
+        if let Ok(tree) = parse_php(text) {
+            if let Ok(patterns) = extract_all_php_patterns(&tree, text, &lang_php) {
+                push_php_patterns(&patterns, &mut data, None);
+            }
         }
     }
 

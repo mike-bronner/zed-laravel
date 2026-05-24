@@ -13649,6 +13649,93 @@ return [
     }
 }
 
+/// Return the column range of the classified pattern under the cursor.
+/// Used by `prepare_rename` so the editor highlights the right span.
+fn pattern_range_at(
+    patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
+    line: u32,
+    column: u32,
+) -> Option<Range> {
+    let pat = patterns.find_at_position(line, column)?;
+    let (l, start, end) = match pat {
+        laravel_lsp::salsa_impl::PatternAtPosition::View(v) => (v.line, v.column, v.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Route(r) => (r.line, r.column, r.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::ConfigRef(c) => {
+            (c.line, c.column, c.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Translation(t) => {
+            (t.line, t.column, t.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::EnvRef(e) => (e.line, e.column, e.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Component(c) => {
+            (c.line, c.column, c.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Livewire(l) => (l.line, l.column, l.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Middleware(m) => {
+            (m.line, m.column, m.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Binding(b) => (b.line, b.column, b.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Directive(d) => {
+            (d.line, d.string_column, d.string_end_column)
+        }
+        // Other patterns aren't renameable; range still useful for highlights.
+        laravel_lsp::salsa_impl::PatternAtPosition::Asset(a) => (a.line, a.column, a.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Url(u) => (u.line, u.column, u.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Action(a) => (a.line, a.column, a.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Feature(f) => (f.line, f.column, f.end_column),
+    };
+    Some(Range {
+        start: Position {
+            line: l,
+            character: start,
+        },
+        end: Position {
+            line: l,
+            character: end,
+        },
+    })
+}
+
+/// Walk every `routes/*.php` under the project root and surface
+/// `->name(...)` declaration sites whose full name matches `target`. Returns
+/// edit targets ready to be merged with call-site references.
+async fn collect_route_declaration_targets(
+    root: &Path,
+    target: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    let mut targets = Vec::new();
+    let routes_dir = root.join("routes");
+    if !routes_dir.exists() {
+        return targets;
+    }
+    for entry in WalkDir::new(&routes_dir)
+        .max_depth(6)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "php") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let decls = laravel_lsp::route_name_locator::find_declarations_named(&content, target);
+        for d in decls {
+            targets.push(laravel_lsp::rename::EditTarget {
+                file_path: path.to_path_buf(),
+                line: d.line,
+                start_column: d.start_column,
+                end_column: d.end_column,
+            });
+        }
+    }
+    targets
+}
+
 /// Convert a Salsa `ReferenceLocationData` into an LSP `Location`. Positions
 /// are 0-based throughout (matches `tree-sitter` and `lsp-types`). Returns
 /// `None` when the file path can't be expressed as a `file://` URL.
@@ -13826,6 +13913,17 @@ impl LanguageServer for LaravelLanguageServer {
                 // shape — only positions the parser tagged as the matching
                 // pattern kind are returned.
                 references_provider: Some(OneOf::Left(true)),
+
+                // ✅ Rename provider — `textDocument/rename` /
+                // `textDocument/prepareRename`. Phase 2: route names, config
+                // keys, translation keys. Anything that resolves to (or may
+                // resolve to) a PHP class is held back for Phase 3.
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                })),
 
                 // On-type formatting (currently unused, bracket expansion uses completions)
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
@@ -14526,6 +14624,123 @@ impl LanguageServer for LaravelLanguageServer {
             .collect();
 
         Ok(Some(lsp_locations))
+    }
+
+    /// `textDocument/prepareRename` — decide whether the symbol under the
+    /// cursor is renameable, and if so, return the range the editor should
+    /// highlight + use as the initial input. Returning `None` makes the
+    /// editor refuse the rename.
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let position = params.position;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
+            &patterns,
+            position.line,
+            position.character,
+        ) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if !laravel_lsp::rename::can_rename(&symbol) {
+            return Ok(None);
+        }
+
+        let range = pattern_range_at(&patterns, position.line, position.character);
+        Ok(range.map(PrepareRenameResponse::Range))
+    }
+
+    /// `textDocument/rename` — produce a `WorkspaceEdit` rewriting every
+    /// parser-classified call site for the symbol under the cursor PLUS the
+    /// declaration site for that symbol. The "instance chain" rule applies:
+    /// edits target only positions the tree-sitter parser already tagged.
+    async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match laravel_lsp::references::classify_pattern_at_cursor(
+            &patterns,
+            position.line,
+            position.character,
+        ) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if !laravel_lsp::rename::can_rename(&symbol) {
+            return Ok(None);
+        }
+
+        // Call-site references via Salsa. These are always parser-classified.
+        let call_sites = match self.salsa.find_references(symbol.to_data(), true).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                debug!("rename: Salsa find_references error {:?}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = call_sites
+            .into_iter()
+            .map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+            })
+            .collect();
+
+        // Declaration sites — per-kind walkers, tree-sitter based.
+        // `can_rename` above is the gate: a symbol only reaches here when its
+        // declaration walker is implemented. New kinds extend both `can_rename`
+        // and this match arm together.
+        let root_path = self.root_path.read().await.clone();
+        if let laravel_lsp::references::SymbolRef::Route(name) = &symbol {
+            if let Some(root) = root_path.as_ref() {
+                targets.extend(collect_route_declaration_targets(root, name).await);
+            }
+        }
+
+        Ok(laravel_lsp::rename::build_rename_edit(&new_name, &targets))
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")

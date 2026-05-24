@@ -2611,6 +2611,11 @@ pub enum SalsaRequest {
         include_declaration: bool,
         reply: oneshot::Sender<Vec<ReferenceLocationData>>,
     },
+    /// Eagerly parse every registered project file, populating the Salsa
+    /// pattern cache. Fired once shortly after workspace init so the first
+    /// cross-file query (`textDocument/references`) doesn't pay a cold-cache
+    /// penalty. Returns the number of files parsed.
+    WarmPatternCache { reply: oneshot::Sender<usize> },
 
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
@@ -3034,6 +3039,21 @@ impl SalsaHandle {
                 include_declaration,
                 reply: reply_tx,
             })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Eagerly populate the Salsa pattern cache by parsing every registered
+    /// project file. Returns the number of files parsed. Fire this from a
+    /// detached background task once after workspace init — by the time the
+    /// user reaches for `textDocument/references`, parsing should be done.
+    pub async fn warm_pattern_cache(&self) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::WarmPatternCache { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -3768,6 +3788,10 @@ impl SalsaActor {
                 } => {
                     let result = self.handle_find_references(&symbol, include_declaration);
                     let _ = reply.send(result);
+                }
+                SalsaRequest::WarmPatternCache { reply } => {
+                    let parsed = self.handle_warm_pattern_cache();
+                    let _ = reply.send(parsed);
                 }
 
                 // === Service Provider Handlers ===
@@ -4733,6 +4757,32 @@ impl SalsaActor {
         }
 
         references
+    }
+
+    /// Walk every registered project file and trigger pattern parsing —
+    /// populates the Salsa cache so the first cross-file query is cheap.
+    /// Returns the number of files actually parsed.
+    fn handle_warm_pattern_cache(&mut self) -> usize {
+        let mut parsed = 0usize;
+        let all_files: Vec<PathBuf> = self
+            .controller_files
+            .iter()
+            .chain(self.view_files.iter())
+            .chain(self.livewire_files.iter())
+            .chain(self.route_files.iter())
+            .cloned()
+            .collect();
+        let total = all_files.len();
+        for path in &all_files {
+            if self.handle_get_patterns(path).is_some() {
+                parsed += 1;
+            }
+        }
+        info!(
+            "🔥 Warmed pattern cache: parsed {}/{} project files",
+            parsed, total
+        );
+        parsed
     }
 
     /// Generic find-references engine. Walks every registered project file and

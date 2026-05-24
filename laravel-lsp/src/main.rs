@@ -2924,9 +2924,29 @@ impl LaravelLanguageServer {
             .await
         {
             debug!("Failed to register project files with Salsa: {}", e);
-        } else {
-            info!("Laravel LSP: Project files registered with Salsa for reference finding");
+            return;
         }
+
+        info!("Laravel LSP: Project files registered with Salsa for reference finding");
+
+        // Kick off pattern-cache warming on a detached task. Registration
+        // only creates the Salsa `SourceFile` inputs; parsing is lazy until
+        // someone asks for patterns. Warming all project files in the
+        // background means by the time the user reaches for
+        // `textDocument/references` (which happens minutes into a session,
+        // not seconds), the cache is hot and the first call is instant
+        // instead of stalling on a project-wide parse.
+        //
+        // The actor processes requests sequentially, so warming requests
+        // interleave with whatever else the actor's busy with — including
+        // real user requests like hover and goto-definition.
+        let salsa = self.salsa.clone();
+        tokio::spawn(async move {
+            match salsa.warm_pattern_cache().await {
+                Ok(n) => info!("🔥 Laravel LSP: pattern cache warmed ({} files)", n),
+                Err(e) => debug!("warm_pattern_cache failed: {}", e),
+            }
+        });
     }
 
     /// Register environment files directly with Salsa for parsing

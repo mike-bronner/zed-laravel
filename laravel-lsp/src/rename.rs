@@ -55,8 +55,12 @@ pub struct EditTarget {
 /// Enabled kinds:
 /// - Route (decl via [`crate::route_name_locator`])
 /// - Config (decl via [`crate::config_key_locator`])
+/// - Translation (decl across locales via [`crate::translation_key_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
-    matches!(symbol, SymbolRef::Route(_) | SymbolRef::Config(_))
+    matches!(
+        symbol,
+        SymbolRef::Route(_) | SymbolRef::Config(_) | SymbolRef::Translation(_)
+    )
 }
 
 /// Build a single `WorkspaceEdit` that rewrites every `target` to its

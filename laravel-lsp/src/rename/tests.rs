@@ -15,13 +15,12 @@ fn target(path: &str, line: u32, start: u32, end: u32, new_text: &str) -> EditTa
 fn can_rename_accepts_enabled_kinds() {
     assert!(can_rename(&SymbolRef::Route("home".into())));
     assert!(can_rename(&SymbolRef::Config("app.name".into())));
+    assert!(can_rename(&SymbolRef::Translation("auth.failed".into())));
 }
 
 #[test]
 fn can_rename_rejects_kinds_without_decl_finder() {
-    // Translation is gated until its decl-site walker ships. Phase 3 kinds
-    // are gated indefinitely (require PHP class rename infra).
-    assert!(!can_rename(&SymbolRef::Translation("auth.failed".into())));
+    // Phase 3 kinds are gated indefinitely (require PHP class rename infra).
     assert!(!can_rename(&SymbolRef::View("users.profile".into())));
     assert!(!can_rename(&SymbolRef::Component("button".into())));
     assert!(!can_rename(&SymbolRef::Livewire("counter".into())));

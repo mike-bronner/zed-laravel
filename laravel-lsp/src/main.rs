@@ -13720,6 +13720,29 @@ fn collect_config_declaration_target(
     })
 }
 
+/// Resolve translation-key declaration positions across every locale's lang
+/// file. The LEAF segment of the new dotted form is written at each
+/// declaration; the file portion is the lang filename and can't change
+/// without moving the file.
+fn collect_translation_declaration_targets(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    let locations = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, old_key);
+    let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
+    locations
+        .into_iter()
+        .map(|loc| laravel_lsp::rename::EditTarget {
+            file_path: loc.file_path,
+            line: loc.position.line,
+            start_column: loc.position.start_column,
+            end_column: loc.position.end_column,
+            new_text: new_leaf.clone(),
+        })
+        .collect()
+}
+
 /// Walk every `routes/*.php` under the project root and surface
 /// `->name(...)` declaration sites whose full name matches `target`. Each
 /// emitted target writes `new_name` verbatim at the captured position. (For
@@ -14783,6 +14806,15 @@ impl LanguageServer for LaravelLanguageServer {
                     if let Some(t) = collect_config_declaration_target(root, key, &new_name) {
                         targets.push(t);
                     }
+                }
+            }
+            laravel_lsp::references::SymbolRef::Translation(key) => {
+                // Same shape as config but applied across every locale's lang
+                // file under lang/<locale>/<file>.php.
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(collect_translation_declaration_targets(
+                        root, key, &new_name,
+                    ));
                 }
             }
             _ => {}

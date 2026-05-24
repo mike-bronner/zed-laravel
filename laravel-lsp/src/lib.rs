@@ -35,6 +35,7 @@ pub mod route_discovery;
 pub mod route_name_locator;
 pub mod route_outline;
 pub mod slot_navigation;
+pub mod translation_key_locator;
 pub mod translation_lookup;
 pub mod validation_rules;
 pub mod vendor_translations;

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::debug;
 
 use crate::config::kebab_to_pascal_case;
 use crate::middleware_parser::middleware_base_alias;
@@ -695,7 +695,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                                 let base_col = dir.column + 6; // position after @lang
                                 let col = base_col + start_offset;
                                 let end_col = base_col + end_offset;
-                                info!(
+                                debug!(
                                     "📍 @lang translation: key='{}' row={} col={}-{} (args={:?})",
                                     key.key(db),
                                     dir.row,
@@ -732,19 +732,21 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
 
                 // Process PHP content inside {{ ... }} echo statements
                 // Extract translation calls like __("Welcome"), trans("key"), etc.
-                info!(
+                // (Per-echo logging demoted to debug — at scale, these were
+                // tens of thousands of log lines that dominated warming cost.)
+                debug!(
                     "🔍 Processing {} echo PHP snippets",
                     blade_patterns.echo_php.len()
                 );
                 for echo in blade_patterns.echo_php {
-                    info!(
+                    debug!(
                         "🔍 Echo PHP content: {:?} at row {} col {}",
                         echo.php_content, echo.row, echo.column
                     );
                     if let Some((trans_key, start_offset, end_offset)) =
                         extract_translation_from_echo(echo.php_content)
                     {
-                        info!(
+                        debug!(
                             "✅ Found translation '{}' at offsets {}-{}",
                             trans_key, start_offset, end_offset
                         );
@@ -752,7 +754,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                         // Calculate column positions relative to the echo statement
                         let col = echo.column + start_offset;
                         let end_col = echo.column + end_offset;
-                        info!(
+                        debug!(
                             "📍 Translation ref: row={} col={}-{}",
                             echo.row, col, end_col
                         );
@@ -764,7 +766,7 @@ pub fn parse_file_patterns<'db>(db: &'db dyn Db, file: SourceFile) -> ParsedPatt
                             end_col as u32,
                         ));
                     } else {
-                        info!("❌ No translation found in echo content");
+                        debug!("❌ No translation found in echo content");
                     }
                 }
             }
@@ -4024,7 +4026,7 @@ impl SalsaActor {
                         self.pattern_cache.put(path, (0, data));
                         imported += 1;
                     }
-                    info!("🔥 Bulk-imported {} entries into pattern cache", imported);
+                    debug!("🔥 Bulk-imported {} entries into pattern cache", imported);
                     let _ = reply.send(imported);
                 }
 
@@ -4364,7 +4366,7 @@ impl SalsaActor {
         // Check cache first - return cached Arc if version matches (cheap clone)
         if let Some((cached_version, cached_data)) = self.pattern_cache.get(path) {
             if *cached_version == version {
-                info!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
+                debug!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
                 return Some(Arc::clone(cached_data));
             }
         }
@@ -4723,7 +4725,7 @@ impl SalsaActor {
             .put(path.clone(), (version, Arc::clone(&data)));
 
         let total_time = start.elapsed();
-        info!(
+        debug!(
             "🔄 Cache MISS for {} - parse: {:?}, total: {:?}, middleware_count: {}",
             file_name,
             parse_time,

@@ -803,9 +803,13 @@ pub fn extract_all_php_patterns<'a>(
         + result.action_calls.len()
         + result.feature_calls.len()
         + result.feature_name_properties.len();
-    info!(
+    // Per-file extraction stats are spammy at scale — a 40k-file project
+    // generates >1M log lines, which dominates warming time. Demote to debug.
+    tracing::debug!(
         "📊 PHP extraction: {:?} total (query fetch: {:?}), {} patterns found",
-        total_time, query_fetch_time, pattern_count
+        total_time,
+        query_fetch_time,
+        pattern_count
     );
 
     Ok(result)
@@ -1044,9 +1048,11 @@ pub fn extract_all_blade_patterns<'a>(
         + result.directives.len()
         + result.echo_php.len()
         + result.slots.len();
-    info!(
+    tracing::debug!(
         "📊 Blade extraction: {:?} total (query fetch: {:?}), {} patterns found",
-        total_time, query_fetch_time, pattern_count
+        total_time,
+        query_fetch_time,
+        pattern_count
     );
 
     Ok(result)

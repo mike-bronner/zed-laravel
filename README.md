@@ -566,10 +566,20 @@ If your PHP class outline isn't appearing, make sure:
 
 ## 🚧 Planned Features
 
-- 📖 Hover documentation with resolved values
-- 🎨 Inertia.js support (`Inertia::render('Page')`)
-- 📁 Folio page routing
-- ⚡ Volt component support
+**Rename for class-backed patterns** (extending the currently-shipped rename for route names / config keys / translation keys):
+
+- ✏️ **PHP class rename engine** — the foundation: FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Required infrastructure for everything below.
+- 📄 **View rename** — Blade file move + every call-site rewrite. If the view has a backing Renderable / ViewModel class, that gets renamed too (via the class engine above).
+- 🧩 **Blade component rename** — both anonymous (file move) and class-backed (class rename + tag-site updates) flavours, shipping together so the UX never depends on which flavour the user picked.
+- ⚡ **Livewire component rename** — class rename + paired view file move + every `<livewire:name>` tag and `@livewire('name')` directive rewritten.
+- 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
+- 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
+
+**Framework integrations:**
+
+- 🎨 **Inertia.js support** — go-to-definition and autocomplete for `Inertia::render('Page')` calls
+- 📁 **Folio page routing** — surface Folio's filesystem-routed pages in goto-definition / completion / find-references
+- ⚡ **Volt component support** — single-file Livewire components
 
 ## 🤝 Contributing
 

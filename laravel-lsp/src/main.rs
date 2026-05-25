@@ -15518,7 +15518,11 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         if !laravel_lsp::rename::can_rename(&symbol) {
-            return Ok(None);
+            // Surface as an LSP error rather than `Ok(None)` so Zed shows
+            // the user a status-bar message instead of silently dropping
+            // the F2. `Ok(None)` is reserved for "cursor isn't on any
+            // classified Laravel pattern" — silent is correct UX there.
+            return Err(laravel_lsp::rename::unsupported_rename_error(&symbol));
         }
 
         // For declaration-cursor cases, the pattern range from
@@ -15565,7 +15569,10 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         if !laravel_lsp::rename::can_rename(&symbol) {
-            return Ok(None);
+            // Defensive: `prepare_rename` should already have errored, but
+            // a client that skipped the prepare round-trip would land here
+            // — match the same user-facing error rather than no-op.
+            return Err(laravel_lsp::rename::unsupported_rename_error(&symbol));
         }
 
         // Call-site references via Salsa. These are always parser-classified.

@@ -218,6 +218,52 @@ fn file_rename_skips_unrepresentable_paths() {
 }
 
 #[test]
+fn unsupported_rename_error_messages_are_specific_per_kind() {
+    // Each Phase 3 kind gets a kind-specific message so the user knows
+    // what they tried to rename, not just "this can't be renamed".
+    let view_err = unsupported_rename_error(&SymbolRef::View("users.index".into()));
+    assert!(view_err.message.contains("views"));
+
+    let component_err = unsupported_rename_error(&SymbolRef::Component("button".into()));
+    assert!(component_err.message.contains("Blade components"));
+
+    let livewire_err = unsupported_rename_error(&SymbolRef::Livewire("counter".into()));
+    assert!(livewire_err.message.contains("Livewire components"));
+
+    let middleware_err = unsupported_rename_error(&SymbolRef::Middleware("auth".into()));
+    assert!(middleware_err.message.contains("middleware"));
+
+    let binding_err = unsupported_rename_error(&SymbolRef::Binding("cache.store".into()));
+    assert!(binding_err.message.contains("container bindings"));
+}
+
+#[test]
+fn unsupported_rename_error_omits_server_name_prefix() {
+    // Zed wraps the error with its own attribution ("Error: Prepare rename
+    // via laravel-lsp failed: <message>"), so we don't repeat the server
+    // name in the body. Keeps the toast tight.
+    let err = unsupported_rename_error(&SymbolRef::View("x".into()));
+    assert!(
+        !err.message.contains("laravel-lsp"),
+        "message should not duplicate the server name Zed adds: {}",
+        err.message
+    );
+    assert!(err.message.starts_with("renaming"));
+}
+
+#[test]
+fn unsupported_rename_error_uses_server_error_code() {
+    // Not a standard JSON-RPC code (those are reserved for protocol-level
+    // errors) — a server-defined code keeps it out of those buckets so
+    // generic LSP client error handlers don't mis-classify the response.
+    let err = unsupported_rename_error(&SymbolRef::View("x".into()));
+    assert!(matches!(
+        err.code,
+        tower_lsp::jsonrpc::ErrorCode::ServerError(_)
+    ));
+}
+
+#[test]
 fn supports_per_target_new_text() {
     // For config renames we write the leaf segment at the decl position but
     // the full dotted form at every call site. The two targets share a

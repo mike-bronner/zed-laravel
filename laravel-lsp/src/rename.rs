@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::{
     DocumentChangeOperation, DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
     Position, Range, RenameFile, RenameFileOptions, ResourceOp, TextDocumentEdit, TextEdit, Url,
@@ -63,6 +64,45 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
         symbol,
         SymbolRef::Route(_) | SymbolRef::Config(_) | SymbolRef::Translation(_) | SymbolRef::Env(_)
     )
+}
+
+/// Build the LSP error returned to the client when a rename was attempted
+/// on a symbol kind the server understands but hasn't implemented yet.
+///
+/// Returning `Ok(None)` from `prepare_rename` for an unsupported-kind case
+/// makes Zed silently drop the request — the user presses F2 and nothing
+/// happens, no feedback. Returning a `jsonrpc::Error` instead surfaces in
+/// Zed as a toast/status notification so the user knows the server received
+/// the request and declined it on purpose.
+///
+/// The message intentionally does NOT prefix itself with `laravel-lsp:` —
+/// Zed already attributes the error to this server in its own framing
+/// ("Error: Prepare rename via laravel-lsp failed: <our message>").
+///
+/// Reserved for the "we know what this is, we just can't rename it yet"
+/// case. Cursor positions that don't classify as any Laravel pattern at
+/// all still return `Ok(None)` — silent is correct UX for F2 on whitespace.
+pub fn unsupported_rename_error(symbol: &SymbolRef) -> jsonrpc::Error {
+    let kind = match symbol {
+        SymbolRef::View(_) => "views",
+        SymbolRef::Component(_) => "Blade components",
+        SymbolRef::Livewire(_) => "Livewire components",
+        SymbolRef::Middleware(_) => "middleware aliases",
+        SymbolRef::Binding(_) => "container bindings",
+        // The four below are renameable in Phase 2 — should never hit this
+        // branch via `can_rename` gating, but keep an honest fallback so
+        // accidentally calling this on a renameable kind still produces a
+        // coherent message.
+        SymbolRef::Route(_)
+        | SymbolRef::Config(_)
+        | SymbolRef::Translation(_)
+        | SymbolRef::Env(_) => "this symbol",
+    };
+    jsonrpc::Error {
+        code: jsonrpc::ErrorCode::ServerError(1),
+        message: format!("renaming {} is not yet supported.", kind).into(),
+        data: None,
+    }
 }
 
 /// A file move emitted alongside text edits.

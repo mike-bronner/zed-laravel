@@ -48,6 +48,7 @@ pub mod translation_key_locator;
 pub mod translation_lookup;
 pub mod validation_rules;
 pub mod vendor_translations;
+pub mod view_declaration_locator;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;

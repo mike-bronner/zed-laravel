@@ -1,6 +1,6 @@
 use super::*;
 use std::path::PathBuf;
-use tower_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, ResourceOp};
+use tower_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp};
 
 fn target(path: &str, line: u32, start: u32, end: u32, new_text: &str) -> EditTarget {
     EditTarget {
@@ -32,15 +32,17 @@ fn can_rename_accepts_enabled_kinds() {
 }
 
 #[test]
+fn can_rename_accepts_view_kind() {
+    // Phase 3a wired the View file-move pipeline; rename now applies.
+    assert!(can_rename(&SymbolRef::View("users.profile".into())));
+}
+
+#[test]
 fn can_rename_rejects_kinds_without_decl_finder() {
-    // Class-backed kinds are deferred to Phase 3 (require PHP class
-    // rename infrastructure). Middleware and binding aren't gated on
-    // Phase 3 per se but they don't have a renameable declaration
-    // shape that fits the current model — middleware aliases live in
-    // `bootstrap/app.php` `withMiddleware(...)` closures, bindings in
-    // service-provider `register()` methods. Both are deferred until
-    // a tree-sitter walker for those specific shapes lands.
-    assert!(!can_rename(&SymbolRef::View("users.profile".into())));
+    // The remaining Phase 3 kinds. Blade components and Livewire need
+    // PHP class + view file pairing (3b, 3c). Middleware and binding
+    // wait on `bootstrap/app.php` `withMiddleware(...)` and service-
+    // provider `register()` tree-sitter walkers (3e).
     assert!(!can_rename(&SymbolRef::Component("button".into())));
     assert!(!can_rename(&SymbolRef::Livewire("counter".into())));
     assert!(!can_rename(&SymbolRef::Middleware("auth".into())));
@@ -183,6 +185,105 @@ fn text_and_file_renames_combine_in_operations() {
 }
 
 #[test]
+fn text_only_rename_has_no_change_annotations() {
+    // Phase 2 (text-only) renames stay silent-apply — they're small in
+    // scope and the always-confirm UX would be obnoxious for every route
+    // / config / translation / env rename.
+    let targets = vec![target("/tmp/routes/web.php", 1, 30, 34, "home2")];
+    let edit = build_rename_edit(&targets).expect("edit");
+    assert!(
+        edit.change_annotations.is_none(),
+        "text-only rename must not request confirmation"
+    );
+}
+
+#[test]
+fn file_rename_emits_change_annotation_with_confirmation() {
+    // The signal that triggers Zed's multi-buffer preview. Without this,
+    // file moves apply silently and the user can't review what changed.
+    let renames = vec![file_rename(
+        "/tmp/resources/views/old.blade.php",
+        "/tmp/resources/views/new.blade.php",
+    )];
+    let edit = build_rename_workspace_edit(&[], &renames).expect("edit");
+
+    let annotations = edit
+        .change_annotations
+        .expect("change_annotations populated");
+    assert_eq!(annotations.len(), 1);
+    let (_id, annotation) = annotations.iter().next().unwrap();
+    assert_eq!(annotation.needs_confirmation, Some(true));
+    assert!(!annotation.label.is_empty());
+}
+
+#[test]
+fn file_rename_op_references_the_annotation_id() {
+    // The annotation only works when the resource op's annotation_id
+    // matches a key in the annotations map. Defensive: assert they line up.
+    let renames = vec![file_rename(
+        "/tmp/resources/views/old.blade.php",
+        "/tmp/resources/views/new.blade.php",
+    )];
+    let edit = build_rename_workspace_edit(&[], &renames).expect("edit");
+
+    let annotations = edit.change_annotations.as_ref().unwrap();
+    let annotation_keys: Vec<&String> = annotations.keys().collect();
+
+    let ops = match edit.document_changes.as_ref().unwrap() {
+        DocumentChanges::Operations(ops) => ops,
+        _ => panic!("expected Operations"),
+    };
+    let rename = match &ops[0] {
+        DocumentChangeOperation::Op(ResourceOp::Rename(r)) => r,
+        _ => panic!("expected Rename op"),
+    };
+    let id = rename
+        .annotation_id
+        .as_ref()
+        .expect("rename op must carry an annotation_id");
+    assert!(
+        annotation_keys.contains(&id),
+        "rename op's annotation_id {} not found in annotations map keys",
+        id
+    );
+}
+
+#[test]
+fn mixed_text_and_file_rename_annotates_text_edits_too() {
+    // For the multi-buffer preview to show every change (not just the
+    // file move), the text edits also need the annotation. Verify they
+    // land as AnnotatedTextEdit not plain TextEdit.
+    let targets = vec![target(
+        "/tmp/app/Http/Controllers/HomeController.php",
+        4,
+        16,
+        21,
+        "new",
+    )];
+    let renames = vec![file_rename(
+        "/tmp/resources/views/old.blade.php",
+        "/tmp/resources/views/new.blade.php",
+    )];
+    let edit = build_rename_workspace_edit(&targets, &renames).expect("edit");
+
+    let ops = match edit.document_changes.as_ref().unwrap() {
+        DocumentChanges::Operations(ops) => ops,
+        _ => panic!("expected Operations"),
+    };
+    let doc_edit = match &ops[0] {
+        DocumentChangeOperation::Edit(e) => e,
+        _ => panic!("expected text edit first"),
+    };
+    let edit_entry = &doc_edit.edits[0];
+    match edit_entry {
+        OneOf::Right(_) => {}
+        OneOf::Left(_) => {
+            panic!("text edit must be AnnotatedTextEdit when a file rename is in the mix")
+        }
+    }
+}
+
+#[test]
 fn rename_op_uses_safe_collision_options() {
     // Mike's collision policy: emit RenameFile with `overwrite: false` and
     // `ignore_if_exists: false` so the client surfaces a loud error when the
@@ -219,11 +320,9 @@ fn file_rename_skips_unrepresentable_paths() {
 
 #[test]
 fn unsupported_rename_error_messages_are_specific_per_kind() {
-    // Each Phase 3 kind gets a kind-specific message so the user knows
-    // what they tried to rename, not just "this can't be renamed".
-    let view_err = unsupported_rename_error(&SymbolRef::View("users.index".into()));
-    assert!(view_err.message.contains("views"));
-
+    // Each unsupported Phase 3 kind gets a kind-specific message so the
+    // user knows what they tried to rename, not just "this can't be
+    // renamed". View was here too until Phase 3a landed it.
     let component_err = unsupported_rename_error(&SymbolRef::Component("button".into()));
     assert!(component_err.message.contains("Blade components"));
 
@@ -235,6 +334,23 @@ fn unsupported_rename_error_messages_are_specific_per_kind() {
 
     let binding_err = unsupported_rename_error(&SymbolRef::Binding("cache.store".into()));
     assert!(binding_err.message.contains("container bindings"));
+}
+
+#[test]
+fn unsupported_rename_error_points_to_feature_request_url() {
+    // Every "not implemented" toast directs the user to the GitHub issues
+    // page so they have a clear path to ask for the missing feature.
+    let err = unsupported_rename_error(&SymbolRef::Component("button".into()));
+    assert!(
+        err.message.contains(FEATURE_REQUEST_URL),
+        "message should include the feature-request URL: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("feature request"),
+        "message should explicitly invite a feature request: {}",
+        err.message
+    );
 }
 
 #[test]

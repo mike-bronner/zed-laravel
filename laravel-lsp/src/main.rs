@@ -15601,7 +15601,12 @@ impl LanguageServer for LaravelLanguageServer {
         // `can_rename` above is the gate: a symbol only reaches here when its
         // declaration walker is implemented. New kinds extend both `can_rename`
         // and this match arm together.
+        //
+        // Phase 3+: kinds whose "declaration" is a file (not a source
+        // position) push into `file_renames` instead of `targets`. Both
+        // travel together in the final WorkspaceEdit.
         let root_path = self.root_path.read().await.clone();
+        let mut file_renames: Vec<laravel_lsp::rename::FileRename> = Vec::new();
         match &symbol {
             laravel_lsp::references::SymbolRef::Route(name) => {
                 // Route names are written verbatim at every declaration site
@@ -15641,10 +15646,70 @@ impl LanguageServer for LaravelLanguageServer {
                     targets.extend(collect_env_declaration_targets(root, key, &new_name));
                 }
             }
+            laravel_lsp::references::SymbolRef::View(name) => {
+                // Views don't have a textual declaration — the file IS the
+                // declaration. Rename = move the .blade.php + rewrite every
+                // `view('old')` call site (call sites already collected
+                // above into `targets`). New name validation, vendor-path
+                // refusal, and target-path computation surface as toasts
+                // via short-circuit errors rather than silent no-ops.
+                let trimmed_new = new_name.trim();
+                if let Err(e) =
+                    laravel_lsp::view_declaration_locator::validate_view_name(trimmed_new)
+                {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "invalid view name: {}",
+                        e.message()
+                    )));
+                }
+                if name == trimmed_new {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "new view name must differ from the current name.",
+                    ));
+                }
+                let Some(config) = self.get_cached_config().await else {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "Laravel config not available; cannot resolve view paths.",
+                    ));
+                };
+                let Some(current_path) =
+                    laravel_lsp::view_declaration_locator::locate_view_file(name, &config)
+                else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "view file for '{}' not found on disk.",
+                        name
+                    )));
+                };
+                if let Some(root) = root_path.as_ref() {
+                    if laravel_lsp::view_declaration_locator::is_under_vendor(&current_path, root) {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename views located under vendor/.",
+                        ));
+                    }
+                }
+                let Some(target_path) = laravel_lsp::view_declaration_locator::compute_target_path(
+                    name,
+                    trimmed_new,
+                    &current_path,
+                    &config,
+                ) else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "could not compute target path for renamed view '{}'.",
+                        trimmed_new
+                    )));
+                };
+                file_renames.push(laravel_lsp::rename::FileRename {
+                    old_path: current_path,
+                    new_path: target_path,
+                });
+            }
             _ => {}
         }
 
-        Ok(laravel_lsp::rename::build_rename_edit(&targets))
+        Ok(laravel_lsp::rename::build_rename_workspace_edit(
+            &targets,
+            &file_renames,
+        ))
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")

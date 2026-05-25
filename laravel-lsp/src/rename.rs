@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::{
-    DocumentChangeOperation, DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
-    Position, Range, RenameFile, RenameFileOptions, ResourceOp, TextDocumentEdit, TextEdit, Url,
-    WorkspaceEdit,
+    AnnotatedTextEdit, ChangeAnnotation, DocumentChangeOperation, DocumentChanges, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, Range, RenameFile, RenameFileOptions,
+    ResourceOp, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::references::SymbolRef;
@@ -59,11 +59,29 @@ pub struct EditTarget {
 /// - Config (decl via [`crate::config_key_locator`])
 /// - Translation (decl across locales via [`crate::translation_key_locator`])
 /// - Env (decl across `.env*` files via [`crate::env_key_locator`])
+/// - View (file move via [`crate::view_declaration_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
-        SymbolRef::Route(_) | SymbolRef::Config(_) | SymbolRef::Translation(_) | SymbolRef::Env(_)
+        SymbolRef::Route(_)
+            | SymbolRef::Config(_)
+            | SymbolRef::Translation(_)
+            | SymbolRef::Env(_)
+            | SymbolRef::View(_)
     )
+}
+
+/// Build a generic rename-related LSP error with the message a Zed toast
+/// will display. Wraps the verbose `jsonrpc::Error` boilerplate for the
+/// rename handler's many short-circuit cases (invalid new name, vendor
+/// file, missing target, etc.). Use [`unsupported_rename_error`] instead
+/// when the issue is specifically "this symbol kind isn't implemented yet".
+pub fn rename_error(message: impl Into<std::borrow::Cow<'static, str>>) -> jsonrpc::Error {
+    jsonrpc::Error {
+        code: jsonrpc::ErrorCode::ServerError(1),
+        message: message.into(),
+        data: None,
+    }
 }
 
 /// Build the LSP error returned to the client when a rename was attempted
@@ -84,26 +102,36 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
 /// all still return `Ok(None)` — silent is correct UX for F2 on whitespace.
 pub fn unsupported_rename_error(symbol: &SymbolRef) -> jsonrpc::Error {
     let kind = match symbol {
-        SymbolRef::View(_) => "views",
         SymbolRef::Component(_) => "Blade components",
         SymbolRef::Livewire(_) => "Livewire components",
         SymbolRef::Middleware(_) => "middleware aliases",
         SymbolRef::Binding(_) => "container bindings",
-        // The four below are renameable in Phase 2 — should never hit this
+        // The five below are renameable today — should never hit this
         // branch via `can_rename` gating, but keep an honest fallback so
         // accidentally calling this on a renameable kind still produces a
         // coherent message.
-        SymbolRef::Route(_)
+        SymbolRef::View(_)
+        | SymbolRef::Route(_)
         | SymbolRef::Config(_)
         | SymbolRef::Translation(_)
         | SymbolRef::Env(_) => "this symbol",
     };
     jsonrpc::Error {
         code: jsonrpc::ErrorCode::ServerError(1),
-        message: format!("renaming {} is not yet supported.", kind).into(),
+        message: format!(
+            "renaming {} is not yet implemented. If you'd like to see this, \
+             please open a feature request at {}.",
+            kind, FEATURE_REQUEST_URL
+        )
+        .into(),
         data: None,
     }
 }
+
+/// GitHub issues URL the unsupported-rename toast points users to. Lives
+/// here so adding similar "not implemented" toasts elsewhere only needs to
+/// import the constant — no hand-copied URL drift.
+pub const FEATURE_REQUEST_URL: &str = "https://github.com/GeneaLabs/zed-laravel/issues";
 
 /// A file move emitted alongside text edits.
 ///
@@ -177,8 +205,27 @@ pub fn build_rename_workspace_edit(
         grouped.entry(uri).or_default().push(edit);
     }
 
-    let rename_ops: Vec<DocumentChangeOperation> =
-        file_renames.iter().filter_map(file_rename_to_op).collect();
+    // File renames trigger the "needs confirmation" annotation — the LSP
+    // spec mechanism that asks the client to surface a preview before
+    // applying the edit. VSCode honors it and shows a refactor preview;
+    // Zed currently does NOT honor it for WorkspaceEdits containing
+    // resource operations like `RenameFile` (it applies silently, even
+    // though it does open a multi-buffer for text-only renames). Filed
+    // upstream for Zed to consider; the annotation stays here either way
+    // because (a) it's the spec-compliant signal, (b) other clients
+    // already use it, and (c) Zed may add support later — at which point
+    // this Just Works with no code change.
+    let needs_preview = !file_renames.is_empty();
+    let annotation_id = if needs_preview {
+        Some(RENAME_ANNOTATION_ID.to_string())
+    } else {
+        None
+    };
+
+    let rename_ops: Vec<DocumentChangeOperation> = file_renames
+        .iter()
+        .filter_map(|r| file_rename_to_op(r, annotation_id.clone()))
+        .collect();
 
     if grouped.is_empty() && rename_ops.is_empty() {
         // Every input path failed `Url::from_file_path` — nothing to emit.
@@ -192,7 +239,17 @@ pub fn build_rename_workspace_edit(
                 uri: uri.clone(),
                 version: None,
             },
-            edits: edits.iter().cloned().map(OneOf::Left).collect(),
+            edits: edits
+                .iter()
+                .cloned()
+                .map(|edit| match &annotation_id {
+                    Some(id) => OneOf::Right(AnnotatedTextEdit {
+                        text_edit: edit,
+                        annotation_id: id.clone(),
+                    }),
+                    None => OneOf::Left(edit),
+                })
+                .collect(),
         })
         .collect();
 
@@ -213,6 +270,23 @@ pub fn build_rename_workspace_edit(
         DocumentChanges::Operations(ops)
     };
 
+    let change_annotations = if needs_preview {
+        let mut map = HashMap::new();
+        map.insert(
+            RENAME_ANNOTATION_ID.to_string(),
+            ChangeAnnotation {
+                label: "Rename".to_string(),
+                needs_confirmation: Some(true),
+                description: Some(
+                    "Review the file move and updated references before applying.".to_string(),
+                ),
+            },
+        );
+        Some(map)
+    } else {
+        None
+    };
+
     Some(WorkspaceEdit {
         changes: if grouped.is_empty() {
             None
@@ -220,11 +294,20 @@ pub fn build_rename_workspace_edit(
             Some(grouped)
         },
         document_changes: Some(document_changes),
-        change_annotations: None,
+        change_annotations,
     })
 }
 
-fn file_rename_to_op(rename: &FileRename) -> Option<DocumentChangeOperation> {
+/// Annotation ID used for every edit and resource op in a Phase 3+ rename.
+/// One shared ID per workspace edit — clients render it as a single
+/// reviewable change rather than N separate "do you want to apply this?"
+/// prompts.
+const RENAME_ANNOTATION_ID: &str = "laravel-lsp:rename";
+
+fn file_rename_to_op(
+    rename: &FileRename,
+    annotation_id: Option<String>,
+) -> Option<DocumentChangeOperation> {
     let old_uri = path_to_uri(&rename.old_path)?;
     let new_uri = path_to_uri(&rename.new_path)?;
     Some(DocumentChangeOperation::Op(ResourceOp::Rename(
@@ -235,7 +318,7 @@ fn file_rename_to_op(rename: &FileRename) -> Option<DocumentChangeOperation> {
                 overwrite: Some(false),
                 ignore_if_exists: Some(false),
             }),
-            annotation_id: None,
+            annotation_id,
         },
     )))
 }

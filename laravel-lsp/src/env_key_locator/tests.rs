@@ -120,7 +120,12 @@ fn locates_across_every_env_variant_laravel_supports() {
         variants.len(),
         "should match every .env variant, got: {:?}",
         locs.iter()
-            .map(|l| l.file_path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|l| l
+                .file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned())
             .collect::<Vec<_>>()
     );
 
@@ -128,7 +133,13 @@ fn locates_across_every_env_variant_laravel_supports() {
     // results, not just that the count matches.
     let found_names: std::collections::HashSet<String> = locs
         .iter()
-        .map(|l| l.file_path.file_name().unwrap().to_string_lossy().into_owned())
+        .map(|l| {
+            l.file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     for v in &variants {
         assert!(

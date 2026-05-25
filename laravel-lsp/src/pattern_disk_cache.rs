@@ -133,16 +133,14 @@ pub fn load_into(
         return (0, 0);
     };
 
-    let cache: CacheFile = match bincode::serde::decode_from_slice(
-        &bytes,
-        bincode::config::standard(),
-    ) {
-        Ok((c, _)) => c,
-        Err(e) => {
-            tracing::debug!("pattern_disk_cache: decode failed, ignoring: {}", e);
-            return (0, 0);
-        }
-    };
+    let cache: CacheFile =
+        match bincode::serde::decode_from_slice(&bytes, bincode::config::standard()) {
+            Ok((c, _)) => c,
+            Err(e) => {
+                tracing::debug!("pattern_disk_cache: decode failed, ignoring: {}", e);
+                return (0, 0);
+            }
+        };
 
     if cache.schema_version != SCHEMA_VERSION {
         tracing::info!(
@@ -186,8 +184,8 @@ pub fn save_from(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     project_root: &Path,
 ) -> Result<usize> {
-    let cache_path = cache_file_path(project_root)
-        .context("could not resolve cache directory for project")?;
+    let cache_path =
+        cache_file_path(project_root).context("could not resolve cache directory for project")?;
 
     let mut entries: HashMap<PathBuf, CachedEntry> = HashMap::with_capacity(pattern_cache.len());
 

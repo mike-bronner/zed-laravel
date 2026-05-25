@@ -1,9 +1,7 @@
 //! Unit tests for the inverted symbol index.
 
 use super::*;
-use crate::salsa_impl::{
-    ParsedPatternsData, RouteReferenceData, SymbolRefData, ViewReferenceData,
-};
+use crate::salsa_impl::{ParsedPatternsData, RouteReferenceData, SymbolRefData, ViewReferenceData};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,10 +44,7 @@ fn insert_then_find_returns_locations() {
 #[test]
 fn find_with_unknown_name_returns_empty() {
     let mut idx = SymbolIndex::default();
-    idx.insert_file(
-        &PathBuf::from("/proj/a.php"),
-        &fixture("welcome", "home"),
-    );
+    idx.insert_file(&PathBuf::from("/proj/a.php"), &fixture("welcome", "home"));
 
     let hits = idx.find(&SymbolRefData::View("not-a-real-view".into()));
     assert!(hits.is_empty());
@@ -58,10 +53,7 @@ fn find_with_unknown_name_returns_empty() {
 #[test]
 fn find_aggregates_across_multiple_files() {
     let mut idx = SymbolIndex::default();
-    idx.insert_file(
-        &PathBuf::from("/proj/a.php"),
-        &fixture("welcome", "home"),
-    );
+    idx.insert_file(&PathBuf::from("/proj/a.php"), &fixture("welcome", "home"));
     idx.insert_file(
         &PathBuf::from("/proj/b.php"),
         &fixture("welcome", "different-route"),
@@ -112,10 +104,7 @@ fn remove_file_drops_empty_buckets_from_forward_map() {
 #[test]
 fn remove_unknown_file_is_a_noop() {
     let mut idx = SymbolIndex::default();
-    idx.insert_file(
-        &PathBuf::from("/proj/a.php"),
-        &fixture("welcome", "home"),
-    );
+    idx.insert_file(&PathBuf::from("/proj/a.php"), &fixture("welcome", "home"));
 
     idx.remove_file(&PathBuf::from("/proj/never-indexed.php"));
 
@@ -135,7 +124,11 @@ fn re_insert_does_not_double_count() {
     idx.insert_file(&path, &fixture("welcome", "home"));
 
     let hits = idx.find(&SymbolRefData::View("welcome".into()));
-    assert_eq!(hits.len(), 1, "refresh idiom should yield exactly one entry");
+    assert_eq!(
+        hits.len(),
+        1,
+        "refresh idiom should yield exactly one entry"
+    );
 }
 
 #[test]
@@ -158,10 +151,7 @@ fn take_dirty_returns_marked_paths_and_clears() {
 #[test]
 fn clear_resets_everything() {
     let mut idx = SymbolIndex::default();
-    idx.insert_file(
-        &PathBuf::from("/proj/a.php"),
-        &fixture("welcome", "home"),
-    );
+    idx.insert_file(&PathBuf::from("/proj/a.php"), &fixture("welcome", "home"));
     idx.mark_dirty(&PathBuf::from("/proj/b.php"));
 
     idx.clear();
@@ -177,10 +167,7 @@ fn distinct_kinds_dont_collide() {
     // A view named "home" and a route named "home" are different symbols
     // — they must live under different forward keys.
     let mut idx = SymbolIndex::default();
-    idx.insert_file(
-        &PathBuf::from("/proj/file.php"),
-        &fixture("home", "home"),
-    );
+    idx.insert_file(&PathBuf::from("/proj/file.php"), &fixture("home", "home"));
 
     let view_hits = idx.find(&SymbolRefData::View("home".into()));
     let route_hits = idx.find(&SymbolRefData::Route("home".into()));

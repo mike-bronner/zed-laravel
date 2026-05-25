@@ -2782,9 +2782,7 @@ pub enum SalsaRequest {
     /// Watcher events don't need to send this — they incrementally
     /// update the index via `mark_dirty` from inside the relevant
     /// handlers, processed lazily on next query.
-    BuildSymbolIndex {
-        reply: oneshot::Sender<usize>,
-    },
+    BuildSymbolIndex { reply: oneshot::Sender<usize> },
 
     // === Config Management ===
     /// Register configuration files for the project
@@ -3016,9 +3014,7 @@ impl SalsaHandle {
     /// them back out after warming completes for persistence. Returned
     /// `Arc` is cheap to clone — the underlying `DashMap` is the same
     /// instance the actor reads from in `handle_get_patterns`.
-    pub fn pattern_cache(
-        &self,
-    ) -> Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> {
+    pub fn pattern_cache(&self) -> Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> {
         self.pattern_cache.clone()
     }
 
@@ -5251,10 +5247,7 @@ impl SalsaActor {
         // relative and need joining to `root_path`.
         let vendor_root = root_path.join("vendor");
         self.project_root_paths = ProjectRootPaths {
-            controller_roots: controller_paths
-                .iter()
-                .map(|p| root_path.join(p))
-                .collect(),
+            controller_roots: controller_paths.iter().map(|p| root_path.join(p)).collect(),
             view_roots: view_paths.clone(),
             livewire_root: livewire_path.clone(),
             routes_root: Some(root_path.join(&routes_path)),

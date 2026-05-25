@@ -30,7 +30,9 @@ fn watchers_cover_all_four_indexed_directories() {
         globs
     );
     assert!(
-        globs.iter().any(|g| g.contains("routes/") && g.ends_with("*.php")),
+        globs
+            .iter()
+            .any(|g| g.contains("routes/") && g.ends_with("*.php")),
         "missing routes glob: {:?}",
         globs
     );
@@ -60,7 +62,10 @@ fn watchers_omit_livewire_when_not_configured() {
         GlobPattern::String(s) => s.contains("Livewire"),
         _ => false,
     });
-    assert!(!has_livewire, "should not register livewire glob when path is None");
+    assert!(
+        !has_livewire,
+        "should not register livewire glob when path is None"
+    );
 }
 
 #[test]
@@ -122,7 +127,10 @@ fn registration_options_round_trip_through_serde() {
     // emit is shaped correctly.
     let json = reg.register_options.unwrap();
     let parsed: DidChangeWatchedFilesRegistrationOptions = serde_json::from_value(json).unwrap();
-    assert!(!parsed.watchers.is_empty(), "must have at least one watcher");
+    assert!(
+        !parsed.watchers.is_empty(),
+        "must have at least one watcher"
+    );
 
     // We constructed exactly 1 (controllers) + 1 (routes) + 2 (view
     // blade + php) + 1 (livewire) + 2 (vendor php + blade) = 7
@@ -145,12 +153,16 @@ fn watchers_include_vendor_php_and_blade_globs() {
         .collect();
 
     assert!(
-        globs.iter().any(|g| g.contains("/vendor/") && g.ends_with("*.php")),
+        globs
+            .iter()
+            .any(|g| g.contains("/vendor/") && g.ends_with("*.php")),
         "missing vendor php glob: {:?}",
         globs
     );
     assert!(
-        globs.iter().any(|g| g.contains("/vendor/") && g.ends_with("*.blade.php")),
+        globs
+            .iter()
+            .any(|g| g.contains("/vendor/") && g.ends_with("*.blade.php")),
         "missing vendor blade glob: {:?}",
         globs
     );

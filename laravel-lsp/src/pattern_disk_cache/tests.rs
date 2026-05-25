@@ -155,6 +155,9 @@ fn corrupted_cache_file_loads_zero() {
     let restored_cache = Arc::new(DashMap::new());
     let (restored, dropped) = load_into(&restored_cache, project.path());
     assert_eq!(restored, 0, "garbage cache should yield zero entries");
-    assert_eq!(dropped, 0, "garbage isn't counted as dropped — it's not even decoded");
+    assert_eq!(
+        dropped, 0,
+        "garbage isn't counted as dropped — it's not even decoded"
+    );
     assert!(restored_cache.is_empty());
 }

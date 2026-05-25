@@ -60,10 +60,7 @@ pub struct EditTarget {
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
-        SymbolRef::Route(_)
-            | SymbolRef::Config(_)
-            | SymbolRef::Translation(_)
-            | SymbolRef::Env(_)
+        SymbolRef::Route(_) | SymbolRef::Config(_) | SymbolRef::Translation(_) | SymbolRef::Env(_)
     )
 }
 

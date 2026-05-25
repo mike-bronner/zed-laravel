@@ -14653,7 +14653,8 @@ impl LanguageServer for LaravelLanguageServer {
             if server.get_cached_config().await.is_none() {
                 info!("📋 No cached config, registering from files...");
                 if let Some(p) = progress.as_mut() {
-                    p.report("Loading project configuration…", Some(0), true).await;
+                    p.report("Loading project configuration…", Some(0), true)
+                        .await;
                 }
                 server.register_config_with_salsa(&root).await;
             }
@@ -17025,8 +17026,8 @@ async fn main() -> Result<()> {
     // set, so debug sessions can opt back in via `RUST_LOG=salsa=debug`.
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,salsa=warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,salsa=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -13,18 +13,28 @@ fn target(path: &str, line: u32, start: u32, end: u32, new_text: &str) -> EditTa
 
 #[test]
 fn can_rename_accepts_enabled_kinds() {
+    // The four string-keyed Laravel patterns Phase 2 ships rename for.
+    // Each has a declaration locator that finds the source-of-truth
+    // position (route_name_locator, config_key_locator,
+    // translation_key_locator, env_key_locator).
     assert!(can_rename(&SymbolRef::Route("home".into())));
     assert!(can_rename(&SymbolRef::Config("app.name".into())));
     assert!(can_rename(&SymbolRef::Translation("auth.failed".into())));
+    assert!(can_rename(&SymbolRef::Env("APP_KEY".into())));
 }
 
 #[test]
 fn can_rename_rejects_kinds_without_decl_finder() {
-    // Phase 3 kinds are gated indefinitely (require PHP class rename infra).
+    // Class-backed kinds are deferred to Phase 3 (require PHP class
+    // rename infrastructure). Middleware and binding aren't gated on
+    // Phase 3 per se but they don't have a renameable declaration
+    // shape that fits the current model — middleware aliases live in
+    // `bootstrap/app.php` `withMiddleware(...)` closures, bindings in
+    // service-provider `register()` methods. Both are deferred until
+    // a tree-sitter walker for those specific shapes lands.
     assert!(!can_rename(&SymbolRef::View("users.profile".into())));
     assert!(!can_rename(&SymbolRef::Component("button".into())));
     assert!(!can_rename(&SymbolRef::Livewire("counter".into())));
-    assert!(!can_rename(&SymbolRef::Env("APP_KEY".into())));
     assert!(!can_rename(&SymbolRef::Middleware("auth".into())));
     assert!(!can_rename(&SymbolRef::Binding("cache.store".into())));
 }

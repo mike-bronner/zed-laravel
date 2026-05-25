@@ -21,6 +21,7 @@ pub mod config_key_locator;
 pub mod config_lookup;
 pub mod database;
 pub mod document_symbols;
+pub mod env_key_locator;
 pub mod file_watcher;
 pub mod hover;
 pub mod indexing_progress;

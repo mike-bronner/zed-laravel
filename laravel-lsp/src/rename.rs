@@ -56,10 +56,14 @@ pub struct EditTarget {
 /// - Route (decl via [`crate::route_name_locator`])
 /// - Config (decl via [`crate::config_key_locator`])
 /// - Translation (decl across locales via [`crate::translation_key_locator`])
+/// - Env (decl across `.env*` files via [`crate::env_key_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
-        SymbolRef::Route(_) | SymbolRef::Config(_) | SymbolRef::Translation(_)
+        SymbolRef::Route(_)
+            | SymbolRef::Config(_)
+            | SymbolRef::Translation(_)
+            | SymbolRef::Env(_)
     )
 }
 

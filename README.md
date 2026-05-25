@@ -198,7 +198,7 @@ $url = route('users.index', $user);
 
 ### ✏️ Rename
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, or translation key. The extension rewrites every call site AND the declaration site in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, or environment variable. The extension rewrites every call site AND the declaration site in one atomic operation.
 
 **Route names** rewrite call sites and the `->name(...)` declaration together:
 
@@ -238,6 +238,15 @@ lang/en/messages.php:  'welcome' => 'Welcome'  →  'greeting' => 'Welcome'
 lang/es/messages.php:  'welcome' => 'Bienvenido'  →  'greeting' => 'Bienvenido'
 lang/fr/messages.php:  'welcome' => 'Bienvenue'  →  'greeting' => 'Bienvenue'
 // every `__('messages.welcome')` becomes `__('messages.greeting')`
+```
+
+**Environment variables** rewrite call sites AND the key in **every** `.env*` file at the project root that declares it:
+
+```
+.env:          DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
+.env.example:  DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
+.env.testing:  DB_HOST=memory      →   DATABASE_HOST=memory
+// every `env('DB_HOST')` becomes `env('DATABASE_HOST')`
 ```
 
 **Same parser-classified guarantee as Find References** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.

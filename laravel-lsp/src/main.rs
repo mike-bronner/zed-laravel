@@ -14271,10 +14271,33 @@ async fn collect_declaration_locations(
                 }
             }
         }
-        // View, component, livewire, env, middleware, binding: their
-        // declarations either don't exist as a single point (env vars), or
-        // they involve a PHP class (deferred to Phase 3). No additional
-        // locations to surface for now.
+        SymbolRef::Env(key) => {
+            // Env declarations live in every `.env*` file at the project
+            // root that has the matching `KEY=…` line. Surfacing them in
+            // find-references is the same shape as translations — one
+            // Location per matching file.
+            let locs = laravel_lsp::env_key_locator::locate_keys_across_env_files(root, key);
+            for loc in locs {
+                if let Ok(uri) = Url::from_file_path(&loc.file_path) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line: loc.position.line,
+                                character: loc.position.start_column,
+                            },
+                            end: Position {
+                                line: loc.position.line,
+                                character: loc.position.end_column,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        // View, component, livewire, middleware, binding: their declarations
+        // either don't have a single canonical point or they involve a PHP
+        // class (deferred to Phase 3). No additional locations to surface.
         _ => {}
     }
     out
@@ -14299,6 +14322,27 @@ fn collect_translation_declaration_targets(
             start_column: loc.position.start_column,
             end_column: loc.position.end_column,
             new_text: new_leaf.clone(),
+        })
+        .collect()
+}
+
+/// Resolve env-key declaration positions across every `.env*` file at the
+/// project root. Unlike config and translation, env keys aren't dotted —
+/// the new name is written verbatim at every declaration site, matching
+/// what gets written at call sites in `env('NEW_NAME')`.
+fn collect_env_declaration_targets(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    laravel_lsp::env_key_locator::locate_keys_across_env_files(root, old_key)
+        .into_iter()
+        .map(|loc| laravel_lsp::rename::EditTarget {
+            file_path: loc.file_path,
+            line: loc.position.line,
+            start_column: loc.position.start_column,
+            end_column: loc.position.end_column,
+            new_text: new_key.to_string(),
         })
         .collect()
 }
@@ -15579,6 +15623,14 @@ impl LanguageServer for LaravelLanguageServer {
                     targets.extend(collect_translation_declaration_targets(
                         root, key, &new_name,
                     ));
+                }
+            }
+            laravel_lsp::references::SymbolRef::Env(key) => {
+                // Env keys aren't dotted — the new name is written verbatim
+                // at every declaration AND every call site. Touches every
+                // `.env*` file at the project root that has the key.
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(collect_env_declaration_targets(root, key, &new_name));
                 }
             }
             _ => {}

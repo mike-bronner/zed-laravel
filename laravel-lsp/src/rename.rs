@@ -19,10 +19,11 @@
 //! touched.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{
-    OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, TextDocumentEdit, TextEdit,
-    Url, WorkspaceEdit,
+    DocumentChangeOperation, DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
+    Position, Range, RenameFile, RenameFileOptions, ResourceOp, TextDocumentEdit, TextEdit, Url,
+    WorkspaceEdit,
 };
 
 use crate::references::SymbolRef;
@@ -64,20 +65,59 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
     )
 }
 
-/// Build a single `WorkspaceEdit` that rewrites every `target` to its
-/// `new_text`. Returns `None` if there is nothing to rewrite (defensive —
-/// a rename with zero edits is a no-op and editors generally treat the
-/// missing response as "cancelled").
+/// A file move emitted alongside text edits.
 ///
-/// Targets are grouped by file URI; clients that don't support the modern
+/// Phase 3 uses this for class-backed kinds where renaming the symbol also
+/// moves the backing file(s) — view `.blade.php`, anonymous and class-based
+/// Blade components, Livewire view + class, the children of a Livewire MFC
+/// directory. Phase 2's string-keyed kinds (route/config/translation/env)
+/// never produce file renames.
+///
+/// Emitted with `overwrite: false, ignore_if_exists: false` so the client
+/// errors loudly if the target already exists rather than silently clobbering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRename {
+    pub old_path: PathBuf,
+    pub new_path: PathBuf,
+}
+
+/// Build a `WorkspaceEdit` containing only text rewrites — Phase 2's shape.
+///
+/// Returns `None` if `targets` is empty (a rename with zero edits is a no-op
+/// and editors generally treat the missing response as "cancelled"). Targets
+/// are grouped by file URI; clients that don't support the modern
 /// `documentChanges` form still receive a usable `changes` map.
+///
+/// Phase 3 work routes through [`build_rename_workspace_edit`] instead so it
+/// can also carry [`FileRename`] operations.
 pub fn build_rename_edit(targets: &[EditTarget]) -> Option<WorkspaceEdit> {
-    if targets.is_empty() {
+    build_rename_workspace_edit(targets, &[])
+}
+
+/// Build a `WorkspaceEdit` carrying both text rewrites and file moves.
+///
+/// Returns `None` only when BOTH inputs are empty. With a non-empty mix the
+/// returned edit always populates `document_changes` with the modern
+/// `Operations` variant (text edits + `RenameFile` ops interleaved). The
+/// legacy `changes` map is populated with the text-edit portion when present
+/// so clients without `documentChanges` support still apply the text portion
+/// — the file portion silently no-ops on those clients, which is the
+/// expected degradation for an LSP feature gated on a capability they don't
+/// advertise.
+///
+/// `RenameFile` ops are emitted with `overwrite: false, ignore_if_exists:
+/// false`. If a Phase 3 rename would clobber an existing file the client
+/// surfaces the error rather than the server silently overwriting.
+pub fn build_rename_workspace_edit(
+    text_targets: &[EditTarget],
+    file_renames: &[FileRename],
+) -> Option<WorkspaceEdit> {
+    if text_targets.is_empty() && file_renames.is_empty() {
         return None;
     }
 
     let mut grouped: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-    for t in targets {
+    for t in text_targets {
         let Ok(uri) = Url::from_file_path(&t.file_path) else {
             continue;
         };
@@ -97,14 +137,15 @@ pub fn build_rename_edit(targets: &[EditTarget]) -> Option<WorkspaceEdit> {
         grouped.entry(uri).or_default().push(edit);
     }
 
-    if grouped.is_empty() {
+    let rename_ops: Vec<DocumentChangeOperation> =
+        file_renames.iter().filter_map(file_rename_to_op).collect();
+
+    if grouped.is_empty() && rename_ops.is_empty() {
+        // Every input path failed `Url::from_file_path` — nothing to emit.
         return None;
     }
 
-    // Modern `documentChanges` form (preferred by Zed and recent editors).
-    // Versions are `None` because rename is best-effort across both saved and
-    // unsaved buffers; clients reconcile via their own undo stacks.
-    let document_changes: Vec<TextDocumentEdit> = grouped
+    let text_doc_edits: Vec<TextDocumentEdit> = grouped
         .iter()
         .map(|(uri, edits)| TextDocumentEdit {
             text_document: OptionalVersionedTextDocumentIdentifier {
@@ -115,13 +156,52 @@ pub fn build_rename_edit(targets: &[EditTarget]) -> Option<WorkspaceEdit> {
         })
         .collect();
 
+    // Wire-shape preservation: when only text edits are present (the Phase 2
+    // shape), emit the simpler `Edits` variant exactly as before. When a file
+    // rename is in the mix, switch to `Operations` so both can be carried in
+    // one workspace edit. Operations apply in array order on the client —
+    // text edits land first (rewriting source while the file is still at its
+    // old path), then the file move relocates it.
+    let document_changes = if rename_ops.is_empty() {
+        DocumentChanges::Edits(text_doc_edits)
+    } else {
+        let mut ops: Vec<DocumentChangeOperation> = text_doc_edits
+            .into_iter()
+            .map(DocumentChangeOperation::Edit)
+            .collect();
+        ops.extend(rename_ops);
+        DocumentChanges::Operations(ops)
+    };
+
     Some(WorkspaceEdit {
-        changes: Some(grouped),
-        document_changes: Some(tower_lsp::lsp_types::DocumentChanges::Edits(
-            document_changes,
-        )),
+        changes: if grouped.is_empty() {
+            None
+        } else {
+            Some(grouped)
+        },
+        document_changes: Some(document_changes),
         change_annotations: None,
     })
+}
+
+fn file_rename_to_op(rename: &FileRename) -> Option<DocumentChangeOperation> {
+    let old_uri = path_to_uri(&rename.old_path)?;
+    let new_uri = path_to_uri(&rename.new_path)?;
+    Some(DocumentChangeOperation::Op(ResourceOp::Rename(
+        RenameFile {
+            old_uri,
+            new_uri,
+            options: Some(RenameFileOptions {
+                overwrite: Some(false),
+                ignore_if_exists: Some(false),
+            }),
+            annotation_id: None,
+        },
+    )))
+}
+
+fn path_to_uri(path: &Path) -> Option<Url> {
+    Url::from_file_path(path).ok()
 }
 
 #[cfg(test)]

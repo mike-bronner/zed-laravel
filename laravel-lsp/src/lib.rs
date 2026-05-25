@@ -28,6 +28,7 @@ pub mod indexing_progress;
 pub mod livewire_resolver;
 pub mod middleware_parser;
 pub mod model_analyzer;
+pub mod naming;
 pub mod parser;
 pub mod pattern_disk_cache;
 pub mod pattern_indexer;

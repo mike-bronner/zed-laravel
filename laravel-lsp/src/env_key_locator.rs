@@ -32,8 +32,10 @@ pub struct EnvKeyLocation {
 ///
 /// The match strategy:
 ///   * Match any regular file whose name is exactly `.env` OR starts
-///     with `.env.` (so `.env.example`, `.env.testing`,
-///     `.env.production`, `.env.local` all qualify).
+///     with `.env.` — every Laravel-recognised variant is covered:
+///     `.env`, `.env.local`, `.env.testing`, `.env.production`,
+///     `.env.staging`, `.env.example`, plus any custom suffix a
+///     project might invent (`.env.qa`, `.env.docker`, etc.).
 ///   * Skip directories named `.env` — we've seen this in misconfigured
 ///     projects.
 ///   * Read each match as UTF-8; non-UTF-8 files are silently skipped

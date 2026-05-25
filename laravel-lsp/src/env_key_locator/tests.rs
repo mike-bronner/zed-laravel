@@ -94,16 +94,50 @@ fn value_can_contain_equals_sign() {
 }
 
 #[test]
-fn locates_across_multiple_env_files() {
-    // The common case: `.env`, `.env.example`, `.env.testing` all
-    // declare the same key. Rename should touch all of them.
+fn locates_across_every_env_variant_laravel_supports() {
+    // Every `.env*` variant a Laravel project might have. The matcher
+    // is `.env` exact OR `.env.<anything>` prefix, so we exhaustively
+    // verify each named variant lands in the result. New variants
+    // (custom suffixes like `.env.qa`, `.env.docker`) are picked up
+    // automatically by the prefix rule — no per-variant whitelist.
     let tmp = TempDir::new().unwrap();
-    std::fs::write(tmp.path().join(".env"), "APP_NAME=Laravel\n").unwrap();
-    std::fs::write(tmp.path().join(".env.example"), "APP_NAME=YourAppName\n").unwrap();
-    std::fs::write(tmp.path().join(".env.testing"), "APP_NAME=Testing\n").unwrap();
+    let variants = [
+        ".env",
+        ".env.local",
+        ".env.testing",
+        ".env.production",
+        ".env.staging",
+        ".env.example",
+        ".env.qa", // a custom non-canonical variant — should still match
+    ];
+    for name in &variants {
+        std::fs::write(tmp.path().join(name), "APP_NAME=Laravel\n").unwrap();
+    }
 
     let locs = locate_keys_across_env_files(tmp.path(), "APP_NAME");
-    assert_eq!(locs.len(), 3, "should find the key in all three .env files");
+    assert_eq!(
+        locs.len(),
+        variants.len(),
+        "should match every .env variant, got: {:?}",
+        locs.iter()
+            .map(|l| l.file_path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // Sanity: confirm each named variant actually appears in the
+    // results, not just that the count matches.
+    let found_names: std::collections::HashSet<String> = locs
+        .iter()
+        .map(|l| l.file_path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for v in &variants {
+        assert!(
+            found_names.contains(*v),
+            "missing variant `{}` in results: {:?}",
+            v,
+            found_names
+        );
+    }
 }
 
 #[test]

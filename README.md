@@ -240,12 +240,14 @@ lang/fr/messages.php:  'welcome' => 'Bienvenue'  →  'greeting' => 'Bienvenue'
 // every `__('messages.welcome')` becomes `__('messages.greeting')`
 ```
 
-**Environment variables** rewrite call sites AND the key in **every** `.env*` file at the project root that declares it:
+**Environment variables** rewrite call sites AND the key in **every** `.env*` file at the project root that declares it — `.env`, `.env.local`, `.env.testing`, `.env.production`, `.env.staging`, `.env.example`, and any custom variant (`.env.qa`, `.env.docker`, etc.):
 
 ```
-.env:          DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
-.env.example:  DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
-.env.testing:  DB_HOST=memory      →   DATABASE_HOST=memory
+.env:             DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
+.env.local:       DB_HOST=localhost   →   DATABASE_HOST=localhost
+.env.testing:     DB_HOST=memory      →   DATABASE_HOST=memory
+.env.production:  DB_HOST=prod.db     →   DATABASE_HOST=prod.db
+.env.example:     DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
 // every `env('DB_HOST')` becomes `env('DATABASE_HOST')`
 ```
 

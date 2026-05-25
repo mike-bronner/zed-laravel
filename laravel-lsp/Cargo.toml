@@ -20,9 +20,17 @@ tokio = { version = "1.52", features = ["full"] }
 # LRU cache for memory management
 lru = "0.18"
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
+# Serialization. The `rc` feature lets us derive Serialize/Deserialize on
+# types that contain `Arc<T>` (the parsed-pattern data structures fanned
+# out across many Arcs); serde transparently follows the Arcs as values.
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+
+# Binary serde codec for the on-disk pattern cache. JSON would also work
+# but bincode is ~3-5× smaller on disk and ~10× faster to deserialize on
+# a 40k-file project, which matters because the disk-cache load is on the
+# critical path of LSP startup.
+bincode = { version = "2.0", features = ["serde"] }
 
 # Logging
 tracing = "0.1"
@@ -54,6 +62,11 @@ tree-sitter-php = "0.24"
 
 # Additional dependencies for Salsa integration
 arc-swap = "1.9"
+
+# Concurrent hashmap used to share the pattern cache between the Salsa
+# actor (reader) and the warming task (writer). See the comment on
+# SalsaActor::pattern_cache for context.
+dashmap = "6"
 
 [build-dependencies]
 # For downloading grammar from GitHub

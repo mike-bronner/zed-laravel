@@ -74,6 +74,8 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
+**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since the last save get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
+
 **🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. This is also the only way to get correct highlighting for **custom directives** (e.g., `@myCustomDirective`, Livewire's `@teleport`, Pennant's `@feature`) that tree-sitter doesn't know about. Enable it in your Zed `settings.json`:
 
 ```json
@@ -163,6 +165,95 @@ $message = __('auth.failed');
 
 **Supported patterns:**
 `view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature`
+
+### 🔍 Find References
+
+Right-click any recognised pattern and choose **"Find All References"** (or `Shift+F12`) to surface every call site across the project — including inside installed Composer packages.
+
+```php
+$url = route('users.index', $user);
+//           ^^^^^^^^^^^^^ Find references here →
+//
+//   📂 routes/web.php:42         ->name('users.index')
+//   📂 app/Http/Controllers/UserController.php:67   redirect()->route('users.index')
+//   📂 resources/views/nav.blade.php:12   <a href="{{ route('users.index') }}">
+//   📂 vendor/some/package/src/Helpers.php:8   route('users.index')
+```
+
+**Pattern kinds covered:**
+
+| Kind | Example | Where references come from |
+|---|---|---|
+| Views | `view('users.profile')` | every `view()` / `View::make()` / `@extends` / `@include` call site |
+| Routes | `route('home')` | every `route()` call + the `->name(...)` declaration |
+| Configs | `config('app.name')` | every `config()` / `Config::get()` call + the array-key in the source config file |
+| Translations | `__('messages.key')` | every `__()` / `trans()` / `@lang` call + the array-key in every locale's lang file |
+| Env vars | `env('APP_NAME')` | every `env()` call site |
+| Blade components | `<x-button>` | every `<x-button>` opening/closing tag |
+| Livewire | `<livewire:counter>` | tags AND `@livewire('counter')` directives |
+| Middleware | `'auth'` | every `->middleware()` registration |
+| Bindings | `app('cache')` | every `app()` / `resolve()` resolution |
+
+**Parser-classified guarantee:** a coincidental string `'home'` sitting in an unrelated PHP literal is never returned. Only positions the parser has classified as the matching pattern kind appear in results. The LSP `includeDeclaration` flag is honoured — declaration sites (route names, config-key array entries, translation-key array entries) are included or excluded as the client asks.
+
+### ✏️ Rename
+
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, or environment variable. The extension rewrites every call site AND the declaration site in one atomic operation.
+
+**Route names** rewrite call sites and the `->name(...)` declaration together:
+
+```php
+// Before:
+Route::get('/dashboard', DashboardController::class)->name('home');
+// in a controller somewhere:
+return redirect()->route('home');
+// in a blade view:
+<a href="{{ route('home') }}">
+
+// After renaming 'home' → 'dashboard':
+Route::get('/dashboard', DashboardController::class)->name('dashboard');
+return redirect()->route('dashboard');
+<a href="{{ route('dashboard') }}">
+```
+
+Route group prefixes compose correctly — renaming a route from inside `Route::group(['as' => 'admin.'], …)` rewrites only the leaf segment in the declaration while every call site still gets the full new dotted name.
+
+**Config keys** rewrite call sites and the array-key in the source config file:
+
+```php
+// Before — config/app.php:
+'timezone' => 'UTC',
+// usage somewhere:
+$tz = config('app.timezone');
+
+// After renaming 'app.timezone' → 'app.tz':
+'tz' => 'UTC',                 // only the leaf segment rewrites in config/
+$tz = config('app.tz');        // call sites rewrite the full dotted form
+```
+
+**Translation keys** rewrite call sites AND the array-key in **every** locale's lang file:
+
+```
+lang/en/messages.php:  'welcome' => 'Welcome'  →  'greeting' => 'Welcome'
+lang/es/messages.php:  'welcome' => 'Bienvenido'  →  'greeting' => 'Bienvenido'
+lang/fr/messages.php:  'welcome' => 'Bienvenue'  →  'greeting' => 'Bienvenue'
+// every `__('messages.welcome')` becomes `__('messages.greeting')`
+```
+
+**Environment variables** rewrite call sites AND the key in **every** `.env*` file at the project root that declares it — `.env`, `.env.local`, `.env.testing`, `.env.production`, `.env.staging`, `.env.example`, and any custom variant (`.env.qa`, `.env.docker`, etc.):
+
+```
+.env:             DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
+.env.local:       DB_HOST=localhost   →   DATABASE_HOST=localhost
+.env.testing:     DB_HOST=memory      →   DATABASE_HOST=memory
+.env.production:  DB_HOST=prod.db     →   DATABASE_HOST=prod.db
+.env.example:     DB_HOST=127.0.0.1   →   DATABASE_HOST=127.0.0.1
+// every `env('DB_HOST')` becomes `env('DATABASE_HOST')`
+```
+
+**Same parser-classified guarantee as Find References** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
+
+**Not yet renameable** (class-backed kinds — planned follow-up): views, blade components, Livewire components, blade/PHP variables. `prepare_rename` rejects these so you'll see "Can't rename this symbol" when you try — better than half-renaming something.
 
 ### 💡 Autocomplete
 
@@ -486,10 +577,20 @@ If your PHP class outline isn't appearing, make sure:
 
 ## 🚧 Planned Features
 
-- 📖 Hover documentation with resolved values
-- 🎨 Inertia.js support (`Inertia::render('Page')`)
-- 📁 Folio page routing
-- ⚡ Volt component support
+**Rename for class-backed patterns** (extending the currently-shipped rename for route names / config keys / translation keys):
+
+- ✏️ **PHP class rename engine** — the foundation: FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Required infrastructure for everything below.
+- 📄 **View rename** — Blade file move + every call-site rewrite. If the view has a backing Renderable / ViewModel class, that gets renamed too (via the class engine above).
+- 🧩 **Blade component rename** — both anonymous (file move) and class-backed (class rename + tag-site updates) flavours, shipping together so the UX never depends on which flavour the user picked.
+- ⚡ **Livewire component rename** — class rename + paired view file move + every `<livewire:name>` tag and `@livewire('name')` directive rewritten.
+- 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
+- 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
+
+**Framework integrations:**
+
+- 🎨 **Inertia.js support** — go-to-definition and autocomplete for `Inertia::render('Page')` calls
+- 📁 **Folio page routing** — surface Folio's filesystem-routed pages in goto-definition / completion / find-references
+- ⚡ **Volt component support** — single-file Livewire components
 
 ## 🤝 Contributing
 

@@ -31,8 +31,8 @@ use laravel_lsp::salsa_impl::{
     ActionReferenceData, AssetReferenceData, BindingReferenceData, ComponentReferenceData,
     ConfigReferenceData, DirectiveReferenceData, EnvReferenceData, FeatureReferenceData,
     LaravelConfigData, LivewireReferenceData, MiddlewareReferenceData, PatternAtPosition,
-    RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData, UrlReferenceData,
-    ViewReferenceData,
+    ReferenceLocationData, RouteReferenceData, SalsaActor, SalsaHandle, TranslationReferenceData,
+    UrlReferenceData, ViewReferenceData,
 };
 
 // ============================================================================
@@ -1843,6 +1843,23 @@ struct LaravelLanguageServer {
     /// what we found" (the map can be empty if no packages register).
     /// Wrapped in `Arc` so clones share memory across hover calls.
     vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
+
+    /// Per-route-file cache of [`route_name_locator`] output, keyed by
+    /// mtime. Find-references on a route runs route_name_locator on every
+    /// file in `routes/` — without this cache, every invocation re-parses
+    /// the routes/ directory from scratch. The cache turns subsequent
+    /// invocations into a stat + HashMap lookup.
+    route_decl_cache: Arc<
+        RwLock<
+            HashMap<
+                PathBuf,
+                (
+                    std::time::SystemTime,
+                    Arc<Vec<laravel_lsp::route_name_locator::RouteNameDeclaration>>,
+                ),
+            >,
+        >,
+    >,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2745,6 +2762,7 @@ impl LaravelLanguageServer {
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
+            route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2896,11 +2914,23 @@ impl LaravelLanguageServer {
     /// This scans key directories (controllers, views, Livewire, routes) and
     /// registers all PHP/Blade files with Salsa. The Salsa system will then
     /// cache parsed patterns for efficient reference lookups.
-    async fn register_project_files_with_salsa(&self, root_path: &Path) {
+    /// Register the project's PHP/Blade files with Salsa and kick off the
+    /// pattern-cache warming task. If `progress` is provided it'll drive the
+    /// "Discovering files" → "Indexing X of N" → "Indexed" status-bar updates;
+    /// pass `None` from any code path that just needs the registration done
+    /// without UI (e.g. re-registration after a config change).
+    async fn register_project_files_with_salsa(
+        &self,
+        root_path: &Path,
+        progress: Option<laravel_lsp::indexing_progress::IndexingProgress>,
+    ) {
         let config = match self.get_cached_config().await {
             Some(c) => c,
             None => {
                 debug!("Cannot register project files - no config available");
+                if let Some(p) = progress {
+                    p.end("No project config — indexing skipped.").await;
+                }
                 return;
             }
         };
@@ -2910,6 +2940,24 @@ impl LaravelLanguageServer {
 
         // Get Livewire path from config
         let livewire_path = config.livewire_path.clone();
+
+        // Phase 1: file discovery. The Salsa actor's
+        // `handle_register_project_files` walks the project tree and creates
+        // a Salsa input per file. This is the synchronous-inside-the-actor
+        // step that takes ~3s on a 40k-file project (40k file reads).
+        let mut progress = progress;
+        if let Some(p) = progress.as_mut() {
+            // Force this report through the throttle: the very first
+            // user-visible message MUST land, and there's nothing else
+            // competing for the throttle window yet.
+            // Percentage is sent on the wire (driving the fill bar in
+            // clients that render one); the message text never includes
+            // a `(X%)` suffix because Zed's status bar is narrow and the
+            // numerical progress already lives in the descriptive
+            // "Indexing N of M files" text below. Discovery is the
+            // pre-parse phase — leave it at 0 so the bar starts empty.
+            p.report("Discovering project files…", Some(0), true).await;
+        }
 
         // Register with Salsa
         if let Err(e) = self
@@ -2924,9 +2972,323 @@ impl LaravelLanguageServer {
             .await
         {
             debug!("Failed to register project files with Salsa: {}", e);
-        } else {
-            info!("Laravel LSP: Project files registered with Salsa for reference finding");
+            if let Some(p) = progress {
+                p.end("Failed to register project files.").await;
+            }
+            return;
         }
+
+        info!("Laravel LSP: Project files registered with Salsa for reference finding");
+
+        // Disk-cache restore. Loads previously-parsed patterns into the
+        // shared pattern_cache, dropping any entry whose on-disk mtime
+        // doesn't match what was cached. Anything restored here gets
+        // skipped by the warming pass below — that's the whole win for
+        // cross-restart speed. First-ever launch on a project has no
+        // cache file and load_into returns (0, 0).
+        if let Some(p) = progress.as_mut() {
+            p.report("Loading cached index…", Some(0), true).await;
+        }
+        let pattern_cache = self.salsa.pattern_cache();
+        let root_for_load = root_path.to_path_buf();
+        let cache_for_load = pattern_cache.clone();
+        let (restored, dropped) = tokio::task::spawn_blocking(move || {
+            laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
+        })
+        .await
+        .unwrap_or((0, 0));
+        if restored + dropped > 0 {
+            info!(
+                "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
+                restored, dropped
+            );
+        }
+
+        // Pattern-cache warming via THROTTLED parallel parsing.
+        //
+        // History: a previous revision of this code spawned an unbounded
+        // `tokio::task::spawn_blocking` per file. On real-world projects
+        // (hundreds-to-thousands of PHP files) this saturated the blocking
+        // thread pool, pinned every CPU core, and consumed enough RAM to
+        // hang the machine. Don't do that again.
+        //
+        // Throttle invariants:
+        //   * At most `MAX_CONCURRENT_PARSES` parses in flight at any time
+        //     (semaphore-gated). Memory and CPU stay bounded regardless of
+        //     project size.
+        //   * Per-file size cap. This is NOT a defensive guard against
+        //     50MB files — it's a hard requirement for warming to finish
+        //     in reasonable time. Some auto-generated vendor PHP files
+        //     (composer autoload maps, AWS SDK service definitions, Faker
+        //     locale text dumps, IDE helper output) are 500KB–2MB+ of
+        //     deeply-nested array literals. tree-sitter-php on those
+        //     files takes 30+ seconds *each*, single-threaded. With our
+        //     8-worker pool, ~8 such files in flight stalls every core
+        //     and the warming task wall-clock balloons from "seconds"
+        //     to "minutes" on a 40k-file project. Empirically: dropping
+        //     the cap from 4MB → 256KB cut warming from 70s to <10s on
+        //     a real Laravel project with full vendor + Flux icons +
+        //     IDE helpers checked in.
+        //
+        //     Picking 256KB: Mike's biggest real-app PHP file in the
+        //     test project is 55KB (a static data table). IDE helpers
+        //     top out at 186KB. Vendor blobs that hit this cap are all
+        //     auto-generated metadata that doesn't contain user-facing
+        //     `route()`/`view()`/`config()` patterns we care about.
+        //   * Bulk-import in chunks so the actor's pattern_cache.put loop
+        //     never holds the actor for too long on a giant project.
+        const MAX_CONCURRENT_PARSES: usize = 8;
+        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
+
+        let salsa = self.salsa.clone();
+        let root_for_save = root_path.to_path_buf();
+        // pattern_cache already cloned above for the load step; clone
+        // again here so the warming task can (a) skip files already in
+        // cache from the load and (b) hand the same map to save_from.
+        let pattern_cache_for_warm = pattern_cache.clone();
+        tokio::spawn(async move {
+            // `progress` moves into this task — when warming finishes (or
+            // hits an early return) we call `end` to clear the status bar.
+            let mut progress = progress;
+            let started_at = std::time::Instant::now();
+
+            // Defensively prewarm the global query cache on this thread
+            // before spawning parallel parses. The Salsa actor already
+            // prewarms during init, but if our warming task races ahead
+            // of that, one parse_owned call would pay the ~400ms one-time
+            // compilation cost. Doing it here once is free if already
+            // warm, prevents per-task surprises if not.
+            tokio::task::spawn_blocking(laravel_lsp::queries::prewarm_query_cache)
+                .await
+                .ok();
+
+            // Discovery is done — transition to "Indexing" phase. Forced
+            // so the user sees the phase change even if the throttle
+            // would otherwise drop it.
+            if let Some(p) = progress.as_mut() {
+                // Parse phase transition: still at 0% — the per-file
+                // updates below increment from here to 100.
+                p.report("Indexing project files…", Some(0), true).await;
+            }
+
+            let paths = match salsa.list_project_files().await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("list_project_files failed: {}", e);
+                    if let Some(p) = progress {
+                        p.end("Failed to list project files.").await;
+                    }
+                    return;
+                }
+            };
+            // Filter out paths whose parsed patterns the disk cache
+            // already restored — those files are unchanged since the
+            // last save and don't need re-parsing. This is THE point
+            // where cross-restart speed comes from: on a project with
+            // 40k files and no edits, this drops `paths_to_parse` to
+            // (close to) zero, and warming finishes in milliseconds.
+            let total = paths.len();
+            let paths_to_parse: Vec<_> = paths
+                .into_iter()
+                .filter(|p| !pattern_cache_for_warm.contains_key(p))
+                .collect();
+            let to_parse = paths_to_parse.len();
+            let cached_hits = total - to_parse;
+            if cached_hits > 0 {
+                info!(
+                    "🗄️  Warming will reuse {} cached files, parse {}",
+                    cached_hits, to_parse
+                );
+            }
+
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+
+            // Spawn one task per file we still need to parse. The
+            // semaphore ensures we never have more than N parses running
+            // (or holding parsed-tree memory) at once.
+            let mut handles = Vec::with_capacity(to_parse);
+            for path in paths_to_parse {
+                let permit_owner = semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = match permit_owner.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
+                    // Skip `.json.php` files (Laravel/PHP convention for
+                    // pre-baked JSON data wrapped as PHP). These are
+                    // pure data — never user-facing Laravel patterns —
+                    // and tree-sitter-php chokes on their deeply-nested
+                    // array literals (0.4–2.2s *per file*). Mike's test
+                    // project has 1,735 of these under aws-sdk-php.
+                    //
+                    // **We still insert an empty `ParsedPatternsData`**
+                    // for these files so future cache lookups hit
+                    // immediately instead of falling through to the
+                    // Salsa parse path. Without this, `find-references`
+                    // walks every project file and any path not in
+                    // `pattern_cache` re-parses via Salsa — which has
+                    // no size cap and chokes on these exact files.
+                    // The empty patterns are ~30 bytes each in the
+                    // serialized disk cache; negligible.
+                    let path_str = path.to_string_lossy();
+                    if path_str.ends_with(".json.php") {
+                        return Some((
+                            path,
+                            Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                        ));
+                    }
+
+                    // Same idea for the size cap: skip the parse, but
+                    // insert empty patterns so the cache lookup
+                    // succeeds and never falls through to Salsa.
+                    let metadata = std::fs::metadata(&path).ok()?;
+                    if metadata.len() > MAX_FILE_SIZE_BYTES {
+                        info!(
+                            "warming: skipping oversized file {} ({} bytes > {} cap)",
+                            path.display(),
+                            metadata.len(),
+                            MAX_FILE_SIZE_BYTES
+                        );
+                        return Some((
+                            path,
+                            Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                        ));
+                    }
+                    // Actual parse on the blocking pool — tree-sitter is
+                    // CPU-bound and would block the async runtime if run
+                    // directly in a tokio task.
+                    let path_for_task = path.clone();
+                    let parsed: Option<Arc<laravel_lsp::salsa_impl::ParsedPatternsData>> =
+                        tokio::task::spawn_blocking(move || {
+                            let text = std::fs::read_to_string(&path_for_task).ok()?;
+                            Some(laravel_lsp::pattern_indexer::parse_owned(
+                                &path_for_task,
+                                &text,
+                            ))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    parsed.map(|data| (path, data))
+                }));
+            }
+
+            // Collect all parse results into a single buffer, then bulk-
+            // import directly into the shared DashMap-backed pattern cache
+            // via SalsaHandle::bulk_import_patterns. That call bypasses
+            // the actor's mpsc channel entirely — see the comment on
+            // SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
+            // for the architectural why. With this path: warming on a
+            // 40k-file project takes ~7s wall (~6.5s parse + ~10ms import).
+            //
+            // Progress reports are emitted as each handle completes. The
+            // IndexingProgress helper throttles internally so we don't
+            // need to be careful about emitting every iteration.
+            let mut buffer: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+                Vec::with_capacity(to_parse);
+            let mut completed = 0usize;
+            for h in handles {
+                if let Ok(Some(pair)) = h.await {
+                    buffer.push(pair);
+                }
+                completed += 1;
+                if let Some(p) = progress.as_mut() {
+                    // Progress is over the files we're actually parsing
+                    // this session, not the total project size. Showing
+                    // "Indexing 12 of 12 files" after a warm restart
+                    // gives accurate feedback for the work in progress;
+                    // the user already saw the cached restore land in
+                    // the "Loading cached index…" step before this.
+                    let denom = to_parse.max(1);
+                    let pct = ((completed.saturating_mul(100) / denom) as u32).min(100);
+                    p.report(
+                        format!("Indexing {} of {} files…", completed, to_parse),
+                        Some(pct),
+                        false,
+                    )
+                    .await;
+                }
+            }
+            let imported = salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+
+            // Persist the entire live pattern_cache (cached restores +
+            // freshly parsed entries) so the next LSP startup can skip
+            // most of the work. Runs on the blocking pool because it's
+            // sync I/O — and we don't gate user-visible warming
+            // completion on it; the save just runs and logs its outcome.
+            let cache_for_save = pattern_cache_for_warm.clone();
+            let root_for_save_inner = root_for_save.clone();
+            let save_result = tokio::task::spawn_blocking(move || {
+                laravel_lsp::pattern_disk_cache::save_from(&cache_for_save, &root_for_save_inner)
+            })
+            .await;
+            match save_result {
+                Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries", n),
+                Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
+                Err(e) => debug!("Disk cache save task panicked: {}", e),
+            }
+
+            // Build the inverted symbol index now that pattern_cache
+            // is fully populated. Without this, the first
+            // `find-references` query pays an O(N files) walk; with
+            // it, queries are an O(1) hashmap lookup. Index build is
+            // ~50ms on a 60k-file project — well within the warming
+            // budget we already log.
+            match salsa.build_symbol_index().await {
+                Ok(count) => info!("🔍 Symbol index built: {} symbol entries", count),
+                Err(e) => debug!("Symbol index build failed: {}", e),
+            }
+
+            let elapsed = started_at.elapsed();
+            info!(
+                "🔥 Laravel LSP: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
+                imported, cached_hits, total, elapsed
+            );
+
+            if let Some(p) = progress {
+                p.end(format!(
+                    "Indexed {} files in {:.1}s.",
+                    total,
+                    elapsed.as_secs_f64()
+                ))
+                .await;
+            }
+        });
+    }
+
+    /// Return the cached `route_name_locator` output for `path`. Re-parses
+    /// only when the file's mtime differs from the cached entry. Returns
+    /// `None` if the file can't be stat'd or read.
+    ///
+    /// Without this cache, every find-references / rename / prepare_rename
+    /// on a route triggers a fresh tree-sitter parse of every routes/*.php
+    /// file. With it, the first call per mtime parses; subsequent calls
+    /// are HashMap lookups.
+    async fn cached_route_decls(
+        &self,
+        path: &Path,
+    ) -> Option<Arc<Vec<laravel_lsp::route_name_locator::RouteNameDeclaration>>> {
+        let disk_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+
+        // Cache hit?
+        {
+            let cache = self.route_decl_cache.read().await;
+            if let Some((cached_mtime, decls)) = cache.get(path) {
+                if *cached_mtime == disk_mtime {
+                    return Some(decls.clone());
+                }
+            }
+        }
+
+        // Cache miss / stale — read + parse + store.
+        let content = tokio::fs::read_to_string(path).await.ok()?;
+        let decls =
+            Arc::new(laravel_lsp::route_name_locator::extract_route_name_declarations(&content));
+        self.route_decl_cache
+            .write()
+            .await
+            .insert(path.to_path_buf(), (disk_mtime, decls.clone()));
+        Some(decls)
     }
 
     /// Register environment files directly with Salsa for parsing
@@ -3931,8 +4293,13 @@ impl LaravelLanguageServer {
                     config.view_paths.len()
                 );
 
-                // Register project files with Salsa for reference finding
-                self.register_project_files_with_salsa(&discovered_root)
+                // Register project files with Salsa for reference finding.
+                // No progress UI here — this path runs in response to a
+                // mid-session config change, where flashing a status-bar
+                // entry for a re-index would feel surprising. The
+                // user-facing first-load progress is wired into
+                // `initialized()` instead.
+                self.register_project_files_with_salsa(&discovered_root, None)
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
@@ -11831,6 +12198,7 @@ return [
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
+            route_decl_cache: self.route_decl_cache.clone(),
         }
     }
 
@@ -13649,6 +14017,400 @@ return [
     }
 }
 
+/// Classify the symbol under the cursor, with a declaration-site fallback
+/// for files the parser doesn't fully cover.
+///
+/// The tree-sitter `php.scm` query captures every call-site shape for routes
+/// (`route('home')`, `URL::route('home')`, `signed_route('home')`, etc.) but
+/// has no rule for `->name('home')` declarations. When the cursor sits on a
+/// declaration, the primary classifier returns `None`, which would make
+/// references / rename silently no-op — confusing because the user is
+/// pointing right at the symbol's definition.
+///
+/// The fallback walks the file with `route_name_locator` (the same locator
+/// rename already uses) and checks whether the cursor falls inside any
+/// `->name(...)` argument range. If so, return a `Route` symbol carrying
+/// the locator's full route name.
+async fn classify_with_decl_fallback(
+    server: &LaravelLanguageServer,
+    file_path: &Path,
+    patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
+    position: Position,
+) -> Option<laravel_lsp::references::SymbolRef> {
+    // Primary path: the parser already classified something here.
+    if let Some(sym) = laravel_lsp::references::classify_pattern_at_cursor(
+        patterns,
+        position.line,
+        position.character,
+    ) {
+        return Some(sym);
+    }
+
+    // Fallback path: route-name declarations live in `routes/*.php` and
+    // aren't tagged by php.scm. Use the mtime-cached decl walker so
+    // subsequent invocations don't re-parse the file.
+    if !is_in_routes_dir(file_path) {
+        return None;
+    }
+    let decls = server.cached_route_decls(file_path).await?;
+    for decl in decls.iter() {
+        if decl.line == position.line
+            && position.character >= decl.start_column
+            && position.character <= decl.end_column
+        {
+            return Some(laravel_lsp::references::SymbolRef::Route(
+                decl.full_name.clone(),
+            ));
+        }
+    }
+    None
+}
+
+/// Look up the source-text range a `prepare_rename` should return when the
+/// cursor sat on a declaration-fallback site (parser saw nothing, but the
+/// locator did). Used for prepare_rename's editor-highlight range.
+async fn decl_range_at(
+    server: &LaravelLanguageServer,
+    file_path: &Path,
+    position: Position,
+    symbol: &laravel_lsp::references::SymbolRef,
+) -> Option<Range> {
+    // Only route declarations are currently locator-discoverable; configs
+    // and translations are reachable only via call-site classification.
+    let laravel_lsp::references::SymbolRef::Route(name) = symbol else {
+        return None;
+    };
+    let decls = server.cached_route_decls(file_path).await?;
+    for d in decls.iter().filter(|d| d.full_name == *name) {
+        if d.line == position.line
+            && position.character >= d.start_column
+            && position.character <= d.end_column
+        {
+            return Some(Range {
+                start: Position {
+                    line: d.line,
+                    character: d.start_column,
+                },
+                end: Position {
+                    line: d.line,
+                    character: d.end_column,
+                },
+            });
+        }
+    }
+    None
+}
+
+/// Heuristic: is this file under a `routes/` subdirectory anywhere in its
+/// path? Used to gate the declaration-fallback walk so we don't pay the
+/// parse cost on every PHP file.
+fn is_in_routes_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("routes"))
+}
+
+/// Return the column range of the classified pattern under the cursor.
+/// Used by `prepare_rename` so the editor highlights the right span.
+fn pattern_range_at(
+    patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
+    line: u32,
+    column: u32,
+) -> Option<Range> {
+    let pat = patterns.find_at_position(line, column)?;
+    let (l, start, end) = match pat {
+        laravel_lsp::salsa_impl::PatternAtPosition::View(v) => (v.line, v.column, v.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Route(r) => (r.line, r.column, r.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::ConfigRef(c) => {
+            (c.line, c.column, c.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Translation(t) => {
+            (t.line, t.column, t.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::EnvRef(e) => (e.line, e.column, e.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Component(c) => {
+            (c.line, c.column, c.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Livewire(l) => (l.line, l.column, l.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Middleware(m) => {
+            (m.line, m.column, m.end_column)
+        }
+        laravel_lsp::salsa_impl::PatternAtPosition::Binding(b) => (b.line, b.column, b.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Directive(d) => {
+            (d.line, d.string_column, d.string_end_column)
+        }
+        // Other patterns aren't renameable; range still useful for highlights.
+        laravel_lsp::salsa_impl::PatternAtPosition::Asset(a) => (a.line, a.column, a.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Url(u) => (u.line, u.column, u.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Action(a) => (a.line, a.column, a.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::Feature(f) => (f.line, f.column, f.end_column),
+    };
+    Some(Range {
+        start: Position {
+            line: l,
+            character: start,
+        },
+        end: Position {
+            line: l,
+            character: end,
+        },
+    })
+}
+
+/// Resolve the source position of a dotted config key's declaration in
+/// `config/<file>.php` and return an edit target. Wraps
+/// [`laravel_lsp::config_key_locator::locate_key`] so the rename handler
+/// stays terse.
+fn collect_config_declaration_target(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Option<laravel_lsp::rename::EditTarget> {
+    let pos = laravel_lsp::config_key_locator::locate_key(root, old_key)?;
+    let file_stem = old_key.split('.').next()?;
+    let file_path = root.join("config").join(format!("{file_stem}.php"));
+    // Decl text = leaf segment of the new dotted form. The file portion
+    // stays — it IS the config filename, which renames don't move.
+    let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
+    Some(laravel_lsp::rename::EditTarget {
+        file_path,
+        line: pos.line,
+        start_column: pos.start_column,
+        end_column: pos.end_column,
+        new_text: new_leaf,
+    })
+}
+
+/// Find every declaration-site `Location` for a classified symbol — the
+/// references-side companion to the rename helpers below. Walks the same
+/// tree-sitter locators but returns `Location` values directly. Kinds whose
+/// declaration is invisible to the parser (everything outside route/config/
+/// translation right now) contribute nothing.
+async fn collect_declaration_locations(
+    server: &LaravelLanguageServer,
+    root: &Path,
+    symbol: &laravel_lsp::references::SymbolRef,
+) -> Vec<Location> {
+    use laravel_lsp::references::SymbolRef;
+    let mut out = Vec::new();
+    match symbol {
+        SymbolRef::Route(name) => {
+            let routes_dir = root.join("routes");
+            if !routes_dir.exists() {
+                return out;
+            }
+            for entry in WalkDir::new(&routes_dir)
+                .max_depth(6)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+                    continue;
+                }
+                let Some(all_decls) = server.cached_route_decls(path).await else {
+                    continue;
+                };
+                for d in all_decls.iter().filter(|d| d.full_name == *name) {
+                    if let Ok(uri) = Url::from_file_path(path) {
+                        out.push(Location {
+                            uri,
+                            range: Range {
+                                start: Position {
+                                    line: d.line,
+                                    character: d.start_column,
+                                },
+                                end: Position {
+                                    line: d.line,
+                                    character: d.end_column,
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        SymbolRef::Config(key) => {
+            if let Some(pos) = laravel_lsp::config_key_locator::locate_key(root, key) {
+                if let Some(file_stem) = key.split('.').next() {
+                    let path = root.join("config").join(format!("{file_stem}.php"));
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        out.push(Location {
+                            uri,
+                            range: Range {
+                                start: Position {
+                                    line: pos.line,
+                                    character: pos.start_column,
+                                },
+                                end: Position {
+                                    line: pos.line,
+                                    character: pos.end_column,
+                                },
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        SymbolRef::Translation(key) => {
+            let locs = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, key);
+            for loc in locs {
+                if let Ok(uri) = Url::from_file_path(&loc.file_path) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line: loc.position.line,
+                                character: loc.position.start_column,
+                            },
+                            end: Position {
+                                line: loc.position.line,
+                                character: loc.position.end_column,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        SymbolRef::Env(key) => {
+            // Env declarations live in every `.env*` file at the project
+            // root that has the matching `KEY=…` line. Surfacing them in
+            // find-references is the same shape as translations — one
+            // Location per matching file.
+            let locs = laravel_lsp::env_key_locator::locate_keys_across_env_files(root, key);
+            for loc in locs {
+                if let Ok(uri) = Url::from_file_path(&loc.file_path) {
+                    out.push(Location {
+                        uri,
+                        range: Range {
+                            start: Position {
+                                line: loc.position.line,
+                                character: loc.position.start_column,
+                            },
+                            end: Position {
+                                line: loc.position.line,
+                                character: loc.position.end_column,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        // View, component, livewire, middleware, binding: their declarations
+        // either don't have a single canonical point or they involve a PHP
+        // class (deferred to Phase 3). No additional locations to surface.
+        _ => {}
+    }
+    out
+}
+
+/// Resolve translation-key declaration positions across every locale's lang
+/// file. The LEAF segment of the new dotted form is written at each
+/// declaration; the file portion is the lang filename and can't change
+/// without moving the file.
+fn collect_translation_declaration_targets(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    let locations = laravel_lsp::translation_key_locator::locate_keys_across_locales(root, old_key);
+    let new_leaf = new_key.rsplit('.').next().unwrap_or(new_key).to_string();
+    locations
+        .into_iter()
+        .map(|loc| laravel_lsp::rename::EditTarget {
+            file_path: loc.file_path,
+            line: loc.position.line,
+            start_column: loc.position.start_column,
+            end_column: loc.position.end_column,
+            new_text: new_leaf.clone(),
+        })
+        .collect()
+}
+
+/// Resolve env-key declaration positions across every `.env*` file at the
+/// project root. Unlike config and translation, env keys aren't dotted —
+/// the new name is written verbatim at every declaration site, matching
+/// what gets written at call sites in `env('NEW_NAME')`.
+fn collect_env_declaration_targets(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    laravel_lsp::env_key_locator::locate_keys_across_env_files(root, old_key)
+        .into_iter()
+        .map(|loc| laravel_lsp::rename::EditTarget {
+            file_path: loc.file_path,
+            line: loc.position.line,
+            start_column: loc.position.start_column,
+            end_column: loc.position.end_column,
+            new_text: new_key.to_string(),
+        })
+        .collect()
+}
+
+/// Walk every `routes/*.php` under the project root and surface
+/// `->name(...)` declaration sites whose full name matches `target`. Each
+/// emitted target writes `new_name` verbatim at the captured position. (For
+/// group-prefixed routes, the locator already emits one target per segment
+/// so the prefix composition stays intact.)
+async fn collect_route_declaration_targets(
+    server: &LaravelLanguageServer,
+    root: &Path,
+    target: &str,
+    new_name: &str,
+) -> Vec<laravel_lsp::rename::EditTarget> {
+    let mut targets = Vec::new();
+    let routes_dir = root.join("routes");
+    if !routes_dir.exists() {
+        return targets;
+    }
+    for entry in WalkDir::new(&routes_dir)
+        .max_depth(6)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "php") {
+            continue;
+        }
+        // Mtime-cached: first invocation per file mtime parses the file
+        // with route_name_locator; subsequent invocations are a HashMap hit
+        // until the file changes on disk.
+        let Some(all_decls) = server.cached_route_decls(path).await else {
+            continue;
+        };
+        for d in all_decls.iter().filter(|d| d.full_name == target) {
+            targets.push(laravel_lsp::rename::EditTarget {
+                file_path: path.to_path_buf(),
+                line: d.line,
+                start_column: d.start_column,
+                end_column: d.end_column,
+                new_text: new_name.to_string(),
+            });
+        }
+    }
+    targets
+}
+
+/// Convert a Salsa `ReferenceLocationData` into an LSP `Location`. Positions
+/// are 0-based throughout (matches `tree-sitter` and `lsp-types`). Returns
+/// `None` when the file path can't be expressed as a `file://` URL.
+fn reference_location_to_lsp(loc: &ReferenceLocationData) -> Option<Location> {
+    let uri = Url::from_file_path(&loc.file_path).ok()?;
+    Some(Location {
+        uri,
+        range: Range {
+            start: Position {
+                line: loc.line,
+                character: loc.column,
+            },
+            end: Position {
+                line: loc.line,
+                character: loc.end_column,
+            },
+        },
+    })
+}
+
 /// Convert a `document_symbols::SymbolEntry` (LSP-agnostic) into a tower-lsp
 /// `DocumentSymbol`. Recurses into children. `selection_range` is set to the
 /// same range as `range` — clients use selection_range for the click target.
@@ -13799,6 +14561,25 @@ impl LanguageServer for LaravelLanguageServer {
                 // and scopes.
                 document_symbol_provider: Some(OneOf::Left(true)),
 
+                // ✅ References provider — `textDocument/references`. Finds
+                // every parser-classified call site for a Laravel pattern
+                // (view, route, config, translation, env, blade component,
+                // livewire, middleware, binding). Never matches raw string
+                // shape — only positions the parser tagged as the matching
+                // pattern kind are returned.
+                references_provider: Some(OneOf::Left(true)),
+
+                // ✅ Rename provider — `textDocument/rename` /
+                // `textDocument/prepareRename`. Phase 2: route names, config
+                // keys, translation keys. Anything that resolves to (or may
+                // resolve to) a PHP class is held back for Phase 3.
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                })),
+
                 // On-type formatting (currently unused, bracket expansion uses completions)
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
                     first_trigger_character: "{".to_string(),
@@ -13848,22 +14629,78 @@ impl LanguageServer for LaravelLanguageServer {
         // This doesn't block the LSP - Zed can start sending requests immediately
         // Note: If cache exists, config/middleware/env are already loaded in initialize()
         let server = self.clone_for_spawn();
+        let client = self.client.clone();
         tokio::spawn(async move {
+            // Open a single LSP work-done progress token that spans the
+            // full first-load indexing flow (config → files → warming).
+            // Title is just "Laravel" so the user can see at a glance
+            // which extension owns the status-bar entry — Zed's status
+            // bar can host multiple LSP progress entries simultaneously
+            // and an unbranded one would be ambiguous. The descriptive
+            // detail ("Indexing 12,345 of 40,589 files") lives in the
+            // `message` so the title stays short.
+            //
+            // If the client doesn't support work-done-progress, `begin`
+            // returns None and the rest of the flow just skips reports.
+            let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+                client,
+                "Laravel",
+                "Starting indexer…",
+            )
+            .await;
+
             // Register config if not loaded from cache
             if server.get_cached_config().await.is_none() {
                 info!("📋 No cached config, registering from files...");
+                if let Some(p) = progress.as_mut() {
+                    p.report("Loading project configuration…", Some(0), true)
+                        .await;
+                }
                 server.register_config_with_salsa(&root).await;
             }
 
-            // Register project files with Salsa for reference finding (if config available)
+            // Register project files with Salsa for reference finding (if config available).
+            // The progress handle is MOVED into register_project_files_with_salsa,
+            // which forwards it into the spawned warming task — that task is
+            // responsible for ending the progress when warming completes.
             if let Some(config) = server.get_cached_config().await {
                 info!(
                     "Laravel config available: {} view paths",
                     config.view_paths.len()
                 );
-                server.register_project_files_with_salsa(&root).await;
+
+                // Tell the client which files to watch for live cache
+                // invalidation. This MUST happen before warming starts,
+                // not after, so that any external changes during the
+                // 7-second cold parse are captured rather than missed.
+                // We use dynamic registration (not declared in
+                // `initialize`) because the view paths and livewire
+                // path depend on project config we only just loaded.
+                let registration = laravel_lsp::file_watcher::build_registration(
+                    &root,
+                    &config.view_paths,
+                    config.livewire_path.as_deref(),
+                );
+                match server.client.register_capability(vec![registration]).await {
+                    Ok(_) => info!(
+                        "🛡️  Registered file watcher: {} view paths, livewire={}",
+                        config.view_paths.len(),
+                        config.livewire_path.is_some()
+                    ),
+                    Err(e) => debug!(
+                        "File watcher registration failed (client may not support it): {}",
+                        e
+                    ),
+                }
+
+                server
+                    .register_project_files_with_salsa(&root, progress.take())
+                    .await;
             } else {
                 info!("Config not available for project file registration");
+                if let Some(p) = progress.take() {
+                    p.end("No project config found.").await;
+                }
             }
 
             // Register env files with Salsa (if not loaded from cache)
@@ -14105,6 +14942,139 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    /// Client-reported file change for a path matching one of our
+    /// registered globs (set up via `client.register_capability` in
+    /// `initialized`). Catches changes made outside Zed — `git pull`,
+    /// external formatters, second-editor saves — that would otherwise
+    /// leave the in-memory pattern cache stale.
+    ///
+    /// Behaviour:
+    ///
+    /// - **Created / Changed**: read the file (if reachable), push the
+    ///   new content into Salsa via `update_file`. That call also
+    ///   removes the path from `pattern_cache`, so the next reference
+    ///   query parses fresh. We do NOT re-parse eagerly — spreading
+    ///   the work across user-driven queries is cheaper than burning
+    ///   CPU on a `git checkout` burst.
+    ///
+    /// - **Deleted**: tell Salsa to drop the file entirely. This
+    ///   removes its `SourceFile` input AND every per-file cache
+    ///   keyed by path (pattern_cache, loop_blocks_cache, etc.).
+    ///
+    /// - **Open documents**: events for currently-open files are
+    ///   skipped. The editor buffer is authoritative for those — its
+    ///   content has already been (or will be) pushed via
+    ///   `didChange`. Honouring a disk-side change would clobber
+    ///   unsaved buffer content.
+    ///
+    /// All work is idempotent: duplicate events for the same path
+    /// collapse safely, atomic-write event storms (Created+Deleted+
+    /// Renamed for tmp files) are filtered by the glob layer.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if params.changes.is_empty() {
+            return;
+        }
+
+        // Snapshot open-doc URIs once so we don't hammer the documents
+        // lock per event in a burst.
+        let open_docs: std::collections::HashSet<Url> = {
+            let docs = self.documents.read().await;
+            docs.keys().cloned().collect()
+        };
+
+        let mut created_or_changed = 0usize;
+        let mut deleted = 0usize;
+        let mut skipped_open = 0usize;
+
+        for change in params.changes {
+            if open_docs.contains(&change.uri) {
+                skipped_open += 1;
+                continue;
+            }
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            match change.typ {
+                FileChangeType::CREATED => {
+                    // Best-effort read. The file may already be gone
+                    // (delete-after-change race) — skip silently.
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // Register the new path in its category list FIRST
+                    // so that subsequent find-references walks visit
+                    // it. Then push content into Salsa via update_file
+                    // (which also invalidates pattern_cache for the
+                    // path). Order matters: if update_file ran first,
+                    // a concurrent reference query that started
+                    // between the two awaits would parse the file but
+                    // never iterate its path. Adding to the category
+                    // list first closes that race.
+                    let _ = self
+                        .salsa
+                        .update_project_file_list(
+                            path.clone(),
+                            laravel_lsp::salsa_impl::FileListOp::Add,
+                        )
+                        .await;
+                    // Version 0 is fine here: `handle_update_file`
+                    // bumps the Salsa input version internally on
+                    // every set, which is what invalidates downstream
+                    // tracked queries. The numeric version field is
+                    // for the editor's textDocument/didChange path
+                    // and isn't load-bearing on this code path.
+                    if let Err(e) = self.salsa.update_file(path, 0, text).await {
+                        debug!("watched-files: update_file failed: {}", e);
+                    } else {
+                        created_or_changed += 1;
+                    }
+                }
+                FileChangeType::CHANGED => {
+                    // No category-list update needed — a CHANGED event
+                    // is for a file that was already in our index.
+                    // Just invalidate cache + push fresh content.
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    if let Err(e) = self.salsa.update_file(path, 0, text).await {
+                        debug!("watched-files: update_file failed: {}", e);
+                    } else {
+                        created_or_changed += 1;
+                    }
+                }
+                FileChangeType::DELETED => {
+                    // Tear down both the Salsa input and the
+                    // category-list entry. Order is the reverse of
+                    // CREATED for the same reason: drop from the list
+                    // FIRST so concurrent find-references don't visit
+                    // a path whose Salsa state we're about to remove.
+                    let _ = self
+                        .salsa
+                        .update_project_file_list(
+                            path.clone(),
+                            laravel_lsp::salsa_impl::FileListOp::Remove,
+                        )
+                        .await;
+                    if let Err(e) = self.salsa.remove_file(path).await {
+                        debug!("watched-files: remove_file failed: {}", e);
+                    } else {
+                        deleted += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // One summary log per batch, not per file — bursts of 1000
+        // events shouldn't produce 1000 log lines.
+        if created_or_changed + deleted + skipped_open > 0 {
+            debug!(
+                "🛡️  watched files: {} updated, {} deleted, {} skipped (open in editor)",
+                created_or_changed, deleted, skipped_open
+            );
+        }
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
@@ -14436,6 +15406,238 @@ impl LanguageServer for LaravelLanguageServer {
 
         let symbols: Vec<DocumentSymbol> = entries.iter().map(symbol_entry_to_lsp).collect();
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    /// `textDocument/references` — find every parser-classified call site for
+    /// the Laravel pattern under the cursor.
+    ///
+    /// The handler dispatches to [`laravel_lsp::references::
+    /// classify_pattern_at_cursor`] to identify which pattern kind + name the
+    /// cursor is on. We never raw-shape-match: positions the parser hasn't
+    /// classified as a Laravel pattern are not considered. The Salsa actor
+    /// then walks every registered project file and returns positions tagged
+    /// with the matching kind + name.
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let include_declaration = params.context.include_declaration;
+
+        // Call sites come from Salsa — every parser-classified position.
+        let call_sites = match self
+            .salsa
+            .find_references(symbol.to_data(), include_declaration)
+            .await
+        {
+            Ok(locs) => locs,
+            Err(e) => {
+                debug!("references: Salsa error {:?}", e);
+                return Ok(None);
+            }
+        };
+
+        let mut lsp_locations: Vec<Location> = call_sites
+            .into_iter()
+            .filter_map(|loc| reference_location_to_lsp(&loc))
+            .collect();
+
+        // Declaration sites come from per-kind tree-sitter walkers (same
+        // walkers rename uses). The parser's php.scm captures call sites
+        // only — declaration sites like `->name('home')` in route files,
+        // array keys in `config/<file>.php`, and array keys in
+        // `lang/<locale>/<file>.php` aren't tagged as `route_refs` /
+        // `config_refs` / `translation_refs`, so they have to be found
+        // separately. Per the LSP spec (and Zed's default), we include them
+        // when `include_declaration` is set.
+        if include_declaration {
+            let root_path = self.root_path.read().await.clone();
+            if let Some(root) = root_path.as_ref() {
+                lsp_locations.extend(collect_declaration_locations(self, root, &symbol).await);
+            }
+        }
+
+        Ok(Some(lsp_locations))
+    }
+
+    /// `textDocument/prepareRename` — decide whether the symbol under the
+    /// cursor is renameable, and if so, return the range the editor should
+    /// highlight + use as the initial input. Returning `None` makes the
+    /// editor refuse the rename.
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let position = params.position;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if !laravel_lsp::rename::can_rename(&symbol) {
+            return Ok(None);
+        }
+
+        // For declaration-cursor cases, the pattern range from
+        // `pattern_range_at` is None (the parser didn't classify the
+        // position). Fall back to the locator-reported decl range.
+        let pattern_range = pattern_range_at(&patterns, position.line, position.character);
+        let range = match pattern_range {
+            Some(r) => Some(r),
+            None => decl_range_at(self, &file_path, position, &symbol).await,
+        };
+        Ok(range.map(PrepareRenameResponse::Range))
+    }
+
+    /// `textDocument/rename` — produce a `WorkspaceEdit` rewriting every
+    /// parser-classified call site for the symbol under the cursor PLUS the
+    /// declaration site for that symbol. The "instance chain" rule applies:
+    /// edits target only positions the tree-sitter parser already tagged.
+    async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let path_str = match file_path.to_str() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if !path_str.ends_with(".php") && !path_str.ends_with(".blade.php") {
+            return Ok(None);
+        }
+
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
+            Ok(Some(p)) => p,
+            _ => return Ok(None),
+        };
+
+        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if !laravel_lsp::rename::can_rename(&symbol) {
+            return Ok(None);
+        }
+
+        // Call-site references via Salsa. These are always parser-classified.
+        let call_sites = match self.salsa.find_references(symbol.to_data(), true).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                debug!("rename: Salsa find_references error {:?}", e);
+                return Ok(None);
+            }
+        };
+
+        // Call-site rewrite text: the full `new_name` as the user typed it.
+        // Decl-site rewrite text is computed per-kind below — it may differ.
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = call_sites
+            .into_iter()
+            .map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+                new_text: new_name.clone(),
+            })
+            .collect();
+
+        // Declaration sites — per-kind walkers, tree-sitter based.
+        // `can_rename` above is the gate: a symbol only reaches here when its
+        // declaration walker is implemented. New kinds extend both `can_rename`
+        // and this match arm together.
+        let root_path = self.root_path.read().await.clone();
+        match &symbol {
+            laravel_lsp::references::SymbolRef::Route(name) => {
+                // Route names are written verbatim at every declaration site
+                // (the locator emits one target per `->name(...)` segment;
+                // group prefixes get their own segments).
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(
+                        collect_route_declaration_targets(self, root, name, &new_name).await,
+                    );
+                }
+            }
+            laravel_lsp::references::SymbolRef::Config(key) => {
+                // Config decl writes only the LEAF segment of the new dotted
+                // form (e.g. "app.name" → "app.label" writes "label" at the
+                // key position in config/app.php). The file portion can't
+                // change without moving the config file.
+                if let Some(root) = root_path.as_ref() {
+                    if let Some(t) = collect_config_declaration_target(root, key, &new_name) {
+                        targets.push(t);
+                    }
+                }
+            }
+            laravel_lsp::references::SymbolRef::Translation(key) => {
+                // Same shape as config but applied across every locale's lang
+                // file under lang/<locale>/<file>.php.
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(collect_translation_declaration_targets(
+                        root, key, &new_name,
+                    ));
+                }
+            }
+            laravel_lsp::references::SymbolRef::Env(key) => {
+                // Env keys aren't dotted — the new name is written verbatim
+                // at every declaration AND every call site. Touches every
+                // `.env*` file at the project root that has the key.
+                if let Some(root) = root_path.as_ref() {
+                    targets.extend(collect_env_declaration_targets(root, key, &new_name));
+                }
+            }
+            _ => {}
+        }
+
+        Ok(laravel_lsp::rename::build_rename_edit(&targets))
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")
@@ -15813,12 +17015,19 @@ mod tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with environment-based filtering
-    // Default to INFO level, can be overridden with RUST_LOG env var
-    // e.g., RUST_LOG=debug for verbose output during development
+    // Initialize logging with environment-based filtering.
+    //
+    // Default to INFO for our own crate, but WARN for `salsa` — its
+    // `salsa::function::execute …: executing query` traces fire once per
+    // tracked-function call at INFO. On a 40k-file project that's 40k+ log
+    // lines from a foreign crate during cache warming, which dwarfed every
+    // other cost in the warming loop (turned 8s of real work into 71s of
+    // log formatting). The downstream `RUST_LOG` env var still wins when
+    // set, so debug sessions can opt back in via `RUST_LOG=salsa=debug`.
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,salsa=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -38,12 +38,17 @@ fn can_rename_accepts_view_kind() {
 }
 
 #[test]
+fn can_rename_accepts_component_kind() {
+    // Phase 3b wired the Blade-component file-move + class-decl pipeline.
+    assert!(can_rename(&SymbolRef::Component("button".into())));
+}
+
+#[test]
 fn can_rename_rejects_kinds_without_decl_finder() {
-    // The remaining Phase 3 kinds. Blade components and Livewire need
-    // PHP class + view file pairing (3b, 3c). Middleware and binding
-    // wait on `bootstrap/app.php` `withMiddleware(...)` and service-
-    // provider `register()` tree-sitter walkers (3e).
-    assert!(!can_rename(&SymbolRef::Component("button".into())));
+    // The remaining Phase 3 kinds. Livewire needs the resolver dispatcher
+    // wired into the rename handler (3c). Middleware and binding wait on
+    // `bootstrap/app.php` `withMiddleware(...)` and service-provider
+    // `register()` tree-sitter walkers (3e).
     assert!(!can_rename(&SymbolRef::Livewire("counter".into())));
     assert!(!can_rename(&SymbolRef::Middleware("auth".into())));
     assert!(!can_rename(&SymbolRef::Binding("cache.store".into())));
@@ -322,10 +327,7 @@ fn file_rename_skips_unrepresentable_paths() {
 fn unsupported_rename_error_messages_are_specific_per_kind() {
     // Each unsupported Phase 3 kind gets a kind-specific message so the
     // user knows what they tried to rename, not just "this can't be
-    // renamed". View was here too until Phase 3a landed it.
-    let component_err = unsupported_rename_error(&SymbolRef::Component("button".into()));
-    assert!(component_err.message.contains("Blade components"));
-
+    // renamed". View landed in 3a; Blade components landed in 3b.
     let livewire_err = unsupported_rename_error(&SymbolRef::Livewire("counter".into()));
     assert!(livewire_err.message.contains("Livewire components"));
 
@@ -340,7 +342,7 @@ fn unsupported_rename_error_messages_are_specific_per_kind() {
 fn unsupported_rename_error_points_to_feature_request_url() {
     // Every "not implemented" toast directs the user to the GitHub issues
     // page so they have a clear path to ask for the missing feature.
-    let err = unsupported_rename_error(&SymbolRef::Component("button".into()));
+    let err = unsupported_rename_error(&SymbolRef::Livewire("counter".into()));
     assert!(
         err.message.contains(FEATURE_REQUEST_URL),
         "message should include the feature-request URL: {}",
@@ -358,7 +360,7 @@ fn unsupported_rename_error_omits_server_name_prefix() {
     // Zed wraps the error with its own attribution ("Error: Prepare rename
     // via laravel-lsp failed: <message>"), so we don't repeat the server
     // name in the body. Keeps the toast tight.
-    let err = unsupported_rename_error(&SymbolRef::View("x".into()));
+    let err = unsupported_rename_error(&SymbolRef::Livewire("x".into()));
     assert!(
         !err.message.contains("laravel-lsp"),
         "message should not duplicate the server name Zed adds: {}",

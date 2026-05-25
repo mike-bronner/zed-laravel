@@ -127,5 +127,46 @@ pub fn is_under_vendor(path: &Path, root: &Path) -> bool {
     path.starts_with(root.join("vendor"))
 }
 
+/// Reverse of [`locate_view_file`]: given a `.blade.php` path that lives
+/// under a configured `view_paths` entry, derive the dotted view name
+/// Laravel would resolve to it.
+///
+/// Returns `None` when:
+///   - `path` doesn't end with `.blade.php`
+///   - `path` lives under `view_paths/components/` (that's a Blade
+///     component, not a view — different rename pipeline)
+///   - `path` doesn't sit under any configured `view_paths` entry
+///   - the resulting name fails validation (slashes, empty segments, etc.)
+///
+/// Used by the file-rename handler to compute the symbol name from the
+/// path Zed is about to rename.
+pub fn view_name_for_path(path: &Path, config: &LaravelConfigData) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.ends_with(".blade.php") {
+        return None;
+    }
+
+    for base in &config.view_paths {
+        let Ok(rel) = path.strip_prefix(base) else {
+            continue;
+        };
+        let rel_str = rel.to_str()?;
+        // Anything under `components/` belongs to the Blade-component
+        // rewriter, not the view rewriter — refuse the match so the
+        // caller routes correctly.
+        if rel_str.starts_with("components/") || rel_str.starts_with("components\\") {
+            return None;
+        }
+        let stripped = rel_str.strip_suffix(".blade.php")?;
+        // Convert path separators to dots. Use both `/` and `\` because
+        // PathBuf on Windows uses backslashes.
+        let dotted = stripped.replace(['/', '\\'], ".");
+        if validate_view_name(&dotted).is_ok() {
+            return Some(dotted);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;

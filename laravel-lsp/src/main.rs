@@ -4823,6 +4823,132 @@ impl LaravelLanguageServer {
         }
     }
 
+    /// For a single file-tree rename, classify the file as either a view
+    /// or a Blade component and collect the text edits needed to rewrite
+    /// every call site that referenced the old name with the new name.
+    ///
+    /// Returns `None` when the file pair doesn't match any handled kind
+    /// (e.g., not a `.blade.php`, not under a configured `view_paths`)
+    /// — the caller skips it without erroring. Returns `Some(vec)` even
+    /// when the vec is empty (the symbol had no call sites) so the
+    /// caller can distinguish "wasn't a known kind" from "known kind,
+    /// nothing to do".
+    async fn collect_will_rename_targets(
+        &self,
+        file_rename: &FileRename,
+        config: &LaravelConfigData,
+    ) -> Option<Vec<laravel_lsp::rename::EditTarget>> {
+        let old_path = Url::parse(&file_rename.old_uri).ok()?.to_file_path().ok()?;
+        let new_path = Url::parse(&file_rename.new_uri).ok()?.to_file_path().ok()?;
+        info!(
+            "   📥 collect_will_rename_targets: {} → {}",
+            old_path.display(),
+            new_path.display()
+        );
+
+        // Try View first — `view_name_for_path` refuses
+        // `components/`-rooted paths so component renames don't get
+        // misclassified.
+        if let Some(old_name) =
+            laravel_lsp::view_declaration_locator::view_name_for_path(&old_path, config)
+        {
+            info!("      ↪️  classified as VIEW: old name = '{}'", old_name);
+            let Some(new_name) =
+                laravel_lsp::view_declaration_locator::view_name_for_path(&new_path, config)
+            else {
+                info!("      ⚠️  new_path doesn't classify as a view — refusing");
+                return None;
+            };
+            info!("      ↪️  new view name = '{}'", new_name);
+            if old_name == new_name {
+                info!("      ⏸️  old == new, no edits needed");
+                return Some(Vec::new());
+            }
+            let edits = self
+                .collect_call_site_edits_for_symbol(
+                    laravel_lsp::salsa_impl::SymbolRefData::View(old_name),
+                    new_name,
+                )
+                .await;
+            info!("      ✅ produced {} text edits", edits.len());
+            return Some(edits);
+        }
+
+        // Then try Blade component.
+        if let Some(old_name) =
+            laravel_lsp::component_declaration_locator::component_name_for_blade_path(
+                &old_path, config,
+            )
+        {
+            info!(
+                "      ↪️  classified as COMPONENT: old name = '{}'",
+                old_name
+            );
+            let Some(new_name) =
+                laravel_lsp::component_declaration_locator::component_name_for_blade_path(
+                    &new_path, config,
+                )
+            else {
+                info!("      ⚠️  new_path doesn't classify as a component — refusing");
+                return None;
+            };
+            info!("      ↪️  new component name = '{}'", new_name);
+            if old_name == new_name {
+                info!("      ⏸️  old == new, no edits needed");
+                return Some(Vec::new());
+            }
+            // Component call sites carry the full `x-name` range and
+            // need the `x-` prefix preserved on rewrite. Override the
+            // text after collecting.
+            let mut edits = self
+                .collect_call_site_edits_for_symbol(
+                    laravel_lsp::salsa_impl::SymbolRefData::Component(old_name),
+                    new_name.clone(),
+                )
+                .await;
+            let prefixed = format!("x-{}", new_name);
+            for edit in &mut edits {
+                edit.new_text = prefixed.clone();
+            }
+            info!(
+                "      ✅ produced {} text edits (prefixed: '{}')",
+                edits.len(),
+                prefixed
+            );
+            return Some(edits);
+        }
+
+        info!("      ⏭️  no classifier matched");
+        None
+    }
+
+    /// Find every call site of `symbol` via Salsa and return one
+    /// `EditTarget` per site, all rewriting to `new_text`. Used by both
+    /// `rename` (with the user's typed new name) and `will_rename_files`
+    /// (with a name derived from the renamed file path).
+    async fn collect_call_site_edits_for_symbol(
+        &self,
+        symbol: laravel_lsp::salsa_impl::SymbolRefData,
+        new_text: String,
+    ) -> Vec<laravel_lsp::rename::EditTarget> {
+        match self.salsa.find_references(symbol, true).await {
+            Ok(refs) => refs
+                .into_iter()
+                .map(|r| laravel_lsp::rename::EditTarget {
+                    file_path: r.file_path,
+                    line: r.line,
+                    start_column: r.column,
+                    end_column: r.end_column,
+                    new_text: new_text.clone(),
+                })
+                .collect(),
+            Err(e) => {
+                debug!("will_rename_files: find_references error {:?}", e);
+                Vec::new()
+            }
+        }
+    }
+
     /// Invalidate the local config cache
     /// Call this when config files change (composer.json, config/*.php)
     async fn invalidate_config_cache(&self) {
@@ -14128,6 +14254,13 @@ fn pattern_range_at(
         }
         laravel_lsp::salsa_impl::PatternAtPosition::EnvRef(e) => (e.line, e.column, e.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Component(c) => {
+            // Range covers the full `x-name` tag including the prefix.
+            // Keeping the prefix visible in the rename input gives the
+            // user a clear picture of what they're editing — matches
+            // what they see in source. The rename handler strips `x-`
+            // for file-path computation and re-prefixes text edits so
+            // tags stay valid regardless of whether the user types the
+            // prefix back in.
             (c.line, c.column, c.end_column)
         }
         laravel_lsp::salsa_impl::PatternAtPosition::Livewire(l) => (l.line, l.column, l.end_column),
@@ -14604,6 +14737,34 @@ impl LanguageServer for LaravelLanguageServer {
                         },
                     ),
                 ),
+
+                // ✅ `workspace/willRenameFiles` — Phase 3d. When the user
+                // renames a `.blade.php` in Zed's file tree, we get a
+                // chance to rewrite every call site referencing the old
+                // name before the rename happens. Pattern is intentionally
+                // narrow: only `.blade.php` files in any depth. Class-file
+                // (.php) renames could be added later for class-based
+                // components and Livewire classes.
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: None,
+                    file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                        will_rename: Some(FileOperationRegistrationOptions {
+                            filters: vec![FileOperationFilter {
+                                scheme: Some("file".to_string()),
+                                pattern: FileOperationPattern {
+                                    glob: "**/*.blade.php".to_string(),
+                                    matches: Some(FileOperationPatternKind::File),
+                                    options: None,
+                                },
+                            }],
+                        }),
+                        did_create: None,
+                        will_create: None,
+                        did_rename: None,
+                        did_delete: None,
+                        will_delete: None,
+                    }),
+                }),
 
                 ..Default::default()
             },
@@ -15597,6 +15758,19 @@ impl LanguageServer for LaravelLanguageServer {
             })
             .collect();
 
+        // For Blade components, call-site ranges cover the full `x-name`
+        // tag-name node — rewriting with a bare name would produce `<foo>`
+        // and break the tag. Override each call-site `new_text` with the
+        // `x-`-prefixed form. The user's typed prefix (if any) is
+        // normalized in the Component arm below; here we re-prefix once
+        // for every call site so source tags stay valid.
+        if matches!(&symbol, laravel_lsp::references::SymbolRef::Component(_)) {
+            let prefixed = format!("x-{}", new_name.trim().trim_start_matches("x-"));
+            for target in &mut targets {
+                target.new_text = prefixed.clone();
+            }
+        }
+
         // Declaration sites — per-kind walkers, tree-sitter based.
         // `can_rename` above is the gate: a symbol only reaches here when its
         // declaration walker is implemented. New kinds extend both `can_rename`
@@ -15644,6 +15818,141 @@ impl LanguageServer for LaravelLanguageServer {
                 // `.env*` file at the project root that has the key.
                 if let Some(root) = root_path.as_ref() {
                     targets.extend(collect_env_declaration_targets(root, key, &new_name));
+                }
+            }
+            laravel_lsp::references::SymbolRef::Component(name) => {
+                // Blade `<x-...>` components. Two shapes:
+                //   - Anonymous: just a .blade.php file.
+                //   - Class-based: .blade.php + a PHP class file under
+                //     app/View/Components/ with `class X extends Component`
+                //     and a `namespace App\View\Components[\Sub];` line.
+                //
+                // For class-based, rename moves both files AND rewrites the
+                // class name (always) and the namespace declaration (only
+                // when the move crosses directories, changing the
+                // conventional namespace).
+                // Defensive: if the user types the `x-` Blade-tag prefix
+                // out of habit (the rename input itself excludes it, but
+                // they might paste from memory), strip it before
+                // resolving paths. Without this, `x-foo` would resolve
+                // to `components/x-foo.blade.php` and brick the component.
+                let trimmed_raw = new_name.trim();
+                let trimmed_new = trimmed_raw.strip_prefix("x-").unwrap_or(trimmed_raw);
+                if let Err(e) =
+                    laravel_lsp::component_declaration_locator::validate_component_name(trimmed_new)
+                {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "invalid component name: {}",
+                        e.message()
+                    )));
+                }
+                if name == trimmed_new {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "new component name must differ from the current name.",
+                    ));
+                }
+                let Some(config) = self.get_cached_config().await else {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "Laravel config not available; cannot resolve component paths.",
+                    ));
+                };
+                let Some(current) =
+                    laravel_lsp::component_declaration_locator::locate_component(name, &config)
+                else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "no Blade or class file found for component '{}'.",
+                        name
+                    )));
+                };
+
+                // Vendor refusal — both file paths must live in the project.
+                if let Some(root) = root_path.as_ref() {
+                    let vendor_blade = current.blade_file.as_ref().is_some_and(|p| {
+                        laravel_lsp::component_declaration_locator::is_under_vendor(p, root)
+                    });
+                    let vendor_class = current.class_file.as_ref().is_some_and(|p| {
+                        laravel_lsp::component_declaration_locator::is_under_vendor(p, root)
+                    });
+                    if vendor_blade || vendor_class {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename components located under vendor/.",
+                        ));
+                    }
+                }
+
+                // Target blade path — only when a blade file exists.
+                if let Some(current_blade) = &current.blade_file {
+                    let Some(target_blade) =
+                        laravel_lsp::component_declaration_locator::compute_blade_target_path(
+                            name,
+                            trimmed_new,
+                            current_blade,
+                            &config,
+                        )
+                    else {
+                        return Err(laravel_lsp::rename::rename_error(format!(
+                            "could not compute target path for component blade file '{}'.",
+                            trimmed_new
+                        )));
+                    };
+                    file_renames.push(laravel_lsp::rename::FileRename {
+                        old_path: current_blade.clone(),
+                        new_path: target_blade,
+                    });
+                }
+
+                // Target class file + declaration rewrites — only when a
+                // class file exists.
+                if let Some(current_class) = &current.class_file {
+                    let target_class =
+                        laravel_lsp::component_declaration_locator::conventional_class_file_path(
+                            trimmed_new,
+                            &config,
+                        );
+                    if &target_class != current_class {
+                        file_renames.push(laravel_lsp::rename::FileRename {
+                            old_path: current_class.clone(),
+                            new_path: target_class.clone(),
+                        });
+                    }
+
+                    // Class name rewrite — fires whenever the leaf Pascal-
+                    // form differs (almost always, since rename = name
+                    // change).
+                    let new_class_name =
+                        laravel_lsp::component_declaration_locator::class_name_for(trimmed_new);
+                    if let Some(span) = &current.class_declaration {
+                        if span.current_text != new_class_name {
+                            targets.push(laravel_lsp::rename::EditTarget {
+                                file_path: span.file_path.clone(),
+                                line: span.line,
+                                start_column: span.start_column,
+                                end_column: span.end_column,
+                                new_text: new_class_name,
+                            });
+                        }
+                    }
+
+                    // Namespace rewrite — only when the file moved into a
+                    // different conventional namespace.
+                    if let Some(root) = root_path.as_ref() {
+                        let new_namespace =
+                            laravel_lsp::component_declaration_locator::conventional_namespace_for(
+                                &target_class,
+                                root,
+                            );
+                        if let Some(span) = &current.namespace_declaration {
+                            if !new_namespace.is_empty() && span.current_text != new_namespace {
+                                targets.push(laravel_lsp::rename::EditTarget {
+                                    file_path: span.file_path.clone(),
+                                    line: span.line,
+                                    start_column: span.start_column,
+                                    end_column: span.end_column,
+                                    new_text: new_namespace,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             laravel_lsp::references::SymbolRef::View(name) => {
@@ -15710,6 +16019,66 @@ impl LanguageServer for LaravelLanguageServer {
             &targets,
             &file_renames,
         ))
+    }
+
+    /// `workspace/willRenameFiles` — Phase 3d. Fires when the user
+    /// renames a file in Zed's file tree (right-click → rename). We
+    /// return text edits to rewrite every call site that referenced
+    /// the old name, and the client applies them atomically with the
+    /// file rename.
+    ///
+    /// Today: handles `.blade.php` files classified as either a view
+    /// (`view('users.index')`) or a Blade component (`<x-button>`).
+    /// PHP class file renames (component classes, Livewire classes)
+    /// could be added later — the capability filter would need to
+    /// include `**/*.php` first.
+    async fn will_rename_files(
+        &self,
+        params: RenameFilesParams,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        info!(
+            "🔁 will_rename_files: {} file(s) — {:?}",
+            params.files.len(),
+            params
+                .files
+                .iter()
+                .map(|f| format!("{} → {}", f.old_uri, f.new_uri))
+                .collect::<Vec<_>>()
+        );
+
+        let Some(config) = self.get_cached_config().await else {
+            info!("   ⚠️  will_rename_files: no Laravel config cached, skipping");
+            return Ok(None);
+        };
+
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = Vec::new();
+
+        for file_rename in &params.files {
+            let Some(targets_for_file) =
+                self.collect_will_rename_targets(file_rename, &config).await
+            else {
+                info!(
+                    "   ⏭️  will_rename_files: {} → {} not classified (skipping)",
+                    file_rename.old_uri, file_rename.new_uri
+                );
+                continue;
+            };
+            targets.extend(targets_for_file);
+        }
+
+        // No FileRename ops here — Zed is doing the file move itself.
+        // We only contribute the text edits that keep references valid.
+        let edit = laravel_lsp::rename::build_rename_workspace_edit(&targets, &[]);
+        info!(
+            "   📤 will_rename_files: returning {} ({} total text edits)",
+            if edit.is_some() {
+                "WorkspaceEdit"
+            } else {
+                "None"
+            },
+            targets.len()
+        );
+        Ok(edit)
     }
 
     /// Handle code action requests (quick fixes like "Create missing view")

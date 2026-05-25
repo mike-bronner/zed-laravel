@@ -241,6 +241,59 @@ fn target_path_returns_none_for_unknown_current_path() {
     );
 }
 
+// ---------- view_name_for_path ----------
+
+#[test]
+fn view_name_from_top_level_path() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("resources/views/welcome.blade.php");
+    assert_eq!(view_name_for_path(&path, &cfg), Some("welcome".to_string()));
+}
+
+#[test]
+fn view_name_from_nested_path() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("resources/views/users/profile.blade.php");
+    assert_eq!(
+        view_name_for_path(&path, &cfg),
+        Some("users.profile".to_string())
+    );
+}
+
+#[test]
+fn view_name_returns_none_for_component_path() {
+    // Files under `components/` belong to the component rewriter, not
+    // the view rewriter. Refuse the match so the caller routes
+    // correctly to component_name_for_blade_path.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("resources/views/components/button.blade.php");
+    assert_eq!(view_name_for_path(&path, &cfg), None);
+}
+
+#[test]
+fn view_name_returns_none_for_non_blade_file() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("resources/views/welcome.php");
+    assert_eq!(view_name_for_path(&path, &cfg), None);
+}
+
+#[test]
+fn view_name_returns_none_for_path_outside_view_paths() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("random/place.blade.php");
+    assert_eq!(view_name_for_path(&path, &cfg), None);
+}
+
 // ---------- is_under_vendor ----------
 
 #[test]

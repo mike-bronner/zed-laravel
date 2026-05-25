@@ -2914,11 +2914,23 @@ impl LaravelLanguageServer {
     /// This scans key directories (controllers, views, Livewire, routes) and
     /// registers all PHP/Blade files with Salsa. The Salsa system will then
     /// cache parsed patterns for efficient reference lookups.
-    async fn register_project_files_with_salsa(&self, root_path: &Path) {
+    /// Register the project's PHP/Blade files with Salsa and kick off the
+    /// pattern-cache warming task. If `progress` is provided it'll drive the
+    /// "Discovering files" → "Indexing X of N" → "Indexed" status-bar updates;
+    /// pass `None` from any code path that just needs the registration done
+    /// without UI (e.g. re-registration after a config change).
+    async fn register_project_files_with_salsa(
+        &self,
+        root_path: &Path,
+        progress: Option<laravel_lsp::indexing_progress::IndexingProgress>,
+    ) {
         let config = match self.get_cached_config().await {
             Some(c) => c,
             None => {
                 debug!("Cannot register project files - no config available");
+                if let Some(p) = progress {
+                    p.end("No project config — indexing skipped.").await;
+                }
                 return;
             }
         };
@@ -2928,6 +2940,24 @@ impl LaravelLanguageServer {
 
         // Get Livewire path from config
         let livewire_path = config.livewire_path.clone();
+
+        // Phase 1: file discovery. The Salsa actor's
+        // `handle_register_project_files` walks the project tree and creates
+        // a Salsa input per file. This is the synchronous-inside-the-actor
+        // step that takes ~3s on a 40k-file project (40k file reads).
+        let mut progress = progress;
+        if let Some(p) = progress.as_mut() {
+            // Force this report through the throttle: the very first
+            // user-visible message MUST land, and there's nothing else
+            // competing for the throttle window yet.
+            // Percentage is sent on the wire (driving the fill bar in
+            // clients that render one); the message text never includes
+            // a `(X%)` suffix because Zed's status bar is narrow and the
+            // numerical progress already lives in the descriptive
+            // "Indexing N of M files" text below. Discovery is the
+            // pre-parse phase — leave it at 0 so the bar starts empty.
+            p.report("Discovering project files…", Some(0), true).await;
+        }
 
         // Register with Salsa
         if let Err(e) = self
@@ -2942,10 +2972,37 @@ impl LaravelLanguageServer {
             .await
         {
             debug!("Failed to register project files with Salsa: {}", e);
+            if let Some(p) = progress {
+                p.end("Failed to register project files.").await;
+            }
             return;
         }
 
         info!("Laravel LSP: Project files registered with Salsa for reference finding");
+
+        // Disk-cache restore. Loads previously-parsed patterns into the
+        // shared pattern_cache, dropping any entry whose on-disk mtime
+        // doesn't match what was cached. Anything restored here gets
+        // skipped by the warming pass below — that's the whole win for
+        // cross-restart speed. First-ever launch on a project has no
+        // cache file and load_into returns (0, 0).
+        if let Some(p) = progress.as_mut() {
+            p.report("Loading cached index…", Some(0), true).await;
+        }
+        let pattern_cache = self.salsa.pattern_cache();
+        let root_for_load = root_path.to_path_buf();
+        let cache_for_load = pattern_cache.clone();
+        let (restored, dropped) = tokio::task::spawn_blocking(move || {
+            laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
+        })
+        .await
+        .unwrap_or((0, 0));
+        if restored + dropped > 0 {
+            info!(
+                "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
+                restored, dropped
+            );
+        }
 
         // Pattern-cache warming via THROTTLED parallel parsing.
         //
@@ -2959,16 +3016,40 @@ impl LaravelLanguageServer {
         //   * At most `MAX_CONCURRENT_PARSES` parses in flight at any time
         //     (semaphore-gated). Memory and CPU stay bounded regardless of
         //     project size.
-        //   * Per-file size cap. Tree-sitter on a 50MB PHP file is the
-        //     wrong tool for the wrong workload — skip + log.
+        //   * Per-file size cap. This is NOT a defensive guard against
+        //     50MB files — it's a hard requirement for warming to finish
+        //     in reasonable time. Some auto-generated vendor PHP files
+        //     (composer autoload maps, AWS SDK service definitions, Faker
+        //     locale text dumps, IDE helper output) are 500KB–2MB+ of
+        //     deeply-nested array literals. tree-sitter-php on those
+        //     files takes 30+ seconds *each*, single-threaded. With our
+        //     8-worker pool, ~8 such files in flight stalls every core
+        //     and the warming task wall-clock balloons from "seconds"
+        //     to "minutes" on a 40k-file project. Empirically: dropping
+        //     the cap from 4MB → 256KB cut warming from 70s to <10s on
+        //     a real Laravel project with full vendor + Flux icons +
+        //     IDE helpers checked in.
+        //
+        //     Picking 256KB: Mike's biggest real-app PHP file in the
+        //     test project is 55KB (a static data table). IDE helpers
+        //     top out at 186KB. Vendor blobs that hit this cap are all
+        //     auto-generated metadata that doesn't contain user-facing
+        //     `route()`/`view()`/`config()` patterns we care about.
         //   * Bulk-import in chunks so the actor's pattern_cache.put loop
         //     never holds the actor for too long on a giant project.
         const MAX_CONCURRENT_PARSES: usize = 8;
-        const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024; // 4 MB
-        const BULK_IMPORT_CHUNK: usize = 256;
+        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
 
         let salsa = self.salsa.clone();
+        let root_for_save = root_path.to_path_buf();
+        // pattern_cache already cloned above for the load step; clone
+        // again here so the warming task can (a) skip files already in
+        // cache from the load and (b) hand the same map to save_from.
+        let pattern_cache_for_warm = pattern_cache.clone();
         tokio::spawn(async move {
+            // `progress` moves into this task — when warming finishes (or
+            // hits an early return) we call `end` to clear the status bar.
+            let mut progress = progress;
             let started_at = std::time::Instant::now();
 
             // Defensively prewarm the global query cache on this thread
@@ -2981,38 +3062,97 @@ impl LaravelLanguageServer {
                 .await
                 .ok();
 
+            // Discovery is done — transition to "Indexing" phase. Forced
+            // so the user sees the phase change even if the throttle
+            // would otherwise drop it.
+            if let Some(p) = progress.as_mut() {
+                // Parse phase transition: still at 0% — the per-file
+                // updates below increment from here to 100.
+                p.report("Indexing project files…", Some(0), true).await;
+            }
+
             let paths = match salsa.list_project_files().await {
                 Ok(p) => p,
                 Err(e) => {
                     debug!("list_project_files failed: {}", e);
+                    if let Some(p) = progress {
+                        p.end("Failed to list project files.").await;
+                    }
                     return;
                 }
             };
+            // Filter out paths whose parsed patterns the disk cache
+            // already restored — those files are unchanged since the
+            // last save and don't need re-parsing. This is THE point
+            // where cross-restart speed comes from: on a project with
+            // 40k files and no edits, this drops `paths_to_parse` to
+            // (close to) zero, and warming finishes in milliseconds.
             let total = paths.len();
+            let paths_to_parse: Vec<_> = paths
+                .into_iter()
+                .filter(|p| !pattern_cache_for_warm.contains_key(p))
+                .collect();
+            let to_parse = paths_to_parse.len();
+            let cached_hits = total - to_parse;
+            if cached_hits > 0 {
+                info!(
+                    "🗄️  Warming will reuse {} cached files, parse {}",
+                    cached_hits, to_parse
+                );
+            }
+
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
 
-            // Spawn one task per file, each gated by the semaphore. The
+            // Spawn one task per file we still need to parse. The
             // semaphore ensures we never have more than N parses running
             // (or holding parsed-tree memory) at once.
-            let mut handles = Vec::with_capacity(total);
-            for path in paths {
+            let mut handles = Vec::with_capacity(to_parse);
+            for path in paths_to_parse {
                 let permit_owner = semaphore.clone();
                 handles.push(tokio::spawn(async move {
                     let _permit = match permit_owner.acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => return None,
                     };
-                    // Skip oversized files so a checked-in vendor blob or
-                    // accidental large file can't stall the indexer.
+                    // Skip `.json.php` files (Laravel/PHP convention for
+                    // pre-baked JSON data wrapped as PHP). These are
+                    // pure data — never user-facing Laravel patterns —
+                    // and tree-sitter-php chokes on their deeply-nested
+                    // array literals (0.4–2.2s *per file*). Mike's test
+                    // project has 1,735 of these under aws-sdk-php.
+                    //
+                    // **We still insert an empty `ParsedPatternsData`**
+                    // for these files so future cache lookups hit
+                    // immediately instead of falling through to the
+                    // Salsa parse path. Without this, `find-references`
+                    // walks every project file and any path not in
+                    // `pattern_cache` re-parses via Salsa — which has
+                    // no size cap and chokes on these exact files.
+                    // The empty patterns are ~30 bytes each in the
+                    // serialized disk cache; negligible.
+                    let path_str = path.to_string_lossy();
+                    if path_str.ends_with(".json.php") {
+                        return Some((
+                            path,
+                            Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                        ));
+                    }
+
+                    // Same idea for the size cap: skip the parse, but
+                    // insert empty patterns so the cache lookup
+                    // succeeds and never falls through to Salsa.
                     let metadata = std::fs::metadata(&path).ok()?;
                     if metadata.len() > MAX_FILE_SIZE_BYTES {
-                        debug!(
-                            "warming: skipping {} ({}B exceeds {}B cap)",
+                        info!(
+                            "warming: skipping oversized file {} ({} bytes > {} cap)",
                             path.display(),
                             metadata.len(),
                             MAX_FILE_SIZE_BYTES
                         );
-                        return None;
+                        return Some((
+                            path,
+                            Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                        ));
                     }
                     // Actual parse on the blocking pool — tree-sitter is
                     // CPU-bound and would block the async runtime if run
@@ -3033,30 +3173,86 @@ impl LaravelLanguageServer {
                 }));
             }
 
-            // Collect results as tasks finish. Bulk-import in chunks so the
-            // actor doesn't stall on a single 1000-entry insert loop.
+            // Collect all parse results into a single buffer, then bulk-
+            // import directly into the shared DashMap-backed pattern cache
+            // via SalsaHandle::bulk_import_patterns. That call bypasses
+            // the actor's mpsc channel entirely — see the comment on
+            // SalsaActor::pattern_cache and SalsaHandle::bulk_import_patterns
+            // for the architectural why. With this path: warming on a
+            // 40k-file project takes ~7s wall (~6.5s parse + ~10ms import).
+            //
+            // Progress reports are emitted as each handle completes. The
+            // IndexingProgress helper throttles internally so we don't
+            // need to be careful about emitting every iteration.
             let mut buffer: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
-                Vec::with_capacity(BULK_IMPORT_CHUNK);
-            let mut imported = 0usize;
+                Vec::with_capacity(to_parse);
+            let mut completed = 0usize;
             for h in handles {
                 if let Ok(Some(pair)) = h.await {
                     buffer.push(pair);
-                    if buffer.len() >= BULK_IMPORT_CHUNK {
-                        let chunk = std::mem::take(&mut buffer);
-                        imported += salsa.bulk_import_patterns(chunk).await.unwrap_or(0);
-                    }
+                }
+                completed += 1;
+                if let Some(p) = progress.as_mut() {
+                    // Progress is over the files we're actually parsing
+                    // this session, not the total project size. Showing
+                    // "Indexing 12 of 12 files" after a warm restart
+                    // gives accurate feedback for the work in progress;
+                    // the user already saw the cached restore land in
+                    // the "Loading cached index…" step before this.
+                    let denom = to_parse.max(1);
+                    let pct = ((completed.saturating_mul(100) / denom) as u32).min(100);
+                    p.report(
+                        format!("Indexing {} of {} files…", completed, to_parse),
+                        Some(pct),
+                        false,
+                    )
+                    .await;
                 }
             }
-            if !buffer.is_empty() {
-                imported += salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+            let imported = salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+
+            // Persist the entire live pattern_cache (cached restores +
+            // freshly parsed entries) so the next LSP startup can skip
+            // most of the work. Runs on the blocking pool because it's
+            // sync I/O — and we don't gate user-visible warming
+            // completion on it; the save just runs and logs its outcome.
+            let cache_for_save = pattern_cache_for_warm.clone();
+            let root_for_save_inner = root_for_save.clone();
+            let save_result = tokio::task::spawn_blocking(move || {
+                laravel_lsp::pattern_disk_cache::save_from(&cache_for_save, &root_for_save_inner)
+            })
+            .await;
+            match save_result {
+                Ok(Ok(n)) => info!("🗄️  Disk cache: saved {} entries", n),
+                Ok(Err(e)) => debug!("Disk cache save failed: {}", e),
+                Err(e) => debug!("Disk cache save task panicked: {}", e),
             }
 
+            // Build the inverted symbol index now that pattern_cache
+            // is fully populated. Without this, the first
+            // `find-references` query pays an O(N files) walk; with
+            // it, queries are an O(1) hashmap lookup. Index build is
+            // ~50ms on a 60k-file project — well within the warming
+            // budget we already log.
+            match salsa.build_symbol_index().await {
+                Ok(count) => info!("🔍 Symbol index built: {} symbol entries", count),
+                Err(e) => debug!("Symbol index build failed: {}", e),
+            }
+
+            let elapsed = started_at.elapsed();
             info!(
-                "🔥 Laravel LSP: pattern cache warmed ({}/{} files imported, {:?})",
-                imported,
-                total,
-                started_at.elapsed()
+                "🔥 Laravel LSP: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
+                imported, cached_hits, total, elapsed
             );
+
+            if let Some(p) = progress {
+                p.end(format!(
+                    "Indexed {} files in {:.1}s.",
+                    total,
+                    elapsed.as_secs_f64()
+                ))
+                .await;
+            }
         });
     }
 
@@ -4097,8 +4293,13 @@ impl LaravelLanguageServer {
                     config.view_paths.len()
                 );
 
-                // Register project files with Salsa for reference finding
-                self.register_project_files_with_salsa(&discovered_root)
+                // Register project files with Salsa for reference finding.
+                // No progress UI here — this path runs in response to a
+                // mid-session config change, where flashing a status-bar
+                // entry for a re-index would feel surprising. The
+                // user-facing first-load progress is wired into
+                // `initialized()` instead.
+                self.register_project_files_with_salsa(&discovered_root, None)
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
@@ -14384,22 +14585,77 @@ impl LanguageServer for LaravelLanguageServer {
         // This doesn't block the LSP - Zed can start sending requests immediately
         // Note: If cache exists, config/middleware/env are already loaded in initialize()
         let server = self.clone_for_spawn();
+        let client = self.client.clone();
         tokio::spawn(async move {
+            // Open a single LSP work-done progress token that spans the
+            // full first-load indexing flow (config → files → warming).
+            // Title is just "Laravel" so the user can see at a glance
+            // which extension owns the status-bar entry — Zed's status
+            // bar can host multiple LSP progress entries simultaneously
+            // and an unbranded one would be ambiguous. The descriptive
+            // detail ("Indexing 12,345 of 40,589 files") lives in the
+            // `message` so the title stays short.
+            //
+            // If the client doesn't support work-done-progress, `begin`
+            // returns None and the rest of the flow just skips reports.
+            let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+                client,
+                "Laravel",
+                "Starting indexer…",
+            )
+            .await;
+
             // Register config if not loaded from cache
             if server.get_cached_config().await.is_none() {
                 info!("📋 No cached config, registering from files...");
+                if let Some(p) = progress.as_mut() {
+                    p.report("Loading project configuration…", Some(0), true).await;
+                }
                 server.register_config_with_salsa(&root).await;
             }
 
-            // Register project files with Salsa for reference finding (if config available)
+            // Register project files with Salsa for reference finding (if config available).
+            // The progress handle is MOVED into register_project_files_with_salsa,
+            // which forwards it into the spawned warming task — that task is
+            // responsible for ending the progress when warming completes.
             if let Some(config) = server.get_cached_config().await {
                 info!(
                     "Laravel config available: {} view paths",
                     config.view_paths.len()
                 );
-                server.register_project_files_with_salsa(&root).await;
+
+                // Tell the client which files to watch for live cache
+                // invalidation. This MUST happen before warming starts,
+                // not after, so that any external changes during the
+                // 7-second cold parse are captured rather than missed.
+                // We use dynamic registration (not declared in
+                // `initialize`) because the view paths and livewire
+                // path depend on project config we only just loaded.
+                let registration = laravel_lsp::file_watcher::build_registration(
+                    &root,
+                    &config.view_paths,
+                    config.livewire_path.as_deref(),
+                );
+                match server.client.register_capability(vec![registration]).await {
+                    Ok(_) => info!(
+                        "🛡️  Registered file watcher: {} view paths, livewire={}",
+                        config.view_paths.len(),
+                        config.livewire_path.is_some()
+                    ),
+                    Err(e) => debug!(
+                        "File watcher registration failed (client may not support it): {}",
+                        e
+                    ),
+                }
+
+                server
+                    .register_project_files_with_salsa(&root, progress.take())
+                    .await;
             } else {
                 info!("Config not available for project file registration");
+                if let Some(p) = progress.take() {
+                    p.end("No project config found.").await;
+                }
             }
 
             // Register env files with Salsa (if not loaded from cache)
@@ -14641,6 +14897,139 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    /// Client-reported file change for a path matching one of our
+    /// registered globs (set up via `client.register_capability` in
+    /// `initialized`). Catches changes made outside Zed — `git pull`,
+    /// external formatters, second-editor saves — that would otherwise
+    /// leave the in-memory pattern cache stale.
+    ///
+    /// Behaviour:
+    ///
+    /// - **Created / Changed**: read the file (if reachable), push the
+    ///   new content into Salsa via `update_file`. That call also
+    ///   removes the path from `pattern_cache`, so the next reference
+    ///   query parses fresh. We do NOT re-parse eagerly — spreading
+    ///   the work across user-driven queries is cheaper than burning
+    ///   CPU on a `git checkout` burst.
+    ///
+    /// - **Deleted**: tell Salsa to drop the file entirely. This
+    ///   removes its `SourceFile` input AND every per-file cache
+    ///   keyed by path (pattern_cache, loop_blocks_cache, etc.).
+    ///
+    /// - **Open documents**: events for currently-open files are
+    ///   skipped. The editor buffer is authoritative for those — its
+    ///   content has already been (or will be) pushed via
+    ///   `didChange`. Honouring a disk-side change would clobber
+    ///   unsaved buffer content.
+    ///
+    /// All work is idempotent: duplicate events for the same path
+    /// collapse safely, atomic-write event storms (Created+Deleted+
+    /// Renamed for tmp files) are filtered by the glob layer.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if params.changes.is_empty() {
+            return;
+        }
+
+        // Snapshot open-doc URIs once so we don't hammer the documents
+        // lock per event in a burst.
+        let open_docs: std::collections::HashSet<Url> = {
+            let docs = self.documents.read().await;
+            docs.keys().cloned().collect()
+        };
+
+        let mut created_or_changed = 0usize;
+        let mut deleted = 0usize;
+        let mut skipped_open = 0usize;
+
+        for change in params.changes {
+            if open_docs.contains(&change.uri) {
+                skipped_open += 1;
+                continue;
+            }
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            match change.typ {
+                FileChangeType::CREATED => {
+                    // Best-effort read. The file may already be gone
+                    // (delete-after-change race) — skip silently.
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // Register the new path in its category list FIRST
+                    // so that subsequent find-references walks visit
+                    // it. Then push content into Salsa via update_file
+                    // (which also invalidates pattern_cache for the
+                    // path). Order matters: if update_file ran first,
+                    // a concurrent reference query that started
+                    // between the two awaits would parse the file but
+                    // never iterate its path. Adding to the category
+                    // list first closes that race.
+                    let _ = self
+                        .salsa
+                        .update_project_file_list(
+                            path.clone(),
+                            laravel_lsp::salsa_impl::FileListOp::Add,
+                        )
+                        .await;
+                    // Version 0 is fine here: `handle_update_file`
+                    // bumps the Salsa input version internally on
+                    // every set, which is what invalidates downstream
+                    // tracked queries. The numeric version field is
+                    // for the editor's textDocument/didChange path
+                    // and isn't load-bearing on this code path.
+                    if let Err(e) = self.salsa.update_file(path, 0, text).await {
+                        debug!("watched-files: update_file failed: {}", e);
+                    } else {
+                        created_or_changed += 1;
+                    }
+                }
+                FileChangeType::CHANGED => {
+                    // No category-list update needed — a CHANGED event
+                    // is for a file that was already in our index.
+                    // Just invalidate cache + push fresh content.
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    if let Err(e) = self.salsa.update_file(path, 0, text).await {
+                        debug!("watched-files: update_file failed: {}", e);
+                    } else {
+                        created_or_changed += 1;
+                    }
+                }
+                FileChangeType::DELETED => {
+                    // Tear down both the Salsa input and the
+                    // category-list entry. Order is the reverse of
+                    // CREATED for the same reason: drop from the list
+                    // FIRST so concurrent find-references don't visit
+                    // a path whose Salsa state we're about to remove.
+                    let _ = self
+                        .salsa
+                        .update_project_file_list(
+                            path.clone(),
+                            laravel_lsp::salsa_impl::FileListOp::Remove,
+                        )
+                        .await;
+                    if let Err(e) = self.salsa.remove_file(path).await {
+                        debug!("watched-files: remove_file failed: {}", e);
+                    } else {
+                        deleted += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // One summary log per batch, not per file — bursts of 1000
+        // events shouldn't produce 1000 log lines.
+        if created_or_changed + deleted + skipped_open > 0 {
+            debug!(
+                "🛡️  watched files: {} updated, {} deleted, {} skipped (open in editor)",
+                created_or_changed, deleted, skipped_open
+            );
+        }
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
@@ -16573,12 +16962,19 @@ mod tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with environment-based filtering
-    // Default to INFO level, can be overridden with RUST_LOG env var
-    // e.g., RUST_LOG=debug for verbose output during development
+    // Initialize logging with environment-based filtering.
+    //
+    // Default to INFO for our own crate, but WARN for `salsa` — its
+    // `salsa::function::execute …: executing query` traces fire once per
+    // tracked-function call at INFO. On a 40k-file project that's 40k+ log
+    // lines from a foreign crate during cache warming, which dwarfed every
+    // other cost in the warming loop (turned 8s of real work into 71s of
+    // log formatting). The downstream `RUST_LOG` env var still wins when
+    // set, so debug sessions can opt back in via `RUST_LOG=salsa=debug`.
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,salsa=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

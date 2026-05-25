@@ -325,7 +325,7 @@ pub struct TranslationReference<'db> {
 }
 
 /// Asset helper type - mirrors queries::AssetHelperType
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AssetHelperType {
     Asset,
     PublicPath,
@@ -1909,7 +1909,7 @@ impl LaravelDatabase {
 // ============================================================================
 
 /// View reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ViewReferenceData {
     pub name: String,
     pub line: u32,
@@ -1919,7 +1919,7 @@ pub struct ViewReferenceData {
 }
 
 /// Component reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ComponentReferenceData {
     pub name: String,
     pub tag_name: String,
@@ -1929,7 +1929,7 @@ pub struct ComponentReferenceData {
 }
 
 /// Directive reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DirectiveReferenceData {
     pub name: String,
     pub arguments: Option<String>,
@@ -1943,7 +1943,7 @@ pub struct DirectiveReferenceData {
 }
 
 /// Env reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnvReferenceData {
     pub name: String,
     pub has_fallback: bool,
@@ -1953,7 +1953,7 @@ pub struct EnvReferenceData {
 }
 
 /// Config reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfigReferenceData {
     pub key: String,
     pub line: u32,
@@ -1962,7 +1962,7 @@ pub struct ConfigReferenceData {
 }
 
 /// Livewire reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LivewireReferenceData {
     pub name: String,
     pub line: u32,
@@ -1971,7 +1971,7 @@ pub struct LivewireReferenceData {
 }
 
 /// Middleware reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MiddlewareReferenceData {
     pub name: String,
     pub line: u32,
@@ -1980,7 +1980,7 @@ pub struct MiddlewareReferenceData {
 }
 
 /// Translation reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TranslationReferenceData {
     pub key: String,
     pub line: u32,
@@ -1989,7 +1989,7 @@ pub struct TranslationReferenceData {
 }
 
 /// Asset reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssetReferenceData {
     pub path: String,
     pub helper_type: AssetHelperType,
@@ -1999,7 +1999,7 @@ pub struct AssetReferenceData {
 }
 
 /// Binding reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BindingReferenceData {
     pub name: String,
     pub is_class_reference: bool,
@@ -2009,7 +2009,7 @@ pub struct BindingReferenceData {
 }
 
 /// Route reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouteReferenceData {
     pub name: String,
     pub line: u32,
@@ -2018,7 +2018,7 @@ pub struct RouteReferenceData {
 }
 
 /// URL reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UrlReferenceData {
     pub path: String,
     pub line: u32,
@@ -2027,7 +2027,7 @@ pub struct UrlReferenceData {
 }
 
 /// Action reference data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActionReferenceData {
     pub action: String,
     pub line: u32,
@@ -2036,7 +2036,7 @@ pub struct ActionReferenceData {
 }
 
 /// Feature reference data for transfer across async boundaries (Laravel Pennant)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FeatureReferenceData {
     /// The feature name (string key like 'new-api' or class name like 'NewApi')
     pub feature_name: String,
@@ -2050,7 +2050,7 @@ pub struct FeatureReferenceData {
 }
 
 /// Laravel configuration data for transfer across async boundaries
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaravelConfigData {
     pub root: PathBuf,
     pub view_paths: Vec<PathBuf>,
@@ -2289,7 +2289,7 @@ pub enum SymbolRefData {
 
 /// Location of a single parser-classified reference. Generic across pattern
 /// kinds — `Backend::references` converts these into LSP `Location`s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceLocationData {
     pub file_path: PathBuf,
     pub line: u32,
@@ -2490,7 +2490,7 @@ pub struct ParsedBindingData {
 }
 
 /// Entry in the sorted position index for fast lookup
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PositionEntry {
     line: u32,
     column: u32,
@@ -2500,7 +2500,7 @@ struct PositionEntry {
 
 /// All parsed patterns for a file - plain data for transfer
 /// Uses Rc for efficient cloning when building the position index
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParsedPatternsData {
     pub views: Vec<Arc<ViewReferenceData>>,
     pub components: Vec<Arc<ComponentReferenceData>>,
@@ -2516,13 +2516,20 @@ pub struct ParsedPatternsData {
     pub url_refs: Vec<Arc<UrlReferenceData>>,
     pub action_refs: Vec<Arc<ActionReferenceData>>,
     pub feature_refs: Vec<Arc<FeatureReferenceData>>,
-    /// Sorted index of all patterns by (line, column) for O(log n) lookup
+    /// Sorted index of all patterns by (line, column) for O(log n) lookup.
+    /// Skipped during (de)serialization — when loading from the on-disk
+    /// cache, the caller must invoke `build_position_index()` to rebuild
+    /// this. We don't persist it because (a) it duplicates data already
+    /// in the Vec fields above, (b) rebuilding is O(n log n) and fast,
+    /// and (c) PatternAtPosition's Arc fields would deserialize as
+    /// independent allocations, which is wasteful.
+    #[serde(skip)]
     sorted_positions: Vec<PositionEntry>,
 }
 
 /// A pattern found at a specific cursor position
 /// Uses Rc for cheap cloning (just increments reference count)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PatternAtPosition {
     View(Arc<ViewReferenceData>),
     Component(Arc<ComponentReferenceData>),
@@ -2752,6 +2759,33 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<()>,
     },
 
+    /// Tell the actor to update its per-category file lists in
+    /// response to a filesystem event from the language client. The
+    /// path is classified against the roots captured at the last
+    /// `register_project_files` call; if it falls under a known root,
+    /// it's added to (or removed from) that category's list.
+    ///
+    /// Returns the assigned `FileCategory` as a tuple-stringified
+    /// label, or `None` if the path didn't match any project root
+    /// (the actor silently ignored it). Used for logging — the
+    /// watcher handler isn't required to do anything with the value.
+    UpdateProjectFileList {
+        path: PathBuf,
+        op: FileListOp,
+        reply: oneshot::Sender<Option<&'static str>>,
+    },
+
+    /// Rebuild the symbol_index from the current pattern_cache. Sent
+    /// once after warming completes so the first find-references query
+    /// is fast. Replies with the total entry count for logging.
+    ///
+    /// Watcher events don't need to send this — they incrementally
+    /// update the index via `mark_dirty` from inside the relevant
+    /// handlers, processed lazily on next query.
+    BuildSymbolIndex {
+        reply: oneshot::Sender<usize>,
+    },
+
     // === Config Management ===
     /// Register configuration files for the project
     RegisterConfigFiles {
@@ -2968,9 +3002,26 @@ pub enum SalsaRequest {
 #[derive(Clone)]
 pub struct SalsaHandle {
     sender: mpsc::Sender<SalsaRequest>,
+    /// Shared concurrent pattern cache — same `Arc<DashMap>` the actor
+    /// holds. Reads and writes from here NEVER go through the actor's
+    /// mpsc channel, which means they're never blocked behind a slow
+    /// handler. See the comment on `SalsaActor::pattern_cache` for why
+    /// this exists.
+    pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
 }
 
 impl SalsaHandle {
+    /// Borrow the shared pattern cache directly. The on-disk cache module
+    /// uses this to pre-load entries before warming starts, and to read
+    /// them back out after warming completes for persistence. Returned
+    /// `Arc` is cheap to clone — the underlying `DashMap` is the same
+    /// instance the actor reads from in `handle_get_patterns`.
+    pub fn pattern_cache(
+        &self,
+    ) -> Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> {
+        self.pattern_cache.clone()
+    }
+
     /// Update or create a file in the database
     pub async fn update_file(
         &self,
@@ -3096,6 +3147,45 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::RemoveFile {
                 path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Build (or rebuild) the inverted symbol index from the current
+    /// pattern cache. Called by the warming task once warming finishes
+    /// so the first `find-references` query is O(1) rather than
+    /// O(N files). Returns the total entry count for logging.
+    pub async fn build_symbol_index(&self) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BuildSymbolIndex { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Update the per-category project file lists in response to a
+    /// filesystem event. `Add` is for `Created` notifications, `Remove`
+    /// for `Deleted`. Returns the category label the actor classified
+    /// the path under (useful for logging), or `None` if the path
+    /// didn't match any indexed project root.
+    pub async fn update_project_file_list(
+        &self,
+        path: PathBuf,
+        op: FileListOp,
+    ) -> Result<Option<&'static str>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::UpdateProjectFileList {
+                path,
+                op,
                 reply: reply_tx,
             })
             .await
@@ -3251,24 +3341,31 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
-    /// Bulk-import pre-parsed patterns into the actor's cache. One actor
-    /// round-trip total, regardless of how many entries — the heavy parsing
-    /// happened in parallel on the blocking thread pool before this call.
+    /// Bulk-import pre-parsed patterns into the shared pattern cache.
+    ///
+    /// **Does NOT go through the actor mpsc channel.** Earlier revisions
+    /// routed this through the actor and we observed a 65-second stall
+    /// per cold start on a 40k-file project — the actor's `blocking_recv`
+    /// thread was not waking up when the warming task sent its message,
+    /// and only un-stalled when an unrelated `did_open` arrived. We never
+    /// fully pinned down the wake-up failure, but the architectural fix
+    /// is correct regardless: pattern_cache writes are pure data ops and
+    /// have no Salsa-mutable-db requirements, so they shouldn't be
+    /// serialized through the actor's single-threaded request queue.
+    ///
+    /// This is now a tight synchronous loop of `DashMap::insert` calls.
+    /// Real-world cost: ~7ms for 40,589 entries (per earlier bench).
+    /// The `async fn` and `Result` shape is preserved for source
+    /// compatibility with the existing call sites.
     pub async fn bulk_import_patterns(
         &self,
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
     ) -> Result<usize, &'static str> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(SalsaRequest::BulkImportPatterns {
-                entries,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "Salsa actor disconnected")?;
-        reply_rx
-            .await
-            .map_err(|_| "Salsa actor dropped reply channel")
+        let total = entries.len();
+        for (path, data) in entries {
+            self.pattern_cache.insert(path, (0, data));
+        }
+        Ok(total)
     }
 
     // === Service Provider Methods ===
@@ -3757,16 +3854,125 @@ impl SalsaHandle {
     }
 }
 
+/// Absolute root directories captured at `register_project_files` time.
+/// Used by the file-watcher handler to classify newly-created paths
+/// into the right per-category list without re-doing the directory
+/// walk. Each `*_roots` field is a list of absolute paths because some
+/// project layouts have multiple roots (e.g. multi-themed view paths).
+///
+/// Stored on `SalsaActor` (not passed in per request) because watcher
+/// notifications arrive asynchronously and need consistent state to
+/// classify against.
+#[derive(Default, Debug, Clone)]
+struct ProjectRootPaths {
+    controller_roots: Vec<PathBuf>,
+    view_roots: Vec<PathBuf>,
+    livewire_root: Option<PathBuf>,
+    routes_root: Option<PathBuf>,
+    vendor_root: Option<PathBuf>,
+}
+
+impl ProjectRootPaths {
+    /// Classify an absolute path into the file-category list it
+    /// belongs to. Order matters here: vendor wins over views even
+    /// though a published `vendor/<pkg>/resources/views/foo.blade.php`
+    /// technically lives under both `vendor/` AND a view path; we
+    /// treat it as vendor because that's where its source-of-truth
+    /// content lives. Returns `None` for paths outside every known
+    /// root (build artifacts, .git, dotfiles, etc.).
+    fn classify(&self, path: &Path) -> Option<FileCategory> {
+        if let Some(root) = &self.vendor_root {
+            if path.starts_with(root) {
+                return Some(FileCategory::Vendor);
+            }
+        }
+        if let Some(root) = &self.livewire_root {
+            if path.starts_with(root) {
+                return Some(FileCategory::Livewire);
+            }
+        }
+        for root in &self.controller_roots {
+            if path.starts_with(root) {
+                return Some(FileCategory::Controller);
+            }
+        }
+        if let Some(root) = &self.routes_root {
+            if path.starts_with(root) {
+                return Some(FileCategory::Route);
+            }
+        }
+        for root in &self.view_roots {
+            if path.starts_with(root) {
+                return Some(FileCategory::View);
+            }
+        }
+        None
+    }
+}
+
+/// Discriminant returned by `ProjectRootPaths::classify` so the
+/// watcher-update path can pick the right `Vec<PathBuf>` to mutate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileCategory {
+    Controller,
+    View,
+    Livewire,
+    Route,
+    Vendor,
+}
+
+impl FileCategory {
+    /// Short label for logging — keeps log lines readable without
+    /// pulling in a full Debug derive at the call site.
+    fn label(self) -> &'static str {
+        match self {
+            FileCategory::Controller => "controller",
+            FileCategory::View => "view",
+            FileCategory::Livewire => "livewire",
+            FileCategory::Route => "route",
+            FileCategory::Vendor => "vendor",
+        }
+    }
+}
+
+/// Operation for `SalsaRequest::UpdateProjectFileList`. `Add` is sent
+/// on a `Created` filesystem event; `Remove` on `Deleted`. There's no
+/// "Change" variant because a change to an already-listed file
+/// doesn't affect the list — only its contents change, and those flow
+/// through `update_file` separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileListOp {
+    Add,
+    Remove,
+}
+
 /// The Salsa actor that owns the database and runs on a dedicated thread
 pub struct SalsaActor {
     db: LaravelDatabase,
     receiver: mpsc::Receiver<SalsaRequest>,
     /// Map from path to SourceFile for efficient lookups and updates
     files: HashMap<PathBuf, SourceFile>,
-    /// LRU cache of converted pattern data to avoid repeated conversion
-    /// Key: file path, Value: (file version, cached patterns wrapped in Arc)
-    /// Limited to 256 entries to prevent unbounded memory growth
-    pattern_cache: LruCache<PathBuf, (i32, Arc<ParsedPatternsData>)>,
+    /// Concurrent map of converted pattern data, SHARED with the SalsaHandle.
+    /// Key: file path, Value: (file version, cached patterns wrapped in Arc).
+    ///
+    /// **Architectural note:** this is intentionally NOT routed through the
+    /// actor's mpsc channel. The previous LRU-inside-actor design had a real
+    /// production-pathological behaviour: warming would send a single
+    /// `BulkImportPatterns` message and the actor's `blocking_recv()` thread
+    /// would not get woken up until some unrelated LSP request (typically a
+    /// `did_open`) arrived. On a 40k-file project the result was a 65-second
+    /// stall every cold start. We never fully tracked down the wake-up
+    /// failure (looked like a tokio mpsc + blocking_recv interaction), but
+    /// bypassing the actor for cache writes side-steps the problem entirely
+    /// AND yields a more correct architecture: pattern_cache reads/writes
+    /// are pure data ops with no Salsa-mutable-db requirements, so there's
+    /// no reason they should serialize through the actor.
+    ///
+    /// DashMap is lock-free for reads and uses per-shard locks for writes
+    /// (16 shards by default), so contention between the actor's read path
+    /// and warming's bulk insert is negligible. ~5KB per entry × 65k cap
+    /// = ~320MB worst case. Cap enforced manually on insert.
+    pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     /// LRU cache of parsed Blade loop blocks, keyed by file path + version.
     /// Salsa already memoizes the underlying query, but caching the Arc avoids
     /// re-walking the query graph on every diagnostic / completion request.
@@ -3805,6 +4011,30 @@ pub struct SalsaActor {
     view_files: Vec<PathBuf>,
     livewire_files: Vec<PathBuf>,
     route_files: Vec<PathBuf>,
+    /// Vendor `*.php` and `*.blade.php` files. Composer packages can ship
+    /// Livewire components, routes, controllers, views, and translations
+    /// just like user code — find-references and goto-definition both
+    /// need to see them. We index everything under `vendor/` and rely on
+    /// the warming-stage filters (`.json.php` skip, 256KB size cap) to
+    /// drop the auto-generated noise.
+    vendor_files: Vec<PathBuf>,
+
+    /// Root directories captured from the most recent
+    /// `register_project_files` call. We retain them so the file-watcher
+    /// handler can classify newly-created paths into the right
+    /// per-category list (controllers, views, livewire, routes,
+    /// vendor) by checking which root the path falls under.
+    ///
+    /// All paths here are absolute, so prefix matching against an
+    /// incoming absolute event path is a straightforward
+    /// `path.starts_with(prefix)`.
+    project_root_paths: ProjectRootPaths,
+
+    /// Inverted symbol index — turns find-references from O(N files)
+    /// into O(1) hash lookup. Built at warming completion via a
+    /// `BuildSymbolIndex` message; kept fresh thereafter via the
+    /// `mark_dirty` / `take_dirty` pattern (see `symbol_index.rs`).
+    symbol_index: crate::symbol_index::SymbolIndex,
 
     // === Service Provider Registry ===
     /// Cached middleware aliases from service provider analysis
@@ -3844,19 +4074,20 @@ impl SalsaActor {
     pub fn spawn() -> SalsaHandle {
         let (tx, rx) = mpsc::channel(256);
 
+        // Shared pattern cache: created here, cloned into both the actor
+        // and the SalsaHandle. Both ends use the SAME map so writes from
+        // either side are immediately visible on the other.
+        let pattern_cache: Arc<dashmap::DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>> =
+            Arc::new(dashmap::DashMap::with_capacity(65536));
+        let pattern_cache_for_actor = pattern_cache.clone();
+
         std::thread::spawn(move || {
             let mut actor = SalsaActor {
                 db: LaravelDatabase::new(),
                 receiver: rx,
                 // Pre-allocate with reasonable capacity to avoid early reallocations
                 files: HashMap::with_capacity(64),
-                // Pattern cache holds parsed patterns for every project file.
-                // Cap at 8192 entries so full-project indexing on real-world
-                // Laravel apps (a few hundred to a few thousand PHP files)
-                // doesn't get evicted mid-session. ~10KB per entry × 8192 ≈
-                // 80MB worst case, which is reasonable for an LSP that's
-                // serving cross-file queries.
-                pattern_cache: LruCache::new(NonZeroUsize::new(8192).unwrap()),
+                pattern_cache: pattern_cache_for_actor,
                 loop_blocks_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 php_assignments_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
                 document_symbols_cache: LruCache::new(NonZeroUsize::new(256).unwrap()),
@@ -3874,6 +4105,9 @@ impl SalsaActor {
                 view_files: Vec::new(),
                 livewire_files: Vec::new(),
                 route_files: Vec::new(),
+                vendor_files: Vec::new(),
+                project_root_paths: ProjectRootPaths::default(),
+                symbol_index: crate::symbol_index::SymbolIndex::default(),
                 // Service provider registry
                 sp_middleware_aliases: HashMap::new(),
                 sp_bindings: HashMap::new(),
@@ -3900,7 +4134,10 @@ impl SalsaActor {
             actor.run();
         });
 
-        SalsaHandle { sender: tx }
+        SalsaHandle {
+            sender: tx,
+            pattern_cache,
+        }
     }
 
     /// Main event loop - process requests until shutdown
@@ -3942,11 +4179,38 @@ impl SalsaActor {
                 }
                 SalsaRequest::RemoveFile { path, reply } => {
                     self.files.remove(&path);
-                    self.pattern_cache.pop(&path);
+                    self.pattern_cache.remove(&path);
                     self.loop_blocks_cache.pop(&path);
                     self.php_assignments_cache.pop(&path);
                     self.document_symbols_cache.pop(&path);
+                    // Drop from the inverted index too. Doing this
+                    // synchronously (rather than via mark_dirty) is
+                    // correct: there's no future state to refresh
+                    // to — the file is gone.
+                    self.symbol_index.remove_file(&path);
                     let _ = reply.send(());
+                }
+
+                SalsaRequest::UpdateProjectFileList { path, op, reply } => {
+                    let result = self.handle_update_project_file_list(path, op);
+                    let _ = reply.send(result);
+                }
+
+                SalsaRequest::BuildSymbolIndex { reply } => {
+                    // Full rebuild from current pattern_cache. Cheap on
+                    // a freshly-warmed project (~50ms for 60k entries
+                    // because we're just iterating a DashMap and
+                    // pushing into HashMaps — no parsing). Clear first
+                    // so we start from a known state.
+                    self.symbol_index.clear();
+                    let cache = self.pattern_cache.clone();
+                    for entry in cache.iter() {
+                        let path = entry.key();
+                        let (_, ref patterns) = *entry.value();
+                        self.symbol_index.insert_file(path, patterns);
+                    }
+                    let count = self.symbol_index.entry_count();
+                    let _ = reply.send(count);
                 }
 
                 // === Config Handlers ===
@@ -4005,29 +4269,34 @@ impl SalsaActor {
                     let _ = reply.send(result);
                 }
                 SalsaRequest::ListProjectFiles { reply } => {
+                    // Vendor is chained in last so its paths are at the
+                    // tail of the warming spawn order — purely a
+                    // cosmetic choice. User-code paths get parsed first
+                    // when the semaphore frees up, so users see results
+                    // for their own code faster on cold start.
                     let paths: Vec<PathBuf> = self
                         .controller_files
                         .iter()
                         .chain(self.view_files.iter())
                         .chain(self.livewire_files.iter())
                         .chain(self.route_files.iter())
+                        .chain(self.vendor_files.iter())
                         .cloned()
                         .collect();
                     let _ = reply.send(paths);
                 }
+                // NOTE: BulkImportPatterns is intentionally kept as a no-op
+                // fallback in case any code path still sends it. The real
+                // bulk import now writes directly to the shared
+                // pattern_cache via SalsaHandle::bulk_import_patterns
+                // (which does NOT round-trip through this actor channel).
+                // See SalsaActor::pattern_cache for the architectural why.
                 SalsaRequest::BulkImportPatterns { entries, reply } => {
-                    let mut imported = 0usize;
+                    let total = entries.len();
                     for (path, data) in entries {
-                        // pattern_cache is keyed by path + version. New entries
-                        // come from the cold-start indexer, so version 0 is
-                        // correct — Salsa's `update_file` bumps the version
-                        // when the editor edits a file, which invalidates the
-                        // cache via the version check in handle_get_patterns.
-                        self.pattern_cache.put(path, (0, data));
-                        imported += 1;
+                        self.pattern_cache.insert(path, (0, data));
                     }
-                    debug!("🔥 Bulk-imported {} entries into pattern cache", imported);
-                    let _ = reply.send(imported);
+                    let _ = reply.send(total);
                 }
 
                 // === Service Provider Handlers ===
@@ -4238,10 +4507,16 @@ impl SalsaActor {
     /// Handle file update - create or update the SourceFile
     fn handle_update_file(&mut self, path: PathBuf, version: i32, text: String) {
         // Invalidate caches for this file - will be recomputed on next request
-        self.pattern_cache.pop(&path);
+        self.pattern_cache.remove(&path);
         self.loop_blocks_cache.pop(&path);
         self.php_assignments_cache.pop(&path);
         self.document_symbols_cache.pop(&path);
+        // Mark for re-indexing on next find-references query. We don't
+        // re-index eagerly here because (a) most file edits are
+        // followed by more edits before any query runs, and (b) the
+        // new patterns aren't parsed until something asks for them
+        // via get_patterns anyway. Lazy refresh amortizes both costs.
+        self.symbol_index.mark_dirty(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -4356,23 +4631,41 @@ impl SalsaActor {
     /// Returns Arc for efficient sharing without cloning the entire data structure
     fn handle_get_patterns(&mut self, path: &PathBuf) -> Option<Arc<ParsedPatternsData>> {
         let start = Instant::now();
-        let file = self.files.get(path)?;
-        let version = file.version(&self.db);
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Check cache first - return cached Arc if version matches (cheap clone)
-        if let Some((cached_version, cached_data)) = self.pattern_cache.get(path) {
-            if *cached_version == version {
-                debug!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
-                return Some(Arc::clone(cached_data));
-            }
+        // CHECK pattern_cache FIRST — before touching `self.files`. The
+        // cache is the fast path for the vast majority of queries:
+        // warming + disk cache populate it for every indexed file, and
+        // `handle_update_file` removes the entry when content changes.
+        // So a cache hit always means the entry is current (no version
+        // check needed). This is the lookup that lets us skip
+        // `ensure_file_registered` during project-file registration —
+        // we don't need a Salsa SourceFile input to serve cached
+        // patterns.
+        //
+        // DashMap::get returns a Ref guard; clone the Arc out and drop
+        // the guard so we don't hold a shard lock across the return.
+        if let Some(entry) = self.pattern_cache.get(path) {
+            let (_, cached_data) = entry.value();
+            let data = Arc::clone(cached_data);
+            drop(entry);
+            debug!("✅ Cache HIT for {} ({:?})", file_name, start.elapsed());
+            return Some(data);
         }
 
-        // Cache miss or version mismatch - need to convert
-        // This call is memoized by Salsa - it only re-parses if the file content changed
+        // Cache miss. We need to parse via the Salsa-tracked function,
+        // which requires a `SourceFile` input. Lazily create it now if
+        // it doesn't exist yet — this is where the file-read cost we
+        // skipped at registration time finally lands. The cost is paid
+        // once per file, only when something queries it past the cache.
+        self.ensure_file_registered(path);
+
+        let file = self.files.get(path)?;
+        let version = file.version(&self.db);
+
         let parse_start = Instant::now();
         let patterns = parse_file_patterns(&self.db, *file);
         let parse_time = parse_start.elapsed();
@@ -4722,7 +5015,7 @@ impl SalsaActor {
 
         // Cache the Arc for future requests (cheap Arc::clone on cache hit)
         self.pattern_cache
-            .put(path.clone(), (version, Arc::clone(&data)));
+            .insert(path.clone(), (version, Arc::clone(&data)));
 
         let total_time = start.elapsed();
         debug!(
@@ -4893,6 +5186,43 @@ impl SalsaActor {
 
     // === Reference Finding Handlers ===
 
+    /// Add or remove a path in the appropriate per-category file list
+    /// based on the classification of its absolute path against the
+    /// roots captured at `register_project_files` time. Returns the
+    /// category label that was mutated, or `None` if the path didn't
+    /// match any project root (silently dropped).
+    ///
+    /// Idempotency: `Add` is a no-op if the path is already in the
+    /// list; `Remove` is a no-op if it isn't. This matters because
+    /// LSP filesystem-event delivery isn't deduplicated — an atomic
+    /// write can produce two `Created` events for the same final
+    /// path, and we shouldn't end up with duplicates in `vendor_files`.
+    fn handle_update_project_file_list(
+        &mut self,
+        path: PathBuf,
+        op: FileListOp,
+    ) -> Option<&'static str> {
+        let category = self.project_root_paths.classify(&path)?;
+        let list = match category {
+            FileCategory::Controller => &mut self.controller_files,
+            FileCategory::View => &mut self.view_files,
+            FileCategory::Livewire => &mut self.livewire_files,
+            FileCategory::Route => &mut self.route_files,
+            FileCategory::Vendor => &mut self.vendor_files,
+        };
+        match op {
+            FileListOp::Add => {
+                if !list.contains(&path) {
+                    list.push(path);
+                }
+            }
+            FileListOp::Remove => {
+                list.retain(|p| p != &path);
+            }
+        }
+        Some(category.label())
+    }
+
     /// Handle project files registration
     /// Scans directories and registers all PHP/Blade files with Salsa
     fn handle_register_project_files(
@@ -4912,6 +5242,28 @@ impl SalsaActor {
         self.view_files.clear();
         self.livewire_files.clear();
         self.route_files.clear();
+        self.vendor_files.clear();
+
+        // Capture the absolute roots we're about to walk so the file-
+        // watcher handler can classify Created/Deleted events back into
+        // the right category list without re-walking. View paths are
+        // already absolute (config layer resolves them); the others are
+        // relative and need joining to `root_path`.
+        let vendor_root = root_path.join("vendor");
+        self.project_root_paths = ProjectRootPaths {
+            controller_roots: controller_paths
+                .iter()
+                .map(|p| root_path.join(p))
+                .collect(),
+            view_roots: view_paths.clone(),
+            livewire_root: livewire_path.clone(),
+            routes_root: Some(root_path.join(&routes_path)),
+            vendor_root: if vendor_root.is_dir() {
+                Some(vendor_root)
+            } else {
+                None
+            },
+        };
 
         // Scan controller directories
         for controller_path in &controller_paths {
@@ -4926,8 +5278,11 @@ impl SalsaActor {
                         if let Some(ext) = entry.path().extension() {
                             if ext == "php" {
                                 let path = entry.path().to_path_buf();
-                                self.controller_files.push(path.clone());
-                                self.ensure_file_registered(&path);
+                                self.controller_files.push(path);
+                                // No ensure_file_registered: deferred to
+                                // first cache miss in handle_get_patterns.
+                                // See the comment on handle_get_patterns
+                                // for the architectural why.
                             }
                         }
                     }
@@ -4948,8 +5303,8 @@ impl SalsaActor {
                         if let Some(file_name) = entry.path().file_name() {
                             if file_name.to_string_lossy().ends_with(".blade.php") {
                                 let path = entry.path().to_path_buf();
-                                self.view_files.push(path.clone());
-                                self.ensure_file_registered(&path);
+                                self.view_files.push(path);
+                                // Salsa input deferred to first cache miss.
                             }
                         }
                     }
@@ -4970,8 +5325,8 @@ impl SalsaActor {
                         if let Some(ext) = entry.path().extension() {
                             if ext == "php" {
                                 let path = entry.path().to_path_buf();
-                                self.livewire_files.push(path.clone());
-                                self.ensure_file_registered(&path);
+                                self.livewire_files.push(path);
+                                // Salsa input deferred to first cache miss.
                             }
                         }
                     }
@@ -4991,11 +5346,49 @@ impl SalsaActor {
                     if let Some(ext) = entry.path().extension() {
                         if ext == "php" {
                             let path = entry.path().to_path_buf();
-                            self.route_files.push(path.clone());
-                            self.ensure_file_registered(&path);
+                            self.route_files.push(path);
+                            // Salsa input deferred to first cache miss.
                         }
                     }
                 }
+            }
+        }
+
+        // Scan vendor/ — Composer packages can declare Livewire,
+        // routes, controllers, views, translations. We index every
+        // `*.php` and `*.blade.php` under vendor/ and rely on the
+        // warming-stage filters (skip `*.json.php` data files, drop
+        // anything >256KB) to keep tree-sitter away from pathological
+        // auto-generated content.
+        //
+        // Yes, this reads ~21k file contents on a real-world project,
+        // which adds a few seconds to first registration. Subsequent
+        // startups load most of those entries from the disk cache
+        // (see pattern_disk_cache.rs), so the cost is bounded and
+        // one-time per `composer install`.
+        let vendor_dir = root_path.join("vendor");
+        if vendor_dir.is_dir() {
+            for entry in WalkDir::new(&vendor_dir)
+                .into_iter()
+                .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(true))
+                .filter_map(|e| e.ok())
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                // Match both `*.php` and `*.blade.php` in one pass. The
+                // `.blade.php` test must come first because a file
+                // ending in `.blade.php` also satisfies `.php`.
+                let is_blade = name.ends_with(".blade.php");
+                let is_php = !is_blade && name.ends_with(".php");
+                if !(is_php || is_blade) {
+                    continue;
+                }
+                let path = entry.path().to_path_buf();
+                self.vendor_files.push(path);
+                // Salsa input deferred to first cache miss — see
+                // handle_get_patterns for the architectural why.
             }
         }
 
@@ -5104,6 +5497,31 @@ impl SalsaActor {
             }
         }
 
+        // Search vendor files — package controllers/views often call
+        // `view(...)` against published view namespaces, and find-view-
+        // references should surface those alongside user code.
+        // FileReferenceType::Controller is used as a catch-all
+        // category: there's no `Vendor` variant on the existing enum,
+        // and adding one would ripple through every consumer for a
+        // cosmetic distinction we don't actually use. The file_path is
+        // what matters for navigation.
+        for path in &self.vendor_files.clone() {
+            if let Some(patterns) = self.handle_get_patterns(path) {
+                for view_ref in &patterns.views {
+                    if view_ref.name == view_name {
+                        references.push(ViewReferenceLocationData {
+                            file_path: path.clone(),
+                            line: view_ref.line,
+                            character: view_ref.column,
+                            reference_type: FileReferenceType::Controller,
+                            view_name: view_ref.name.clone(),
+                            is_route_view: view_ref.is_route_view,
+                        });
+                    }
+                }
+            }
+        }
+
         references
     }
 
@@ -5118,26 +5536,33 @@ impl SalsaActor {
         symbol: &SymbolRefData,
         _include_declaration: bool,
     ) -> Vec<ReferenceLocationData> {
-        let mut references = Vec::new();
-
-        // Walk every registered file. The filter inside the helper keeps the
-        // cost cheap — only the relevant pattern collection on each file's
-        // ParsedPatternsData is touched, and we never read non-cached files.
-        let mut all_files: Vec<PathBuf> = Vec::new();
-        all_files.extend(self.controller_files.iter().cloned());
-        all_files.extend(self.view_files.iter().cloned());
-        all_files.extend(self.livewire_files.iter().cloned());
-        all_files.extend(self.route_files.iter().cloned());
-
-        for path in &all_files {
-            let patterns = match self.handle_get_patterns(path) {
-                Some(p) => p,
-                None => continue,
-            };
-            collect_matches_for_symbol(path, &patterns, symbol, &mut references);
+        // Refresh any files whose patterns may have drifted since
+        // their entries were last indexed (edits via `didChange`,
+        // watcher Created/Changed events, etc.). The dirty set is
+        // populated by `handle_update_file` and any other mutator;
+        // here we drain it and re-index the affected paths exactly
+        // once per query.
+        //
+        // Borrow note: `handle_get_patterns` takes `&mut self`, and
+        // we can't hold a `&mut` on `self.symbol_index` across that
+        // call. So `take_dirty` clones the paths out FIRST (releasing
+        // the borrow), then we iterate them serially.
+        let dirty = self.symbol_index.take_dirty();
+        if !dirty.is_empty() {
+            tracing::debug!(
+                "🔍 symbol_index: refreshing {} dirty file(s) before query",
+                dirty.len()
+            );
+            for path in dirty {
+                self.symbol_index.remove_file(&path);
+                if let Some(patterns) = self.handle_get_patterns(&path) {
+                    self.symbol_index.insert_file(&path, &patterns);
+                }
+            }
         }
 
-        references
+        // O(1) lookup — the hot path the whole index exists for.
+        self.symbol_index.find(symbol)
     }
 
     // === Service Provider Handlers ===

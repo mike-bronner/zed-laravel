@@ -21,11 +21,14 @@ pub mod config_key_locator;
 pub mod config_lookup;
 pub mod database;
 pub mod document_symbols;
+pub mod file_watcher;
 pub mod hover;
+pub mod indexing_progress;
 pub mod livewire_resolver;
 pub mod middleware_parser;
 pub mod model_analyzer;
 pub mod parser;
+pub mod pattern_disk_cache;
 pub mod pattern_indexer;
 pub mod php_class;
 pub mod php_outline;
@@ -44,6 +47,9 @@ pub mod vendor_translations;
 
 // Salsa 0.25 implementation (incremental computation)
 pub mod salsa_impl;
+
+// Inverted symbol index for O(1) find-references
+pub mod symbol_index;
 
 // Re-export commonly used types
 pub use config::find_project_root;

@@ -49,7 +49,11 @@ use crate::salsa_impl::ParsedPatternsData;
 ///
 /// History:
 ///   v1 — initial pattern cache.
-const SCHEMA_VERSION: u32 = 1;
+///   v2 — @livewire('name') directive form added to `livewire_refs`
+///        so directive-form references are classified and indexed the
+///        same as `<livewire:name>` tag form. Old caches lacked these
+///        entries, breaking goto/hover/rename on the directive form.
+const SCHEMA_VERSION: u32 = 2;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

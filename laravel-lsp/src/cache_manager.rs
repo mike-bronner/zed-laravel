@@ -22,7 +22,13 @@ use tracing::{debug, info, warn};
 /// Current cache version - increment when cache format changes
 /// v2: Split 'file' into 'class_file' (for existence) and 'source_file' (for navigation)
 /// v3: Moved cache to XDG-compliant location
-const CACHE_VERSION: u32 = 3;
+/// v4: Middleware alias source_line corrected from 0-based to 1-based
+///     (matches bindings + the goto-def consumer's expectation; was
+///     causing goto-def for any non-first bulk-array alias to land one
+///     line above the actual alias). v3 caches still parse but encode
+///     the wrong line — drop them on read so rebuilt entries get the
+///     correct line.
+const CACHE_VERSION: u32 = 4;
 
 /// Get the XDG-compliant cache directory for a project
 ///

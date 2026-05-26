@@ -83,10 +83,20 @@ pub fn classify_pattern_at_cursor(
         PatternAtPosition::Middleware(m) => Some(SymbolRef::Middleware(m.name.clone())),
         PatternAtPosition::Binding(b) => Some(SymbolRef::Binding(b.name.clone())),
         PatternAtPosition::Directive(d) => {
+            let args = d.arguments.as_deref()?;
+            // `@livewire('counter')` directive form. Carried in the
+            // directive bucket because the .scm captures it as a generic
+            // directive node, not as a Livewire pattern. Classify it as
+            // a Livewire symbol so rename / find-references / goto match
+            // the `<livewire:...>` tag form.
+            if d.name == "livewire" {
+                let name = directive_first_string_arg(args)?;
+                return Some(SymbolRef::Livewire(name));
+            }
             // @include('users.profile') and friends carry the view name in the
             // arguments. The classifier surfaces it as a view symbol so the
             // user can find every other place that view is referenced.
-            let view_name = directive_view_name(&d.name, d.arguments.as_deref()?)?;
+            let view_name = directive_view_name(&d.name, args)?;
             Some(SymbolRef::View(view_name))
         }
         // Patterns that don't yet participate in cross-file references.
@@ -108,8 +118,16 @@ fn directive_view_name(name: &str, args: &str) -> Option<String> {
     ) {
         return None;
     }
+    directive_first_string_arg(args)
+}
+
+/// Extract the first string argument from a directive's parenthesized
+/// argument list. Handles `@livewire('counter')`, `@include('view')`, etc.
+/// Returns `None` when the args can't be parsed as a single quoted
+/// string at the head position.
+fn directive_first_string_arg(args: &str) -> Option<String> {
     let trimmed = args.trim().trim_matches('(').trim_matches(')').trim();
-    // `@each('view', $items, 'name')` — first arg only.
+    // First comma-separated argument; trim quotes.
     let first = trimmed.split(',').next()?.trim();
     let unquoted = first.trim_matches('\'').trim_matches('"');
     if unquoted.is_empty() {

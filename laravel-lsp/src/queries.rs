@@ -930,6 +930,77 @@ pub fn extract_all_blade_patterns<'a>(
                     string_column,
                     string_end_column,
                 });
+
+                // `@livewire('counter')` also feeds the Livewire bucket
+                // so the symbol index treats directive-form references
+                // the same as `<livewire:counter>` tag references —
+                // find-references / rename / hover all see both.
+                if directive_name == "livewire" {
+                    if let Some(info) = &param_info {
+                        let trimmed = info
+                            .text
+                            .trim()
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim();
+                        if let Some(first_arg) = trimmed.split(',').next() {
+                            let first_arg = first_arg.trim();
+                            // Three shapes appear in real Laravel code:
+                            //   - `@livewire('name')` — string name (the
+                            //     common case)
+                            //   - `@livewire(Foo::class)` — class-reference
+                            //     form (less common; the runtime derives
+                            //     the kebab name from the class basename)
+                            //   - `@livewire($var)` — dynamic; can't be
+                            //     resolved statically, skip entirely
+                            let component_name: Option<&str> =
+                                if first_arg.starts_with('\'') || first_arg.starts_with('"') {
+                                    // String literal — strip the quotes.
+                                    let unquoted = first_arg
+                                        .trim_start_matches(['\'', '"'])
+                                        .trim_end_matches(['\'', '"']);
+                                    if unquoted.is_empty() {
+                                        None
+                                    } else {
+                                        Some(unquoted)
+                                    }
+                                } else if let Some(class_fqn) = first_arg.strip_suffix("::class") {
+                                    // Class reference — extract the basename
+                                    // (slice into source, no allocation).
+                                    // e.g. `App\Livewire\NestedComponentA::class`
+                                    // → `NestedComponentA`. The basename
+                                    // stays in PascalCase here; if cross-
+                                    // form linkage to `<livewire:kebab-case>`
+                                    // tags is needed later, the salsa layer
+                                    // can normalize when it copies the name
+                                    // into an owned String.
+                                    let trimmed_fqn = class_fqn.trim();
+                                    let basename =
+                                        trimmed_fqn.rsplit('\\').next().unwrap_or(trimmed_fqn);
+                                    if basename.is_empty() {
+                                        None
+                                    } else {
+                                        Some(basename)
+                                    }
+                                } else {
+                                    // Dynamic (`$var`) or anything else
+                                    // we can't resolve at parse time.
+                                    None
+                                };
+
+                            if let Some(name) = component_name {
+                                result.livewire.push(LivewireMatch {
+                                    component_name: name,
+                                    byte_start: node.start_byte(),
+                                    byte_end: node.end_byte(),
+                                    row: start_pos.row,
+                                    column: string_column,
+                                    end_column: string_end_column,
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             // @livewire('component-name') directive - component_name capture

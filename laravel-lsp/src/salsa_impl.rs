@@ -1601,7 +1601,11 @@ pub fn parse_service_provider_source<'db>(
                     alias_name,
                     class_str.to_string(),
                     file_path,
-                    alias_def.row as u32,
+                    // Tree-sitter's row is 0-based, but the
+                    // `source_line` field is 1-based by convention
+                    // (matches binding source_line and the goto-def
+                    // consumer that subtracts 1). +1 to convert.
+                    alias_def.row as u32 + 1,
                     priority,
                     path.clone(),
                 ));
@@ -1627,7 +1631,10 @@ pub fn parse_service_provider_source<'db>(
                     alias_name,
                     format!("MiddlewareGroup<{}>", group_def.group_name), // Placeholder to indicate it's a group
                     None, // Groups don't have a single file
-                    group_def.row as u32,
+                    // Same 0-based → 1-based correction as the alias
+                    // branch above; goto-def + the rename locator both
+                    // expect 1-based source_line.
+                    group_def.row as u32 + 1,
                     priority,
                     path.clone(),
                 ));
@@ -5518,12 +5525,35 @@ impl SalsaActor {
         references
     }
 
+    // Cap on the number of dirty files we'll synchronously re-parse
+    // inside a single `find_references` call. Past this threshold the
+    // actor would block long enough to cause Zed to time out and reset
+    // the LSP connection (observed crossing into the tens of seconds at
+    // 10k+ dirty entries). When we cross the cap we drop the dirty set
+    // on the floor and serve the current index — slightly stale, but
+    // alive. Affected files re-index naturally on next save or on the
+    // next warming pass.
+    //
+    // Sized to be comfortably larger than any single bulk import (full
+    // vendor parse is ~120 files; a hot edit session typically has tens
+    // of dirty files) but small enough that the worst case fits in a
+    // tower-lsp request budget.
+    const DIRTY_REFRESH_CAP: usize = 1000;
+
     /// Generic find-references engine. Walks every registered project file and
     /// pulls parser-classified patterns from Salsa for each — matching only
     /// when both the kind and the name agree with `symbol`. The
     /// `include_declaration` flag is honoured for kinds where the parser
     /// distinguishes declaration from usage (currently a no-op since the
     /// parser doesn't tag declarations; reserved for future use).
+    ///
+    /// Defensive: if the dirty set has more than [`Self::DIRTY_REFRESH_CAP`]
+    /// entries (it can blow up to 11k+ on `workspace/didChangeWatchedFiles`
+    /// bursts at Zed startup), we skip the per-file re-parse entirely.
+    /// Re-parsing thousands of files serially before a single query
+    /// freezes the actor long enough that Zed times out the LSP and
+    /// resets the connection — a stale-but-live answer beats a dead
+    /// server every time.
     fn handle_find_references(
         &mut self,
         symbol: &SymbolRefData,
@@ -5543,9 +5573,36 @@ impl SalsaActor {
         let start = std::time::Instant::now();
         let dirty = self.symbol_index.take_dirty();
         let dirty_count = dirty.len();
-        if !dirty.is_empty() {
-            tracing::info!(
-                "🔍 find_references: refreshing {} dirty file(s) before query for {:?}",
+        if dirty_count > Self::DIRTY_REFRESH_CAP {
+            // Safety valve. The dirty set has historically blown up to
+            // 11k+ entries during a single warm session (likely from
+            // bulk `workspace/didChangeWatchedFiles` events on Zed
+            // startup), and re-parsing all of them serially before a
+            // single find-references query freezes the actor for tens
+            // of seconds — long enough that Zed gives up and resets the
+            // connection. When we cross this threshold we skip the
+            // refresh entirely and serve the cached index as-is. The
+            // result may be slightly stale (entries from files that
+            // were edited but not yet reflected in the index), but a
+            // partially-stale rename UI is dramatically better than
+            // a hung server. The dirty paths are dropped (not
+            // re-queued), so the staleness is bounded to "until the
+            // affected file is re-saved or re-indexed by warming".
+            tracing::warn!(
+                "⚠️  find_references: dirty set has {} entries (cap {}), \
+                 SKIPPING refresh for {:?} — results may be stale. \
+                 This typically means a watched-files burst (e.g. Zed \
+                 startup) flooded the index; affected files re-index \
+                 on next save.",
+                dirty_count,
+                Self::DIRTY_REFRESH_CAP,
+                symbol
+            );
+            // Intentional: do NOT re-queue. Re-queuing would just hit
+            // this branch again on the next query.
+        } else if !dirty.is_empty() {
+            tracing::debug!(
+                "find_references: refreshing {} dirty file(s) before query for {:?}",
                 dirty_count,
                 symbol
             );
@@ -5562,8 +5619,8 @@ impl SalsaActor {
         let find_start = std::time::Instant::now();
         let results = self.symbol_index.find(symbol);
         let find_elapsed = find_start.elapsed();
-        tracing::info!(
-            "🔍 find_references: {:?} → {} result(s) (refresh {} dirty in {:?}, lookup {:?})",
+        tracing::debug!(
+            "find_references: {:?} → {} result(s) (refresh {} dirty in {:?}, lookup {:?})",
             symbol,
             results.len(),
             dirty_count,

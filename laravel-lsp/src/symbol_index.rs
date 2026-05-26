@@ -148,7 +148,19 @@ impl SymbolIndex {
     /// Mark a path as needing refresh. Cheap (just a HashSet insert);
     /// the actual re-parse work happens later in `take_dirty()`.
     pub fn mark_dirty(&mut self, path: &Path) {
-        self.dirty.insert(path.to_path_buf());
+        let was_new = self.dirty.insert(path.to_path_buf());
+        // Diagnostic: log every 100 marks so we can see the growth shape
+        // without flooding. Phase 3c investigation surfaced 11k+ dirty
+        // entries at find_references time; mark_dirty's only known
+        // caller is `handle_update_file`, so we want to know how often
+        // that's actually firing.
+        if was_new && self.dirty.len().is_multiple_of(100) {
+            tracing::debug!(
+                "symbol_index.dirty grew to {} (last added: {})",
+                self.dirty.len(),
+                path.display()
+            );
+        }
     }
 
     /// Drain and return the dirty set so the caller can re-index each

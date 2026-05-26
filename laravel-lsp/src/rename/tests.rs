@@ -50,12 +50,19 @@ fn can_rename_accepts_livewire_kind() {
 }
 
 #[test]
-fn can_rename_rejects_kinds_without_decl_finder() {
-    // Only middleware and binding remain. They wait on `bootstrap/app.php`
-    // `withMiddleware(...)` and service-provider `register()` tree-sitter
-    // walkers (3e).
-    assert!(!can_rename(&SymbolRef::Middleware("auth".into())));
-    assert!(!can_rename(&SymbolRef::Binding("cache.store".into())));
+fn can_rename_accepts_middleware_kind() {
+    // Phase 3e wired the middleware-alias registration-site walker via
+    // the unified `middleware_binding_locator`. Symbol shape: the alias
+    // string itself (`'auth'` → `'authenticate'`).
+    assert!(can_rename(&SymbolRef::Middleware("auth".into())));
+}
+
+#[test]
+fn can_rename_accepts_binding_kind() {
+    // Phase 3e wired container-binding rename through the same locator
+    // — the registration-site shape (`$this->app->bind('cache', …)`) is
+    // structurally identical to middleware alias registration.
+    assert!(can_rename(&SymbolRef::Binding("cache.store".into())));
 }
 
 #[test]
@@ -328,16 +335,18 @@ fn file_rename_skips_unrepresentable_paths() {
 }
 
 #[test]
-fn unsupported_rename_error_messages_are_specific_per_kind() {
-    // Each unsupported Phase 3 kind gets a kind-specific message so the
-    // user knows what they tried to rename, not just "this can't be
-    // renamed". View landed in 3a; Blade components in 3b; Livewire in 3c.
-    // Only middleware and binding remain for the helper.
+fn unsupported_rename_error_returns_generic_message_for_all_kinds() {
+    // After Phase 3e wired Middleware + Binding, every classifier-known
+    // SymbolRef variant is renameable. `unsupported_rename_error`
+    // survives only as a defensive fallback for future symbol kinds
+    // that get added without updating `can_rename` — so the message no
+    // longer names a specific kind. Just confirm it produces a coherent
+    // "not implemented" string that points to the feature-request URL.
     let middleware_err = unsupported_rename_error(&SymbolRef::Middleware("auth".into()));
-    assert!(middleware_err.message.contains("middleware"));
+    assert!(middleware_err.message.contains("not yet implemented"));
 
     let binding_err = unsupported_rename_error(&SymbolRef::Binding("cache.store".into()));
-    assert!(binding_err.message.contains("container bindings"));
+    assert!(binding_err.message.contains("not yet implemented"));
 }
 
 #[test]

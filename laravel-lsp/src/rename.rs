@@ -66,6 +66,10 @@ pub struct EditTarget {
 /// - Livewire (`<livewire:...>` / `@livewire(...)` — kind-dispatched
 ///   file moves over V4 SFC / V4 MFC / V3 Class / Volt via
 ///   [`crate::livewire_declaration_locator`])
+/// - Middleware (alias-string rewrite at registration + call sites via
+///   [`crate::middleware_binding_locator`])
+/// - Binding (container binding name rewrite at registration + call
+///   sites via [`crate::middleware_binding_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
@@ -76,6 +80,8 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
             | SymbolRef::View(_)
             | SymbolRef::Component(_)
             | SymbolRef::Livewire(_)
+            | SymbolRef::Middleware(_)
+            | SymbolRef::Binding(_)
     )
 }
 
@@ -108,28 +114,19 @@ pub fn rename_error(message: impl Into<std::borrow::Cow<'static, str>>) -> jsonr
 /// Reserved for the "we know what this is, we just can't rename it yet"
 /// case. Cursor positions that don't classify as any Laravel pattern at
 /// all still return `Ok(None)` — silent is correct UX for F2 on whitespace.
-pub fn unsupported_rename_error(symbol: &SymbolRef) -> jsonrpc::Error {
-    let kind = match symbol {
-        SymbolRef::Middleware(_) => "middleware aliases",
-        SymbolRef::Binding(_) => "container bindings",
-        // The seven below are renameable today — should never hit this
-        // branch via `can_rename` gating, but keep an honest fallback so
-        // accidentally calling this on a renameable kind still produces a
-        // coherent message.
-        SymbolRef::View(_)
-        | SymbolRef::Component(_)
-        | SymbolRef::Livewire(_)
-        | SymbolRef::Route(_)
-        | SymbolRef::Config(_)
-        | SymbolRef::Translation(_)
-        | SymbolRef::Env(_) => "this symbol",
-    };
+pub fn unsupported_rename_error(_symbol: &SymbolRef) -> jsonrpc::Error {
+    // Phase 3e wired up Middleware + Binding, so every SymbolRef variant
+    // we classify is renameable today. This branch survives as a
+    // defensive fallback for the (impossible-by-`can_rename`-gating)
+    // case where a future symbol kind is added without updating the
+    // gate. Generic message so we don't claim a specific kind is
+    // unsupported when in fact it's just unknown.
     jsonrpc::Error {
         code: jsonrpc::ErrorCode::ServerError(1),
         message: format!(
-            "renaming {} is not yet implemented. If you'd like to see this, \
-             please open a feature request at {}.",
-            kind, FEATURE_REQUEST_URL
+            "renaming this symbol is not yet implemented. If you'd like \
+             to see this, please open a feature request at {}.",
+            FEATURE_REQUEST_URL
         )
         .into(),
         data: None,

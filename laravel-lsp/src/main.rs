@@ -4855,8 +4855,8 @@ impl LaravelLanguageServer {
     ) -> Option<Vec<laravel_lsp::rename::EditTarget>> {
         let old_path = Url::parse(&file_rename.old_uri).ok()?.to_file_path().ok()?;
         let new_path = Url::parse(&file_rename.new_uri).ok()?.to_file_path().ok()?;
-        info!(
-            "   📥 collect_will_rename_targets: {} → {}",
+        debug!(
+            "collect_will_rename_targets: {} → {}",
             old_path.display(),
             new_path.display()
         );
@@ -15265,6 +15265,10 @@ impl LanguageServer for LaravelLanguageServer {
         if params.changes.is_empty() {
             return;
         }
+        debug!(
+            "did_change_watched_files: {} change(s) from client",
+            params.changes.len()
+        );
 
         // Snapshot open-doc URIs once so we don't hammer the documents
         // lock per event in a burst.
@@ -15803,15 +15807,15 @@ impl LanguageServer for LaravelLanguageServer {
         let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
         {
             Some(s) => {
-                info!(
-                    "🪪 prepare_rename: {:?} at {}:{}",
+                debug!(
+                    "prepare_rename: classified as {:?} at {}:{}",
                     s, position.line, position.character
                 );
                 s
             }
             None => {
-                info!(
-                    "🪪 prepare_rename: no classifier match at {}:{}",
+                debug!(
+                    "prepare_rename: no classifier match at {}:{}",
                     position.line, position.character
                 );
                 return Ok(None);
@@ -15835,8 +15839,8 @@ impl LanguageServer for LaravelLanguageServer {
             None => decl_range_at(self, &file_path, position, &symbol).await,
         };
         match &range {
-            Some(r) => info!(
-                "🪪 prepare_rename: returning Range {}:{}..{}:{} for {:?}",
+            Some(r) => debug!(
+                "prepare_rename: returning Range {}:{}..{}:{} for {:?}",
                 r.start.line, r.start.character, r.end.line, r.end.character, symbol
             ),
             None => debug!("prepare_rename: returning None for {:?}", symbol),
@@ -15852,8 +15856,8 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
-        info!(
-            "✏️  rename request: {} at {}:{} → new_name='{}'",
+        debug!(
+            "rename request: {} at {}:{} → new_name='{}'",
             uri, position.line, position.character, new_name
         );
 
@@ -15877,7 +15881,7 @@ impl LanguageServer for LaravelLanguageServer {
         let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
         {
             Some(s) => {
-                info!("✏️  rename: classified as {:?}", s);
+                debug!("rename: classified as {:?}", s);
                 s
             }
             None => {
@@ -15900,7 +15904,7 @@ impl LanguageServer for LaravelLanguageServer {
         // Call-site references via Salsa. These are always parser-classified.
         let call_sites = match self.salsa.find_references(symbol.to_data(), true).await {
             Ok(refs) => {
-                info!("✏️  rename: found {} call site(s) for {:?}", refs.len(), symbol);
+                debug!("rename: found {} call site(s) for {:?}", refs.len(), symbol);
                 refs
             }
             Err(e) => {
@@ -16426,13 +16430,169 @@ impl LanguageServer for LaravelLanguageServer {
                     new_path: target_path,
                 });
             }
-            _ => {}
+            laravel_lsp::references::SymbolRef::Middleware(alias) => {
+                // Middleware aliases register as a quoted string at a single
+                // line in Kernel.php / bootstrap/app.php (Laravel 11+) or in
+                // a custom service-provider `register()`. The lookup gives
+                // us source_file + source_line; we then scan that line for
+                // the quoted alias to get the exact column span. Call sites
+                // already collected via Salsa; only the registration site
+                // is added here.
+                //
+                // Parameter forms like `auth:sanctum` aren't renameable —
+                // the cursor is on a use site that includes guard params,
+                // not the alias itself. Refuse with a clear toast rather
+                // than partially-rewriting and losing the `:sanctum` tail.
+                if alias.contains(':') {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "cannot rename a parameterized middleware reference \
+                         (e.g. 'auth:sanctum'); rename the bare alias \
+                         instead.",
+                    ));
+                }
+                let trimmed_new = new_name.trim();
+                if let Err(e) =
+                    laravel_lsp::middleware_binding_locator::validate_alias_name(trimmed_new)
+                {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "invalid middleware alias: {}",
+                        e.message()
+                    )));
+                }
+                if alias == trimmed_new {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "new middleware alias must differ from the current name.",
+                    ));
+                }
+                let Some((_class, _class_file, source_file, source_line)) =
+                    self.get_cached_middleware(alias).await
+                else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "middleware alias '{}' not found in registry.",
+                        alias
+                    )));
+                };
+                let Some(source_path) = source_file else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "registration site for middleware alias '{}' is unknown.",
+                        alias
+                    )));
+                };
+                if let Some(root) = root_path.as_ref() {
+                    if laravel_lsp::view_declaration_locator::is_under_vendor(&source_path, root) {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename middleware aliases registered under vendor/.",
+                        ));
+                    }
+                }
+                let Some(line_1based) = source_line else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "registration line for middleware alias '{}' is unknown.",
+                        alias
+                    )));
+                };
+                let Some(span) = laravel_lsp::middleware_binding_locator::locate_alias_on_line(
+                    &source_path,
+                    line_1based,
+                    alias,
+                ) else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "could not locate quoted alias '{}' on line {} of {}.",
+                        alias,
+                        line_1based,
+                        source_path.display()
+                    )));
+                };
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: source_path,
+                    line: span.line,
+                    start_column: span.start_column,
+                    end_column: span.end_column,
+                    new_text: trimmed_new.to_string(),
+                });
+            }
+            laravel_lsp::references::SymbolRef::Binding(name) => {
+                // Container bindings (`$this->app->bind('cache', ...)`,
+                // `app()->singleton(...)`, etc.) follow the same shape as
+                // middleware aliases: a quoted name on a single source
+                // line. Same vendor refusal, same locator. Kept as a
+                // separate arm because the error messages need to name
+                // the right symbol kind for the user-facing toast.
+                let trimmed_new = new_name.trim();
+                if let Err(e) =
+                    laravel_lsp::middleware_binding_locator::validate_alias_name(trimmed_new)
+                {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "invalid binding name: {}",
+                        e.message()
+                    )));
+                }
+                if name == trimmed_new {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "new binding name must differ from the current name.",
+                    ));
+                }
+                let Some((_class, _class_file, source_file, source_line)) =
+                    self.get_cached_binding(name).await
+                else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "binding '{}' not found in registry.",
+                        name
+                    )));
+                };
+                let Some(source_path) = source_file else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "registration site for binding '{}' is unknown.",
+                        name
+                    )));
+                };
+                if let Some(root) = root_path.as_ref() {
+                    if laravel_lsp::view_declaration_locator::is_under_vendor(&source_path, root) {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename bindings registered under vendor/.",
+                        ));
+                    }
+                }
+                let Some(line_1based) = source_line else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "registration line for binding '{}' is unknown.",
+                        name
+                    )));
+                };
+                let Some(span) = laravel_lsp::middleware_binding_locator::locate_alias_on_line(
+                    &source_path,
+                    line_1based,
+                    name,
+                ) else {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "could not locate quoted binding name '{}' on line {} of {}.",
+                        name,
+                        line_1based,
+                        source_path.display()
+                    )));
+                };
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: source_path,
+                    line: span.line,
+                    start_column: span.start_column,
+                    end_column: span.end_column,
+                    new_text: trimmed_new.to_string(),
+                });
+            }
         }
 
-        Ok(laravel_lsp::rename::build_rename_workspace_edit(
-            &targets,
-            &file_renames,
-        ))
+        let edit = laravel_lsp::rename::build_rename_workspace_edit(&targets, &file_renames);
+        debug!(
+            "rename: built WorkspaceEdit with {} text edit(s) + {} file rename(s) → {}",
+            targets.len(),
+            file_renames.len(),
+            if edit.is_some() {
+                "Some(WorkspaceEdit)"
+            } else {
+                "None"
+            },
+        );
+        Ok(edit)
     }
 
     /// `workspace/willRenameFiles` — Phase 3d. Fires when the user
@@ -16450,8 +16610,8 @@ impl LanguageServer for LaravelLanguageServer {
         &self,
         params: RenameFilesParams,
     ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
-        info!(
-            "🔁 will_rename_files: {} file(s) — {:?}",
+        debug!(
+            "will_rename_files: {} file(s) — {:?}",
             params.files.len(),
             params
                 .files
@@ -16471,8 +16631,8 @@ impl LanguageServer for LaravelLanguageServer {
             let Some(targets_for_file) =
                 self.collect_will_rename_targets(file_rename, &config).await
             else {
-                info!(
-                    "   ⏭️  will_rename_files: {} → {} not classified (skipping)",
+                debug!(
+                    "will_rename_files: {} → {} not classified (skipping)",
                     file_rename.old_uri, file_rename.new_uri
                 );
                 continue;
@@ -16483,8 +16643,8 @@ impl LanguageServer for LaravelLanguageServer {
         // No FileRename ops here — Zed is doing the file move itself.
         // We only contribute the text edits that keep references valid.
         let edit = laravel_lsp::rename::build_rename_workspace_edit(&targets, &[]);
-        info!(
-            "   📤 will_rename_files: returning {} ({} total text edits)",
+        debug!(
+            "will_rename_files: returning {} ({} total text edits)",
             if edit.is_some() {
                 "WorkspaceEdit"
             } else {

@@ -30,6 +30,7 @@ pub mod livewire_config;
 pub mod livewire_declaration_locator;
 pub mod livewire_resolver;
 pub mod livewire_version;
+pub mod middleware_binding_locator;
 pub mod middleware_parser;
 pub mod model_analyzer;
 pub mod naming;

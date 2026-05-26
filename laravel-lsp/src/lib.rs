@@ -40,6 +40,7 @@ pub mod pattern_indexer;
 pub mod php_class;
 pub mod php_outline;
 pub mod queries;
+pub mod query_chain;
 pub mod references;
 pub mod rename;
 pub mod route_binding;

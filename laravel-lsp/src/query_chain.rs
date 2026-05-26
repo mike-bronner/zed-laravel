@@ -1,0 +1,23 @@
+//! Eloquent query builder chain completion.
+//!
+//! Recognises fluent chains in PHP source, identifies the model or table they're
+//! rooted at, and answers the question "what columns or relations are valid at
+//! the cursor". Phase 1 implements static method completion for direct chains;
+//! the data structures (`BuilderChain`, `ChainContext`) are designed to also
+//! support Phase 2's diagnostics and goto-definition-on-column.
+//!
+//! Three chain modes drive completion:
+//!
+//! - `EloquentBuilder` — pre-execution Eloquent (`User::where(...)`). `where()`
+//!   offers DB columns; `with()` offers relations.
+//! - `BaseBuilder` — `DB::table('users')` or post-`toBase()`. `where()` offers
+//!   raw schema columns; `with()` returns nothing (no relations on the base
+//!   query builder).
+//! - `EloquentCollection` — post-execution Eloquent (`User::all()->where(...)`).
+//!   `where()` filters a hydrated collection, so accessors and cast names are
+//!   valid alongside DB columns.
+
+pub mod chain;
+pub mod methods;
+
+pub use chain::*;

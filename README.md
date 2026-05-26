@@ -198,7 +198,9 @@ $url = route('users.index', $user);
 
 ### ✏️ Rename
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, or environment variable. The extension rewrites every call site AND the declaration site in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, or container binding. The extension rewrites every call site AND the declaration site (or moves the backing file) in one atomic operation.
+
+You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
 **Route names** rewrite call sites and the `->name(...)` declaration together:
 
@@ -251,9 +253,34 @@ lang/fr/messages.php:  'welcome' => 'Bienvenue'  →  'greeting' => 'Bienvenue'
 // every `env('DB_HOST')` becomes `env('DATABASE_HOST')`
 ```
 
+**Views** move the `.blade.php` file and rewrite every call site:
+
+```php
+// Before — resources/views/users/profile.blade.php exists:
+return view('users.profile');
+@include('users.profile')
+<x-card>{{ view('users.profile') }}</x-card>
+
+// After renaming 'users.profile' → 'users.account':
+//   File moved: resources/views/users/profile.blade.php → resources/views/users/account.blade.php
+return view('users.account');
+@include('users.account')
+<x-card>{{ view('users.account') }}</x-card>
+```
+
+**Blade components** handle both anonymous and class-backed flavours. For class-backed components, the `app/View/Components/Foo.php` file is also moved, the `class Foo extends Component` declaration is rewritten, and the `namespace App\View\Components\…;` declaration is updated when the move crosses directories. Tag-site rewrites preserve the `x-` prefix.
+
+**Livewire components** dispatch over four shapes (V4 SFC, V4 MFC, V3 Class, Volt) auto-detected from your `livewire.php` config and `composer.lock`. Both `<livewire:name>` tag form and `@livewire('name')` directive form get rewritten. Volt single-file components rename atomically. The MFC directory's children get renamed in place; the empty old directory is left behind as a known LSP-protocol limitation (LSPs can't delete directories atomically alongside child renames).
+
+**Middleware aliases** rewrite the registration string at its source (in `Kernel.php`, `bootstrap/app.php`, or any service-provider `register()`) AND every `->middleware('x')` call site. Works for both the per-entry `'auth' => …` form and Laravel 11's bulk `$middleware->alias([…])` form. Parameterized references like `'auth:sanctum'` are refused with a clear message — rename the bare alias instead.
+
+**Container bindings** follow the same shape as middleware aliases: the quoted name at the registration site PLUS every `app('x')`, `resolve('x')`, `app()->make('x')` call site.
+
 **Same parser-classified guarantee as Find References** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
 
-**Not yet renameable** (class-backed kinds — planned follow-up): views, blade components, Livewire components, blade/PHP variables. `prepare_rename` rejects these so you'll see "Can't rename this symbol" when you try — better than half-renaming something.
+**Vendor-located files refuse to rename** — never moves a Composer-installed view, component, or Livewire class, and never rewrites a middleware alias or binding registered inside `vendor/`. You'll see a toast explaining why instead of a silent no-op.
+
+**Not yet renameable** (out of scope for this round, planned follow-up): Blade variables (`@foreach`, `@php` locals + the `view('x', ['key' => …])` / `compact('key')` linkage), PHP function-local variables. `prepare_rename` returns nothing for these so F2 silently does nothing.
 
 ### 💡 Autocomplete
 
@@ -577,12 +604,9 @@ If your PHP class outline isn't appearing, make sure:
 
 ## 🚧 Planned Features
 
-**Rename for class-backed patterns** (extending the currently-shipped rename for route names / config keys / translation keys):
+**Rename — remaining work** (the class-backed kinds shipped; variables didn't):
 
-- ✏️ **PHP class rename engine** — the foundation: FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Required infrastructure for everything below.
-- 📄 **View rename** — Blade file move + every call-site rewrite. If the view has a backing Renderable / ViewModel class, that gets renamed too (via the class engine above).
-- 🧩 **Blade component rename** — both anonymous (file move) and class-backed (class rename + tag-site updates) flavours, shipping together so the UX never depends on which flavour the user picked.
-- ⚡ **Livewire component rename** — class rename + paired view file move + every `<livewire:name>` tag and `@livewire('name')` directive rewritten.
+- ✏️ **PHP class rename engine** — FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Foundation for renaming controllers, models, jobs, etc. as first-class symbols.
 - 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
 - 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
 
@@ -590,7 +614,6 @@ If your PHP class outline isn't appearing, make sure:
 
 - 🎨 **Inertia.js support** — go-to-definition and autocomplete for `Inertia::render('Page')` calls
 - 📁 **Folio page routing** — surface Folio's filesystem-routed pages in goto-definition / completion / find-references
-- ⚡ **Volt component support** — single-file Livewire components
 
 ## 🤝 Contributing
 

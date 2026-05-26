@@ -1808,6 +1808,20 @@ struct LaravelLanguageServer {
     file_exists_cache: Arc<RwLock<HashMap<PathBuf, (bool, Instant)>>>,
     /// Cached Laravel config to avoid repeated Salsa lookups
     cached_config: Arc<RwLock<Option<LaravelConfigData>>>,
+    /// Cached Livewire config + version, keyed by the root path they were
+    /// loaded for. Parsing `config/livewire.php` and scanning
+    /// `composer.lock` on every diagnostic / hover / goto would be wasteful;
+    /// this caches the parsed result across calls. Invalidated by
+    /// `invalidate_config_cache` along with the other config state.
+    cached_livewire: Arc<
+        RwLock<
+            Option<(
+                PathBuf,
+                laravel_lsp::livewire_config::LivewireConfig,
+                laravel_lsp::livewire_version::LivewireVersion,
+            )>,
+        >,
+    >,
     /// Track last goto_definition request per file for coalescing rapid requests
     /// Maps URI to (position, timestamp) - skip duplicate requests within coalesce window
     last_goto_request: Arc<RwLock<HashMap<Url, (Position, Instant)>>>,
@@ -2751,6 +2765,7 @@ impl LaravelLanguageServer {
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
+            cached_livewire: Arc::new(RwLock::new(None)),
             last_goto_request: Arc::new(RwLock::new(HashMap::new())),
             initialized_root: Arc::new(RwLock::new(None)),
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
@@ -4757,7 +4772,7 @@ impl LaravelLanguageServer {
                 config.driver, config.host, config.port
             );
         } else {
-            info!("   ⚠️  Database config not found - will show diagnostic on first use");
+            debug!("warn:  Database config not found - will show diagnostic on first use");
         }
 
         // Always store provider - errors handled when completions requested
@@ -4852,16 +4867,16 @@ impl LaravelLanguageServer {
         if let Some(old_name) =
             laravel_lsp::view_declaration_locator::view_name_for_path(&old_path, config)
         {
-            info!("      ↪️  classified as VIEW: old name = '{}'", old_name);
+            debug!("classified as VIEW: old name = '{}'", old_name);
             let Some(new_name) =
                 laravel_lsp::view_declaration_locator::view_name_for_path(&new_path, config)
             else {
-                info!("      ⚠️  new_path doesn't classify as a view — refusing");
+                debug!("warn:  new_path doesn't classify as a view — refusing");
                 return None;
             };
-            info!("      ↪️  new view name = '{}'", new_name);
+            debug!("new view name = '{}'", new_name);
             if old_name == new_name {
-                info!("      ⏸️  old == new, no edits needed");
+                debug!("  old == new, no edits needed");
                 return Some(Vec::new());
             }
             let edits = self
@@ -4870,7 +4885,7 @@ impl LaravelLanguageServer {
                     new_name,
                 )
                 .await;
-            info!("      ✅ produced {} text edits", edits.len());
+            debug!("produced {} text edits", edits.len());
             return Some(edits);
         }
 
@@ -4889,12 +4904,12 @@ impl LaravelLanguageServer {
                     &new_path, config,
                 )
             else {
-                info!("      ⚠️  new_path doesn't classify as a component — refusing");
+                debug!("warn:  new_path doesn't classify as a component — refusing");
                 return None;
             };
-            info!("      ↪️  new component name = '{}'", new_name);
+            debug!("new component name = '{}'", new_name);
             if old_name == new_name {
-                info!("      ⏸️  old == new, no edits needed");
+                debug!("  old == new, no edits needed");
                 return Some(Vec::new());
             }
             // Component call sites carry the full `x-name` range and
@@ -4918,7 +4933,7 @@ impl LaravelLanguageServer {
             return Some(edits);
         }
 
-        info!("      ⏭️  no classifier matched");
+        debug!("  no classifier matched");
         None
     }
 
@@ -4949,10 +4964,96 @@ impl LaravelLanguageServer {
         }
     }
 
+    /// Load `config/livewire.php` and parse it into a [`LivewireConfig`]
+    /// against the given project root. Falls back to the v4 ship defaults
+    /// when the file is missing or unreadable — Phase 3c never errors on
+    /// the absence of a Livewire config, just degrades to defaults.
+    async fn load_livewire_config(
+        &self,
+        root: &Path,
+    ) -> laravel_lsp::livewire_config::LivewireConfig {
+        let path = root.join("config/livewire.php");
+        let source = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        laravel_lsp::livewire_config::parse(&source, root)
+    }
+
+    /// Read `composer.lock` and return the detected Livewire major version.
+    /// Returns `Unknown` when the lock is missing or doesn't carry a
+    /// `livewire/livewire` entry — the resolver treats Unknown as
+    /// "try v4 paths first, then v3" so this is a safe default.
+    async fn detect_livewire_version(
+        &self,
+        root: &Path,
+    ) -> laravel_lsp::livewire_version::LivewireVersion {
+        let path = root.join("composer.lock");
+        let json = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        laravel_lsp::livewire_version::detect_from_composer_lock(&json)
+    }
+
+    /// Lazy + cached load of (LivewireConfig, LivewireVersion) for the
+    /// current project root. Reused by every Livewire goto / hover /
+    /// diagnostic — parsing `config/livewire.php` and scanning
+    /// `composer.lock` on every call would be wasteful for what's
+    /// effectively immutable per-project state.
+    ///
+    /// Returns `None` only when the project root hasn't been determined
+    /// yet (first request before `initialize`).
+    async fn get_cached_livewire(
+        &self,
+    ) -> Option<(
+        laravel_lsp::livewire_config::LivewireConfig,
+        laravel_lsp::livewire_version::LivewireVersion,
+    )> {
+        let root = self.root_path.read().await.clone()?;
+        {
+            let guard = self.cached_livewire.read().await;
+            if let Some((cached_root, cfg, ver)) = guard.as_ref() {
+                if cached_root == &root {
+                    return Some((cfg.clone(), *ver));
+                }
+            }
+        }
+        let cfg = self.load_livewire_config(&root).await;
+        let ver = self.detect_livewire_version(&root).await;
+        *self.cached_livewire.write().await = Some((root, cfg.clone(), ver));
+        Some((cfg, ver))
+    }
+
+    /// Resolve a Livewire-component name to its full
+    /// [`livewire_resolver::LivewireComponent`] (kind + every file path
+    /// that participates). The new-resolver entry point goto / hover /
+    /// diagnostics route through to find v4 SFC and MFC components,
+    /// not just the legacy `app/Livewire/{Pascal}.php` shape the older
+    /// [`LaravelConfigData::resolve_livewire_path`] handled.
+    ///
+    /// Returns `None` when no on-disk file matches the name (the
+    /// component genuinely doesn't exist) or when configs aren't loaded.
+    async fn resolve_livewire_component(
+        &self,
+        name: &str,
+    ) -> Option<laravel_lsp::livewire_resolver::LivewireComponent> {
+        let (cfg, ver) = self.get_cached_livewire().await?;
+        laravel_lsp::livewire_resolver::resolve_component(name, &cfg, ver)
+    }
+
+    /// Backwards-compatible single-path resolver for callers that just
+    /// want "the file" backing a Livewire component (goto, hover). For
+    /// V4 MFC this returns the directory; for everything else it returns
+    /// the primary file (blade for SFC/Volt, class file for V3 Class).
+    async fn resolve_livewire_primary_path(&self, name: &str) -> Option<PathBuf> {
+        let component = self.resolve_livewire_component(name).await?;
+        component.paths.into_iter().next()
+    }
+
     /// Invalidate the local config cache
     /// Call this when config files change (composer.json, config/*.php)
     async fn invalidate_config_cache(&self) {
         *self.cached_config.write().await = None;
+        // Livewire's cached config + version share the same invalidation
+        // surface — they depend on `config/livewire.php` and
+        // `composer.lock`, both of which change in tandem with the
+        // general Laravel config layer.
+        *self.cached_livewire.write().await = None;
     }
 
     /// Get middleware from cache first, then Salsa
@@ -8694,7 +8795,7 @@ impl LaravelLanguageServer {
                     fields.len()
                 );
                 if fields.is_empty() {
-                    info!("   ⚠️  No fields found - check if cursor is inside a validation array");
+                    debug!("warn:  No fields found - check if cursor is inside a validation array");
                     // Show first few lines around cursor for debugging
                     let lines: Vec<&str> = content.lines().collect();
                     if cursor_line > 0 && cursor_line < lines.len() {
@@ -8956,7 +9057,7 @@ impl LaravelLanguageServer {
                         }
                     }
                 } else {
-                    info!("   ⚠️  Database schema provider not initialized");
+                    debug!("warn:  Database schema provider not initialized");
 
                     // Publish diagnostic at the validation rule position
                     let mut shown = self.database_diagnostic_shown.write().await;
@@ -11375,8 +11476,10 @@ return [
         &self,
         lw: &LivewireReferenceData,
     ) -> Option<GotoDefinitionResponse> {
-        let config = self.get_cached_config().await?;
-        let path = config.resolve_livewire_path(&lw.name)?;
+        // Routes through the new resolver so v4 SFC and MFC components
+        // resolve correctly (the old `LaravelConfigData::resolve_livewire_path`
+        // only knew about `app/Livewire/{Pascal}.php`).
+        let path = self.resolve_livewire_primary_path(&lw.name).await?;
 
         if self.file_exists_cached(&path).await {
             if let Ok(target_uri) = Url::from_file_path(&path) {
@@ -12313,6 +12416,7 @@ return [
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
+            cached_livewire: self.cached_livewire.clone(),
             last_goto_request: self.last_goto_request.clone(),
             initialized_root: self.initialized_root.clone(),
             pending_salsa_updates: self.pending_salsa_updates.clone(),
@@ -12354,7 +12458,7 @@ return [
         let config = match self.get_cached_config().await {
             Some(c) => c,
             None => {
-                info!("   ⚠️  Cannot validate: config not set");
+                debug!("warn:  Cannot validate: config not set");
                 return;
             }
         };
@@ -12364,7 +12468,7 @@ return [
         let file_path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => {
-                info!("   ⚠️  Cannot convert URI to file path");
+                debug!("warn:  Cannot convert URI to file path");
                 return;
             }
         };
@@ -12378,7 +12482,7 @@ return [
         let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             Ok(None) => {
-                info!("   ⚠️  No patterns found in Salsa for {}", uri);
+                debug!("warn:  No patterns found in Salsa for {}", uri);
                 // Fall back to empty patterns - file might not be in Salsa yet
                 // Ensure Salsa has the file before proceeding
                 let _ = self
@@ -12391,7 +12495,7 @@ return [
                 }
             }
             Err(e) => {
-                info!("   ⚠️  Error getting patterns from Salsa: {}", e);
+                debug!("warn:  Error getting patterns from Salsa: {}", e);
                 return;
             }
         };
@@ -13138,14 +13242,30 @@ return [
             }
         }
 
-        // Check Blade components (<x-button>) using Salsa patterns
+        // Check Blade components (<x-button>) using Salsa patterns. A
+        // component is considered to exist if EITHER a conventional view
+        // file (`resources/views/components/{name}.blade.php`) OR a class
+        // file (`app/View/Components/{Pascal}.php`) is on disk. The class-
+        // only case covers components like `<x-app-layout>` whose
+        // `render()` method returns a view at a non-conventional path
+        // (`view('layouts.app')`) — common in Laravel Breeze/Jetstream
+        // starter kits.
         let root_for_components = self.root_path.read().await;
         for comp_ref in &patterns.components {
             let possible_paths = config.resolve_component_path(&comp_ref.name);
             let view_exists = possible_paths.iter().any(|p| p.exists());
 
-            if !view_exists {
-                // View not found - offer to create view (anonymous) or view+class
+            let class_path =
+                laravel_lsp::component_declaration_locator::conventional_class_file_path(
+                    &comp_ref.name,
+                    &config,
+                );
+            let class_exists = class_path.is_file();
+
+            if !view_exists && !class_exists {
+                // Neither view nor class exists — surface as "not found"
+                // so the user gets a Create Missing View / Create Missing
+                // Component code action.
                 let expected_path = possible_paths
                     .first()
                     .map(|p| p.to_string_lossy().to_string())
@@ -13176,41 +13296,53 @@ return [
                 };
                 diagnostics.push(diagnostic);
             }
-            // Note: We intentionally don't create a diagnostic when the view exists
-            // but the PHP class doesn't - anonymous components are valid in Laravel
         }
         drop(root_for_components);
 
-        // Check Livewire components using Salsa patterns
+        // Check Livewire components using Salsa patterns. The resolver
+        // routes through three layers in order:
+        //   1. The new Livewire resolver (v4 SFC/MFC, V3 Class, Volt).
+        //   2. Fallback to view-path resolution (matches the goto
+        //      directive handler — finds `<livewire:...>` and `@livewire(...)`
+        //      components whose view lives at a non-conventional path,
+        //      typically because the class is vendor-registered like
+        //      Jetstream's published components at `resources/views/api/`).
+        //   3. Only after BOTH miss do we publish the "not found" diagnostic.
         for lw_ref in &patterns.livewire_refs {
-            if let Some(livewire_path) = config.resolve_livewire_path(&lw_ref.name) {
-                if !livewire_path.exists() {
-                    let diagnostic = Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: lw_ref.line,
-                                character: lw_ref.column,
-                            },
-                            end: Position {
-                                line: lw_ref.line,
-                                character: lw_ref.end_column,
-                            },
+            let has_livewire_kind = self
+                .resolve_livewire_component(&lw_ref.name)
+                .await
+                .is_some();
+            let view_exists = if has_livewire_kind {
+                true
+            } else {
+                config
+                    .resolve_view_path(&lw_ref.name)
+                    .iter()
+                    .any(|p| p.exists())
+            };
+            if !view_exists {
+                let diagnostic = Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: lw_ref.line,
+                            character: lw_ref.column,
                         },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        code: None,
-                        source: Some("laravel".to_string()),
-                        message: format!(
-                            "Livewire component not found: '{}'\nExpected at: {}",
-                            lw_ref.name,
-                            livewire_path.to_string_lossy()
-                        ),
-                        related_information: None,
-                        tags: None,
-                        code_description: None,
-                        data: None,
-                    };
-                    diagnostics.push(diagnostic);
-                }
+                        end: Position {
+                            line: lw_ref.line,
+                            character: lw_ref.end_column,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    source: Some("laravel".to_string()),
+                    message: format!("Livewire component not found: '{}'", lw_ref.name),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                };
+                diagnostics.push(diagnostic);
             }
         }
 
@@ -14076,14 +14208,10 @@ return [
     }
 
     /// Same shape as [`Self::resolve_view_file`] but for Livewire components.
+    /// Routed through the new resolver so all four shapes (V4 SFC, V4 MFC,
+    /// V3 Class, Volt) are discovered, not just the legacy class path.
     async fn resolve_livewire_file(&self, name: &str) -> Option<PathBuf> {
-        let config = self.get_cached_config().await?;
-        let path = config.resolve_livewire_path(name)?;
-        if self.file_exists_cached(&path).await {
-            Some(path)
-        } else {
-            None
-        }
+        self.resolve_livewire_primary_path(name).await
     }
 
     /// Render a path as a string relative to the project root when possible.
@@ -15076,7 +15204,7 @@ impl LanguageServer for LaravelLanguageServer {
             self.validate_and_publish_diagnostics(&uri, &text).await;
             info!("   ✅ Diagnostics published for {}", uri);
         } else {
-            info!("   ⚠️  Document not found in cache for {}", uri);
+            debug!("warn:  Document not found in cache for {}", uri);
         }
     }
 
@@ -15674,8 +15802,20 @@ impl LanguageServer for LaravelLanguageServer {
 
         let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
         {
-            Some(s) => s,
-            None => return Ok(None),
+            Some(s) => {
+                info!(
+                    "🪪 prepare_rename: {:?} at {}:{}",
+                    s, position.line, position.character
+                );
+                s
+            }
+            None => {
+                info!(
+                    "🪪 prepare_rename: no classifier match at {}:{}",
+                    position.line, position.character
+                );
+                return Ok(None);
+            }
         };
 
         if !laravel_lsp::rename::can_rename(&symbol) {
@@ -15694,6 +15834,13 @@ impl LanguageServer for LaravelLanguageServer {
             Some(r) => Some(r),
             None => decl_range_at(self, &file_path, position, &symbol).await,
         };
+        match &range {
+            Some(r) => info!(
+                "🪪 prepare_rename: returning Range {}:{}..{}:{} for {:?}",
+                r.start.line, r.start.character, r.end.line, r.end.character, symbol
+            ),
+            None => debug!("prepare_rename: returning None for {:?}", symbol),
+        }
         Ok(range.map(PrepareRenameResponse::Range))
     }
 
@@ -15705,6 +15852,10 @@ impl LanguageServer for LaravelLanguageServer {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
+        info!(
+            "✏️  rename request: {} at {}:{} → new_name='{}'",
+            uri, position.line, position.character, new_name
+        );
 
         let file_path = match uri.to_file_path() {
             Ok(p) => p,
@@ -15725,22 +15876,35 @@ impl LanguageServer for LaravelLanguageServer {
 
         let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
         {
-            Some(s) => s,
-            None => return Ok(None),
+            Some(s) => {
+                info!("✏️  rename: classified as {:?}", s);
+                s
+            }
+            None => {
+                debug!(
+                    "rename: classify returned None at {}:{}",
+                    position.line, position.character
+                );
+                return Ok(None);
+            }
         };
 
         if !laravel_lsp::rename::can_rename(&symbol) {
             // Defensive: `prepare_rename` should already have errored, but
             // a client that skipped the prepare round-trip would land here
             // — match the same user-facing error rather than no-op.
+            debug!("rename: can_rename rejected {:?}", symbol);
             return Err(laravel_lsp::rename::unsupported_rename_error(&symbol));
         }
 
         // Call-site references via Salsa. These are always parser-classified.
         let call_sites = match self.salsa.find_references(symbol.to_data(), true).await {
-            Ok(refs) => refs,
+            Ok(refs) => {
+                info!("✏️  rename: found {} call site(s) for {:?}", refs.len(), symbol);
+                refs
+            }
             Err(e) => {
-                debug!("rename: Salsa find_references error {:?}", e);
+                debug!("rename: find_references error {:?}", e);
                 return Ok(None);
             }
         };
@@ -15768,6 +15932,26 @@ impl LanguageServer for LaravelLanguageServer {
             let prefixed = format!("x-{}", new_name.trim().trim_start_matches("x-"));
             for target in &mut targets {
                 target.new_text = prefixed.clone();
+            }
+        }
+
+        // For Livewire, call sites come in two flavors with different
+        // ranges: tag `<livewire:counter>` (range covers the full
+        // `livewire:counter`) and directive `@livewire('counter')`
+        // (range covers just `counter`). Differentiate by span length —
+        // if the original span is longer than the OLD symbol name, the
+        // prefix is included in the range and we re-prefix on rewrite.
+        if let laravel_lsp::references::SymbolRef::Livewire(old_name) = &symbol {
+            let bare_new = new_name.trim().trim_start_matches("livewire:").to_string();
+            let tag_new_text = format!("livewire:{}", bare_new);
+            let old_chars = old_name.chars().count() as u32;
+            for target in &mut targets {
+                let span = target.end_column.saturating_sub(target.start_column);
+                if span > old_chars {
+                    target.new_text = tag_new_text.clone();
+                } else {
+                    target.new_text = bare_new.clone();
+                }
             }
         }
 
@@ -15955,6 +16139,236 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                 }
             }
+            laravel_lsp::references::SymbolRef::Livewire(name) => {
+                debug!("rename Livewire: old='{}', new='{}'", name, new_name);
+                // Livewire dispatches by kind:
+                //   - V4 SFC: rename single .blade.php
+                //   - V4 MFC: rename each child file (empty dir left behind)
+                //   - V3 Class: rename class file + view file + class decl
+                //               + namespace decl (if cross-dir)
+                //   - Volt: rename single .blade.php
+                let trimmed_raw = new_name.trim();
+                let trimmed_new = trimmed_raw.strip_prefix("livewire:").unwrap_or(trimmed_raw);
+                if let Err(e) =
+                    laravel_lsp::livewire_declaration_locator::validate_livewire_name(trimmed_new)
+                {
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "invalid Livewire component name: {}",
+                        e.message()
+                    )));
+                }
+                if name == trimmed_new {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "new Livewire component name must differ from the current name.",
+                    ));
+                }
+                let Some(root) = root_path.as_ref() else {
+                    return Err(laravel_lsp::rename::rename_error(
+                        "project root not yet known; cannot resolve Livewire paths.",
+                    ));
+                };
+                let (livewire_config, livewire_version) = match self.get_cached_livewire().await {
+                    Some(v) => v,
+                    None => {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "could not load Livewire configuration.",
+                        ));
+                    }
+                };
+                info!(
+                    "   livewire version: {:?}, class_path: {}, view_path: {}, class_namespace: {}",
+                    livewire_version,
+                    livewire_config.class_path.display(),
+                    livewire_config.view_path.display(),
+                    livewire_config.class_namespace
+                );
+                let current = match laravel_lsp::livewire_declaration_locator::locate(
+                    name,
+                    &livewire_config,
+                    livewire_version,
+                ) {
+                    Some(c) => c,
+                    None => {
+                        // Conventional Livewire paths missed. Try the
+                        // generic Laravel view-path resolver — this
+                        // covers two distinct cases:
+                        //   1. View-only Livewire components (no class
+                        //      file; component is registered explicitly
+                        //      via `Livewire::component(...)`).
+                        //   2. Vendor-registered components whose views
+                        //      were published to a non-conventional path
+                        //      (e.g., Jetstream → `resources/views/api/`).
+                        //
+                        // We can rename case 1 (view + call sites). Case 2
+                        // we refuse because moving the published view
+                        // breaks the package's registered name. The two
+                        // are distinguished by whether the matching view
+                        // is under `vendor/`.
+                        let Some(laravel_cfg) = self.get_cached_config().await else {
+                            return Err(laravel_lsp::rename::rename_error(
+                                "Laravel config not available for view-path fallback.",
+                            ));
+                        };
+                        let Some(view_path) = laravel_cfg
+                            .resolve_view_path(name)
+                            .into_iter()
+                            .find(|p| p.exists())
+                        else {
+                            info!(
+                                "   locate('{}') returned None and view-path fallback also missed",
+                                name
+                            );
+                            return Err(laravel_lsp::rename::rename_error(format!(
+                                "Cannot find Livewire component '{}' anywhere — neither \
+                                 the conventional Livewire paths nor the view-path \
+                                 resolver matched.",
+                                name
+                            )));
+                        };
+                        info!(
+                            "   locate('{}') returned None; view-only fallback found view at {}",
+                            name,
+                            view_path.display()
+                        );
+
+                        // Vendor refusal — published views from a vendor
+                        // package should not be renamed locally (the
+                        // package's registration still points at the old
+                        // name and would break).
+                        if let Some(root) = root_path.as_ref() {
+                            if laravel_lsp::view_declaration_locator::is_under_vendor(
+                                &view_path, root,
+                            ) {
+                                return Err(laravel_lsp::rename::rename_error(format!(
+                                    "Cannot rename Livewire component '{}': the only \
+                                     matching view lives under vendor/.",
+                                    name
+                                )));
+                            }
+                        }
+
+                        // Compute the target view path. Reuse the View
+                        // rename's logic — it preserves the same
+                        // view_paths root the source file sits under.
+                        let Some(target_view) =
+                            laravel_lsp::view_declaration_locator::compute_target_path(
+                                name,
+                                trimmed_new,
+                                &view_path,
+                                &laravel_cfg,
+                            )
+                        else {
+                            return Err(laravel_lsp::rename::rename_error(format!(
+                                "could not compute target view path for view-only \
+                                 Livewire rename to '{}'.",
+                                trimmed_new
+                            )));
+                        };
+
+                        file_renames.push(laravel_lsp::rename::FileRename {
+                            old_path: view_path,
+                            new_path: target_view,
+                        });
+
+                        // Short-circuit out of the Livewire arm — no
+                        // class file or declaration to rewrite. The
+                        // call-site text edits in `targets` (already
+                        // built above) carry the new name; the
+                        // file_renames vec carries the file move.
+                        return Ok(laravel_lsp::rename::build_rename_workspace_edit(
+                            &targets,
+                            &file_renames,
+                        ));
+                    }
+                };
+                info!(
+                    "   located kind={:?}, paths={:?}",
+                    current.kind, current.paths
+                );
+
+                // Vendor refusal — checks the primary file (paths[0]).
+                if let Some(primary) = current.paths.first() {
+                    if laravel_lsp::livewire_declaration_locator::is_under_vendor(primary, root) {
+                        return Err(laravel_lsp::rename::rename_error(
+                            "cannot rename Livewire components located under vendor/.",
+                        ));
+                    }
+                }
+
+                let Some(target) = laravel_lsp::livewire_declaration_locator::compute_target_paths(
+                    name,
+                    trimmed_new,
+                    &current,
+                    &livewire_config,
+                ) else {
+                    debug!("compute_target_paths returned None");
+                    return Err(laravel_lsp::rename::rename_error(format!(
+                        "could not compute target paths for Livewire rename to '{}'.",
+                        trimmed_new
+                    )));
+                };
+                debug!("target paths: {:?}", target.paths);
+
+                // Emit FileRenames. For V4 MFC, skip the directory entry
+                // at paths[0] — emitting it as a RenameFile would race
+                // with the child renames (sequencing tangles). Children
+                // move individually; the now-empty old directory is left
+                // behind as a known small-cleanup item.
+                let pair_start = if current.kind
+                    == laravel_lsp::livewire_resolver::LivewireComponentKind::V4Mfc
+                {
+                    1
+                } else {
+                    0
+                };
+                for (old, new) in current.paths[pair_start..].iter().zip(target.paths.iter()) {
+                    if old == new {
+                        continue;
+                    }
+                    file_renames.push(laravel_lsp::rename::FileRename {
+                        old_path: old.clone(),
+                        new_path: new.clone(),
+                    });
+                }
+
+                // V3 Class: rewrite class declaration + namespace
+                // declaration when they change.
+                if current.kind == laravel_lsp::livewire_resolver::LivewireComponentKind::V3Class {
+                    let new_class_name =
+                        laravel_lsp::component_declaration_locator::class_name_for(trimmed_new);
+                    if let Some(span) = &current.class_declaration {
+                        if span.current_text != new_class_name {
+                            targets.push(laravel_lsp::rename::EditTarget {
+                                file_path: span.file_path.clone(),
+                                line: span.line,
+                                start_column: span.start_column,
+                                end_column: span.end_column,
+                                new_text: new_class_name,
+                            });
+                        }
+                    }
+                    // Namespace tracks the new class file's parent dir
+                    // under the Laravel `app/` autoload root.
+                    if let Some(new_class_path) = target.paths.first() {
+                        let new_namespace =
+                            laravel_lsp::component_declaration_locator::conventional_namespace_for(
+                                new_class_path,
+                                root,
+                            );
+                        if let Some(span) = &current.namespace_declaration {
+                            if !new_namespace.is_empty() && span.current_text != new_namespace {
+                                targets.push(laravel_lsp::rename::EditTarget {
+                                    file_path: span.file_path.clone(),
+                                    line: span.line,
+                                    start_column: span.start_column,
+                                    end_column: span.end_column,
+                                    new_text: new_namespace,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             laravel_lsp::references::SymbolRef::View(name) => {
                 // Views don't have a textual declaration — the file IS the
                 // declaration. Rename = move the .blade.php + rewrite every
@@ -16047,7 +16461,7 @@ impl LanguageServer for LaravelLanguageServer {
         );
 
         let Some(config) = self.get_cached_config().await else {
-            info!("   ⚠️  will_rename_files: no Laravel config cached, skipping");
+            debug!("warn:  will_rename_files: no Laravel config cached, skipping");
             return Ok(None);
         };
 
@@ -17014,7 +17428,7 @@ impl LanguageServer for LaravelLanguageServer {
                             found
                         }
                         None => {
-                            info!("   ⚠️ No root path available");
+                            debug!("warn: No root path available");
                             Vec::new()
                         }
                     }
@@ -17138,7 +17552,7 @@ impl LanguageServer for LaravelLanguageServer {
                 cached_rules.len()
             );
             if cached_rules.is_empty() {
-                info!("   ⚠️  No cached rules - context detection will use fallback only");
+                debug!("warn:  No cached rules - context detection will use fallback only");
             }
 
             // Check for validation rule PARAMETER context first (e.g., "exists:█" or "after:█")

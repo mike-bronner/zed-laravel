@@ -63,6 +63,9 @@ pub struct EditTarget {
 /// - Component (Blade `<x-...>` — file move + optional class file +
 ///   class declaration + namespace declaration via
 ///   [`crate::component_declaration_locator`])
+/// - Livewire (`<livewire:...>` / `@livewire(...)` — kind-dispatched
+///   file moves over V4 SFC / V4 MFC / V3 Class / Volt via
+///   [`crate::livewire_declaration_locator`])
 pub fn can_rename(symbol: &SymbolRef) -> bool {
     matches!(
         symbol,
@@ -72,6 +75,7 @@ pub fn can_rename(symbol: &SymbolRef) -> bool {
             | SymbolRef::Env(_)
             | SymbolRef::View(_)
             | SymbolRef::Component(_)
+            | SymbolRef::Livewire(_)
     )
 }
 
@@ -106,15 +110,15 @@ pub fn rename_error(message: impl Into<std::borrow::Cow<'static, str>>) -> jsonr
 /// all still return `Ok(None)` — silent is correct UX for F2 on whitespace.
 pub fn unsupported_rename_error(symbol: &SymbolRef) -> jsonrpc::Error {
     let kind = match symbol {
-        SymbolRef::Livewire(_) => "Livewire components",
         SymbolRef::Middleware(_) => "middleware aliases",
         SymbolRef::Binding(_) => "container bindings",
-        // The six below are renameable today — should never hit this
+        // The seven below are renameable today — should never hit this
         // branch via `can_rename` gating, but keep an honest fallback so
         // accidentally calling this on a renameable kind still produces a
         // coherent message.
         SymbolRef::View(_)
         | SymbolRef::Component(_)
+        | SymbolRef::Livewire(_)
         | SymbolRef::Route(_)
         | SymbolRef::Config(_)
         | SymbolRef::Translation(_)

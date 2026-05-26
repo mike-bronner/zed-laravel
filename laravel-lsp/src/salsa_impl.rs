@@ -5540,11 +5540,14 @@ impl SalsaActor {
         // we can't hold a `&mut` on `self.symbol_index` across that
         // call. So `take_dirty` clones the paths out FIRST (releasing
         // the borrow), then we iterate them serially.
+        let start = std::time::Instant::now();
         let dirty = self.symbol_index.take_dirty();
+        let dirty_count = dirty.len();
         if !dirty.is_empty() {
-            tracing::debug!(
-                "🔍 symbol_index: refreshing {} dirty file(s) before query",
-                dirty.len()
+            tracing::info!(
+                "🔍 find_references: refreshing {} dirty file(s) before query for {:?}",
+                dirty_count,
+                symbol
             );
             for path in dirty {
                 self.symbol_index.remove_file(&path);
@@ -5553,9 +5556,21 @@ impl SalsaActor {
                 }
             }
         }
+        let refresh_elapsed = start.elapsed();
 
         // O(1) lookup — the hot path the whole index exists for.
-        self.symbol_index.find(symbol)
+        let find_start = std::time::Instant::now();
+        let results = self.symbol_index.find(symbol);
+        let find_elapsed = find_start.elapsed();
+        tracing::info!(
+            "🔍 find_references: {:?} → {} result(s) (refresh {} dirty in {:?}, lookup {:?})",
+            symbol,
+            results.len(),
+            dirty_count,
+            refresh_elapsed,
+            find_elapsed,
+        );
+        results
     }
 
     // === Service Provider Handlers ===

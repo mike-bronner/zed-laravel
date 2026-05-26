@@ -27,6 +27,7 @@ pub mod file_watcher;
 pub mod hover;
 pub mod indexing_progress;
 pub mod livewire_config;
+pub mod livewire_declaration_locator;
 pub mod livewire_resolver;
 pub mod livewire_version;
 pub mod middleware_parser;

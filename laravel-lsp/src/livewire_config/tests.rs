@@ -10,7 +10,7 @@ fn defaults_match_livewire_4_ship_config() {
     let cfg = LivewireConfig::defaults(root());
 
     assert_eq!(cfg.make_command_type, ComponentFormat::Sfc);
-    assert_eq!(cfg.make_command_emoji, true);
+    assert!(cfg.make_command_emoji);
     assert_eq!(cfg.class_namespace, "App\\Livewire");
     assert_eq!(cfg.class_path, Path::new("/project/app/Livewire"));
     assert_eq!(
@@ -52,7 +52,7 @@ fn parses_make_command_emoji_false() {
         ];
     "#;
     let cfg = parse(src, root());
-    assert_eq!(cfg.make_command_emoji, false);
+    assert!(!cfg.make_command_emoji);
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn parses_make_command_type_class() {
     "#;
     let cfg = parse(src, root());
     assert_eq!(cfg.make_command_type, ComponentFormat::Class);
-    assert_eq!(cfg.make_command_emoji, true);
+    assert!(cfg.make_command_emoji);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn ignores_keys_on_comment_lines() {
         ];
     "#;
     let cfg = parse(src, root());
-    assert_eq!(cfg.make_command_emoji, true);
+    assert!(cfg.make_command_emoji);
 }
 
 #[test]

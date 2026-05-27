@@ -155,6 +155,67 @@ fn test_extract_relationships() {
 }
 
 #[test]
+fn related_model_is_resolved_to_fqcn_using_namespace() {
+    // Phase 5.11: the bare `Book::class` reference inside a namespaced
+    // file should resolve to the full FQCN. Without this, dotted-path
+    // walking (`Version::with('books.|')`) falls back to basename
+    // search and may land on the wrong file when a same-named class
+    // exists in a different namespace (e.g. an unrelated Nova filter).
+    let content = r#"<?php
+namespace CrossBibleInc\BibleModels\Models;
+
+class Version
+{
+    public function books(): HasMany
+    {
+        return $this->hasMany(Book::class);
+    }
+}
+"#;
+    let metadata = ModelMetadata::from_content(content);
+    let books = metadata
+        .relationships
+        .iter()
+        .find(|r| r.method_name == "books")
+        .expect("books relationship");
+    assert_eq!(
+        books.related_model.as_deref(),
+        Some("CrossBibleInc\\BibleModels\\Models\\Book"),
+        "bare Book::class in namespaced file should resolve to FQCN"
+    );
+}
+
+#[test]
+fn related_model_resolves_aliased_class_via_use_statement() {
+    // `use App\Models\Post as Article;` — referring to Article::class
+    // inside the class body should resolve to the imported FQCN.
+    let content = r#"<?php
+namespace App\Http\Controllers;
+
+use App\Models\Post as Article;
+
+class FeedController
+{
+    public function items(): HasMany
+    {
+        return $this->hasMany(Article::class);
+    }
+}
+"#;
+    let metadata = ModelMetadata::from_content(content);
+    let items = metadata
+        .relationships
+        .iter()
+        .find(|r| r.method_name == "items")
+        .expect("items relationship");
+    assert_eq!(
+        items.related_model.as_deref(),
+        Some("App\\Models\\Post"),
+        "use alias should be resolved to its target FQCN"
+    );
+}
+
+#[test]
 fn test_pascal_to_snake() {
     assert_eq!(ModelMetadata::pascal_to_snake("FirstName"), "first_name");
     assert_eq!(

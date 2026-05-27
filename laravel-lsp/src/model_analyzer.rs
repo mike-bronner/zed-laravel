@@ -432,6 +432,21 @@ impl ModelMetadata {
     fn extract_relationships(content: &str) -> Vec<RelationshipInfo> {
         let mut relationships = Vec::new();
 
+        // Resolve `Post::class` references through THIS file's namespace +
+        // use statements once, then reuse for every relationship. If we
+        // stored just the basename (`"Post"`), a later dotted-path hop
+        // would basename-walk and could land on the wrong file (e.g.
+        // `app/Nova/Filters/Post.php` instead of the actual model).
+        // Resolving to FQCN at extraction time fixes that — the
+        // basename `Post::class` inside `namespace App\Models;` becomes
+        // the full FQCN `App\Models\Post`, ready for Composer's PSR-4
+        // resolver to find the right file.
+        let file_namespace = Self::extract_namespace(content);
+        let use_aliases = Self::extract_use_aliases_from_php(content);
+        let resolve_class = |bare: String| -> String {
+            Self::resolve_to_fqcn(&bare, file_namespace.as_deref(), &use_aliases)
+        };
+
         // Common relationship types - ordered longest first to avoid partial matches
         let relationship_types = [
             "belongsToMany",
@@ -466,7 +481,8 @@ impl ModelMetadata {
                             let related_model = Self::extract_related_model_from_relationship(
                                 content,
                                 &method_name,
-                            );
+                            )
+                            .map(&resolve_class);
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -495,7 +511,8 @@ impl ModelMetadata {
                             let related_model = Self::extract_related_model_from_relationship(
                                 content,
                                 &method_name,
-                            );
+                            )
+                            .map(&resolve_class);
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -582,9 +599,15 @@ pub fn map_cast_to_php_type(cast: &str) -> String {
     }
 }
 
-/// Get the PHP type for a relationship
+/// Get the PHP type for a relationship.
+///
+/// `related_model` may be a FQCN (`App\Models\Post`) or a bare class
+/// name (`Post`). The displayed label always uses the simple name —
+/// completion details should be short, and the model's namespace
+/// rarely adds value at a glance.
 pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> String {
-    let model = related_model.unwrap_or("Model");
+    let model_full = related_model.unwrap_or("Model");
+    let model = model_full.rsplit('\\').next().unwrap_or(model_full);
 
     match rel_type {
         // Single model relationships

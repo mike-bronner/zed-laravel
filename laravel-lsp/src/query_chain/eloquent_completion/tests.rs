@@ -342,9 +342,13 @@ class Bare extends Model {}
 
 #[tokio::test]
 async fn resolve_related_model_finds_target_class() {
-    // Parent model declares `tokens` as `hasMany(OAuthToken::class)`. The
-    // helper should return "OAuthToken" so the closure-scope hop can use
-    // it as the effective model for the inner chain.
+    // Parent model declares `tokens` as `hasMany(OAuthToken::class)`.
+    // Phase 5.11 resolves the bare `OAuthToken::class` reference through
+    // the source file's namespace, so the helper returns the FQCN
+    // `App\Models\OAuthToken`. Storing the FQCN (not just the basename)
+    // is what makes dotted-path walking work for relationships whose
+    // related model lives in a different namespace from a basename
+    // collision elsewhere in the project.
     let body = r#"<?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
@@ -356,7 +360,7 @@ class OAuthClient extends Model {
 "#;
     let (_dir, root) = project_with_model("OAuthClient", body);
     let related = resolve_related_model("App\\Models\\OAuthClient", "tokens", &root).await;
-    assert_eq!(related.as_deref(), Some("OAuthToken"));
+    assert_eq!(related.as_deref(), Some("App\\Models\\OAuthToken"));
 }
 
 #[tokio::test]
@@ -578,7 +582,8 @@ class Post extends Model {}
     ])
     .await;
     let resolved = walk_dotted_hops("App\\Models\\User", "posts", &root).await;
-    assert_eq!(resolved.as_deref(), Some("Post"));
+    // Phase 5.11: related_model is the resolved FQCN, not the basename.
+    assert_eq!(resolved.as_deref(), Some("App\\Models\\Post"));
 }
 
 #[tokio::test]
@@ -625,10 +630,14 @@ class Profile extends Model {}
     ])
     .await;
     let resolved = walk_dotted_hops("App\\Models\\User", "posts.author.profile", &root).await;
+    // Phase 5.11: each hop's related_model is now the resolved FQCN,
+    // so the final resolved class is `App\Models\Profile`, not the
+    // bare basename. That's what makes class-locator route correctly
+    // when there's a same-named class in another namespace.
     assert_eq!(
         resolved.as_deref(),
-        Some("Profile"),
-        "three hops should land at Profile"
+        Some("App\\Models\\Profile"),
+        "three hops should land at App\\Models\\Profile"
     );
 }
 

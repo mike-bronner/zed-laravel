@@ -806,7 +806,15 @@ impl DatabaseSchemaProvider {
         }
     }
 
-    /// Resolve an environment variable from .env file
+    /// Resolve an environment variable from .env file.
+    ///
+    /// The regex uses `[ \t]*` (horizontal whitespace only) around `=`,
+    /// NOT `\s*` — `\s` matches newlines in Rust's regex crate, which
+    /// meant the value for an empty `KEY=` would consume the newline and
+    /// then capture the *next line's content* up to its newline. That
+    /// turned a blank `DB_PASSWORD=` into "SESSION_DRIVER=database" (or
+    /// whatever line followed), which was sent as the literal password
+    /// to MySQL and rejected as bad credentials.
     fn resolve_env(&self, key: &str) -> Option<String> {
         let env_path = self.project_root.join(".env");
         let content = match std::fs::read_to_string(&env_path) {
@@ -817,8 +825,13 @@ impl DatabaseSchemaProvider {
             }
         };
 
-        // Pattern: KEY=value or KEY="value" or KEY='value'
-        let pattern = format!(r#"(?m)^{}\s*=\s*['"]?([^'"\n]*)['"]?"#, regex::escape(key));
+        // Pattern: KEY=value or KEY="value" or KEY='value', all on one
+        // line. `[ \t]*` stays horizontal so a blank value (`KEY=\n`)
+        // captures the empty string, not the next line.
+        let pattern = format!(
+            r#"(?m)^{}[ \t]*=[ \t]*['"]?([^'"\n]*)['"]?"#,
+            regex::escape(key)
+        );
         let regex = match Regex::new(&pattern) {
             Ok(r) => r,
             Err(e) => {
@@ -858,6 +871,15 @@ impl DatabaseSchemaProvider {
         let primary_label = candidates.first().map(|c| c.label.clone());
 
         for cand in &candidates {
+            // Log the exact URL shape we're handing to sqlx (with the
+            // password masked). This makes "is the new binary loaded?"
+            // and "did the empty-password URL change actually take
+            // effect?" trivially answerable from the LSP log.
+            info!(
+                "MySQL: trying candidate '{}' with url={}",
+                cand.label,
+                mask_url_password(&cand.url)
+            );
             match MySqlPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(Duration::from_secs(5))

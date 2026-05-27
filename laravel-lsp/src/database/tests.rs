@@ -383,6 +383,87 @@ fn mysql_candidates_non_empty_password_keeps_colon() {
     );
 }
 
+// ---- resolve_env: empty value should NOT swallow next line (Phase 5.5) ----
+
+#[test]
+fn resolve_env_empty_value_returns_none_not_next_line() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    // The exact shape that broke in Mike's tru-data project: an empty
+    // DB_PASSWORD followed by other entries. The old regex `\s*=\s*` let
+    // the `\s*` after `=` consume the newline and matched the next line
+    // as the value.
+    std::fs::write(
+        dir.path().join(".env"),
+        "DB_PASSWORD=\nSESSION_DRIVER=database\nDB_CONNECTION=mysql\n",
+    )
+    .unwrap();
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let result = provider.resolve_env("DB_PASSWORD");
+    assert_eq!(
+        result, None,
+        "empty value should produce None (filtered by .filter(!is_empty)), \
+         not the next line's content"
+    );
+}
+
+#[test]
+fn resolve_env_normal_value_works() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        "DB_PASSWORD=secret\nDB_USERNAME=sail\n",
+    )
+    .unwrap();
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    assert_eq!(
+        provider.resolve_env("DB_PASSWORD"),
+        Some("secret".to_string())
+    );
+    assert_eq!(
+        provider.resolve_env("DB_USERNAME"),
+        Some("sail".to_string())
+    );
+}
+
+#[test]
+fn resolve_env_quoted_value_strips_quotes() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        "DB_PASSWORD=\"s3cr3t!\"\nOTHER='single quoted'\n",
+    )
+    .unwrap();
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    assert_eq!(
+        provider.resolve_env("DB_PASSWORD"),
+        Some("s3cr3t!".to_string())
+    );
+    assert_eq!(
+        provider.resolve_env("OTHER"),
+        Some("single quoted".to_string())
+    );
+}
+
+#[test]
+fn resolve_env_handles_trailing_whitespace_on_key() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    // Some editors / templates pad with spaces around `=`. Still single-line.
+    std::fs::write(
+        dir.path().join(".env"),
+        "DB_PASSWORD = padded\nDB_HOST=127.0.0.1\n",
+    )
+    .unwrap();
+    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    assert_eq!(
+        provider.resolve_env("DB_PASSWORD"),
+        Some("padded".to_string())
+    );
+}
+
 #[test]
 fn postgres_candidates_empty_password_url_has_no_colon() {
     let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));

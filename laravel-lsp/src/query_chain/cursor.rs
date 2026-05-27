@@ -367,7 +367,7 @@ fn detect_in_chain(
     // The cursor must be inside a string-literal arg of the cursor link.
     // `pluck` is `ArgKind::Column` even though it terminates the chain —
     // we still complete inside its first arg.
-    let (quote, _dotted_prefix) = string_arg_at(cursor_link, byte_offset)?;
+    let (quote, string_value) = string_arg_at(cursor_link, byte_offset)?;
 
     if !matches!(
         cursor_link.arg,
@@ -376,15 +376,31 @@ fn detect_in_chain(
         return None;
     }
 
+    // Phase 7: dotted-relation paths in relation positions. For
+    // `with('posts.author.|')` the value is "posts.author." — everything
+    // before the LAST dot is the relation chain to walk
+    // ("posts" → Post, then "author" on Post → Author), and the portion
+    // after is the typing prefix that the editor uses for fuzzy
+    // filtering. Only meaningful for Relation / ClosureCarrier args
+    // — Column args don't follow dotted hops (`where('a.b')` isn't a
+    // thing) and Table args are single-segment.
+    let dotted_prefix = if matches!(cursor_link.arg, ArgKind::Relation | ArgKind::ClosureCarrier) {
+        // Find the last `.` in the string value. If present, return the
+        // substring up to (not including) that dot — those are the
+        // segments we walk.
+        string_value
+            .rfind('.')
+            .map(|idx| string_value[..idx].to_string())
+    } else {
+        None
+    };
+
     Some(ChainContext {
         mode,
         effective_table,
         effective_model,
         expecting: cursor_link.arg,
-        // Dotted-relation prefix splitting lives in Phase 7. Phase 3 doesn't
-        // need it (DB::table chains don't have relation methods), and Phase 4
-        // (Eloquent columns) is single-segment.
-        dotted_prefix: None,
+        dotted_prefix,
         closure_relation_hop,
         quote,
     })
@@ -433,14 +449,14 @@ fn parent_chain_eloquent_model(
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning
-/// its quote character. Walks both top-level `StringLit` args and string
-/// literals nested inside an `Array` arg, so `with(['posts'|, 'comments'])`
+/// its quote character and value. Walks both top-level `StringLit` args and
+/// string literals nested inside an `Array` arg, so `with(['posts'|, 'comments'])`
 /// resolves the same as `with('posts'|)`. Returns `None` if no string arg
 /// covers the cursor.
-fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, ())> {
+fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String)> {
     for arg in &link.args {
-        if let Some(quote) = string_arg_in(arg, byte_offset) {
-            return Some((quote, ()));
+        if let Some((quote, value)) = string_arg_in(arg, byte_offset) {
+            return Some((quote, value));
         }
     }
     None
@@ -448,26 +464,26 @@ fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, ())> {
 
 /// Check whether a single arg (or any of its nested string elements, for
 /// `Array` args) contains the cursor and is a string literal. Returns the
-/// quote character on hit. Pulled out as a separate helper so `Array`
-/// can recurse into its elements without duplicating the span check.
-fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<char> {
+/// quote character + literal value on hit. Pulled out as a separate helper
+/// so `Array` can recurse into its elements without duplicating the span check.
+fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String)> {
     match arg {
         ChainArg::StringLit {
             quote,
+            value,
             span_byte_range,
-            ..
         } => {
             let (start, end) = *span_byte_range;
             if byte_offset >= start && byte_offset <= end {
-                Some(*quote)
+                Some((*quote, value.clone()))
             } else {
                 None
             }
         }
         ChainArg::Array { elements, .. } => {
             for elem in elements {
-                if let Some(q) = string_arg_in(elem, byte_offset) {
-                    return Some(q);
+                if let Some(found) = string_arg_in(elem, byte_offset) {
+                    return Some(found);
                 }
             }
             None

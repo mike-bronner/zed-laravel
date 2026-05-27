@@ -3003,7 +3003,11 @@ impl LaravelLanguageServer {
         // a known table — same shape as a `DB::table('x')->where('|')`
         // chain. Bonus: no casts/accessors get applied (Base = schema
         // only), which is correct for what `->toBase()` returns.
-        let ctx = match (ctx.mode, ctx.effective_table.as_ref(), ctx.effective_model.clone()) {
+        let ctx = match (
+            ctx.mode,
+            ctx.effective_table.as_ref(),
+            ctx.effective_model.clone(),
+        ) {
             (BuilderMode::BaseBuilder, None, Some(model)) => {
                 let root_clone = self.initialized_root.read().await.clone();
                 match root_clone {

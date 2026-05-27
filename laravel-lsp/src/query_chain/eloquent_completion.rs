@@ -276,12 +276,41 @@ pub async fn relations(
     wrap_with_quote: Option<char>,
     project_root: &Path,
 ) -> Vec<CompletionItem> {
-    let Some(class) = &ctx.effective_model else {
+    let Some(starting_class) = &ctx.effective_model else {
         info!("🔗 relations: ctx.effective_model is None — returning 0 items");
         return Vec::new();
     };
 
-    let Some(path) = find_php_class_file(class, project_root) else {
+    // Phase 7: if the user is typing a dotted relation path like
+    // `with('posts.author.|')`, walk each hop on the starting model to
+    // arrive at the final model whose relations we'll list. The cursor
+    // resolver populates `dotted_prefix` with everything before the last
+    // `.`; the editor handles fuzzy-filtering the part after.
+    let class = if let Some(prefix) = ctx.dotted_prefix.as_deref() {
+        match walk_dotted_hops(starting_class, prefix, project_root).await {
+            Some(resolved) => {
+                if resolved != *starting_class {
+                    info!(
+                        "🔗 relations: dotted-path hop {:?} on {:?} → {:?}",
+                        prefix, starting_class, resolved
+                    );
+                }
+                resolved
+            }
+            None => {
+                info!(
+                    "🔗 relations: dotted-path hop {:?} failed on {:?} \
+                     (segment doesn't resolve to a known relation)",
+                    prefix, starting_class
+                );
+                return Vec::new();
+            }
+        }
+    } else {
+        starting_class.clone()
+    };
+
+    let Some(path) = find_php_class_file(&class, project_root) else {
         info!(
             "🔗 relations: no PHP file found for class {:?} under {:?}",
             class, project_root
@@ -348,6 +377,38 @@ pub async fn relations(
             }
         })
         .collect()
+}
+
+/// Phase 7 helper: walk a dotted relation path, returning the model
+/// class at the FINAL hop. Each segment must resolve as a relation on
+/// the previous segment's model.
+///
+/// Examples:
+/// - `walk_dotted_hops("User", "posts", root)` → `Some("Post")` (one hop)
+/// - `walk_dotted_hops("User", "posts.author", root)` → `Some("Author")`
+/// - `walk_dotted_hops("User", "posts.author.profile", root)` → `Some("Profile")`
+/// - Any segment that fails to resolve → `None`
+///
+/// Returns the starting model unchanged if `dotted_prefix` is empty.
+pub async fn walk_dotted_hops(
+    starting_model: &str,
+    dotted_prefix: &str,
+    project_root: &Path,
+) -> Option<String> {
+    if dotted_prefix.is_empty() {
+        return Some(starting_model.to_string());
+    }
+    let mut current = starting_model.to_string();
+    for segment in dotted_prefix.split('.') {
+        if segment.is_empty() {
+            // Empty segment means the user typed two consecutive dots
+            // (e.g. `with('posts..|')`). Treat as a no-op — keep the
+            // current model, don't try to resolve "".
+            continue;
+        }
+        current = resolve_related_model(&current, segment, project_root).await?;
+    }
+    Some(current)
 }
 
 /// Phase 8 helper: walk one relation hop. Given a parent class name and

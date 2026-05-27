@@ -578,6 +578,65 @@ fn closure_scope_with_unrelated_var_returns_none() {
     );
 }
 
+// ---- Dotted relation paths (Phase 7) -------------------------------------
+
+#[test]
+fn dotted_relation_path_single_hop_sets_prefix() {
+    // `User::with('posts.|')` — cursor right after the dot.
+    // dotted_prefix = "posts" (the hop to walk before listing relations).
+    let ctx = detect("User::with('posts.|');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("posts"));
+}
+
+#[test]
+fn dotted_relation_path_multi_hop_sets_full_prefix() {
+    // `User::with('posts.author.|')` — two hops. The walker resolves
+    // posts → Post, then author → Author. Items will be Author's
+    // relations.
+    let ctx = detect("User::with('posts.author.|');").expect("ctx");
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("posts.author"));
+}
+
+#[test]
+fn dotted_relation_path_cursor_mid_last_segment_still_uses_prior_dots() {
+    // `User::with('posts.au|thor')` — cursor inside the last segment.
+    // The prefix is everything before the last dot ("posts"); the
+    // editor handles fuzzy-filtering by what the user typed of the
+    // final segment.
+    let ctx = detect("User::with('posts.au|thor');").expect("ctx");
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("posts"));
+}
+
+#[test]
+fn dotted_relation_path_no_dot_means_no_prefix() {
+    // `User::with('posts|')` — no dot. We're listing User's relations
+    // at the top level, no hops needed.
+    let ctx = detect("User::with('posts|');").expect("ctx");
+    assert!(ctx.dotted_prefix.is_none());
+}
+
+#[test]
+fn dotted_path_only_applies_to_relation_args_not_columns() {
+    // `User::where('a.b|', 1)` — column args don't have dotted-path
+    // semantics. We should NOT set dotted_prefix here.
+    let ctx = detect("User::where('a.b|', 1);").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert!(
+        ctx.dotted_prefix.is_none(),
+        "dotted prefix should only fire for Relation/ClosureCarrier args"
+    );
+}
+
+#[test]
+fn dotted_path_in_where_has_closure_carrier_also_works() {
+    // `User::whereHas('posts.author.|', closure)` — whereHas's first
+    // arg is a relation name, supports dotted paths the same as with().
+    let ctx = detect("User::whereHas('posts.author.|', function ($q) {});").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::ClosureCarrier);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("posts.author"));
+}
+
 // ---- Mode flips: toBase / Collection terminators (Phase 6) -------------
 
 #[test]

@@ -530,3 +530,199 @@ async fn columns_for_collection_falls_back_when_model_missing() {
     let items = columns_for_collection(&ctx, &db, None, &root).await;
     assert!(items.is_empty());
 }
+
+// ---- walk_dotted_hops (Phase 7) ------------------------------------------
+
+/// Helper: scaffolding for the relation-hop tests. Build a tempdir with
+/// the given (class_name, body) model files, then return the root.
+async fn project_with_models_helper(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("app/Models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    for (name, body) in files {
+        std::fs::write(models_dir.join(format!("{name}.php")), body).unwrap();
+    }
+    let root = dir.path().to_path_buf();
+    (dir, root)
+}
+
+#[tokio::test]
+async fn walk_dotted_hops_empty_prefix_returns_starting_model() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let resolved = walk_dotted_hops("App\\Models\\User", "", &root).await;
+    assert_eq!(resolved.as_deref(), Some("App\\Models\\User"));
+}
+
+#[tokio::test]
+async fn walk_dotted_hops_single_segment_one_hop() {
+    let (_dir, root) = project_with_models_helper(&[
+        (
+            "User",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#,
+        ),
+        (
+            "Post",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Post extends Model {}
+"#,
+        ),
+    ])
+    .await;
+    let resolved = walk_dotted_hops("App\\Models\\User", "posts", &root).await;
+    assert_eq!(resolved.as_deref(), Some("Post"));
+}
+
+#[tokio::test]
+async fn walk_dotted_hops_multi_segment_chains_relations() {
+    let (_dir, root) = project_with_models_helper(&[
+        (
+            "User",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#,
+        ),
+        (
+            "Post",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Post extends Model {
+    public function author() { return $this->belongsTo(Author::class); }
+}
+"#,
+        ),
+        (
+            "Author",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Author extends Model {
+    public function profile() { return $this->hasOne(Profile::class); }
+}
+"#,
+        ),
+        (
+            "Profile",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Profile extends Model {}
+"#,
+        ),
+    ])
+    .await;
+    let resolved = walk_dotted_hops("App\\Models\\User", "posts.author.profile", &root).await;
+    assert_eq!(
+        resolved.as_deref(),
+        Some("Profile"),
+        "three hops should land at Profile"
+    );
+}
+
+#[tokio::test]
+async fn walk_dotted_hops_unresolved_segment_returns_none() {
+    let (_dir, root) = project_with_models_helper(&[(
+        "User",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#,
+    )])
+    .await;
+    // User has `posts` but no `nonexistent` relation.
+    let resolved = walk_dotted_hops("App\\Models\\User", "nonexistent", &root).await;
+    assert!(resolved.is_none(), "missing relation should yield None");
+}
+
+// ---- relations with dotted_prefix (Phase 7) ------------------------------
+
+#[tokio::test]
+async fn relations_walks_dotted_prefix_to_final_models_relations() {
+    // `User::with('posts.|')` — should resolve `posts` to Post, then
+    // return Post's relations (Author).
+    let (_dir, root) = project_with_models_helper(&[
+        (
+            "User",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#,
+        ),
+        (
+            "Post",
+            r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Post extends Model {
+    public function author() { return $this->belongsTo(Author::class); }
+    public function comments() { return $this->hasMany(Comment::class); }
+}
+"#,
+        ),
+    ])
+    .await;
+    let ctx = ChainContext {
+        mode: BuilderMode::EloquentBuilder,
+        effective_table: None,
+        effective_model: Some("App\\Models\\User".to_string()),
+        expecting: ArgKind::Relation,
+        dotted_prefix: Some("posts".to_string()),
+        closure_relation_hop: None,
+        quote: '\'',
+    };
+    let items = relations(&ctx, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"author"),
+        "expected Post::author in dotted-path result; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"comments"),
+        "expected Post::comments; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn relations_with_failing_dotted_hop_returns_empty() {
+    let (_dir, root) = project_with_models_helper(&[(
+        "User",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#,
+    )])
+    .await;
+    let ctx = ChainContext {
+        mode: BuilderMode::EloquentBuilder,
+        effective_table: None,
+        effective_model: Some("App\\Models\\User".to_string()),
+        expecting: ArgKind::Relation,
+        dotted_prefix: Some("nonexistent".to_string()),
+        closure_relation_hop: None,
+        quote: '\'',
+    };
+    let items = relations(&ctx, None, &root).await;
+    assert!(items.is_empty(), "unresolvable hop should yield no items");
+}

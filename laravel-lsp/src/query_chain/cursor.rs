@@ -353,22 +353,47 @@ fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainCont
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning
-/// its quote character. Returns `None` if no string arg covers the cursor.
+/// its quote character. Walks both top-level `StringLit` args and string
+/// literals nested inside an `Array` arg, so `with(['posts'|, 'comments'])`
+/// resolves the same as `with('posts'|)`. Returns `None` if no string arg
+/// covers the cursor.
 fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, ())> {
     for arg in &link.args {
-        if let ChainArg::StringLit {
-            quote,
-            span_byte_range,
-            ..
-        } = arg
-        {
-            let (start, end) = *span_byte_range;
-            if byte_offset >= start && byte_offset <= end {
-                return Some((*quote, ()));
-            }
+        if let Some(quote) = string_arg_in(arg, byte_offset) {
+            return Some((quote, ()));
         }
     }
     None
+}
+
+/// Check whether a single arg (or any of its nested string elements, for
+/// `Array` args) contains the cursor and is a string literal. Returns the
+/// quote character on hit. Pulled out as a separate helper so `Array`
+/// can recurse into its elements without duplicating the span check.
+fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<char> {
+    match arg {
+        ChainArg::StringLit {
+            quote,
+            span_byte_range,
+            ..
+        } => {
+            let (start, end) = *span_byte_range;
+            if byte_offset >= start && byte_offset <= end {
+                Some(*quote)
+            } else {
+                None
+            }
+        }
+        ChainArg::Array { elements, .. } => {
+            for elem in elements {
+                if let Some(q) = string_arg_in(elem, byte_offset) {
+                    return Some(q);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Count literal `(` minus `)` on a single line. Does NOT try to skip

@@ -111,6 +111,15 @@ pub enum ChainArg {
         params: Vec<ClosureParam>,
         body_byte_range: (usize, usize),
     },
+    /// Array literal: `['posts', 'comments']`, `[$var, 'col']`, etc.
+    /// `elements` recursively classifies each entry (string literals are
+    /// kept as `StringLit` so the cursor resolver can walk them; values
+    /// we don't model become `Other`). The span covers the entire array
+    /// expression including the brackets.
+    Array {
+        elements: Vec<ChainArg>,
+        span_byte_range: (usize, usize),
+    },
     Other,
 }
 

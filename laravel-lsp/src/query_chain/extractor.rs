@@ -57,20 +57,37 @@ pub fn shift_chain_byte_ranges(
     for link in &mut chain.links {
         link.span_byte_range = (shift(link.span_byte_range.0), shift(link.span_byte_range.1));
         for arg in &mut link.args {
-            match arg {
-                ChainArg::StringLit {
-                    span_byte_range, ..
-                } => {
-                    *span_byte_range = (shift(span_byte_range.0), shift(span_byte_range.1));
-                }
-                ChainArg::Closure {
-                    body_byte_range, ..
-                } => {
-                    *body_byte_range = (shift(body_byte_range.0), shift(body_byte_range.1));
-                }
-                ChainArg::Other => {}
+            shift_arg(arg, &shift);
+        }
+    }
+}
+
+/// Recursively shift byte ranges inside a single `ChainArg`. Handles
+/// `Array` by walking its elements (which themselves are `ChainArg`s) so
+/// nested string literals inside `with(['posts'])` survive the Blade
+/// span re-base.
+fn shift_arg(arg: &mut ChainArg, shift: &impl Fn(usize) -> usize) {
+    match arg {
+        ChainArg::StringLit {
+            span_byte_range, ..
+        } => {
+            *span_byte_range = (shift(span_byte_range.0), shift(span_byte_range.1));
+        }
+        ChainArg::Closure {
+            body_byte_range, ..
+        } => {
+            *body_byte_range = (shift(body_byte_range.0), shift(body_byte_range.1));
+        }
+        ChainArg::Array {
+            elements,
+            span_byte_range,
+        } => {
+            *span_byte_range = (shift(span_byte_range.0), shift(span_byte_range.1));
+            for elem in elements {
+                shift_arg(elem, shift);
             }
         }
+        ChainArg::Other => {}
     }
 }
 
@@ -261,7 +278,72 @@ fn extract_args(args_node: Node, bytes: &[u8]) -> Vec<ChainArg> {
                     body_byte_range: body,
                 });
             }
+            Some(("array_creation_expression", n)) => {
+                // `with(['posts', 'comments'])`, `select(['name', 'email'])`,
+                // etc. — recursively classify the elements so the cursor
+                // resolver can find string literals inside the array.
+                let elements = extract_array_elements(n, bytes);
+                out.push(ChainArg::Array {
+                    elements,
+                    span_byte_range: (n.start_byte(), n.end_byte()),
+                });
+            }
             _ => out.push(ChainArg::Other),
+        }
+    }
+    out
+}
+
+/// Decode an `array_creation_expression` into a flat `Vec<ChainArg>` of
+/// its top-level elements. We don't recurse into nested arrays — Laravel
+/// idioms (`with([…])`, `select([…])`) put strings directly inside, and
+/// surfacing string literals from a 2D array would mis-fire completion.
+///
+/// Each array element in tree-sitter PHP is wrapped in an
+/// `array_element_initializer` whose `value` field holds the actual
+/// expression. For keyed pairs (`'key' => $value`), we look at the
+/// `value` side — that's what completion typically targets (e.g.
+/// `with(['posts' => fn ($q) => …])`, the cursor in `'posts'` is the
+/// relation; the closure is the constraint).
+fn extract_array_elements(array_node: Node, bytes: &[u8]) -> Vec<ChainArg> {
+    let mut out = Vec::new();
+    let mut cursor = array_node.walk();
+    for child in array_node.named_children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        // Look at every named child of the element — we want to surface
+        // BOTH the key string (in `'foo' => …`, the user might be on
+        // 'foo') AND the value string (in `'foo'` non-keyed, that's the
+        // value). Iterating both means a cursor on either side gets
+        // matched.
+        let mut inner_cursor = child.walk();
+        for sub in child.named_children(&mut inner_cursor) {
+            match sub.kind() {
+                "string" => {
+                    if let Some((value, quote)) = single_quoted_string(sub, bytes) {
+                        out.push(ChainArg::StringLit {
+                            value,
+                            quote,
+                            span_byte_range: (sub.start_byte(), sub.end_byte()),
+                        });
+                    } else {
+                        out.push(ChainArg::Other);
+                    }
+                }
+                "encapsed_string" => {
+                    if let Some(value) = encapsed_string_content(sub, bytes) {
+                        out.push(ChainArg::StringLit {
+                            value,
+                            quote: '"',
+                            span_byte_range: (sub.start_byte(), sub.end_byte()),
+                        });
+                    } else {
+                        out.push(ChainArg::Other);
+                    }
+                }
+                _ => out.push(ChainArg::Other),
+            }
         }
     }
     out

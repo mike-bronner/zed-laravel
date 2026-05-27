@@ -787,6 +787,69 @@ fn new_parent_returns_unknown_for_now() {
     assert_eq!(chain.receiver, ChainReceiver::Unknown);
 }
 
+// ---- Array-syntax args (Phase 5.2) ---------------------------------------
+
+#[test]
+fn with_array_arg_classifies_as_array_with_string_elements() {
+    // `with(['posts', 'comments'])` — the first arg is an array of strings.
+    // ChainArg::Array carries the elements as nested ChainArgs.
+    let chains = extract("User::with(['posts', 'comments']);");
+    assert_eq!(chains.len(), 1);
+    let with_link = &chains[0].links[0];
+    assert_eq!(with_link.args.len(), 1);
+    match &with_link.args[0] {
+        ChainArg::Array { elements, .. } => {
+            assert_eq!(elements.len(), 2);
+            match (&elements[0], &elements[1]) {
+                (ChainArg::StringLit { value: v1, .. }, ChainArg::StringLit { value: v2, .. }) => {
+                    assert_eq!(v1, "posts");
+                    assert_eq!(v2, "comments");
+                }
+                other => panic!("expected two StringLit elements, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array arg, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_array_arg_carries_no_elements() {
+    // `with([''])` — single empty string. Useful as the cursor-between-
+    // quotes shape Mike hit when the array form is auto-paired.
+    let chains = extract("User::with(['']);");
+    let with_link = &chains[0].links[0];
+    match &with_link.args[0] {
+        ChainArg::Array { elements, .. } => {
+            assert_eq!(elements.len(), 1);
+            match &elements[0] {
+                ChainArg::StringLit { value, .. } => assert_eq!(value, ""),
+                other => panic!("expected empty StringLit, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array arg, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_arg_with_non_string_element_falls_through_to_other() {
+    // `select([$col, 'name'])` — first element is a variable (Other),
+    // second is a string. Both surface so the cursor resolver can find
+    // the string element.
+    let chains = extract("User::select([$col, 'name']);");
+    let select_link = &chains[0].links[0];
+    match &select_link.args[0] {
+        ChainArg::Array { elements, .. } => {
+            assert_eq!(elements.len(), 2);
+            assert!(matches!(elements[0], ChainArg::Other));
+            match &elements[1] {
+                ChainArg::StringLit { value, .. } => assert_eq!(value, "name"),
+                other => panic!("expected StringLit name, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array arg, got {other:?}"),
+    }
+}
+
 #[test]
 fn unknown_receiver_falls_through_when_inner_is_unhandled() {
     // A parenthesised expression whose inner shape we don't recognise

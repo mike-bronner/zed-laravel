@@ -466,6 +466,34 @@ fn eloquent_static_where_has_first_arg_resolves_to_closure_carrier() {
 }
 
 #[test]
+fn eloquent_static_with_array_arg_resolves_to_relation_completion() {
+    // Mike's reported case: `User::with([''])` with cursor between the
+    // two `'`s inside the array. Without Phase 5.2 the array arg was
+    // ChainArg::Other and string_arg_at found nothing; now we recurse
+    // into Array elements and the StringLit inside is reachable.
+    let ctx = detect("User::with(['|']);")
+        .expect("cursor inside array-arg string should resolve to Relation");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn eloquent_static_with_array_arg_multiple_strings() {
+    // `User::with(['posts', 'co|mments'])` — cursor on the second string
+    // in the array. Same resolution as the single-string case.
+    let ctx = detect("User::with(['posts', 'co|mments']);").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+}
+
+#[test]
+fn eloquent_static_select_array_arg_resolves_to_column() {
+    // `User::select(['na|me', 'email'])` — column completion in array form.
+    let ctx = detect("User::select(['na|me', 'email']);").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+}
+
+#[test]
 fn eloquent_static_load_first_arg_resolves_to_relation() {
     // `User::load(...)` doesn't actually exist as a static (load is on the
     // model instance / collection), but `loadCount` and similar are on

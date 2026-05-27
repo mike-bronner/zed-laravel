@@ -2908,6 +2908,15 @@ impl LaravelLanguageServer {
                                     "Closure{{body={}..{}}}",
                                     body_byte_range.0, body_byte_range.1
                                 ),
+                                laravel_lsp::query_chain::ChainArg::Array {
+                                    elements,
+                                    span_byte_range,
+                                } => format!(
+                                    "Array{{{}..{},n={}}}",
+                                    span_byte_range.0,
+                                    span_byte_range.1,
+                                    elements.len()
+                                ),
                                 laravel_lsp::query_chain::ChainArg::Other => "Other".to_string(),
                             })
                             .collect();

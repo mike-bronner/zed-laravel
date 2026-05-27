@@ -23,6 +23,7 @@ pub mod eloquent_completion;
 pub mod extractor;
 pub mod methods;
 pub mod use_aliases;
+pub mod var_type;
 
 pub use chain::*;
 pub use cursor::{

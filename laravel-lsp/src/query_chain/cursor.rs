@@ -305,7 +305,7 @@ fn detect_in_chain(
             Some(class.clone()),
             None,
         ),
-        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) => {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type }) => {
             // Phase 8: if the chain's receiver var is bound by an enclosing
             // closure carrier, inherit the parent chain's effective model.
             // Two flavors:
@@ -316,6 +316,13 @@ fn detect_in_chain(
             // - SameModel (`where(closure)`, `when($cond, closure)`,
             //   `having(closure)`, etc.): closure binds to the *same* model
             //   as the parent. Inherit `effective_model` directly; no hop.
+            //
+            // Phase 9 (fallback): no closure scope match? Try the resolved
+            // `php_type` captured at extraction time from a typed function
+            // parameter (`function show(User $user)`) or a `@var` docblock
+            // (`/** @var User $u */`). This is what makes the idiomatic
+            // controller-style `public function show(User $user) {
+            // $user->newQuery()->where('|'); }` work end-to-end.
             match chain.closure_scope.as_ref() {
                 Some(binding) if &binding.param_var == var => {
                     let parent_model = parent_chain_eloquent_model(chains, chain)?;
@@ -331,7 +338,15 @@ fn detect_in_chain(
                         }
                     }
                 }
-                _ => return None,
+                _ => match php_type {
+                    Some(class) => (
+                        BuilderMode::EloquentBuilder,
+                        None,
+                        Some(class.clone()),
+                        None,
+                    ),
+                    None => return None,
+                },
             }
         }
         ChainReceiver::Unknown => return None,

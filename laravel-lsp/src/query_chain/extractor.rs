@@ -484,10 +484,15 @@ fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> Chai
                 return ChainReceiver::Unknown;
             };
             let var = raw.trim_start_matches('$').to_string();
-            ChainReceiver::Eloquent(EloquentReceiver::InstanceVar {
-                var,
-                php_type: None, // var_type::resolve fills this in later
-            })
+            // Phase 9: try to resolve `$var`'s declared class via either a
+            // typed function parameter (`function show(User $user)`) or an
+            // `@var` docblock immediately above the variable's assignment.
+            // Both forms are common in Laravel controllers, repositories,
+            // and Livewire components. `None` is acceptable — receiver
+            // resolution will still fall back to Phase 8's closure-scope
+            // path if applicable; otherwise completion silently no-ops.
+            let php_type = super::var_type::resolve(node, bytes, &var, aliases);
+            ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type })
         }
         // `(new self)->with(...)` / `(new User)->where(...)` etc. — the
         // common Laravel pattern of starting a chain from a freshly-

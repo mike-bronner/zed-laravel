@@ -73,6 +73,44 @@ fn fixup_auto_paired_close_returns_unchanged_no_quoting() {
 }
 
 #[test]
+fn fixup_auto_paired_quotes_but_unclosed_paren_injects_close_paren() {
+    // The real-world Sail-typing case: editor auto-paired the quotes
+    // (`DB::table('')`) but the `)` was never typed. Without injecting `)`,
+    // tree-sitter recovers by extending the call expression downstream and
+    // the `''` arg ends up classified as ChainArg::Other — completion
+    // silently misses. We need to leave the cursor's open quote alone but
+    // patch the missing paren so the call expression terminates at the
+    // close quote.
+    let src = "DB::table(''\n        \\Log::info('keep going');\n";
+    let cursor_between_quotes = "DB::table('".len();
+    let prep =
+        fixup_for_completion(src, cursor_between_quotes).expect("auto-pair safety + paren fixup");
+    // Insertion stays bare — the source already has the open quote and the
+    // editor auto-paired the close.
+    assert_eq!(prep.quote_for_insertion, None);
+    // The `)` must land right after the auto-paired close quote, so the
+    // call expression is `DB::table('')` and the rest of the file parses
+    // independently.
+    assert!(
+        prep.fixed_content.starts_with("DB::table('')"),
+        "got: {:?}",
+        prep.fixed_content
+    );
+}
+
+#[test]
+fn fixup_auto_paired_quotes_with_balanced_parens_stays_unchanged() {
+    // Same shape as the bug-fix case above, but the `)` IS already present
+    // (full auto-pair, or user typed `)` after seeing autocomplete). Don't
+    // inject another `)`.
+    let src = "DB::table('')";
+    let cursor_between_quotes = "DB::table('".len();
+    let prep = fixup_for_completion(src, cursor_between_quotes).expect("balanced");
+    assert_eq!(prep.fixed_content, src);
+    assert_eq!(prep.quote_for_insertion, None);
+}
+
+#[test]
 fn fixup_after_open_paren_injects_empty_string_and_close_paren() {
     // User just typed `(`. No quotes yet. Inject `'')` so the call parses
     // with an empty-string first arg AND a closing paren.
@@ -235,6 +273,31 @@ fn db_table_cursor_outside_string_returns_none() {
     // Cursor on the method name `wher|e` — not inside a string arg.
     let ctx = detect("DB::table('users')->wher|e('a', 1);");
     assert!(ctx.is_none());
+}
+
+#[test]
+fn db_table_with_auto_paired_quotes_no_close_paren_resolves_to_table_completion() {
+    // The Sail-typing case end-to-end: user typed `DB::table('` and the
+    // editor auto-paired the `'`, leaving source as `DB::table('')` with no
+    // `)` yet. Without the paren fixup tree-sitter recovers by extending
+    // the call expression, and detect_chain_context_at returns None — the
+    // bug we're fixing. After fixup, we should land on BaseBuilder /
+    // expecting=Table with an empty effective_table (user hasn't typed
+    // anything yet — show all tables).
+    let raw = "<?php\nDB::table('')";
+    let cursor_byte = "<?php\nDB::table('".len();
+    let prep = fixup_for_completion(raw, cursor_byte).expect("auto-pair + paren fixup");
+    let tree = crate::parser::parse_php(&prep.fixed_content).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, &prep.fixed_content)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+    let ctx = detect_chain_context_at(&chains, cursor_byte)
+        .expect("after fixup injects `)`, the cursor should resolve to a Table completion context");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Table);
+    assert_eq!(ctx.effective_table.as_deref(), Some(""));
 }
 
 // ---- detect_chain_context_at: Eloquent (Phase 4+ — current expectation) -

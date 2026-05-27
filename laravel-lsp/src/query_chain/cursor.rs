@@ -92,6 +92,33 @@ pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<Complet
         // cursor (the editor inserted it), don't inject another — that
         // produces `'''` and breaks the parse worse than the original.
         if content[byte_offset..].starts_with(unclosed) {
+            // BUT: the editor only auto-pairs the quote, not the surrounding
+            // `)`. If the user typed `DB::table('` and the editor inserted
+            // the second `'`, the source is `DB::table('')` with no closing
+            // paren. Tree-sitter recovers by extending the call expression
+            // downstream, which causes the empty-string arg to fall out of
+            // the argument list entirely (classified as `Other` instead of
+            // `StringLit`). Inject `)` right after the close quote so the
+            // call expression terminates cleanly.
+            let line_end = content[line_start..]
+                .find('\n')
+                .map(|n| line_start + n)
+                .unwrap_or(content.len());
+            let full_line = &content[line_start..line_end];
+            if line_paren_balance_outside_strings(full_line) > 0 {
+                // Insertion point: one byte past the auto-paired close quote.
+                let insert_at = byte_offset + unclosed.len_utf8();
+                let mut fixed = String::with_capacity(content.len() + 1);
+                fixed.push_str(&content[..insert_at]);
+                fixed.push(')');
+                fixed.push_str(&content[insert_at..]);
+                return Some(CompletionPrep {
+                    fixed_content: fixed,
+                    // Source already has both quotes — completion items go
+                    // in bare.
+                    quote_for_insertion: None,
+                });
+            }
             return Some(CompletionPrep::unchanged(content));
         }
 
@@ -314,6 +341,34 @@ fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, ())> {
         }
     }
     None
+}
+
+/// Count `(` minus `)` on a single line, skipping over the contents of
+/// single- and double-quoted string literals. Backslash escapes inside a
+/// string are honored so `'\'')'` doesn't terminate the string early.
+///
+/// Used by the auto-pair-safety branch of [`fixup_for_completion`] to
+/// decide whether the call expression still needs a `)` injected after the
+/// editor's auto-paired close quote.
+fn line_paren_balance_outside_strings(line: &str) -> i32 {
+    let mut balance: i32 = 0;
+    let mut in_string: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (in_string, c) {
+            (Some(_), '\\') => {
+                // Skip the next char (escaped).
+                chars.next();
+            }
+            (Some(q), c) if c == q => in_string = None,
+            (None, '\'') => in_string = Some('\''),
+            (None, '"') => in_string = Some('"'),
+            (None, '(') => balance += 1,
+            (None, ')') => balance -= 1,
+            _ => {}
+        }
+    }
+    balance
 }
 
 #[cfg(test)]

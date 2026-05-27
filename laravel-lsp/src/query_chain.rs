@@ -18,6 +18,8 @@
 //!   valid alongside DB columns.
 
 pub mod chain;
+pub mod extractor;
 pub mod methods;
 
 pub use chain::*;
+pub use extractor::extract_chains;

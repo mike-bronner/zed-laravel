@@ -6,14 +6,14 @@
 //! same tree-sitter pass as everything else and consumers (completion today,
 //! diagnostics and goto-def in Phase 2) read it without re-parsing.
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BuilderChain {
     pub receiver: ChainReceiver,
     pub span_byte_range: (usize, usize),
     pub links: Vec<ChainLink>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ChainReceiver {
     Eloquent(EloquentReceiver),
     DbTable {
@@ -23,7 +23,7 @@ pub enum ChainReceiver {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum EloquentReceiver {
     /// `User::query()`, `User::where(...)`, etc. — any static call against a
     /// class that resolves to an Eloquent model.
@@ -38,7 +38,7 @@ pub enum EloquentReceiver {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ChainLink {
     pub method: String,
     /// What kind of argument this method expects at its first interesting
@@ -54,7 +54,7 @@ pub struct ChainLink {
 
 /// What kind of argument the cursor's link expects. Used at the cursor only —
 /// for prior links, the walker reads `effect` instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ArgKind {
     /// `where`, `orderBy`, `select`, `pluck`, `sortBy`, … — first string arg
     /// is a column name. Which sources count as "a column" depends on the
@@ -76,7 +76,7 @@ pub enum ArgKind {
 }
 
 /// What the walker does when it processes this link en route to the cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ChainEffect {
     /// No change to context. Includes `Column` / `Relation` methods that
     /// don't terminate (`where`, `with`, …) and the explicit transparent
@@ -96,7 +96,7 @@ pub enum ChainEffect {
     Terminate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ChainArg {
     StringLit {
         value: String,
@@ -110,7 +110,7 @@ pub enum ChainArg {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClosureParam {
     pub name: String,
     pub php_type: Option<String>,
@@ -141,7 +141,7 @@ pub struct ChainContext {
     pub quote: char,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BuilderMode {
     /// Pre-execution Eloquent: full property/relation/cast support.
     EloquentBuilder,

@@ -54,6 +54,136 @@ where
     None
 }
 
+/// Turn a raw sqlx-mysql error string into an actionable toast message.
+///
+/// sqlx surfaces MySQL errors as `... error returned from database: NNNN
+/// (SQLSTATE): server-message ...`. We match on the well-known error
+/// codes that have specific remediations and produce a focused message;
+/// anything else falls through to the generic "check your .env" guidance.
+///
+/// Why pattern-match the string instead of using `sqlx::Error::Database`
+/// fields? The error has already been formatted by the time it reaches
+/// this layer (it's a `String`, not a `sqlx::Error`). Re-plumbing the
+/// typed error all the way up would touch every candidate iteration
+/// site; substring matching is plenty robust for a fixed set of MySQL
+/// error codes whose wire format is part of the MySQL protocol.
+fn classify_mysql_error(raw_error: &str, db_name: &str, candidates_str: &str) -> String {
+    // 1049 (42000): Unknown database — connection + auth succeeded,
+    // the named database doesn't exist on this server. Frame the
+    // remediation in Laravel terms — once the database exists, the
+    // user runs `artisan migrate` to populate it. We deliberately
+    // don't dictate HOW to create the database (`CREATE DATABASE`,
+    // `mysql -e`, a GUI tool, Sail helper, etc.); that's outside
+    // Laravel and varies by setup.
+    if raw_error.contains("1049 (42000)") || raw_error.contains("Unknown database") {
+        return format!(
+            "MySQL accepted the connection and credentials, but database \
+             '{db_name}' doesn't exist on this server. Create the database \
+             with your usual tool, then run `php artisan migrate` (or \
+             `./vendor/bin/sail artisan migrate` for Sail projects) to set \
+             up the schema. Or set DB_DATABASE in .env to a database that \
+             already exists. (Tried: [{candidates_str}])"
+        );
+    }
+    // 1045 (28000): Access denied for user — host reachable, credentials
+    // wrong. Specific enough to call out instead of suggesting host issues.
+    if raw_error.contains("1045 (28000)") || raw_error.contains("Access denied for user") {
+        return format!(
+            "MySQL is reachable but rejected the credentials. Check \
+             DB_USERNAME and DB_PASSWORD in .env. The user may need a \
+             password, may not exist on this server, or may be restricted \
+             to socket-only auth. (Tried: [{candidates_str}]) Error: {raw_error}"
+        );
+    }
+    // 2003 / "Can't connect" / TCP refused — server unreachable.
+    if raw_error.contains("2003") || raw_error.contains("Connection refused") {
+        return format!(
+            "Couldn't reach the MySQL server at [{candidates_str}]. Check \
+             DB_HOST / DB_PORT in .env. If using Sail/Docker Compose, ensure \
+             the container is running and the port is mapped to your host \
+             (run `./vendor/bin/sail up -d`). Error: {raw_error}"
+        );
+    }
+    // 1044 (42000): Access denied for user to database — user exists but
+    // doesn't have privileges on the requested database. This is a DB
+    // admin task, not Laravel-fixable, so the guidance is generic.
+    if raw_error.contains("1044 (42000)") {
+        return format!(
+            "MySQL accepted the connection but the user has no privileges \
+             on database '{db_name}'. Either grant the user access to this \
+             database, or set DB_USERNAME / DB_PASSWORD in .env to a user \
+             that has access. Error: {raw_error}"
+        );
+    }
+    // 1146 (42S02): Base table or view not found — schema exists but
+    // the specific table doesn't. Migrations are the Laravel answer.
+    if raw_error.contains("1146 (42S02)") || raw_error.contains("doesn't exist") {
+        return format!(
+            "MySQL is connected and the database '{db_name}' exists, but a \
+             required table is missing. Run `php artisan migrate` (or \
+             `./vendor/bin/sail artisan migrate` for Sail projects) to \
+             apply pending migrations. Error: {raw_error}"
+        );
+    }
+    // Generic fallback — keeps the original guidance for unknown error
+    // codes. Better to over-explain than to miss something.
+    format!(
+        "MySQL connection failed. Tried candidates: [{candidates_str}]. \
+         Last error: {raw_error}. Check DB_URL / DB_HOST / DB_PORT / \
+         DB_DATABASE / DB_USERNAME / DB_PASSWORD / DB_SOCKET in .env. \
+         If using Sail/Docker Compose, ensure the container is running \
+         and the port is mapped to your host (run `./vendor/bin/sail up -d`)."
+    )
+}
+
+/// Postgres equivalent of [`classify_mysql_error`]. SQLSTATE codes:
+/// - `3D000` invalid_catalog_name → database doesn't exist
+/// - `28P01` invalid_password → wrong credentials
+/// - `28000` invalid_authorization_specification → role/host issue
+fn classify_postgres_error(raw_error: &str, db_name: &str, candidates_str: &str) -> String {
+    // 3D000 invalid_catalog_name → database doesn't exist. Same Laravel
+    // framing as MySQL: create the database, then run `artisan migrate`.
+    if raw_error.contains("3D000") {
+        return format!(
+            "PostgreSQL accepted the connection and credentials, but \
+             database '{db_name}' doesn't exist. Create the database with \
+             your usual tool, then run `php artisan migrate` (or \
+             `./vendor/bin/sail artisan migrate` for Sail projects) to set \
+             up the schema. Or set DB_DATABASE in .env to a database that \
+             already exists. (Tried: [{candidates_str}])"
+        );
+    }
+    if raw_error.contains("28P01") || raw_error.contains("password authentication failed") {
+        return format!(
+            "PostgreSQL rejected the credentials. Check DB_USERNAME / \
+             DB_PASSWORD in .env. (Tried: [{candidates_str}]) Error: {raw_error}"
+        );
+    }
+    if raw_error.contains("Connection refused") || raw_error.contains("could not connect") {
+        return format!(
+            "Couldn't reach the PostgreSQL server at [{candidates_str}]. Check \
+             DB_HOST / DB_PORT in .env. If using Sail/Docker Compose, ensure \
+             the container is running. Error: {raw_error}"
+        );
+    }
+    // 42P01 undefined_table → schema exists but the table doesn't. Run
+    // migrations.
+    if raw_error.contains("42P01") {
+        return format!(
+            "PostgreSQL is connected and the database '{db_name}' exists, \
+             but a required table is missing. Run `php artisan migrate` (or \
+             `./vendor/bin/sail artisan migrate` for Sail projects) to apply \
+             pending migrations. Error: {raw_error}"
+        );
+    }
+    format!(
+        "PostgreSQL connection failed. Tried candidates: [{candidates_str}]. \
+         Last error: {raw_error}. Check DB_URL / DB_HOST / DB_PORT / \
+         DB_DATABASE / DB_USERNAME / DB_PASSWORD / DB_SOCKET in .env. \
+         If using Sail/Docker Compose, ensure the container is running."
+    )
+}
+
 /// Build the `user[:password]` userinfo segment of a `driver://userinfo@…`
 /// connection URL.
 ///
@@ -916,18 +1046,13 @@ impl DatabaseSchemaProvider {
         let pool = match pool_opt {
             Some(p) => p,
             None => {
-                let msg = format!(
-                    "MySQL connection failed. Tried candidates: [{}]. Last error: {}. \
-                     Check DB_URL / DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD / \
-                     DB_SOCKET in .env. If using Sail/Docker Compose, ensure the container is \
-                     running and the port is mapped to your host (run `./vendor/bin/sail up -d`).",
-                    candidates
-                        .iter()
-                        .map(|c| c.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    last_err.unwrap_or_else(|| "(no error captured)".to_string())
-                );
+                let candidates_str = candidates
+                    .iter()
+                    .map(|c| c.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let raw_err = last_err.unwrap_or_else(|| "(no error captured)".to_string());
+                let msg = classify_mysql_error(&raw_err, &config.database, &candidates_str);
                 warn!("{}", msg);
                 self.set_error("mysql", &msg).await;
                 return None;
@@ -1292,18 +1417,13 @@ impl DatabaseSchemaProvider {
         let pool = match pool_opt {
             Some(p) => p,
             None => {
-                let msg = format!(
-                    "PostgreSQL connection failed. Tried candidates: [{}]. Last error: {}. \
-                     Check DB_URL / DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD / \
-                     DB_SOCKET in .env. If using Sail/Docker Compose, ensure the container is \
-                     running.",
-                    candidates
-                        .iter()
-                        .map(|c| c.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    last_err.unwrap_or_else(|| "(no error captured)".to_string())
-                );
+                let candidates_str = candidates
+                    .iter()
+                    .map(|c| c.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let raw_err = last_err.unwrap_or_else(|| "(no error captured)".to_string());
+                let msg = classify_postgres_error(&raw_err, &config.database, &candidates_str);
                 warn!("{}", msg);
                 self.set_error("pgsql", &msg).await;
                 return None;

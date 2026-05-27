@@ -139,31 +139,183 @@ impl ModelMetadata {
         let content = std::fs::read_to_string(path).ok()?;
         let mut metadata = Self::from_content(&content);
 
-        if let Some(parent_class) = Self::extract_parent_class(&content) {
+        if let Some(parent_raw) = Self::extract_parent_class(&content) {
             // Stop at Eloquent's base class. Real Laravel models extend
             // `Model` directly OR via `Authenticatable` (which itself
             // extends Model). We only halt on Model — Authenticatable
             // and Pivot etc. are worth walking into (they may declare
             // their own $table fallbacks for specific use cases).
-            let basename = parent_class.rsplit('\\').next().unwrap_or(&parent_class);
+            let basename = parent_raw.rsplit('\\').next().unwrap_or(&parent_raw);
             if basename != "Model" {
-                if let Some(parent_path) =
-                    crate::class_locator::find_php_class_file(&parent_class, project_root)
-                {
+                // Resolve the parent through the child file's use
+                // statements + namespace so we get the actual FQCN
+                // (e.g. `Token` → `Laravel\Passport\Token`). Then map
+                // FQCN → file path via the Laravel/Composer
+                // convention. Falls back to a basename search if the
+                // FQCN path doesn't exist on disk — covers projects
+                // with non-standard PSR-4 layouts.
+                let use_aliases = Self::extract_use_aliases_from_php(&content);
+                let file_namespace = Self::extract_namespace(&content);
+                let parent_fqcn =
+                    Self::resolve_to_fqcn(&parent_raw, file_namespace.as_deref(), &use_aliases);
+
+                let parent_path = Self::find_class_file_by_fqcn(&parent_fqcn, project_root)
+                    .or_else(|| {
+                        crate::class_locator::find_php_class_file_in_app_or_vendor(
+                            &parent_fqcn,
+                            project_root,
+                        )
+                    });
+
+                if let Some(parent_path) = parent_path {
                     if let Some(parent_meta) =
                         Self::resolve_recursive(&parent_path, project_root, visited, depth + 1)
                     {
                         metadata.merge_inherited(parent_meta);
                     }
                 }
-                // If the parent isn't in app/-style search roots (e.g.
-                // vendor/ class without PSR-4 hookup here), just stop
-                // walking. We don't pretend to inherit something we
-                // can't read.
+                // No parent file found: built-in PHP class, missing
+                // dependency, or unconventional autoload. Walking stops.
             }
         }
 
         Some(metadata)
+    }
+
+    /// Extract `use Foo\Bar;` / `use Foo\Bar as Baz;` statements from
+    /// PHP source. Returns a `local_name → FQCN` map.
+    ///
+    /// Doesn't handle grouped uses (`use Foo\{Bar, Baz};`),
+    /// `use function`, or `use const` — none of those participate in
+    /// class inheritance, which is what this walker resolves.
+    fn extract_use_aliases_from_php(content: &str) -> HashMap<String, String> {
+        let re = match Regex::new(r"(?m)^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;") {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+        let mut aliases = HashMap::new();
+        for caps in re.captures_iter(content) {
+            let fqcn = caps[1].trim_start_matches('\\').to_string();
+            let local = caps
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string());
+            aliases.insert(local, fqcn);
+        }
+        aliases
+    }
+
+    /// Extract the `namespace Foo\Bar;` declaration. Returns the
+    /// namespace without the leading backslash. Returns `None` for
+    /// files without a namespace declaration (global namespace).
+    fn extract_namespace(content: &str) -> Option<String> {
+        let re = Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").ok()?;
+        re.captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// Resolve a class reference (as it appears in `extends`,
+    /// `implements`, etc.) to its fully-qualified class name.
+    ///
+    /// Resolution rules mirror PHP:
+    /// - `\Foo\Bar` (leading backslash) is already fully qualified —
+    ///   strip the backslash.
+    /// - `Foo\Bar` (no leading backslash, contains backslash) is
+    ///   partially qualified — first segment may be an aliased use,
+    ///   else prepend the file's namespace.
+    /// - `Bar` (unqualified) — look in use aliases first, else
+    ///   prepend the file's namespace.
+    fn resolve_to_fqcn(
+        name: &str,
+        file_namespace: Option<&str>,
+        use_aliases: &HashMap<String, String>,
+    ) -> String {
+        if let Some(stripped) = name.strip_prefix('\\') {
+            return stripped.to_string();
+        }
+        if name.contains('\\') {
+            let first = name.split('\\').next().unwrap_or("");
+            if let Some(prefix) = use_aliases.get(first) {
+                let rest = &name[first.len()..]; // includes leading `\`
+                return format!("{prefix}{rest}");
+            }
+            if let Some(ns) = file_namespace {
+                return format!("{ns}\\{name}");
+            }
+            return name.to_string();
+        }
+        if let Some(fqcn) = use_aliases.get(name) {
+            return fqcn.clone();
+        }
+        if let Some(ns) = file_namespace {
+            return format!("{ns}\\{name}");
+        }
+        name.to_string()
+    }
+
+    /// Map a fully-qualified class name to its source file path using
+    /// Laravel/Composer conventions:
+    ///
+    /// - `App\Models\User` → `app/Models/User.php`
+    ///   (or `src/...` if the project uses `src/` for app code)
+    /// - `Laravel\Passport\Token` →
+    ///   `vendor/laravel/passport/src/Token.php`
+    ///   (lowercased vendor + package, then `src/`, then remaining
+    ///   segments as path)
+    /// - `Spatie\Permission\Models\Role` →
+    ///   `vendor/spatie/permission/src/Models/Role.php`
+    ///
+    /// Returns `None` if none of the candidate paths exist on disk.
+    /// The caller then falls back to a basename walk via class_locator.
+    fn find_class_file_by_fqcn(fqcn: &str, project_root: &Path) -> Option<PathBuf> {
+        let segments: Vec<&str> = fqcn.split('\\').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return None;
+        }
+        let class_name = *segments.last().unwrap();
+        let ns_segments = &segments[..segments.len() - 1];
+
+        // App\Models\User → app/Models/User.php (and src/ alternative)
+        if ns_segments.first().map(|s| s.to_ascii_lowercase()) == Some("app".to_string()) {
+            let rest = &ns_segments[1..];
+            for app_dir in ["app", "src"] {
+                let mut path = project_root.join(app_dir);
+                for seg in rest {
+                    path = path.join(seg);
+                }
+                path = path.join(format!("{class_name}.php"));
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+
+        // Vendor convention: lowercase first two segments → package
+        // directory; remaining segments are paths under `src/` (or
+        // under the package root if `src/` doesn't exist for this
+        // particular package).
+        if ns_segments.len() >= 2 {
+            let vendor = ns_segments[0].to_ascii_lowercase();
+            let pkg = ns_segments[1].to_ascii_lowercase();
+            let rest = &ns_segments[2..];
+
+            for src_segment in ["src", ""] {
+                let mut path = project_root.join("vendor").join(&vendor).join(&pkg);
+                if !src_segment.is_empty() {
+                    path = path.join(src_segment);
+                }
+                for seg in rest {
+                    path = path.join(seg);
+                }
+                path = path.join(format!("{class_name}.php"));
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+
+        None
     }
 
     /// Extract the parent class name from `class X extends Y`. Returns

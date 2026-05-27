@@ -320,6 +320,113 @@ fn postgres_candidates_socket_uses_libpq_style_url() {
     );
 }
 
+// ---- classify_mysql_error: actionable per-error-code toasts (Phase 5.8b) ---
+
+#[test]
+fn classify_mysql_unknown_database_recommends_artisan_migrate() {
+    use super::classify_mysql_error;
+    let raw = "tcp 127.0.0.1:3306: error returned from database: 1049 (42000): Unknown database 'tru_data'";
+    let msg = classify_mysql_error(raw, "tru_data", "tcp 127.0.0.1:3306");
+    assert!(
+        msg.contains("php artisan migrate"),
+        "remediation should be in Laravel terms (artisan migrate), not SQL; got: {msg}"
+    );
+    assert!(
+        msg.contains("sail artisan migrate"),
+        "should mention the Sail variant of the artisan command; got: {msg}"
+    );
+    assert!(
+        msg.contains("accepted the connection"),
+        "should tell user that auth worked; got: {msg}"
+    );
+    assert!(
+        !msg.contains("CREATE DATABASE"),
+        "should NOT include raw SQL commands; got: {msg}"
+    );
+    assert!(
+        !msg.contains("Check DB_URL / DB_HOST"),
+        "should NOT show the generic 'check everything' message; got: {msg}"
+    );
+}
+
+#[test]
+fn classify_mysql_missing_table_recommends_artisan_migrate() {
+    use super::classify_mysql_error;
+    let raw =
+        "tcp 127.0.0.1:3306: error returned from database: 1146 (42S02): Table 'tru_data.users' doesn't exist";
+    let msg = classify_mysql_error(raw, "tru_data", "tcp 127.0.0.1:3306");
+    assert!(
+        msg.contains("php artisan migrate"),
+        "missing-table case should also point at artisan migrate; got: {msg}"
+    );
+    assert!(
+        msg.contains("table is missing"),
+        "should call out that the table specifically is missing; got: {msg}"
+    );
+}
+
+#[test]
+fn classify_mysql_access_denied_calls_out_credentials() {
+    use super::classify_mysql_error;
+    let raw = "tcp 127.0.0.1:3306: error returned from database: 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)";
+    let msg = classify_mysql_error(raw, "tru_data", "tcp 127.0.0.1:3306");
+    assert!(
+        msg.contains("DB_USERNAME"),
+        "should call out DB_USERNAME/PASSWORD; got: {msg}"
+    );
+    assert!(
+        msg.contains("rejected the credentials"),
+        "should say MySQL is reachable but rejected creds; got: {msg}"
+    );
+}
+
+#[test]
+fn classify_mysql_connection_refused_blames_host() {
+    use super::classify_mysql_error;
+    let raw = "tcp 127.0.0.1:3306: 2003 Can't connect to MySQL server (Connection refused)";
+    let msg = classify_mysql_error(raw, "tru_data", "tcp 127.0.0.1:3306");
+    assert!(
+        msg.contains("Couldn't reach the MySQL server"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("DB_HOST / DB_PORT"), "got: {msg}");
+}
+
+#[test]
+fn classify_mysql_unknown_error_falls_through_to_generic() {
+    use super::classify_mysql_error;
+    let raw = "tcp 127.0.0.1:3306: some weird sqlx-side error we've never seen";
+    let msg = classify_mysql_error(raw, "tru_data", "tcp 127.0.0.1:3306");
+    assert!(msg.contains("MySQL connection failed"), "got: {msg}");
+    assert!(
+        msg.contains("Check DB_URL / DB_HOST"),
+        "generic message should keep the full .env checklist; got: {msg}"
+    );
+}
+
+#[test]
+fn classify_postgres_unknown_database_recommends_artisan_migrate() {
+    use super::classify_postgres_error;
+    let raw = "tcp 127.0.0.1:5432: error returned from database: code: \"3D000\" message: \"database \\\"foo\\\" does not exist\"";
+    let msg = classify_postgres_error(raw, "foo", "tcp 127.0.0.1:5432");
+    assert!(
+        msg.contains("php artisan migrate"),
+        "Postgres unknown-database should also use Laravel framing; got: {msg}"
+    );
+    assert!(!msg.contains("CREATE DATABASE"), "no raw SQL; got: {msg}");
+}
+
+#[test]
+fn classify_postgres_missing_table_recommends_artisan_migrate() {
+    use super::classify_postgres_error;
+    let raw = "tcp 127.0.0.1:5432: error returned from database: code: \"42P01\" message: \"relation \\\"users\\\" does not exist\"";
+    let msg = classify_postgres_error(raw, "foo", "tcp 127.0.0.1:5432");
+    assert!(
+        msg.contains("php artisan migrate"),
+        "Postgres missing-table should point at migrations; got: {msg}"
+    );
+}
+
 // ---- userinfo / empty-password URL shape (Phase 5.4) --------------------
 
 #[test]

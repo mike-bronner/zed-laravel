@@ -395,6 +395,203 @@ class B extends A {}
 }
 
 #[test]
+fn inheritance_finds_parent_in_vendor_directory() {
+    // Mike's actual case: OAuthAccessToken (in app/Models) extends
+    // Laravel\Passport\Token (in vendor/laravel/passport/src/Token.php).
+    // The inheritance walker should find the parent in vendor/.
+    let dir = TempDir::new().expect("tempdir");
+    let app_models = dir.path().join("app/Models");
+    std::fs::create_dir_all(&app_models).unwrap();
+    std::fs::write(
+        app_models.join("OAuthAccessToken.php"),
+        r#"<?php
+namespace App\Models;
+use Laravel\Passport\Token;
+class OAuthAccessToken extends Token {}
+"#,
+    )
+    .unwrap();
+
+    // Mimic vendor/laravel/passport/src/Token.php — the realistic place
+    // for a Passport class.
+    let vendor_passport = dir.path().join("vendor/laravel/passport/src");
+    std::fs::create_dir_all(&vendor_passport).unwrap();
+    std::fs::write(
+        vendor_passport.join("Token.php"),
+        r#"<?php
+namespace Laravel\Passport;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'oauth_access_tokens';
+}
+"#,
+    )
+    .unwrap();
+
+    let child_path = app_models.join("OAuthAccessToken.php");
+    let metadata = ModelMetadata::from_file_with_inheritance(&child_path, dir.path())
+        .expect("metadata resolves");
+    assert_eq!(metadata.class_name, "OAuthAccessToken");
+    assert_eq!(
+        metadata.table_name.as_deref(),
+        Some("oauth_access_tokens"),
+        "should inherit $table from vendor parent class"
+    );
+}
+
+#[test]
+fn inheritance_app_class_wins_over_vendor_when_same_name() {
+    // If a project ships its own `Token` class in app/Models AND there's
+    // also a `Token` in vendor/, the app-side one wins (PSR-4 in real
+    // Laravel would resolve to the project class; we match that
+    // intuition).
+    let dir = TempDir::new().expect("tempdir");
+    let app_models = dir.path().join("app/Models");
+    std::fs::create_dir_all(&app_models).unwrap();
+    std::fs::write(
+        app_models.join("Child.php"),
+        r#"<?php
+namespace App\Models;
+class Child extends Token {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app_models.join("Token.php"),
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'app_tokens';
+}
+"#,
+    )
+    .unwrap();
+
+    // Plant a different Token in vendor — should be ignored.
+    let vendor = dir.path().join("vendor/some/pkg/src");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(
+        vendor.join("Token.php"),
+        r#"<?php
+namespace Some\Pkg;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'vendor_tokens';
+}
+"#,
+    )
+    .unwrap();
+
+    let child_path = app_models.join("Child.php");
+    let metadata = ModelMetadata::from_file_with_inheritance(&child_path, dir.path()).unwrap();
+    assert_eq!(
+        metadata.table_name.as_deref(),
+        Some("app_tokens"),
+        "app-side parent should win over a vendor parent of the same basename"
+    );
+}
+
+#[test]
+fn inheritance_follows_use_statement_to_vendor_psr4_path() {
+    // The realistic Laravel shape: child file declares its namespace and
+    // `use`s the parent class explicitly. The walker should resolve
+    // `extends Token` → `Laravel\Passport\Token` (via use), then map the
+    // FQCN to `vendor/laravel/passport/src/Token.php` (Composer convention).
+    let dir = TempDir::new().expect("tempdir");
+    let app_models = dir.path().join("app/Models");
+    std::fs::create_dir_all(&app_models).unwrap();
+    std::fs::write(
+        app_models.join("OAuthAccessToken.php"),
+        r#"<?php
+namespace App\Models;
+use Laravel\Passport\Token;
+class OAuthAccessToken extends Token {}
+"#,
+    )
+    .unwrap();
+
+    // BOTH a vendor Passport Token AND an unrelated Token elsewhere — to
+    // prove that the use-statement-based resolver picks the right one,
+    // not the first basename match.
+    let vendor_passport = dir.path().join("vendor/laravel/passport/src");
+    std::fs::create_dir_all(&vendor_passport).unwrap();
+    std::fs::write(
+        vendor_passport.join("Token.php"),
+        r#"<?php
+namespace Laravel\Passport;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'oauth_access_tokens';
+}
+"#,
+    )
+    .unwrap();
+
+    // A red-herring Token in a different vendor package — basename-only
+    // matching would pick whichever appeared first in the walk order.
+    let vendor_other = dir.path().join("vendor/some/other-pkg/src");
+    std::fs::create_dir_all(&vendor_other).unwrap();
+    std::fs::write(
+        vendor_other.join("Token.php"),
+        r#"<?php
+namespace Some\OtherPkg;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'WRONG_TABLE';
+}
+"#,
+    )
+    .unwrap();
+
+    let child_path = app_models.join("OAuthAccessToken.php");
+    let metadata = ModelMetadata::from_file_with_inheritance(&child_path, dir.path()).unwrap();
+    assert_eq!(
+        metadata.table_name.as_deref(),
+        Some("oauth_access_tokens"),
+        "should follow `use Laravel\\Passport\\Token;` to the Passport class, \
+         NOT pick the first basename match"
+    );
+}
+
+#[test]
+fn inheritance_aliased_use_resolves_to_target() {
+    // `use Laravel\Passport\Token as PassportToken;` — the child extends
+    // PassportToken. Walker should resolve PassportToken (the alias) to
+    // the FQCN and find the vendor file.
+    let dir = TempDir::new().expect("tempdir");
+    let app_models = dir.path().join("app/Models");
+    std::fs::create_dir_all(&app_models).unwrap();
+    std::fs::write(
+        app_models.join("MyToken.php"),
+        r#"<?php
+namespace App\Models;
+use Laravel\Passport\Token as PassportToken;
+class MyToken extends PassportToken {}
+"#,
+    )
+    .unwrap();
+
+    let vendor = dir.path().join("vendor/laravel/passport/src");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(
+        vendor.join("Token.php"),
+        r#"<?php
+namespace Laravel\Passport;
+use Illuminate\Database\Eloquent\Model;
+class Token extends Model {
+    protected $table = 'oauth_tokens';
+}
+"#,
+    )
+    .unwrap();
+
+    let child_path = app_models.join("MyToken.php");
+    let metadata = ModelMetadata::from_file_with_inheritance(&child_path, dir.path()).unwrap();
+    assert_eq!(metadata.table_name.as_deref(), Some("oauth_tokens"));
+}
+
+#[test]
 fn inheritance_walks_grandparent() {
     // Multi-level chain: Child → Parent → Grandparent (which has the
     // $table). All three levels walked.

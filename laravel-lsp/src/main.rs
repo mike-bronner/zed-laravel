@@ -9108,8 +9108,11 @@ impl LaravelLanguageServer {
         context: &ValidationParamContext,
         content: &str,
         cursor_line: usize,
-        uri: &Url,
-        position: Position,
+        // `uri` and `position` were used by the inline DB-error diagnostic
+        // we removed in Phase 5.3; the toast doesn't need them. Kept in
+        // the signature so callers don't have to change.
+        _uri: &Url,
+        _position: Position,
     ) -> Vec<CompletionItem> {
         use laravel_lsp::validation_rules::{LaravelRulesParser, ParamType};
 
@@ -9240,39 +9243,13 @@ impl LaravelLanguageServer {
                     if tables.is_empty() {
                         if let Some(error) = provider.get_last_error().await {
                             info!("   ❌ Database connection error: {}", error.message);
-
-                            // Check if we've already shown this diagnostic
-                            let mut shown = self.database_diagnostic_shown.write().await;
-                            if !*shown {
-                                *shown = true;
-
-                                // Publish diagnostic at the validation rule position
-                                let diagnostic = Diagnostic {
-                                    range: Range {
-                                        start: position,
-                                        end: Position {
-                                            line: position.line,
-                                            character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
-                                        },
-                                    },
-                                    severity: Some(DiagnosticSeverity::INFORMATION),
-                                    code: None,
-                                    source: Some("laravel".to_string()),
-                                    message: format!(
-                                        "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n- DB_CONNECTION\n- DB_HOST\n- DB_DATABASE\n- DB_USERNAME\n- DB_PASSWORD",
-                                        error.message
-                                    ),
-                                    related_information: None,
-                                    tags: None,
-                                    code_description: None,
-                                    data: None,
-                                };
-
-                                self.client
-                                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
-                                    .await;
-                            }
-
+                            // Surface the unreachable-DB notification via the
+                            // single persistent toast. The previous inline
+                            // diagnostic at the rule position used the same
+                            // one-shot flag as the toast, so whichever fired
+                            // first hid the other. One channel = one signal,
+                            // and toast persists until the user dismisses it.
+                            self.maybe_notify_db_unreachable(&error.message).await;
                             // Return empty - no completions available
                             return Vec::new();
                         }
@@ -9434,36 +9411,14 @@ impl LaravelLanguageServer {
                     }
                 } else {
                     debug!("warn:  Database schema provider not initialized");
-
-                    // Publish diagnostic at the validation rule position
-                    let mut shown = self.database_diagnostic_shown.write().await;
-                    if !*shown {
-                        *shown = true;
-
-                        let diagnostic = Diagnostic {
-                            range: Range {
-                                start: position,
-                                end: Position {
-                                    line: position.line,
-                                    character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::INFORMATION),
-                            code: None,
-                            source: Some("laravel".to_string()),
-                            message: "Database not configured. Set DB_CONNECTION, DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env for exists:/unique: autocomplete.".to_string(),
-                            related_information: None,
-                            tags: None,
-                            code_description: None,
-                            data: None,
-                        };
-
-                        self.client
-                            .publish_diagnostics(uri.clone(), vec![diagnostic], None)
-                            .await;
-                    }
-
-                    // Return empty - no completions available
+                    // Same persistent-toast channel as the unreachable-DB
+                    // path above. "Provider not initialised" means no .env
+                    // (or no detection of one); say so explicitly.
+                    self.maybe_notify_db_unreachable(
+                        "Database not configured. Set DB_CONNECTION, DB_HOST, \
+                         DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env.",
+                    )
+                    .await;
                     Vec::new()
                 }
             }
@@ -12737,46 +12692,6 @@ return [
         })
     }
 
-    /// Check if database connection has failed and return an Info diagnostic if so
-    /// This diagnostic is shown once per session when exists:/unique: validation rules are used
-    /// but the database cannot be connected
-    async fn get_database_error_diagnostic(&self) -> Option<Diagnostic> {
-        // Check if we've already shown this diagnostic
-        let mut shown = self.database_diagnostic_shown.write().await;
-        if *shown {
-            return None;
-        }
-
-        // Check if database schema provider exists and has an error
-        let schema_guard = self.database_schema.read().await;
-        if let Some(ref provider) = *schema_guard {
-            if let Some(error) = provider.get_last_error().await {
-                // Mark as shown so we don't show it again
-                *shown = true;
-
-                return Some(Diagnostic {
-                    range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    code: None,
-                    source: Some("laravel".to_string()),
-                    message: format!(
-                        "Database connection failed: {}\nConfigure database settings in .env for exists:/unique: validation autocomplete.",
-                        error.message
-                    ),
-                    related_information: None,
-                    tags: None,
-                    code_description: None,
-                    data: None,
-                });
-            }
-        }
-
-        None
-    }
-
     /// Clone server for spawning async tasks
     fn clone_for_spawn(&self) -> Self {
         LaravelLanguageServer {
@@ -12824,10 +12739,15 @@ return [
             diagnostics.push(vendor_diag);
         }
 
-        // Check for database connection error diagnostic (shows once per session)
-        if let Some(db_diag) = self.get_database_error_diagnostic().await {
-            diagnostics.push(db_diag);
-        }
+        // Database-unreachable notifications go through the persistent
+        // toast (`maybe_notify_db_unreachable`) — driven from the chain
+        // completion handler when an LSP-completing path actually needs
+        // the DB and finds it unavailable. We deliberately don't publish
+        // a diagnostic from here: a 0:0 diagnostic on whatever file
+        // happened to be open is awkward, and emitting both a diagnostic
+        // AND a toast meant whichever fired first stole the
+        // `database_diagnostic_shown` flag and suppressed the other.
+        // Toast wins; diagnostic is gone.
 
         // Get the Laravel config (checks memory cache first, then Salsa)
         let t_config = std::time::Instant::now();

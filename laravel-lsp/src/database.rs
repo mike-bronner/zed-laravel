@@ -731,6 +731,34 @@ impl DatabaseSchemaProvider {
         };
         let _ = used_fallback_host; // documented in info! above
 
+        // Diagnostic identity probe — when SHOW TABLES returns 0 rows but
+        // the user knows the DB has tables, the connection probably landed
+        // on the wrong MySQL instance (e.g., Homebrew MySQL on 127.0.0.1:3306
+        // intercepting before Sail). Log the server identity so the user can
+        // see what they're actually connected to.
+        if let Ok(row) = sqlx::query(
+            "SELECT DATABASE() AS db, @@hostname AS hostname, USER() AS user, @@version AS version",
+        )
+        .fetch_one(&pool)
+        .await
+        {
+            let db_name: String = row.try_get("db").unwrap_or_default();
+            let hostname: String = row.try_get("hostname").unwrap_or_default();
+            let user: String = row.try_get("user").unwrap_or_default();
+            let version: String = row.try_get("version").unwrap_or_default();
+            info!(
+                "MySQL connected: db={:?} server_hostname={:?} user={:?} version={:?}",
+                db_name, hostname, user, version
+            );
+        }
+        if let Ok(rows) = sqlx::query("SHOW DATABASES").fetch_all(&pool).await {
+            let dbs: Vec<String> = rows
+                .into_iter()
+                .filter_map(|r| r.try_get::<String, _>(0).ok())
+                .collect();
+            info!("MySQL: visible databases = {:?}", dbs);
+        }
+
         // Get tables
         let tables: Vec<String> = sqlx::query("SHOW TABLES")
             .fetch_all(&pool)

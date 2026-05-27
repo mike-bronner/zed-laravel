@@ -17,6 +17,7 @@ pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod component_declaration_locator;
+pub mod composer_autoload;
 pub mod config;
 pub mod config_key_locator;
 pub mod config_lookup;

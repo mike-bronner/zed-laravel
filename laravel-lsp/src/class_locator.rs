@@ -66,29 +66,49 @@ pub fn find_php_class_file_in_app_or_vendor(class_name: &str, root: &Path) -> Op
     find_php_class_file_impl(class_name, root, true)
 }
 
-/// Map a fully-qualified class name to its source file path using
-/// Laravel/Composer conventions:
+/// Map a fully-qualified class name to its source file path.
 ///
-/// - `App\Models\User` → `app/Models/User.php` (or `src/Models/User.php`
-///   for projects that use `src/` for app code)
-/// - `Laravel\Passport\Token` → `vendor/laravel/passport/src/Token.php`
-///   (lowercased vendor + package, then `src/`, then remaining
-///   namespace segments as path components)
-/// - `Spatie\Permission\Models\Role` →
-///   `vendor/spatie/permission/src/Models/Role.php`
+/// Resolution order:
+///
+/// 1. **Real Composer PSR-4 data** ([`crate::composer_autoload::ComposerAutoload`])
+///    — reads the project's `composer.json` + `vendor/composer/installed.json`
+///    and uses the actual declared PSR-4 prefix → directory mappings.
+///    This handles packages whose directory name is hyphenated even
+///    though the namespace isn't (e.g. `CrossBibleInc\BibleModels\` →
+///    `vendor/crossbibleinc/bible-models/src/`).
+/// 2. **Conventional heuristic fallback** — for projects without an
+///    `installed.json` (rare), the original mapping kicks in:
+///    - `App\Models\User` → `app/Models/User.php` (or `src/Models/User.php`)
+///    - `Laravel\Passport\Token` → `vendor/laravel/passport/src/Token.php`
+///      (lowercased vendor + package, then `src/`)
 ///
 /// `search_vendor`: when `true`, only consider the vendor/ mapping;
 /// when `false`, only consider the App/ mapping. Callers chain both
-/// modes to cover the realistic search space.
+/// modes to cover the realistic search space. The Composer step
+/// honors this split too — it segregates project-rooted and
+/// vendor-rooted entries.
 ///
-/// Returns `None` if no candidate path exists on disk. The caller then
-/// falls back to a basename walk so we still resolve unconventional
-/// PSR-4 layouts.
+/// Returns `None` if neither strategy finds a file on disk. The caller
+/// then falls back to a basename walk so we still resolve
+/// unconventional PSR-4 layouts.
 fn find_php_class_file_by_fqcn(
     fqcn: &str,
     project_root: &Path,
     search_vendor: bool,
 ) -> Option<PathBuf> {
+    // Try the real Composer PSR-4 map first. Filter results by
+    // whether the resolved path is under vendor/ so the caller's
+    // app-vs-vendor segregation still holds.
+    let autoload = crate::composer_autoload::ComposerAutoload::for_project(project_root);
+    if let Some(path) = autoload.resolve(fqcn) {
+        let is_vendor = path.starts_with(project_root.join("vendor"));
+        if is_vendor == search_vendor {
+            return Some(path);
+        }
+        // Path exists but on the wrong side of the app/vendor split
+        // for this call. Fall through to the heuristic — the OTHER
+        // call (with the flipped flag) will pick up the Composer hit.
+    }
     let segments: Vec<&str> = fqcn.split('\\').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return None;

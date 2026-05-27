@@ -149,6 +149,18 @@ fn build_chain_from_root(root: Node, bytes: &[u8]) -> Option<BuilderChain> {
             if kind == "scoped_call_expression" {
                 // Bottom of the chain. The scope is the receiver.
                 let receiver = scoped_call_receiver(node, bytes, &links_reversed);
+
+                // For `DB::table('|')`, the bottom link's first string arg
+                // names a table. Annotate it so the cursor resolver can
+                // distinguish "table name" from "column name" at the
+                // ArgKind level. The bottom link is the one we just pushed
+                // (last in links_reversed before reversal).
+                if matches!(receiver, ChainReceiver::DbTable { .. }) {
+                    if let Some(bottom) = links_reversed.last_mut() {
+                        bottom.arg = ArgKind::Table;
+                    }
+                }
+
                 links_reversed.reverse();
                 return Some(BuilderChain {
                     receiver,
@@ -310,9 +322,12 @@ fn scoped_call_receiver(
         return ChainReceiver::Unknown;
     };
 
-    if class_name == "DB" || class_name.ends_with("\\DB") {
+    // PHP class names are case-insensitive — `db::table()` and `DB::table()`
+    // resolve to the same class at runtime. Match accordingly so `db::`
+    // chains aren't silently misclassified as Eloquent models.
+    if is_db_facade(class_name) {
         if let Some(bottom_link) = links_reversed.last() {
-            if bottom_link.method == "table" {
+            if bottom_link.method.eq_ignore_ascii_case("table") {
                 if let Some(ChainArg::StringLit {
                     value,
                     span_byte_range,
@@ -333,6 +348,15 @@ fn scoped_call_receiver(
     // does the actual class lookup.
     let class_name = class_name.trim_start_matches('\\').to_string();
     ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class_name))
+}
+
+/// Whether `class_name` (as it appears in the source — possibly with `\`
+/// segments) refers to the Laravel `DB` facade. PHP class names are
+/// case-insensitive, so `DB`, `db`, `Db`, and `\Illuminate\Support\Facades\DB`
+/// all match.
+fn is_db_facade(class_name: &str) -> bool {
+    let basename = class_name.rsplit('\\').next().unwrap_or(class_name);
+    basename.eq_ignore_ascii_case("DB")
 }
 
 /// Receiver for a chain whose deepest call is a `member_call_expression`

@@ -112,6 +112,39 @@ fn extracts_db_table_with_double_quotes() {
     }
 }
 
+#[test]
+fn db_table_link_gets_table_arg_kind() {
+    // The bottom-most link (`table`) of a DB::table chain is annotated with
+    // ArgKind::Table so the cursor resolver can offer table-name completion.
+    let chains = extract("DB::table('users')->where('email', 1);");
+    let c = &chains[0];
+    let table_link = c.links.iter().find(|l| l.method == "table").unwrap();
+    assert_eq!(table_link.arg, ArgKind::Table);
+}
+
+#[test]
+fn lowercase_db_facade_recognised() {
+    // PHP class names are case-insensitive. `db::table('users')` resolves to
+    // the same DB facade and should produce a DbTable receiver.
+    let chains = extract("db::table('users')->where('email', 1);");
+    assert_eq!(chains.len(), 1);
+    match &chains[0].receiver {
+        ChainReceiver::DbTable { table, .. } => assert_eq!(table, "users"),
+        other => panic!("expected DbTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn fqcn_db_facade_recognised() {
+    // \Illuminate\Support\Facades\DB::table('users') — fully-qualified form.
+    let chains = extract("\\Illuminate\\Support\\Facades\\DB::table('users')->where('email', 1);");
+    assert_eq!(chains.len(), 1);
+    match &chains[0].receiver {
+        ChainReceiver::DbTable { table, .. } => assert_eq!(table, "users"),
+        other => panic!("expected DbTable, got {other:?}"),
+    }
+}
+
 // ---- Link classification ------------------------------------------------
 
 #[test]

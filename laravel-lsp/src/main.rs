@@ -2788,6 +2788,11 @@ impl LaravelLanguageServer {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
                 eloquent_completion::columns_raw(&ctx, db).await
             }
+            // `DB::table('|')` — table-name completion. Mode is always
+            // BaseBuilder by the time the receiver is recognised, but we
+            // don't gate on it: even if a future receiver shape produced
+            // Table args in another mode, tables are tables.
+            (_, ArgKind::Table) => eloquent_completion::tables(db).await,
             // Other (mode, expecting) combinations land in Phases 4-6.
             _ => Vec::new(),
         };

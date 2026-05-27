@@ -133,7 +133,7 @@ fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainCont
 
     if !matches!(
         cursor_link.arg,
-        ArgKind::Column | ArgKind::Relation | ArgKind::ClosureCarrier
+        ArgKind::Column | ArgKind::Relation | ArgKind::ClosureCarrier | ArgKind::Table
     ) {
         return None;
     }

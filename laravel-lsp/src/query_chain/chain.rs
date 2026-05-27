@@ -69,6 +69,10 @@ pub enum ArgKind {
     /// name (treated as `Relation`) or the closure body (handled by closure
     /// scope tracking).
     ClosureCarrier,
+    /// `DB::table('|')` — first string arg names a database table. Set by
+    /// the extractor after receiver detection (the method name alone doesn't
+    /// reveal this; we need to know the class is `DB`).
+    Table,
     /// This link doesn't expose a completable argument we recognise — used
     /// for terminators with no relevant string args, mode-flippers, and
     /// transparent transformers.

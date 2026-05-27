@@ -96,11 +96,27 @@ fn db_table_with_chained_where_still_base_mode() {
 }
 
 #[test]
-fn db_table_inside_table_arg_itself_returns_none() {
-    // Cursor on the `'users|'` arg of DB::table() — the `table` link has
-    // ArgKind::None (the receiver is a table, not a column), so no completion.
-    let ctx = detect("DB::table('users|')->where('a', 1);");
-    assert!(ctx.is_none(), "expected None, got {:?}", ctx);
+fn db_table_inside_table_arg_offers_table_completion() {
+    // Cursor on the `'users|'` arg of DB::table() — the `table` link's first
+    // string arg gets ArgKind::Table so the completion handler returns the
+    // list of database tables.
+    let ctx = detect("DB::table('users|')->where('a', 1);")
+        .expect("cursor inside DB::table() string arg should produce a ChainContext");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Table);
+    assert_eq!(ctx.quote, '\'');
+}
+
+#[test]
+fn lowercase_db_facade_resolves_too() {
+    // PHP class names are case-insensitive, so `db::table('|')` works just
+    // like `DB::table('|')`. The receiver is DbTable, the link is Table.
+    let ctx = detect("db::table('|');").expect("db (lowercase) should resolve to DB facade");
+    assert_eq!(ctx.expecting, ArgKind::Table);
+    match ctx.effective_table.as_deref() {
+        Some("") => {} // empty table name — the user just typed `'`
+        other => panic!("unexpected table: {:?}", other),
+    }
 }
 
 #[test]

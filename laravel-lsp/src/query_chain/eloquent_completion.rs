@@ -20,6 +20,27 @@ use super::chain::*;
 use crate::database::DatabaseSchemaProvider;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
+/// Build table-name completions for the cursor inside `DB::table('|')`.
+/// Reads `DatabaseSchema::get_tables()` and returns one item per table.
+/// Independent of `BuilderMode` — `DB::table` is always BaseBuilder by the
+/// time anything chains off it, but at this point in the chain we're
+/// completing the chain *entry* itself.
+pub async fn tables(db: &DatabaseSchemaProvider) -> Vec<CompletionItem> {
+    db.get_tables()
+        .await
+        .into_iter()
+        .map(|name| CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some("table".to_string()),
+            sort_text: Some(format!("1_{name}")),
+            filter_text: Some(name.clone()),
+            insert_text: Some(name),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Build column completions for a `BaseBuilder` chain. Reads the schema
 /// directly — no model lookup, no casts, no accessors.
 ///

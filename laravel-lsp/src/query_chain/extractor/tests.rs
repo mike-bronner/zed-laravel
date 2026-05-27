@@ -296,6 +296,44 @@ fn double_quoted_string_arg() {
     }
 }
 
+#[test]
+fn empty_string_arg_is_stringlit_not_other() {
+    // After fixup, the source the extractor sees often contains `('')` —
+    // either because the editor auto-paired the quote, or because case-3
+    // in fixup_for_completion injected an empty string. The extractor MUST
+    // classify the empty `''` as a StringLit (so the cursor-resolver finds
+    // it via string_arg_at and completion fires), not fall through to
+    // ChainArg::Other. Same shape for double quotes.
+    let chains = extract("DB::table('users')->where('');");
+    let where_link = chains[0]
+        .links
+        .iter()
+        .find(|l| l.method == "where")
+        .expect("expected a `where` link");
+    assert_eq!(where_link.args.len(), 1);
+    match &where_link.args[0] {
+        ChainArg::StringLit { value, quote, .. } => {
+            assert_eq!(value, "", "empty literal should have empty value");
+            assert_eq!(*quote, '\'');
+        }
+        other => panic!("expected StringLit for empty arg, got {other:?}"),
+    }
+
+    let chains = extract("DB::table('users')->where(\"\");");
+    let where_link = chains[0]
+        .links
+        .iter()
+        .find(|l| l.method == "where")
+        .expect("expected a `where` link");
+    match &where_link.args[0] {
+        ChainArg::StringLit { value, quote, .. } => {
+            assert_eq!(value, "");
+            assert_eq!(*quote, '"');
+        }
+        other => panic!("expected StringLit, got {other:?}"),
+    }
+}
+
 // ---- Closure arguments --------------------------------------------------
 
 #[test]

@@ -18,7 +18,8 @@
 
 use super::chain::*;
 use crate::database::DatabaseSchemaProvider;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
+use tracing::info;
 
 /// Build table-name completions for the cursor inside `DB::table('|')` or
 /// right after `DB::table(|`. Reads `DatabaseSchema::get_tables()` and
@@ -44,6 +45,13 @@ pub async fn tables(
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::CLASS),
+                // Single muted "table" badge to the right of the name. Mirrors
+                // the column-item shape so the popup stays visually consistent
+                // when switching between table-name and column-name positions.
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some("table".to_string()),
+                }),
                 detail: Some("table".to_string()),
                 sort_text: Some(format!("1_{name}")),
                 filter_text: Some(name),
@@ -68,10 +76,18 @@ pub async fn columns_raw(
     wrap_with_quote: Option<char>,
 ) -> Vec<CompletionItem> {
     let Some(table) = &ctx.effective_table else {
+        info!("🔗 columns_raw: ctx.effective_table is None — returning 0 items");
         return Vec::new();
     };
 
     let columns = db.get_columns_with_types(table).await;
+    if columns.is_empty() {
+        info!(
+            "🔗 columns_raw: get_columns_with_types({:?}) returned 0 columns \
+             (schema cache may not have this table, or DB not yet warmed)",
+            table
+        );
+    }
     columns
         .into_iter()
         .map(|(name, php_type)| {
@@ -82,6 +98,17 @@ pub async fn columns_raw(
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
+                // Use `label_details` (LSP 3.17) so the type renders right
+                // next to the column name (e.g., "email   string") and the
+                // source table renders as a dimmer suffix on the right
+                // ("from users"). Editors that support it (Zed, VS Code)
+                // render each piece distinctly; older clients fall back to
+                // `detail` below, which we still set as a single-string
+                // approximation.
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: Some(format!("  {php_type}")),
+                    description: Some(table.clone()),
+                }),
                 detail: Some(format!("{php_type} ({table})")),
                 // DB columns rank first; later modes will add accessors at
                 // sort_text = "2_…" so columns still rank above them.

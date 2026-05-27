@@ -270,6 +270,18 @@ fn detects_db_table_inside_where_string() {
 }
 
 #[test]
+fn detects_db_table_inside_empty_where_string() {
+    // The "backspace to empty" case Mike hit. Source is well-formed
+    // (`where('')`), cursor is between the two `'`. Should still resolve
+    // to a Column completion context so the handler returns all columns.
+    let ctx = detect("DB::table('users')->where('|');")
+        .expect("empty where() arg should still produce a ChainContext");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.effective_table.as_deref(), Some("users"));
+    assert_eq!(ctx.expecting, ArgKind::Column);
+}
+
+#[test]
 fn detects_db_table_with_double_quoted_arg() {
     let ctx = detect("DB::table('users')->where(\"em|\");").expect("ctx");
     assert_eq!(ctx.quote, '"');

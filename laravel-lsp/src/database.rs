@@ -839,27 +839,41 @@ impl DatabaseSchemaProvider {
         // on the wrong MySQL instance (e.g., Homebrew MySQL on 127.0.0.1:3306
         // intercepting before Sail). Log the server identity so the user can
         // see what they're actually connected to.
-        if let Ok(row) = sqlx::query(
+        //
+        // Use match (not if-let) so any error from these probe queries gets
+        // surfaced — silent failure here is what prevented the previous
+        // diagnostic round from telling us anything.
+        match sqlx::query(
             "SELECT DATABASE() AS db, @@hostname AS hostname, USER() AS user, @@version AS version",
         )
         .fetch_one(&pool)
         .await
         {
-            let db_name: String = row.try_get("db").unwrap_or_default();
-            let hostname: String = row.try_get("hostname").unwrap_or_default();
-            let user: String = row.try_get("user").unwrap_or_default();
-            let version: String = row.try_get("version").unwrap_or_default();
-            info!(
-                "MySQL connected: db={:?} server_hostname={:?} user={:?} version={:?}",
-                db_name, hostname, user, version
-            );
+            Ok(row) => {
+                let db_name: String = row.try_get("db").unwrap_or_default();
+                let hostname: String = row.try_get("hostname").unwrap_or_default();
+                let user: String = row.try_get("user").unwrap_or_default();
+                let version: String = row.try_get("version").unwrap_or_default();
+                info!(
+                    "MySQL probe — db={:?} server_hostname={:?} user={:?} version={:?}",
+                    db_name, hostname, user, version
+                );
+            }
+            Err(e) => {
+                warn!("MySQL probe (identity query) failed: {}", e);
+            }
         }
-        if let Ok(rows) = sqlx::query("SHOW DATABASES").fetch_all(&pool).await {
-            let dbs: Vec<String> = rows
-                .into_iter()
-                .filter_map(|r| r.try_get::<String, _>(0).ok())
-                .collect();
-            info!("MySQL: visible databases = {:?}", dbs);
+        match sqlx::query("SHOW DATABASES").fetch_all(&pool).await {
+            Ok(rows) => {
+                let dbs: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| r.try_get::<String, _>(0).ok())
+                    .collect();
+                info!("MySQL probe — visible databases = {:?}", dbs);
+            }
+            Err(e) => {
+                warn!("MySQL probe (SHOW DATABASES) failed: {}", e);
+            }
         }
 
         // Get tables

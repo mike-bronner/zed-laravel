@@ -282,6 +282,29 @@ fn detects_db_table_inside_empty_where_string() {
 }
 
 #[test]
+fn detects_empty_where_with_no_close_paren_end_to_end() {
+    // The exact case Mike reported: user had `where('a'` (no close paren),
+    // hit delete on `a`, ended up with `where(''` (cursor between the two
+    // `'`, still no close paren). Without paren fixup in case-1a the chain
+    // misparses; with it the empty string parses as a `where` arg and the
+    // ctx resolves to Column completion.
+    let raw = "<?php\nDB::table('transaction_type')->where(''";
+    let cursor_byte = "<?php\nDB::table('transaction_type')->where('".len();
+    let prep = fixup_for_completion(raw, cursor_byte).expect("auto-pair + paren fixup");
+    let tree = crate::parser::parse_php(&prep.fixed_content).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, &prep.fixed_content)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+    let ctx = detect_chain_context_at(&chains, cursor_byte)
+        .expect("after fixup the chain should resolve to a Column completion context");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.effective_table.as_deref(), Some("transaction_type"));
+}
+
+#[test]
 fn detects_db_table_with_double_quoted_arg() {
     let ctx = detect("DB::table('users')->where(\"em|\");").expect("ctx");
     assert_eq!(ctx.quote, '"');

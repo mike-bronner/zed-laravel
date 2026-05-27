@@ -17076,8 +17076,16 @@ impl LanguageServer for LaravelLanguageServer {
                 .await
             {
                 if !items.is_empty() {
+                    // `is_incomplete: true` hints the client that this list
+                    // depends on cursor state (which chain link the cursor
+                    // is in, what arg position, etc.) and may change as the
+                    // user types or deletes. Some clients (notably Zed) use
+                    // this to refetch more aggressively — including after a
+                    // delete/backspace that wouldn't otherwise re-trigger
+                    // completion. Cost is nil: schema is cached, the helper
+                    // short-circuits when no chain contains the cursor.
                     return Ok(Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: false,
+                        is_incomplete: true,
                         items,
                     })));
                 }

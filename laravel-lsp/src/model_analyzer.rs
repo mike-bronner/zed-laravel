@@ -7,7 +7,8 @@
 //! - Relationships (belongsTo, hasMany, etc.)
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// Source of a model property
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +89,127 @@ impl ModelMetadata {
             accessors,
             relationships,
         }
+    }
+
+    /// Parse a model file AND walk its `extends` chain, inheriting any
+    /// `$table`, casts, accessors, and relationships the child doesn't
+    /// declare itself.
+    ///
+    /// Real Laravel codebases often factor shared shape into a base
+    /// class — e.g. `OAuthAccessToken extends Token` where `Token`
+    /// declares `protected $table = 'oauth_access_tokens'`. Without
+    /// inheritance walking, the child's `ModelMetadata` has
+    /// `table_name = None` and we fall back to snake-pluralizing
+    /// "OAuthAccessToken" → "o_auth_access_tokens" (wrong) instead of
+    /// using the parent's explicit "oauth_access_tokens".
+    ///
+    /// PHP method/property resolution: child wins on conflict, parent
+    /// fills in what the child doesn't declare. We mirror that:
+    /// - `table_name`: child overrides; parent fills if child has none.
+    /// - `casts`: union; child entries take precedence per-key.
+    /// - `accessors` / `relationships`: appended from parent if not
+    ///   already declared by the same name on the child.
+    ///
+    /// Stops at Laravel's base `Model`, at any parent class file we
+    /// can't locate in the project (vendor classes without app/-side
+    /// shadowing aren't searched here yet), or at a 10-deep recursion
+    /// cap. Cycle-safe via a visited-set.
+    pub fn from_file_with_inheritance(path: &Path, project_root: &Path) -> Option<Self> {
+        let mut visited = HashSet::new();
+        Self::resolve_recursive(path, project_root, &mut visited, 0)
+    }
+
+    fn resolve_recursive(
+        path: &Path,
+        project_root: &Path,
+        visited: &mut HashSet<PathBuf>,
+        depth: usize,
+    ) -> Option<Self> {
+        if depth > 10 {
+            return None;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !visited.insert(canonical) {
+            // Cycle — A extends B extends A. Shouldn't happen in valid
+            // PHP, but parsing is best-effort and we'd rather bail than
+            // recurse forever.
+            return None;
+        }
+
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut metadata = Self::from_content(&content);
+
+        if let Some(parent_class) = Self::extract_parent_class(&content) {
+            // Stop at Eloquent's base class. Real Laravel models extend
+            // `Model` directly OR via `Authenticatable` (which itself
+            // extends Model). We only halt on Model — Authenticatable
+            // and Pivot etc. are worth walking into (they may declare
+            // their own $table fallbacks for specific use cases).
+            let basename = parent_class.rsplit('\\').next().unwrap_or(&parent_class);
+            if basename != "Model" {
+                if let Some(parent_path) =
+                    crate::class_locator::find_php_class_file(&parent_class, project_root)
+                {
+                    if let Some(parent_meta) =
+                        Self::resolve_recursive(&parent_path, project_root, visited, depth + 1)
+                    {
+                        metadata.merge_inherited(parent_meta);
+                    }
+                }
+                // If the parent isn't in app/-style search roots (e.g.
+                // vendor/ class without PSR-4 hookup here), just stop
+                // walking. We don't pretend to inherit something we
+                // can't read.
+            }
+        }
+
+        Some(metadata)
+    }
+
+    /// Extract the parent class name from `class X extends Y`. Returns
+    /// the parent as written (may be a simple name like `Token` or a
+    /// qualified name like `\App\Models\Token`); the caller resolves
+    /// it to a file via `class_locator::find_php_class_file`, which
+    /// matches by basename.
+    fn extract_parent_class(content: &str) -> Option<String> {
+        let re = Regex::new(r"class\s+\w+\s+extends\s+([\w\\]+)").ok()?;
+        re.captures(content)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// PHP-style inheritance merge: child fields win, parent fills the
+    /// gaps. Called only after the parent's full chain is already
+    /// resolved (so grandparent fields are already merged into
+    /// `parent`).
+    fn merge_inherited(&mut self, parent: ModelMetadata) {
+        if self.table_name.is_none() {
+            self.table_name = parent.table_name;
+        }
+        for (k, v) in parent.casts {
+            self.casts.entry(k).or_insert(v);
+        }
+        for acc in parent.accessors {
+            if !self
+                .accessors
+                .iter()
+                .any(|a| a.property_name == acc.property_name)
+            {
+                self.accessors.push(acc);
+            }
+        }
+        for rel in parent.relationships {
+            if !self
+                .relationships
+                .iter()
+                .any(|r| r.method_name == rel.method_name)
+            {
+                self.relationships.push(rel);
+            }
+        }
+        // `class_name` always stays the child's — Laravel's
+        // `static::class` semantics inside model methods resolves to
+        // the concrete class, not its parents.
     }
 
     /// Extract the class name from the model file

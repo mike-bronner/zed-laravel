@@ -163,16 +163,31 @@ pub async fn columns_for_builder(
         return Vec::new();
     };
 
-    // Read + parse to ModelMetadata. Async file I/O so the LSP doesn't
-    // block the runtime on slow disks.
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(c) => c,
+    // Read + parse to ModelMetadata, walking `extends` chains so the
+    // child inherits its parent's `$table` / casts / accessors /
+    // relationships when it doesn't declare them itself. Runs the sync
+    // walker on a blocking thread so the LSP runtime stays responsive
+    // even for deep inheritance trees on slow disks.
+    let path_for_blocking = path.clone();
+    let root_for_blocking = project_root.to_path_buf();
+    let metadata = match tokio::task::spawn_blocking(move || {
+        ModelMetadata::from_file_with_inheritance(&path_for_blocking, &root_for_blocking)
+    })
+    .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            info!(
+                "🔗 columns_for_builder: failed to read/parse {:?} (or no inheritable parent found)",
+                path
+            );
+            return Vec::new();
+        }
         Err(err) => {
-            info!("🔗 columns_for_builder: failed to read {:?}: {}", path, err);
+            info!("🔗 columns_for_builder: blocking task panicked: {}", err);
             return Vec::new();
         }
     };
-    let metadata = ModelMetadata::from_content(&content);
 
     // Resolve the table: prefer `$table`, fall back to Laravel's
     // snake_case + pluralize convention on the class basename. Naive plural
@@ -274,14 +289,25 @@ pub async fn relations(
         return Vec::new();
     };
 
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(c) => c,
+    // Walk `extends` chain so child classes pick up relationships
+    // declared on their parents.
+    let path_for_blocking = path.clone();
+    let root_for_blocking = project_root.to_path_buf();
+    let metadata = match tokio::task::spawn_blocking(move || {
+        ModelMetadata::from_file_with_inheritance(&path_for_blocking, &root_for_blocking)
+    })
+    .await
+    {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            info!("🔗 relations: failed to read/parse {:?}", path);
+            return Vec::new();
+        }
         Err(err) => {
-            info!("🔗 relations: failed to read {:?}: {}", path, err);
+            info!("🔗 relations: blocking task panicked: {}", err);
             return Vec::new();
         }
     };
-    let metadata = ModelMetadata::from_content(&content);
 
     if metadata.relationships.is_empty() {
         info!(
@@ -343,8 +369,16 @@ pub async fn resolve_related_model(
     project_root: &Path,
 ) -> Option<String> {
     let path = find_php_class_file(parent_class, project_root)?;
-    let content = tokio::fs::read_to_string(&path).await.ok()?;
-    let metadata = ModelMetadata::from_content(&content);
+    // Inheritance-aware: a relationship declared on the parent class
+    // should be findable when the chain is rooted at a child class.
+    let path_clone = path.clone();
+    let root_clone = project_root.to_path_buf();
+    let metadata = tokio::task::spawn_blocking(move || {
+        ModelMetadata::from_file_with_inheritance(&path_clone, &root_clone)
+    })
+    .await
+    .ok()
+    .flatten()?;
     let rel = metadata
         .relationships
         .into_iter()

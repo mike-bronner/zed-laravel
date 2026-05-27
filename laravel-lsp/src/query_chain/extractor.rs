@@ -24,6 +24,55 @@ use super::chain::*;
 use super::methods::{arg_kind, chain_effect};
 use tree_sitter::{Node, Tree};
 
+/// Shift every byte range in a chain by `(byte_offset - wrapper_prefix_len)`.
+///
+/// Used when chains are extracted from a Blade-embedded PHP region that was
+/// wrapped with `<?php ` before parsing: snippet-local byte `N` corresponds
+/// to outer-file byte `byte_offset + (N - wrapper_prefix_len)`. Applies to
+/// every span on the chain — the chain itself, every link, every string-arg
+/// and closure-body, and the DbTable receiver's `name_byte_range`.
+///
+/// `saturating_sub` guards against the (impossible-in-practice) case of a
+/// snippet position before the wrapper prefix.
+pub fn shift_chain_byte_ranges(
+    chain: &mut BuilderChain,
+    byte_offset: usize,
+    wrapper_prefix_len: usize,
+) {
+    let shift = |b: usize| byte_offset + b.saturating_sub(wrapper_prefix_len);
+
+    chain.span_byte_range = (
+        shift(chain.span_byte_range.0),
+        shift(chain.span_byte_range.1),
+    );
+
+    if let ChainReceiver::DbTable {
+        name_byte_range, ..
+    } = &mut chain.receiver
+    {
+        *name_byte_range = (shift(name_byte_range.0), shift(name_byte_range.1));
+    }
+
+    for link in &mut chain.links {
+        link.span_byte_range = (shift(link.span_byte_range.0), shift(link.span_byte_range.1));
+        for arg in &mut link.args {
+            match arg {
+                ChainArg::StringLit {
+                    span_byte_range, ..
+                } => {
+                    *span_byte_range = (shift(span_byte_range.0), shift(span_byte_range.1));
+                }
+                ChainArg::Closure {
+                    body_byte_range, ..
+                } => {
+                    *body_byte_range = (shift(body_byte_range.0), shift(body_byte_range.1));
+                }
+                ChainArg::Other => {}
+            }
+        }
+    }
+}
+
 /// Extract every builder chain in the file. Order of return is depth-first
 /// pre-order across the AST — callers that need positional lookup should
 /// build their own index.

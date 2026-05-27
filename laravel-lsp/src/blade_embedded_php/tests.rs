@@ -98,3 +98,70 @@ fn adjust_inner_position_handles_token_at_prefix_boundary() {
     let (_, col) = adjust_inner_position(0, 0, 3, 12);
     assert_eq!(col, 12);
 }
+
+// ---- byte_offset & cross-shape coverage probes -------------------------
+
+#[test]
+fn echo_region_records_byte_offset() {
+    let src = "x{{ route('home') }}y";
+    let regions = extract_php_regions(src);
+    assert_eq!(regions.len(), 1);
+    let region = &regions[0];
+    // The content is " route('home') " (with surrounding spaces inside the
+    // braces). The byte_offset points at the first byte of that content in
+    // the outer source.
+    let extracted_byte = region.byte_offset;
+    let extracted = &src[extracted_byte..extracted_byte + region.content.len()];
+    assert_eq!(
+        extracted, region.content,
+        "byte_offset doesn't point at the content slice"
+    );
+}
+
+#[test]
+fn php_block_region_records_byte_offset() {
+    let src = "x\n@php\n  $url = route('home');\n@endphp\ny";
+    let regions = extract_php_regions(src);
+    let block = regions
+        .iter()
+        .find(|r| r.content.contains("route('home')"))
+        .expect("@php block");
+    let extracted = &src[block.byte_offset..block.byte_offset + block.content.len()];
+    assert_eq!(extracted, block.content);
+}
+
+#[test]
+fn native_php_tag_is_captured() {
+    // <?php ... ?> inside a Blade file. The Blade grammar's _php rule has
+    // a `php_only` alias for the content, which the existing query
+    // `(php_statement (php_only) @echo_php_content)` should match.
+    let src = "<?php $x = route('home'); ?>";
+    let regions = extract_php_regions(src);
+    let captured: Vec<_> = regions
+        .iter()
+        .filter(|r| r.content.contains("route('home')"))
+        .collect();
+    assert!(
+        !captured.is_empty(),
+        "<?php ... ?> region not captured. regions: {:?}",
+        regions
+    );
+}
+
+#[test]
+fn php_inline_short_form_is_captured() {
+    // @php($x = route('home')) — the inline form. The doc comment notes
+    // this was historically skipped; this test pins whether Phase 3.5's
+    // expanded extractor catches it.
+    let src = "@php($x = route('home'))";
+    let regions = extract_php_regions(src);
+    let captured: Vec<_> = regions
+        .iter()
+        .filter(|r| r.content.contains("route('home')"))
+        .collect();
+    assert!(
+        !captured.is_empty(),
+        "@php(...) inline region not captured. regions: {:?}",
+        regions
+    );
+}

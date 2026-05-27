@@ -290,6 +290,221 @@ fn non_call_code_produces_no_chains() {
     assert!(chains.is_empty());
 }
 
+// ---- shift_chain_byte_ranges -------------------------------------------
+
+#[test]
+fn shift_chain_byte_ranges_shifts_every_span() {
+    // Build a chain manually with snippet-local byte ranges, shift it,
+    // verify every span moved correctly. Receiver, links, args, and
+    // closure body all participate.
+    let mut chain = BuilderChain {
+        receiver: ChainReceiver::DbTable {
+            table: "users".to_string(),
+            name_byte_range: (10, 17),
+        },
+        span_byte_range: (6, 50),
+        links: vec![ChainLink {
+            method: "where".to_string(),
+            arg: ArgKind::Column,
+            effect: ChainEffect::None,
+            span_byte_range: (30, 45),
+            args: vec![
+                ChainArg::StringLit {
+                    value: "email".to_string(),
+                    quote: '\'',
+                    span_byte_range: (37, 43),
+                },
+                ChainArg::Closure {
+                    params: vec![ClosureParam {
+                        name: "q".to_string(),
+                        php_type: None,
+                    }],
+                    body_byte_range: (44, 48),
+                },
+            ],
+        }],
+    };
+    // Region starts at outer byte 100. Wrapper prefix is 6 bytes (<?php ).
+    // So snippet byte 6 (start of content) maps to outer byte 100.
+    // Every span shifts by 100 - 6 = 94.
+    super::shift_chain_byte_ranges(&mut chain, 100, 6);
+
+    assert_eq!(chain.span_byte_range, (100, 144));
+    match &chain.receiver {
+        ChainReceiver::DbTable {
+            name_byte_range, ..
+        } => assert_eq!(*name_byte_range, (104, 111)),
+        _ => panic!("receiver type changed"),
+    }
+    let link = &chain.links[0];
+    assert_eq!(link.span_byte_range, (124, 139));
+    match &link.args[0] {
+        ChainArg::StringLit {
+            span_byte_range, ..
+        } => assert_eq!(*span_byte_range, (131, 137)),
+        _ => panic!("arg type changed"),
+    }
+    match &link.args[1] {
+        ChainArg::Closure {
+            body_byte_range, ..
+        } => assert_eq!(*body_byte_range, (138, 142)),
+        _ => panic!("arg type changed"),
+    }
+}
+
+// ---- Blade-embedded chain extraction (Phase 3.5) ----------------------
+
+/// Replicate the in-LSP flow for a Blade source: extract regions, parse each
+/// as wrapped PHP, extract chains, shift ranges back to outer coordinates.
+/// Returns chains in outer-file byte-range space.
+fn extract_blade_chains(source: &str) -> Vec<BuilderChain> {
+    use crate::blade_embedded_php::{extract_php_regions, PHP_WRAPPER_PREFIX_LEN};
+    use crate::parser::parse_php;
+    let mut chains = Vec::new();
+    for region in extract_php_regions(source) {
+        let wrapped = format!("<?php {}", region.content);
+        let Ok(tree) = parse_php(&wrapped) else {
+            continue;
+        };
+        for mut chain in super::extract_chains(&tree, &wrapped) {
+            super::shift_chain_byte_ranges(
+                &mut chain,
+                region.byte_offset,
+                PHP_WRAPPER_PREFIX_LEN as usize,
+            );
+            chains.push(chain);
+        }
+    }
+    chains
+}
+
+#[test]
+fn blade_echo_chain_lands_at_outer_byte_offset() {
+    // Source layout (byte positions in comments):
+    //   0:  <div>{{ DB::table('users')->where('email', 1) }}</div>
+    //              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //              starts at byte 8 (after `<div>{{ `)
+    let source = "<div>{{ DB::table('users')->where('email', 1) }}</div>";
+    let chains = extract_blade_chains(source);
+    assert_eq!(chains.len(), 1);
+    let c = &chains[0];
+    // Receiver is DbTable. The chain span should fall inside the source —
+    // specifically, the chain starts at the `DB` token (byte 8) and ends
+    // somewhere before the closing `)`.
+    assert!(c.span_byte_range.0 >= 8, "{:?}", c.span_byte_range);
+    assert!(
+        c.span_byte_range.1 <= source.len(),
+        "{:?}",
+        c.span_byte_range
+    );
+    // The byte slice for the chain span should look like a chain.
+    let slice = &source[c.span_byte_range.0..c.span_byte_range.1];
+    assert!(slice.starts_with("DB::table"), "slice = {:?}", slice);
+    assert!(slice.contains("where"), "slice = {:?}", slice);
+    // The 'email' string-arg byte range should also be on the outer file.
+    let where_link = c.links.iter().find(|l| l.method == "where").unwrap();
+    if let ChainArg::StringLit {
+        span_byte_range, ..
+    } = &where_link.args[0]
+    {
+        let arg_slice = &source[span_byte_range.0..span_byte_range.1];
+        assert_eq!(arg_slice, "'email'", "arg slice mismatch");
+    } else {
+        panic!("expected StringLit for first where arg");
+    }
+}
+
+#[test]
+fn blade_raw_echo_chain() {
+    let source = "<p>{!! User::where('a', 1)->pluck('email') !!}</p>";
+    let chains = extract_blade_chains(source);
+    assert!(
+        chains.iter().any(|c| matches!(
+            &c.receiver,
+            ChainReceiver::Eloquent(EloquentReceiver::StaticModel(s)) if s == "User"
+        )),
+        "User chain missing from {:?}",
+        chains.iter().map(|c| &c.receiver).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn blade_php_block_chain() {
+    let source = r#"<div>
+@php
+    $users = DB::table('users')->where('active', 1)->get();
+@endphp
+</div>"#;
+    let chains = extract_blade_chains(source);
+    assert_eq!(chains.len(), 1);
+    let c = &chains[0];
+    match &c.receiver {
+        ChainReceiver::DbTable { table, .. } => assert_eq!(table, "users"),
+        other => panic!("expected DbTable, got {other:?}"),
+    }
+    let slice = &source[c.span_byte_range.0..c.span_byte_range.1];
+    assert!(
+        slice.starts_with("DB::table"),
+        "outer-byte slice didn't land on chain start: {:?}",
+        slice
+    );
+}
+
+#[test]
+fn blade_php_inline_short_form_chain() {
+    let source = "<x-card>@php($users = DB::table('users')->where('id', 1)->get())</x-card>";
+    let chains = extract_blade_chains(source);
+    assert_eq!(chains.len(), 1);
+    let c = &chains[0];
+    match &c.receiver {
+        ChainReceiver::DbTable { table, .. } => assert_eq!(table, "users"),
+        other => panic!("expected DbTable, got {other:?}"),
+    }
+    let slice = &source[c.span_byte_range.0..c.span_byte_range.1];
+    assert!(slice.starts_with("DB::table"), "slice = {:?}", slice);
+}
+
+#[test]
+fn blade_native_php_tag_chain() {
+    let source = "<div><?php $u = User::where('id', 1)->get(); ?></div>";
+    let chains = extract_blade_chains(source);
+    let user_chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::StaticModel(s)) if s == "User"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "User chain missing from native <?php ?> region; got receivers {:?}",
+                chains.iter().map(|c| &c.receiver).collect::<Vec<_>>()
+            )
+        });
+    let slice = &source[user_chain.span_byte_range.0..user_chain.span_byte_range.1];
+    assert!(slice.starts_with("User::where"), "slice = {:?}", slice);
+}
+
+#[test]
+fn blade_multiline_chain_in_php_block() {
+    // Multi-line chain inside @php ... @endphp — byte ranges must still land
+    // correctly even though the chain spans multiple lines.
+    let source = r#"@php
+$rows = DB::table('users')
+    ->where('a', 1)
+    ->where('b', 2)
+    ->get();
+@endphp"#;
+    let chains = extract_blade_chains(source);
+    assert_eq!(chains.len(), 1);
+    let c = &chains[0];
+    // Span should cover the whole chain.
+    let slice = &source[c.span_byte_range.0..c.span_byte_range.1];
+    assert!(slice.starts_with("DB::table"), "slice start = {:?}", slice);
+    assert!(slice.contains("'b'"), "slice = {:?}", slice);
+}
+
 #[test]
 fn unknown_receiver_classified_as_unknown() {
     // `($qb)` — parenthesised expression as receiver. We don't try to

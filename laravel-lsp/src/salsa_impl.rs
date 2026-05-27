@@ -4896,9 +4896,6 @@ impl SalsaActor {
                 // Extract Eloquent / DB query builder chains from the same
                 // parsed tree. No second parse — we reuse the `tree` already
                 // produced above for route/url/action/feature extraction.
-                // Blade-embedded chains are deferred to a later phase; chains
-                // inside `{{ }}` are rare and require byte-offset adjustment
-                // back into the outer file.
                 for chain in crate::query_chain::extract_chains(&tree, text) {
                     chains.push(Arc::new(chain));
                 }
@@ -5004,6 +5001,21 @@ impl SalsaActor {
                         column: col,
                         end_column: end_col,
                     }));
+                }
+
+                // Eloquent / DB query builder chains inside this Blade-
+                // embedded PHP region. Snippet-local byte ranges produced by
+                // the extractor reference the `<?php `-wrapped source; shift
+                // each range back into outer-file coordinates so the cursor
+                // resolver can find them by LSP byte offset.
+                use crate::blade_embedded_php::PHP_WRAPPER_PREFIX_LEN;
+                for mut chain in crate::query_chain::extract_chains(&snippet_tree, &wrapped) {
+                    crate::query_chain::extractor::shift_chain_byte_ranges(
+                        &mut chain,
+                        region.byte_offset,
+                        PHP_WRAPPER_PREFIX_LEN as usize,
+                    );
+                    chains.push(Arc::new(chain));
                 }
             }
         }

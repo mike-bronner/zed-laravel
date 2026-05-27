@@ -515,6 +515,69 @@ fn eloquent_instance_receiver_still_returns_none_until_phase_9() {
     );
 }
 
+// ---- Closure-scope resolution (Phase 8) ---------------------------------
+
+#[test]
+fn where_has_closure_resolves_to_parent_model_and_hop() {
+    // `User::whereHas('posts', fn ($q) => $q->where('publi|shed', 1))` —
+    // the inner cursor should produce a ChainContext with effective_model
+    // = "User" (the parent) and closure_relation_hop = Some("posts").
+    // The handler resolves the hop async to flip effective_model to Post.
+    let ctx = detect("User::whereHas('posts', fn ($q) => $q->where('publi|shed', 1));")
+        .expect("inner cursor in whereHas closure should resolve");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+    assert_eq!(ctx.closure_relation_hop.as_deref(), Some("posts"));
+}
+
+#[test]
+fn with_keyed_array_closure_resolves_to_parent_model_and_hop() {
+    // The shape Mike reported:
+    // `OAuthClient::with(['tokens' => function ($q) { $q->where('expi|red', 1); }])`
+    let src = "OAuthClient::with(['tokens' => function ($q) { $q->where('expi|red', 1); }]);";
+    let ctx = detect(src).expect("inner cursor in with-keyed-array closure should resolve");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.effective_model.as_deref(), Some("OAuthClient"));
+    assert_eq!(ctx.closure_relation_hop.as_deref(), Some("tokens"));
+}
+
+#[test]
+fn nested_where_closure_inherits_parent_model() {
+    // `User::where(function ($q) { $q->where('em|', 1); })` — same-model
+    // closure: $q is bound to a User builder. effective_model = "User",
+    // closure_relation_hop = None (no hop, inherit directly).
+    let ctx = detect("User::where(function ($q) { $q->where('em|', 1); });")
+        .expect("inner cursor in same-model closure should resolve");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+    assert!(
+        ctx.closure_relation_hop.is_none(),
+        "same-model bindings shouldn't set closure_relation_hop"
+    );
+}
+
+#[test]
+fn when_closure_inherits_parent_model() {
+    let ctx = detect("User::when($cond, function ($q) { $q->where('na|me', 1); });").expect("ctx");
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+    assert!(ctx.closure_relation_hop.is_none());
+}
+
+#[test]
+fn closure_scope_with_unrelated_var_returns_none() {
+    // The closure receiver is `$other`, not the closure param `$q`. We
+    // shouldn't bind — return None.
+    let ctx =
+        detect("User::whereHas('posts', function ($q) use ($other) { $other->where('a|', 1); });");
+    assert!(
+        ctx.is_none(),
+        "unrelated-var receivers inside the closure shouldn't get the parent's model"
+    );
+}
+
 // ---- Chain terminators end completion -----------------------------------
 
 #[test]

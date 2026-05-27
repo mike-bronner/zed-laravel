@@ -324,6 +324,34 @@ pub async fn relations(
         .collect()
 }
 
+/// Phase 8 helper: walk one relation hop. Given a parent class name and
+/// a relation name, find the parent's model file, read its
+/// `ModelMetadata::relationships`, and return the related model class.
+///
+/// Used when the cursor is inside a relation closure like
+/// `OAuthClient::with(['tokens' => fn ($q) => $q->where('|')])` — we know
+/// the parent model (`OAuthClient`) and the relation name (`tokens`), and
+/// need the related model (e.g. `OAuthToken`) so column/relation
+/// completion runs against the correct class.
+///
+/// Returns `None` when the parent file can't be located, the
+/// relation isn't defined on the parent, or the relation has no
+/// resolvable `related_model` (e.g. a polymorphic `morphTo`).
+pub async fn resolve_related_model(
+    parent_class: &str,
+    relation_name: &str,
+    project_root: &Path,
+) -> Option<String> {
+    let path = find_php_class_file(parent_class, project_root)?;
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let metadata = ModelMetadata::from_content(&content);
+    let rel = metadata
+        .relationships
+        .into_iter()
+        .find(|r| r.method_name == relation_name)?;
+    rel.related_model
+}
+
 /// Convert a PascalCase class basename to Laravel's default table name:
 /// snake_case + naive pluralization. Models with non-standard pluralization
 /// (people, octopi, child → children) declare `$table` explicitly; this

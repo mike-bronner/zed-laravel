@@ -459,6 +459,7 @@ fn shift_chain_byte_ranges_shifts_every_span() {
             name_byte_range: (10, 17),
         },
         span_byte_range: (6, 50),
+        closure_scope: None,
         links: vec![ChainLink {
             method: "where".to_string(),
             arg: ArgKind::Column,
@@ -847,6 +848,219 @@ fn array_arg_with_non_string_element_falls_through_to_other() {
             }
         }
         other => panic!("expected Array arg, got {other:?}"),
+    }
+}
+
+// ---- Closure-scope binding (Phase 8) -------------------------------------
+
+#[test]
+fn where_has_closure_records_relation_and_param_var() {
+    // `User::whereHas('posts', function ($q) { $q->where('published', 1); })`
+    // — the inner `$q->where(...)` chain should be flagged with closure_scope
+    // pointing at the `posts` relation and the `q` param var.
+    let chains = extract("User::whereHas('posts', function ($q) { $q->where('published', 1); });");
+    // Find the INNER chain (the one whose receiver is $q).
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "q"
+            )
+        })
+        .expect("inner $q chain not found");
+    let binding = inner
+        .closure_scope
+        .as_ref()
+        .expect("inner chain should have closure_scope set");
+    assert_eq!(binding.param_var, "q");
+    match &binding.kind {
+        ClosureScopeKind::RelationHop { relation_name } => {
+            assert_eq!(relation_name, "posts");
+        }
+        other => panic!("expected RelationHop, got {other:?}"),
+    }
+}
+
+#[test]
+fn arrow_fn_closure_in_where_has_also_records_binding() {
+    // Arrow-function variant: `User::whereHas('posts', fn ($q) =>
+    // $q->where('a', 1))`. Same binding semantics; we just have a
+    // different AST node kind to walk through.
+    let chains = extract("User::whereHas('posts', fn ($q) => $q->where('a', 1));");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("inner chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(
+        &binding.kind,
+        ClosureScopeKind::RelationHop { relation_name } if relation_name == "posts"
+    ));
+}
+
+#[test]
+fn with_keyed_array_closure_records_relation_from_key() {
+    // The shape Mike reported:
+    // `OAuthClient::with(['tokens' => function (Builder $q) { $q->where('|'); }])`
+    // — the relation name comes from the array element's KEY, not from a
+    // positional argument.
+    let chains =
+        extract("OAuthClient::with(['tokens' => function ($q) { $q->where('expired', 1); }]);");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "q"
+            )
+        })
+        .expect("inner $q chain not found");
+    let binding = inner
+        .closure_scope
+        .as_ref()
+        .expect("closure_scope should be set for with-keyed-array closures");
+    assert_eq!(binding.param_var, "q");
+    assert!(matches!(
+        &binding.kind,
+        ClosureScopeKind::RelationHop { relation_name } if relation_name == "tokens"
+    ));
+}
+
+#[test]
+fn with_keyed_array_arrow_fn_also_records_binding() {
+    let chains = extract("User::with(['posts' => fn ($q) => $q->where('published', 1)]);");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("inner chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(
+        &binding.kind,
+        ClosureScopeKind::RelationHop { relation_name } if relation_name == "posts"
+    ));
+}
+
+// ---- Same-model closure carriers (`where(closure)`, `when`, `having`, etc.) -
+
+#[test]
+fn nested_where_closure_records_same_model_binding() {
+    // `User::where(function ($q) { $q->where('a', 1)->orWhere('b', 2); })`
+    // — the inner `$q->where(...)` is on the SAME model as the outer
+    // where(). Binding kind is SameModel (no relation hop).
+    let chains = extract("User::where(function ($q) { $q->where('a', 1)->orWhere('b', 2); });");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "q"
+            )
+        })
+        .expect("inner $q chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert_eq!(binding.param_var, "q");
+    assert!(matches!(binding.kind, ClosureScopeKind::SameModel));
+}
+
+#[test]
+fn when_closure_records_same_model_binding() {
+    // `User::when($cond, function ($q) { $q->where('|'); })` — `when`'s
+    // closure receives the same builder as the outer chain.
+    let chains = extract("User::when($cond, function ($q) { $q->where('a', 1); });");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "q"
+            )
+        })
+        .expect("inner $q chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(binding.kind, ClosureScopeKind::SameModel));
+}
+
+#[test]
+fn having_closure_records_same_model_binding() {
+    let chains = extract("User::having(function ($q) { $q->where('a', 1); });");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("inner chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(binding.kind, ClosureScopeKind::SameModel));
+}
+
+#[test]
+fn tap_closure_records_same_model_binding() {
+    let chains = extract("User::tap(function ($q) { $q->where('a', 1); });");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("inner chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(binding.kind, ClosureScopeKind::SameModel));
+}
+
+#[test]
+fn closure_param_var_mismatch_means_no_binding() {
+    // The inner chain's receiver is `$other`, not the closure's `$q` param —
+    // the closure binding only applies to the *param's* var, not arbitrary
+    // variables used inside the body.
+    let chains =
+        extract("User::whereHas('posts', function ($q) use ($other) { $other->where('a', 1); });");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "other"
+            )
+        })
+        .expect("inner $other chain");
+    assert!(
+        inner.closure_scope.is_none(),
+        "closure_scope should be None when the receiver var doesn't match the closure param"
+    );
+}
+
+#[test]
+fn random_closure_argument_does_not_bind() {
+    // The closure is the 2nd arg of a method we don't recognize as a
+    // relation-carrier. Don't fabricate a binding from arbitrary
+    // closures.
+    let chains = extract("array_map(fn ($q) => $q->where('a', 1), $items);");
+    if let Some(inner) = chains.iter().find(|c| {
+        matches!(
+            &c.receiver,
+            ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+        )
+    }) {
+        assert!(
+            inner.closure_scope.is_none(),
+            "non-relation method's closure shouldn't bind"
+        );
     }
 }
 

@@ -225,7 +225,7 @@ pub fn detect_chain_context_at(
     byte_offset: usize,
 ) -> Option<ChainContext> {
     let chain = find_chain_containing(chains, byte_offset)?;
-    detect_in_chain(chain, byte_offset)
+    detect_in_chain(chains, chain, byte_offset)
 }
 
 /// Diagnostic variant of [`detect_chain_context_at`] that also returns a
@@ -238,7 +238,7 @@ pub fn detect_chain_context_at_diagnostic<'a>(
 ) -> Result<ChainContext, ChainResolveFailure<'a>> {
     let chain = find_chain_containing(chains, byte_offset)
         .ok_or(ChainResolveFailure::NoChainAtCursor { chains })?;
-    detect_in_chain(chain, byte_offset).ok_or(ChainResolveFailure::InChain { chain })
+    detect_in_chain(chains, chain, byte_offset).ok_or(ChainResolveFailure::InChain { chain })
 }
 
 /// Why `detect_chain_context_at_diagnostic` returned no context.
@@ -279,7 +279,11 @@ fn find_chain_containing(
     best
 }
 
-fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainContext> {
+fn detect_in_chain(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    byte_offset: usize,
+) -> Option<ChainContext> {
     // Initial mode + table + model from the receiver.
     //
     // - DbTable carries the table directly; no model lookup needed.
@@ -288,15 +292,48 @@ fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainCont
     //   `effective_table` stays `None` here — the handler fills it in.
     // - Eloquent instance receivers (`$user->newQuery()`) need `@var`
     //   docblock + typed-param scanning to resolve the class; that lands in
-    //   Phase 9. Return `None` until then.
-    let (mut mode, effective_table, effective_model) = match &chain.receiver {
+    //   Phase 9. Phase 8 handles the special case of `$q` bound by an
+    //   enclosing relation closure: the parent chain's model + the closure's
+    //   relation name resolve via one async hop in the handler.
+    let (mut mode, effective_table, effective_model, closure_relation_hop) = match &chain.receiver {
         ChainReceiver::DbTable { table, .. } => {
-            (BuilderMode::BaseBuilder, Some(table.clone()), None)
+            (BuilderMode::BaseBuilder, Some(table.clone()), None, None)
         }
-        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
-            (BuilderMode::EloquentBuilder, None, Some(class.clone()))
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => (
+            BuilderMode::EloquentBuilder,
+            None,
+            Some(class.clone()),
+            None,
+        ),
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) => {
+            // Phase 8: if the chain's receiver var is bound by an enclosing
+            // closure carrier, inherit the parent chain's effective model.
+            // Two flavors:
+            //
+            // - RelationHop (`whereHas('rel', closure)` / `with(['rel' =>
+            //   closure])`): closure binds to a *related* model's builder.
+            //   The handler walks one hop on the parent's model.
+            // - SameModel (`where(closure)`, `when($cond, closure)`,
+            //   `having(closure)`, etc.): closure binds to the *same* model
+            //   as the parent. Inherit `effective_model` directly; no hop.
+            match chain.closure_scope.as_ref() {
+                Some(binding) if &binding.param_var == var => {
+                    let parent_model = parent_chain_eloquent_model(chains, chain)?;
+                    match &binding.kind {
+                        ClosureScopeKind::RelationHop { relation_name } => (
+                            BuilderMode::EloquentBuilder,
+                            None,
+                            Some(parent_model),
+                            Some(relation_name.clone()),
+                        ),
+                        ClosureScopeKind::SameModel => {
+                            (BuilderMode::EloquentBuilder, None, Some(parent_model), None)
+                        }
+                    }
+                }
+                _ => return None,
+            }
         }
-        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. }) => return None,
         ChainReceiver::Unknown => return None,
     };
 
@@ -348,8 +385,51 @@ fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainCont
         // need it (DB::table chains don't have relation methods), and Phase 4
         // (Eloquent columns) is single-segment.
         dotted_prefix: None,
+        closure_relation_hop,
         quote,
     })
+}
+
+/// Phase 8 helper: find the smallest chain in `chains` whose span strictly
+/// contains `child`'s span and whose receiver is an Eloquent static model.
+/// Returns the model's class name (FQCN if it was resolved through
+/// use-aliases at extraction time).
+///
+/// Used when a child chain's receiver is `$q` bound by an enclosing
+/// `whereHas` / `with` closure — the parent's model is the starting point
+/// for the relation hop the handler will perform.
+fn parent_chain_eloquent_model(
+    chains: &[Arc<BuilderChain>],
+    child: &BuilderChain,
+) -> Option<String> {
+    let (cs, ce) = child.span_byte_range;
+    let mut best: Option<&BuilderChain> = None;
+    for chain in chains {
+        let (ps, pe) = chain.span_byte_range;
+        // Strictly contains (not equal — that'd be the child itself).
+        if ps <= cs && pe >= ce && (ps, pe) != (cs, ce) {
+            // Pick the SMALLEST containing chain — that's the innermost
+            // parent, the one whose method invoked the closure.
+            let new_size = pe - ps;
+            let pick = match best {
+                None => true,
+                Some(b) => {
+                    let cur_size = b.span_byte_range.1 - b.span_byte_range.0;
+                    new_size < cur_size
+                }
+            };
+            if pick {
+                best = Some(chain.as_ref());
+            }
+        }
+    }
+    let parent = best?;
+    match &parent.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => Some(class.clone()),
+        // Future: also support `(new self)` receivers etc. — already
+        // produce StaticModel via Phase 5.1.
+        _ => None,
+    }
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning

@@ -21,7 +21,9 @@
 //! independently (the cursor descends into every child).
 
 use super::chain::*;
-use super::methods::{arg_kind, chain_effect};
+use super::methods::{
+    arg_kind, chain_effect, CLOSURE_CARRIERS, RELATION_METHODS, SAME_MODEL_CLOSURE_CARRIERS,
+};
 use super::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
 use tree_sitter::{Node, Tree};
 
@@ -189,6 +191,7 @@ fn build_chain_from_root(root: Node, bytes: &[u8], aliases: &UseAliases) -> Opti
                     receiver,
                     span_byte_range,
                     links: links_reversed,
+                    closure_scope: None,
                 });
             }
             // member-call: keep descending through .object
@@ -200,11 +203,23 @@ fn build_chain_from_root(root: Node, bytes: &[u8], aliases: &UseAliases) -> Opti
             // We've descended past the calls. The current node is the
             // receiver expression (variable, parenthesised expr, etc.).
             let receiver = member_chain_receiver(node, bytes, aliases);
+            // If this chain's receiver is `$var`, see whether it's bound
+            // by an enclosing relation closure (`whereHas('rel', fn ($var)
+            // => …)` or `with(['rel' => fn ($var) => …])`). We record the
+            // binding here so detect_in_chain can resolve `$var`'s
+            // effective model from the parent chain at completion time.
+            let closure_scope = match &receiver {
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) => {
+                    detect_closure_scope(root, bytes, var)
+                }
+                _ => None,
+            };
             links_reversed.reverse();
             return Some(BuilderChain {
                 receiver,
                 span_byte_range,
                 links: links_reversed,
+                closure_scope,
             });
         }
     }
@@ -571,6 +586,194 @@ fn enclosing_class_name(node: Node, bytes: &[u8]) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Phase 8: detect whether `chain_root` sits inside a relation-bearing
+/// closure that binds `$receiver_var` to a Builder for some relation.
+///
+/// Two shapes we recognize:
+///
+/// 1. `whereHas('rel', fn ($q) => …)` — the closure is the 2nd argument
+///    of a method call (`whereHas` / `doesntHave` / `whereDoesntHave` /
+///    `withCount` etc.). The 1st argument is a string literal holding
+///    the relation name.
+///
+/// 2. `with(['rel' => fn ($q) => …])` — the closure is the value of a
+///    keyed array-element initializer inside the array argument of a
+///    relation method (`with` / `load` / `loadMissing` etc.). The
+///    array element's KEY is the relation name.
+///
+/// Returns `Some(binding)` only when:
+///
+/// - The chain root is genuinely inside such a closure
+/// - The closure's first parameter name matches `receiver_var` (so we
+///   don't accidentally bind a different variable that happens to be
+///   used inside the same closure body)
+/// - A relation-name string is in the right position
+/// - The enclosing call's method name is one we recognise as
+///   relation-carrying
+fn detect_closure_scope(
+    chain_root: Node,
+    bytes: &[u8],
+    receiver_var: &str,
+) -> Option<ClosureScopeBinding> {
+    // Find the nearest enclosing closure by walking parents.
+    let mut current = chain_root.parent();
+    let closure = loop {
+        let n = current?;
+        match n.kind() {
+            "anonymous_function_creation_expression" | "anonymous_function" | "arrow_function" => {
+                break n
+            }
+            _ => current = n.parent(),
+        }
+    };
+
+    // The closure's first formal parameter must be `$receiver_var` —
+    // otherwise the chain's receiver isn't the closure-bound builder,
+    // it's some unrelated variable being used inside.
+    let params = closure.child_by_field_name("parameters")?;
+    let mut params_cursor = params.walk();
+    let first_param = params
+        .named_children(&mut params_cursor)
+        .find(|n| matches!(n.kind(), "simple_parameter" | "variadic_parameter"))?;
+    let name_node = first_param.child_by_field_name("name")?;
+    let raw_name = node_text(name_node, bytes)?;
+    let param_var = raw_name.trim_start_matches('$').to_string();
+    if param_var != receiver_var {
+        return None;
+    }
+
+    // Walk up from the closure to determine which shape we're in.
+    let closure_parent = closure.parent()?;
+    match closure_parent.kind() {
+        // Shape: keyed-array value — `with(['rel' => closure])` (related-model)
+        "array_element_initializer" => {
+            detect_closure_scope_array_keyed(closure, closure_parent, bytes, param_var)
+        }
+        // Shape: positional argument — either `whereHas('rel', closure)`
+        // (related-model hop) or `where(closure)` / `when($cond,
+        // closure)` / `having(closure)` (same-model). The helper
+        // distinguishes based on the enclosing call's method name.
+        "argument" => detect_closure_scope_positional(closure, closure_parent, bytes, param_var),
+        _ => None,
+    }
+}
+
+/// Resolve closure-bearing positional-arg shapes. Two flavors handled:
+///
+/// - Relation-hop carriers (`whereHas('rel', closure)`): the closure
+///   binds to the *related* model's builder. Relation name extracted
+///   from the FIRST string-literal arg.
+/// - Same-model carriers (`where(closure)`, `when($cond, closure)`,
+///   `having(closure)`, `tap(closure)`): the closure binds to the same
+///   model as the outer chain. No relation hop needed.
+fn detect_closure_scope_positional(
+    _closure: Node,
+    arg_node: Node,
+    bytes: &[u8],
+    param_var: String,
+) -> Option<ClosureScopeBinding> {
+    let args_node = arg_node.parent()?;
+    if args_node.kind() != "arguments" {
+        return None;
+    }
+    let call_node = args_node.parent()?;
+    if !matches!(
+        call_node.kind(),
+        "member_call_expression" | "scoped_call_expression"
+    ) {
+        return None;
+    }
+    let method_name_node = call_node.child_by_field_name("name")?;
+    let method_name = node_text(method_name_node, bytes)?;
+
+    // Relation-hop carrier? Extract the relation name from the first
+    // string arg.
+    if CLOSURE_CARRIERS.contains(&method_name) {
+        let mut args_cursor = args_node.walk();
+        let first_arg = args_node
+            .named_children(&mut args_cursor)
+            .find(|n| n.kind() == "argument")?;
+        let first_inner = first_arg.named_child(0)?;
+        let relation_name = match first_inner.kind() {
+            "string" => single_quoted_string(first_inner, bytes).map(|(s, _)| s)?,
+            "encapsed_string" => encapsed_string_content(first_inner, bytes)?,
+            _ => return None,
+        };
+        return Some(ClosureScopeBinding {
+            param_var,
+            kind: ClosureScopeKind::RelationHop { relation_name },
+        });
+    }
+
+    // Same-model carrier? Bind to the outer chain's effective model.
+    if SAME_MODEL_CLOSURE_CARRIERS.contains(&method_name) {
+        return Some(ClosureScopeBinding {
+            param_var,
+            kind: ClosureScopeKind::SameModel,
+        });
+    }
+
+    None
+}
+
+/// Resolve `with(['rel' => fn ($q) => …])` shape. The closure is the
+/// `value` side of an `array_element_initializer` whose `key` is the
+/// relation-name string. The enclosing array_creation_expression must be
+/// the first argument of a relation-carrying method call.
+fn detect_closure_scope_array_keyed(
+    closure: Node,
+    element_node: Node,
+    bytes: &[u8],
+    param_var: String,
+) -> Option<ClosureScopeBinding> {
+    // Locate the key — the array_element_initializer's named children are
+    // [key, value] for keyed pairs, or just [value] for plain entries.
+    // The key is whichever named child ISN'T the closure.
+    let mut elem_cursor = element_node.walk();
+    let key_node = element_node
+        .named_children(&mut elem_cursor)
+        .find(|n| n.id() != closure.id())?;
+    let relation_name = match key_node.kind() {
+        "string" => single_quoted_string(key_node, bytes).map(|(s, _)| s)?,
+        "encapsed_string" => encapsed_string_content(key_node, bytes)?,
+        _ => return None,
+    };
+
+    // Walk up: element → array → argument → arguments → call.
+    let array_node = element_node.parent()?;
+    if array_node.kind() != "array_creation_expression" {
+        return None;
+    }
+    let arg_node = array_node.parent()?;
+    if arg_node.kind() != "argument" {
+        return None;
+    }
+    let args_node = arg_node.parent()?;
+    if args_node.kind() != "arguments" {
+        return None;
+    }
+    let call_node = args_node.parent()?;
+    if !matches!(
+        call_node.kind(),
+        "member_call_expression" | "scoped_call_expression"
+    ) {
+        return None;
+    }
+    let method_name_node = call_node.child_by_field_name("name")?;
+    let method_name = node_text(method_name_node, bytes)?;
+    // For the keyed-array shape, the method is in RELATION_METHODS
+    // (`with`, `load`, `loadMissing`, `loadCount`, etc.). CLOSURE_CARRIERS
+    // also use a keyed-array form sometimes, so accept either.
+    if !RELATION_METHODS.contains(&method_name) && !CLOSURE_CARRIERS.contains(&method_name) {
+        return None;
+    }
+
+    Some(ClosureScopeBinding {
+        param_var,
+        kind: ClosureScopeKind::RelationHop { relation_name },
+    })
 }
 
 /// Extract a single-quoted string's content. Returns `(value, '\'')` on

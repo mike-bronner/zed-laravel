@@ -2943,8 +2943,8 @@ impl LaravelLanguageServer {
             }
         };
         info!(
-            "🔗 chain completion: cursor in chain — mode={:?} expecting={:?} table={:?} model={:?}",
-            ctx.mode, ctx.expecting, ctx.effective_table, ctx.effective_model
+            "🔗 chain completion: cursor in chain — mode={:?} expecting={:?} table={:?} model={:?} closure_hop={:?}",
+            ctx.mode, ctx.expecting, ctx.effective_table, ctx.effective_model, ctx.closure_relation_hop
         );
 
         let db_guard = self.database_schema.read().await;
@@ -2954,6 +2954,45 @@ impl LaravelLanguageServer {
                 info!("🔗 chain completion: database_schema not initialised yet");
                 return None;
             }
+        };
+
+        // Phase 8: if the cursor is inside a relation closure
+        // (`whereHas('rel', fn ($q) => $q->where('|'))` or
+        // `with(['rel' => fn ($q) => …])`), resolve one relation hop on
+        // the parent model BEFORE dispatching. effective_model flips
+        // from parent → related; the rest of the dispatch runs as if
+        // the cursor were inside a direct chain on the related model.
+        let ctx = if let Some(rel) = ctx.closure_relation_hop.clone() {
+            let root_clone = self.initialized_root.read().await.clone();
+            let Some(root) = root_clone else {
+                info!(
+                    "🔗 chain completion: closure-scope hop needs project root, not yet initialised"
+                );
+                return None;
+            };
+            let Some(parent_class) = ctx.effective_model.clone() else {
+                info!("🔗 chain completion: closure_relation_hop set but no parent model");
+                return None;
+            };
+            match eloquent_completion::resolve_related_model(&parent_class, &rel, &root).await {
+                Some(related) => {
+                    info!("🔗 closure-scope: resolved {parent_class}::{rel} → {related}");
+                    laravel_lsp::query_chain::ChainContext {
+                        effective_model: Some(related),
+                        closure_relation_hop: None,
+                        ..ctx
+                    }
+                }
+                None => {
+                    info!(
+                        "🔗 chain completion: couldn't resolve {parent_class}::{rel} \
+                         for closure-scope hop (relation missing or no related_model)"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            ctx
         };
 
         let items = match (ctx.mode, ctx.expecting) {

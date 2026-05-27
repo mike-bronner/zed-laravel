@@ -96,6 +96,35 @@ pub const CLOSURE_CARRIERS: &[&str] = &[
     "withMax",
 ];
 
+/// Methods whose closure argument receives a builder of the SAME model as
+/// the outer chain. Used for grouping conditions (`where(fn ($q) =>
+/// $q->where(...)->orWhere(...))`), conditional clauses (`when($cond,
+/// fn ($q) => ...)` / `unless`), `having` groups, and `tap`. Inside the
+/// closure, completion should resolve against the outer chain's model
+/// directly — no relation hop.
+///
+/// `when` / `unless` actually take a closure as the *2nd* arg (with a
+/// boolean / condition as the 1st), and an optional default closure as
+/// the 3rd. Both closures bind the same way. We don't try to distinguish
+/// positions here — any closure inside one of these calls binds same-
+/// model.
+///
+/// Several of these also appear elsewhere with non-closure args
+/// (`where('column', $value)`) — the same-model binding only applies when
+/// the arg actually IS a closure, which the extractor checks at the
+/// closure-walking step.
+pub const SAME_MODEL_CLOSURE_CARRIERS: &[&str] = &[
+    "where",
+    "orWhere",
+    "whereNot",
+    "orWhereNot",
+    "having",
+    "orHaving",
+    "when",
+    "unless",
+    "tap",
+];
+
 /// Methods that flip the chain from Eloquent → base query builder. After
 /// these, the chain is operating on `Illuminate\Database\Query\Builder`, so
 /// relation methods would error at runtime — completion returns empty for

@@ -11,6 +11,47 @@ pub struct BuilderChain {
     pub receiver: ChainReceiver,
     pub span_byte_range: (usize, usize),
     pub links: Vec<ChainLink>,
+    /// Closure-scope binding when this chain's `$var` receiver is bound
+    /// by an enclosing relation closure — `whereHas('rel', fn ($q) => …)`
+    /// or `with(['rel' => fn ($q) => …])`. The cursor resolver finds the
+    /// parent chain (by span containment), looks up the relation on its
+    /// effective model, and uses the related model as this chain's
+    /// effective model. `None` for chains that aren't inside a
+    /// recognized closure context.
+    #[serde(default)]
+    pub closure_scope: Option<ClosureScopeBinding>,
+}
+
+/// Records that this chain's receiver `$var` is bound by an outer
+/// closure-carrying method. Two flavors:
+///
+/// - `RelationHop`: the closure receives a builder for a *related*
+///   model, like `whereHas('posts', fn ($q) => …)` or `with(['rel' =>
+///   fn ($q) => …])`. The cursor resolver walks one relation hop on the
+///   parent chain's model to get the actual class.
+/// - `SameModel`: the closure receives the *same* builder as the outer
+///   chain, like `where(function ($q) { $q->where(…)->orWhere(…); })` or
+///   `when($cond, fn ($q) => $q->where(…))`. The cursor resolver
+///   inherits the parent chain's effective model directly — no relation
+///   hop needed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ClosureScopeBinding {
+    /// The closure parameter name — must match the chain's
+    /// `InstanceVar::var` for the binding to apply. Captured so
+    /// `whereHas('posts', function ($outer) use ($inner) { … })` doesn't
+    /// accidentally bind a different variable.
+    pub param_var: String,
+    pub kind: ClosureScopeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ClosureScopeKind {
+    /// `whereHas('posts', closure)` / `with(['rel' => closure])` — bind
+    /// to the related model's builder.
+    RelationHop { relation_name: String },
+    /// `where(closure)` / `when($cond, closure)` / `having(closure)` /
+    /// `tap(closure)` etc. — bind to the same model as the outer chain.
+    SameModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -149,6 +190,13 @@ pub struct ChainContext {
     /// user has already typed after the last dot. Completion items filter
     /// against this and `insert_text` is just the current segment.
     pub dotted_prefix: Option<String>,
+    /// Set when the chain is inside a recognized relation closure
+    /// (`whereHas('posts', fn ($q) => $q->where('|'))` or
+    /// `with(['posts' => fn ($q) => $q->where('|')])`). When `Some(rel)`,
+    /// `effective_model` is the *parent* chain's model and the handler
+    /// must resolve `rel` against it (one relation hop) to get the
+    /// actual model to complete against.
+    pub closure_relation_hop: Option<String>,
     /// The quote character the user is typing inside (`'` or `"`). Used so the
     /// completion item doesn't double up quotes when inserting.
     pub quote: char,

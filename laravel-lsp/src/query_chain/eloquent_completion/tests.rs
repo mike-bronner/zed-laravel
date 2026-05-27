@@ -111,6 +111,7 @@ fn make_ctx(class: &str) -> ChainContext {
         effective_model: Some(class.to_string()),
         expecting: ArgKind::Column,
         dotted_prefix: None,
+        closure_relation_hop: None,
         quote: '\'',
     }
 }
@@ -335,6 +336,49 @@ class Bare extends Model {}
     let ctx = make_ctx("App\\Models\\Bare");
     let items = relations(&ctx, None, &root).await;
     assert!(items.is_empty());
+}
+
+// ---- resolve_related_model (Phase 8): one-hop relation walk ------------
+
+#[tokio::test]
+async fn resolve_related_model_finds_target_class() {
+    // Parent model declares `tokens` as `hasMany(OAuthToken::class)`. The
+    // helper should return "OAuthToken" so the closure-scope hop can use
+    // it as the effective model for the inner chain.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class OAuthClient extends Model {
+    public function tokens() {
+        return $this->hasMany(OAuthToken::class);
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("OAuthClient", body);
+    let related = resolve_related_model("App\\Models\\OAuthClient", "tokens", &root).await;
+    assert_eq!(related.as_deref(), Some("OAuthToken"));
+}
+
+#[tokio::test]
+async fn resolve_related_model_returns_none_when_relation_missing() {
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() { return $this->hasMany(Post::class); }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let related = resolve_related_model("App\\Models\\User", "comments", &root).await;
+    assert!(related.is_none(), "missing relation should yield None");
+}
+
+#[tokio::test]
+async fn resolve_related_model_returns_none_when_class_file_missing() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let related = resolve_related_model("App\\Models\\Ghost", "anything", &root).await;
+    assert!(related.is_none());
 }
 
 #[tokio::test]

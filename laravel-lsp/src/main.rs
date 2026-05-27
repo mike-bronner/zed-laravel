@@ -5048,17 +5048,52 @@ impl LaravelLanguageServer {
 
         // Log config status but always store provider
         // Errors will be handled when completions are requested
-        if let Some(config) = provider.get_database_config().await {
+        let has_config = if let Some(config) = provider.get_database_config().await {
             info!(
                 "   🗄️  Database config found: {} @ {}:{}",
                 config.driver, config.host, config.port
             );
+            true
         } else {
             debug!("warn:  Database config not found - will show diagnostic on first use");
-        }
+            false
+        };
 
         // Always store provider - errors handled when completions requested
         *self.database_schema.write().await = Some(provider);
+
+        // Pre-warm the schema cache in the background. The cold fetch costs
+        // ~50ms for SHOW TABLES + ~4ms per table for SHOW COLUMNS — on a
+        // 600-table schema that's ~2.5s. Doing it here, in parallel with
+        // vendor/app provider rescans and pattern cache warming, means the
+        // user's first `DB::table('|')` completion hits a warm cache and
+        // returns instantly. Skipped when there's no config (nothing to
+        // introspect and the toast would be noise).
+        if has_config {
+            let db = self.database_schema.clone();
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                info!("🔥 Pre-warming database schema cache...");
+                let schema = {
+                    let guard = db.read().await;
+                    match guard.as_ref() {
+                        Some(provider) => provider.get_schema().await,
+                        None => None,
+                    }
+                };
+                match schema {
+                    Some(s) => info!(
+                        "🔥 Database schema cache warmed: {} tables in {:?}",
+                        s.tables.len(),
+                        start.elapsed()
+                    ),
+                    None => info!(
+                        "🔥 Database schema pre-warm failed ({:?}) — will retry on first completion",
+                        start.elapsed()
+                    ),
+                }
+            });
+        }
     }
 
     /// Check if a file exists with async I/O and TTL caching

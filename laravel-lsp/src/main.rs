@@ -3194,7 +3194,7 @@ impl LaravelLanguageServer {
         drop(shown);
 
         let message = format!(
-            "Laravel LSP: Database is unreachable, so table and column \
+            "Laravel: Database is unreachable, so table and column \
              autocompletion is disabled. Fix DB connectivity in .env \
              (DB_HOST / DB_PORT / credentials) and reload the window to \
              enable. Error: {error_message}"
@@ -3385,7 +3385,7 @@ impl LaravelLanguageServer {
         {
             debug!("Failed to register config files with Salsa: {}", e);
         } else {
-            info!("Laravel LSP: Config files registered with Salsa for incremental caching");
+            info!("Laravel: Config files registered with Salsa for incremental caching");
         }
     }
 
@@ -3458,7 +3458,7 @@ impl LaravelLanguageServer {
             return;
         }
 
-        info!("Laravel LSP: Project files registered with Salsa for reference finding");
+        info!("Laravel: Project files registered with Salsa for reference finding");
 
         // Disk-cache restore. Loads previously-parsed patterns into the
         // shared pattern_cache, dropping any entry whose on-disk mtime
@@ -3721,7 +3721,7 @@ impl LaravelLanguageServer {
 
             let elapsed = started_at.elapsed();
             info!(
-                "🔥 Laravel LSP: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
+                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
                 imported, cached_hits, total, elapsed
             );
 
@@ -3795,11 +3795,11 @@ impl LaravelLanguageServer {
             let content = if let Ok(env_uri) = Url::from_file_path(&env_path) {
                 if let Some((buffer_content, _version)) = documents.get(&env_uri) {
                     // Use editor buffer content (includes unsaved changes)
-                    debug!("Laravel LSP: Registering .env from buffer: {:?}", env_path);
+                    debug!("Laravel: Registering .env from buffer: {:?}", env_path);
                     Some(buffer_content.clone())
                 } else if env_path.exists() {
                     // Read from disk
-                    debug!("Laravel LSP: Registering .env from disk: {:?}", env_path);
+                    debug!("Laravel: Registering .env from disk: {:?}", env_path);
                     std::fs::read_to_string(&env_path).ok()
                 } else {
                     None
@@ -3828,7 +3828,7 @@ impl LaravelLanguageServer {
 
         if registered_count > 0 {
             info!(
-                "Laravel LSP: {} env files registered with Salsa",
+                "Laravel: {} env files registered with Salsa",
                 registered_count
             );
         }
@@ -4079,7 +4079,7 @@ impl LaravelLanguageServer {
 
         if registered_count > 0 {
             info!(
-                "Laravel LSP: {} service provider files registered with Salsa",
+                "Laravel: {} service provider files registered with Salsa",
                 registered_count
             );
         }
@@ -4783,7 +4783,7 @@ impl LaravelLanguageServer {
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
-                info!("Laravel LSP: Re-validating all open documents due to config change");
+                info!("Laravel: Re-validating all open documents due to config change");
                 let documents = self.documents.read().await;
                 for (doc_uri, (doc_text, _version)) in documents.iter() {
                     self.validate_and_publish_diagnostics(doc_uri, doc_text)
@@ -13175,7 +13175,7 @@ return [
                         }
                     } else {
                         // Middleware not in registry - try to resolve it by convention
-                        info!("Laravel LSP: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
+                        info!("Laravel: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
 
                         // Strip parameters (e.g., 'auth:sanctum' -> 'auth') before converting,
                         // otherwise PascalCase produces invalid class names like 'Auth:Sanctum'.
@@ -13187,11 +13187,11 @@ return [
 
                         // Try to resolve as App\Http\Middleware\{ClassName}
                         if let Some(mw_file_path) = resolve_class_to_file(&app_class, root) {
-                            info!("Laravel LSP: Attempting to resolve middleware '{}' as class '{}' at {:?}", middleware_name, app_class, mw_file_path);
+                            info!("Laravel: Attempting to resolve middleware '{}' as class '{}' at {:?}", middleware_name, app_class, mw_file_path);
 
                             if !mw_file_path.exists() {
                                 // ERROR - middleware not in config and class file doesn't exist
-                                info!("Laravel LSP: Creating ERROR diagnostic for unresolved middleware: {}", middleware_name);
+                                info!("Laravel: Creating ERROR diagnostic for unresolved middleware: {}", middleware_name);
                                 let diagnostic = Diagnostic {
                                     range: Range {
                                         start: Position {
@@ -13218,11 +13218,11 @@ return [
                                 };
                                 diagnostics.push(diagnostic);
                             } else {
-                                info!("Laravel LSP: Middleware '{}' resolved by convention, file exists at {:?}", middleware_name, mw_file_path);
+                                info!("Laravel: Middleware '{}' resolved by convention, file exists at {:?}", middleware_name, mw_file_path);
                             }
                         } else {
                             // Can't resolve - show INFO as we don't know where to check
-                            info!("Laravel LSP: Middleware '{}' NOT found in registry and can't resolve file path, creating INFO diagnostic", middleware_name);
+                            info!("Laravel: Middleware '{}' NOT found in registry and can't resolve file path, creating INFO diagnostic", middleware_name);
                             let diagnostic = Diagnostic {
                                 range: Range {
                                     start: Position {
@@ -13307,7 +13307,7 @@ return [
                             if let Some(ref bind_file_path) = binding_data.file_path {
                                 if !bind_file_path.exists() {
                                     // ERROR - binding exists but class file is missing
-                                    info!("Laravel LSP: Creating ERROR diagnostic for binding with missing class: {}", binding_name);
+                                    info!("Laravel: Creating ERROR diagnostic for binding with missing class: {}", binding_name);
 
                                     // Build the diagnostic message with registration location
                                     let mut message = format!(
@@ -13400,7 +13400,10 @@ return [
                                 }
 
                                 // ERROR - binding not found and not a known framework binding
-                                info!("Laravel LSP: Creating ERROR diagnostic for undefined binding: {}", binding_name);
+                                info!(
+                                    "Laravel: Creating ERROR diagnostic for undefined binding: {}",
+                                    binding_name
+                                );
                                 let diagnostic = Diagnostic {
                                     range: Range {
                                         start: Position {
@@ -15146,7 +15149,7 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         let init_start = std::time::Instant::now();
-        info!("Laravel LSP: INITIALIZE");
+        info!("Laravel: INITIALIZE");
 
         // Read initial settings from initialization_options (if provided)
         // These can be overridden at runtime via did_change_configuration
@@ -15167,7 +15170,7 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
                 *self.root_path.write().await = Some(path.clone());
-                info!("✅ Laravel LSP: Root path set to {:?}", path);
+                info!("✅ Laravel: Root path set to {:?}", path);
 
                 // Load ALL cached data (config, middleware, bindings, env) using batch registration (fast)
                 // This uses 2 round-trips instead of N round-trips for N entries
@@ -15322,10 +15325,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("========================================");
-        info!(
-            "🚀 Laravel LSP: INITIALIZED (build {}) - spawning background work",
-            env!("LARAVEL_LSP_GIT_HASH")
-        );
+        info!("🚀 Laravel ({}) initialized", env!("LARAVEL_LSP_GIT_HASH"));
         info!("========================================");
 
         // Get root path
@@ -15439,7 +15439,7 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
-        info!("Laravel LSP: Shutting down - cleaning up resources");
+        info!("Laravel: Shutting down - cleaning up resources");
 
         // Cancel all pending diagnostic tasks
         {
@@ -15461,7 +15461,7 @@ impl LanguageServer for LaravelLanguageServer {
             debug!("Salsa actor shutdown: {}", e);
         }
 
-        info!("Laravel LSP: Shutdown complete");
+        info!("Laravel: Shutdown complete");
         Ok(())
     }
 
@@ -15545,10 +15545,7 @@ impl LanguageServer for LaravelLanguageServer {
         let version = params.text_document.version;
 
         if let Some(change) = params.content_changes.into_iter().next() {
-            debug!(
-                "Laravel LSP: Document changed: {} (version: {})",
-                uri, version
-            );
+            debug!("Laravel: Document changed: {} (version: {})", uri, version);
 
             // Store in documents buffer immediately (for goto_definition during debounce)
             self.documents
@@ -15567,7 +15564,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
-        info!("🔔 Laravel LSP: did_save called for {}", uri);
+        info!("🔔 Laravel: did_save called for {}", uri);
 
         // Check for lock file changes that trigger rescans
         if let Ok(path) = uri.to_file_path() {
@@ -15633,7 +15630,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        debug!("Laravel LSP: Document closed: {}", uri);
+        debug!("Laravel: Document closed: {}", uri);
 
         // Cancel any pending debounced diagnostics
         if let Some(handle) = self.pending_diagnostics.write().await.remove(&uri) {
@@ -15866,11 +15863,11 @@ impl LanguageServer for LaravelLanguageServer {
         let patterns = match self.salsa.get_patterns(file_path).await {
             Ok(Some(p)) => p,
             Ok(None) => {
-                debug!("Laravel LSP: No patterns cached for file");
+                debug!("Laravel: No patterns cached for file");
                 return Ok(None);
             }
             Err(e) => {
-                debug!("Laravel LSP: Error getting patterns: {:?}", e);
+                debug!("Laravel: Error getting patterns: {:?}", e);
                 return Ok(None);
             }
         };
@@ -15913,30 +15910,30 @@ impl LanguageServer for LaravelLanguageServer {
         // Create location based on pattern type
         let location = match pattern {
             PatternAtPosition::View(view) => {
-                debug!("Laravel LSP: Found view: {}", view.name);
+                debug!("Laravel: Found view: {}", view.name);
                 self.create_view_location_from_salsa(&view).await
             }
             PatternAtPosition::Component(comp) => {
-                debug!("Laravel LSP: Found component: {}", comp.name);
+                debug!("Laravel: Found component: {}", comp.name);
                 self.create_component_location_from_salsa(&comp).await
             }
             PatternAtPosition::Livewire(lw) => {
-                debug!("Laravel LSP: Found livewire: {}", lw.name);
+                debug!("Laravel: Found livewire: {}", lw.name);
                 self.create_livewire_location_from_salsa(&lw).await
             }
             PatternAtPosition::Directive(dir) => {
                 info!(
-                    "🎯 Laravel LSP: Found directive: {} with args {:?} at {}:{}-{}",
+                    "🎯 Laravel: Found directive: {} with args {:?} at {}:{}-{}",
                     dir.name, dir.arguments, dir.line, dir.column, dir.end_column
                 );
                 self.create_directive_location_from_salsa(&dir).await
             }
             PatternAtPosition::EnvRef(env) => {
-                debug!("Laravel LSP: Found env: {}", env.name);
+                debug!("Laravel: Found env: {}", env.name);
                 self.create_env_location_from_salsa(&env).await
             }
             PatternAtPosition::ConfigRef(config) => {
-                debug!("Laravel LSP: Found config: {}", config.key);
+                debug!("Laravel: Found config: {}", config.key);
                 self.create_config_location_from_salsa(&config).await
             }
             PatternAtPosition::Middleware(mw) => {
@@ -15955,39 +15952,39 @@ impl LanguageServer for LaravelLanguageServer {
             }
             PatternAtPosition::Translation(trans) => {
                 info!(
-                    "🎯 Laravel LSP: Found translation pattern: '{}' at {}:{}-{}",
+                    "🎯 Laravel: Found translation pattern: '{}' at {}:{}-{}",
                     trans.key, trans.line, trans.column, trans.end_column
                 );
                 self.create_translation_location_from_salsa(&trans).await
             }
             PatternAtPosition::Asset(asset) => {
-                debug!("Laravel LSP: Found asset: {}", asset.path);
+                debug!("Laravel: Found asset: {}", asset.path);
                 self.create_asset_location_from_salsa(&asset).await
             }
             PatternAtPosition::Binding(binding) => {
-                debug!("Laravel LSP: Found binding: {}", binding.name);
+                debug!("Laravel: Found binding: {}", binding.name);
                 self.create_binding_location_from_salsa(&binding).await
             }
             PatternAtPosition::Route(route) => {
-                debug!("Laravel LSP: Found route: {}", route.name);
+                debug!("Laravel: Found route: {}", route.name);
                 self.create_route_location_from_salsa(&route).await
             }
             PatternAtPosition::Url(url) => {
-                debug!("Laravel LSP: Found url: {}", url.path);
+                debug!("Laravel: Found url: {}", url.path);
                 self.create_url_location_from_salsa(&url).await
             }
             PatternAtPosition::Action(action) => {
-                debug!("Laravel LSP: Found action: {}", action.action);
+                debug!("Laravel: Found action: {}", action.action);
                 self.create_action_location_from_salsa(&action).await
             }
             PatternAtPosition::Feature(feature) => {
-                debug!("Laravel LSP: Found feature: {}", feature.feature_name);
+                debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
             }
         };
 
         if location.is_none() {
-            debug!("Laravel LSP: Could not resolve location for pattern");
+            debug!("Laravel: Could not resolve location for pattern");
         }
 
         Ok(location)

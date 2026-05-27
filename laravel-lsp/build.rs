@@ -39,7 +39,7 @@ fn main() {
 /// expose them through `env!()` for inclusion in the startup banner.
 fn emit_build_metadata() {
     let git_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .args(["rev-parse", "--short=5", "HEAD"])
         .output()
         .ok()
         .and_then(|out| {

@@ -2775,14 +2775,35 @@ impl LaravelLanguageServer {
         let file_path = uri.to_file_path().ok()?;
         let patterns = self.salsa.get_patterns(file_path).await.ok().flatten()?;
         if patterns.chains.is_empty() {
+            debug!("🔗 chain completion: no chains cached for this file");
             return None;
         }
+        debug!("🔗 chain completion: {} chains in file", patterns.chains.len());
 
         let byte_offset = position_to_byte_offset(content, position.line, position.character)?;
-        let ctx = detect_chain_context_at(&patterns.chains, byte_offset)?;
+        let ctx = match detect_chain_context_at(&patterns.chains, byte_offset) {
+            Some(c) => c,
+            None => {
+                debug!(
+                    "🔗 chain completion: cursor at byte {} matched no chain link arg",
+                    byte_offset
+                );
+                return None;
+            }
+        };
+        info!(
+            "🔗 chain completion: cursor in chain — mode={:?} expecting={:?} table={:?} model={:?}",
+            ctx.mode, ctx.expecting, ctx.effective_table, ctx.effective_model
+        );
 
         let db_guard = self.database_schema.read().await;
-        let db = db_guard.as_ref()?;
+        let db = match db_guard.as_ref() {
+            Some(db) => db,
+            None => {
+                info!("🔗 chain completion: database_schema not initialised yet");
+                return None;
+            }
+        };
 
         let items = match (ctx.mode, ctx.expecting) {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
@@ -2796,6 +2817,18 @@ impl LaravelLanguageServer {
             // Other (mode, expecting) combinations land in Phases 4-6.
             _ => Vec::new(),
         };
+
+        if items.is_empty() {
+            info!(
+                "🔗 chain completion: matched {:?} but produced 0 items — \
+                 likely DB unreachable or table/columns not in introspected schema. \
+                 Check the database WARN above; .env DB_HOST may not resolve \
+                 outside of Docker/Sail.",
+                ctx.expecting
+            );
+        } else {
+            info!("🔗 chain completion: returning {} items", items.len());
+        }
 
         Some(items)
     }

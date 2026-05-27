@@ -2951,12 +2951,34 @@ impl LaravelLanguageServer {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
                 eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
             }
+            // `User::where('|')` and friends — Eloquent static-receiver
+            // column completion. Resolves the model class FQCN to a model
+            // file (async I/O), reads `ModelMetadata` for `$table` + casts,
+            // and returns DB columns with cast-aware PHP types in detail.
+            // Needs the project root for class-file lookup — cloned out of
+            // the shared lock so we don't hold it across the model parse.
+            (BuilderMode::EloquentBuilder, ArgKind::Column) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::columns_for_builder(&ctx, db, wrap_with_quote, &root)
+                            .await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve Eloquent model class"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
             // `DB::table('|')` (or `DB::table(|`) — table-name completion.
             // Mode is always BaseBuilder by the time the receiver is
             // recognised, but we don't gate on it: even if a future receiver
             // shape produced Table args in another mode, tables are tables.
             (_, ArgKind::Table) => eloquent_completion::tables(db, wrap_with_quote).await,
-            // Other (mode, expecting) combinations land in Phases 4-6.
+            // Other (mode, expecting) combinations land in Phases 5-9.
             _ => Vec::new(),
         };
 

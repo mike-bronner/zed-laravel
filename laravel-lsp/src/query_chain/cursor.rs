@@ -280,13 +280,23 @@ fn find_chain_containing(
 }
 
 fn detect_in_chain(chain: &BuilderChain, byte_offset: usize) -> Option<ChainContext> {
-    // Initial mode + table + model from the receiver. Phase 3 only handles
-    // DbTable; Eloquent returns None until model lookup lands.
+    // Initial mode + table + model from the receiver.
+    //
+    // - DbTable carries the table directly; no model lookup needed.
+    // - Eloquent static receivers (`User::where(...)`) carry the class FQCN;
+    //   the handler will resolve it to a `ModelMetadata` async (file I/O).
+    //   `effective_table` stays `None` here — the handler fills it in.
+    // - Eloquent instance receivers (`$user->newQuery()`) need `@var`
+    //   docblock + typed-param scanning to resolve the class; that lands in
+    //   Phase 9. Return `None` until then.
     let (mut mode, effective_table, effective_model) = match &chain.receiver {
         ChainReceiver::DbTable { table, .. } => {
             (BuilderMode::BaseBuilder, Some(table.clone()), None)
         }
-        ChainReceiver::Eloquent(_) => return None,
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+            (BuilderMode::EloquentBuilder, None, Some(class.clone()))
+        }
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. }) => return None,
         ChainReceiver::Unknown => return None,
     };
 

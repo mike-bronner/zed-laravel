@@ -17,7 +17,10 @@
 //! their wiring sites can compile against the same module surface.
 
 use super::chain::*;
+use crate::class_locator::find_php_class_file;
 use crate::database::DatabaseSchemaProvider;
+use crate::model_analyzer::{map_cast_to_php_type, ModelMetadata};
+use std::path::Path;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use tracing::info;
 
@@ -120,3 +123,160 @@ pub async fn columns_raw(
         })
         .collect()
 }
+
+/// Build column completions for an `EloquentBuilder` chain — a chain rooted
+/// at a static call on a model class (`User::where('|')`, `User::query()->
+/// where('|')`, `User::firstWhere('|')`, etc.).
+///
+/// Two extra hops compared to [`columns_raw`]:
+/// 1. Resolve the class FQCN in `ctx.effective_model` to a model file path
+///    (uses [`find_php_class_file`]) and parse it to a [`ModelMetadata`].
+/// 2. Determine the table: prefer the model's `$table` property, else
+///    snake-pluralize the class basename (Laravel convention).
+///
+/// Once the table is known, fetch DB columns and apply cast-aware PHP types
+/// — if the model has a cast for a column, the cast's PHP type wins over
+/// the raw SQL → PHP mapping. The cast is also surfaced in `label_details`
+/// so the user can tell at a glance which columns are auto-cast.
+///
+/// Returns an empty `Vec` for any of the failure modes (model not found,
+/// not actually an Eloquent model, table missing from DB schema, etc.) and
+/// logs the cause at INFO so the LSP log is the source of truth for "why
+/// did completion produce nothing here?"
+pub async fn columns_for_builder(
+    ctx: &ChainContext,
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+    project_root: &Path,
+) -> Vec<CompletionItem> {
+    let Some(class) = &ctx.effective_model else {
+        info!("🔗 columns_for_builder: ctx.effective_model is None — returning 0 items");
+        return Vec::new();
+    };
+
+    // Resolve class FQCN → file path.
+    let Some(path) = find_php_class_file(class, project_root) else {
+        info!(
+            "🔗 columns_for_builder: no PHP file found for class {:?} under {:?}",
+            class, project_root
+        );
+        return Vec::new();
+    };
+
+    // Read + parse to ModelMetadata. Async file I/O so the LSP doesn't
+    // block the runtime on slow disks.
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(err) => {
+            info!("🔗 columns_for_builder: failed to read {:?}: {}", path, err);
+            return Vec::new();
+        }
+    };
+    let metadata = ModelMetadata::from_content(&content);
+
+    // Resolve the table: prefer `$table`, fall back to Laravel's
+    // snake_case + pluralize convention on the class basename. Naive plural
+    // rules — covers >95% of real models. Custom-pluralized models declare
+    // `$table` explicitly.
+    let simple_class = class.rsplit('\\').next().unwrap_or(class);
+    let table = metadata
+        .table_name
+        .clone()
+        .unwrap_or_else(|| snake_pluralize(simple_class));
+
+    let columns = db.get_columns_with_types(&table).await;
+    if columns.is_empty() {
+        info!(
+            "🔗 columns_for_builder: get_columns_with_types({:?}) returned 0 columns \
+             (model class {:?}, resolved file {:?}, table derived from {})",
+            table,
+            class,
+            path,
+            if metadata.table_name.is_some() {
+                "$table property"
+            } else {
+                "snake_pluralize convention"
+            }
+        );
+    }
+
+    columns
+        .into_iter()
+        .map(|(name, sql_php_type)| {
+            // Cast override: if the model declares a cast for this column,
+            // its PHP type wins. Example: a JSON column with
+            // `'options' => 'array'` cast surfaces as `array`, not `string`.
+            let (php_type, has_cast) = match metadata.casts.get(&name) {
+                Some(cast) => (map_cast_to_php_type(cast), true),
+                None => (sql_php_type, false),
+            };
+            let insert_text = match wrap_with_quote {
+                Some(q) => format!("{q}{name}{q}"),
+                None => name.clone(),
+            };
+            // Annotate cast-overridden types so the user can tell at a
+            // glance which columns are model-cast vs raw DB-typed.
+            let detail_suffix = if has_cast { " · cast" } else { "" };
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: Some(format!("  {php_type}{detail_suffix}")),
+                    description: Some(table.clone()),
+                }),
+                detail: Some(format!("{php_type}{detail_suffix} ({table})")),
+                sort_text: Some(format!("1_{name}")),
+                filter_text: Some(name),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Convert a PascalCase class basename to Laravel's default table name:
+/// snake_case + naive pluralization. Models with non-standard pluralization
+/// (people, octopi, child → children) declare `$table` explicitly; this
+/// fallback only covers the convention case.
+///
+/// Examples:
+///   `User` → `users`
+///   `BlogPost` → `blog_posts`
+///   `Category` → `categories`
+///   `Address` → `addresses`
+fn snake_pluralize(class_basename: &str) -> String {
+    // PascalCase → snake_case.
+    let mut snake = String::with_capacity(class_basename.len() + 4);
+    for (i, c) in class_basename.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            snake.push('_');
+        }
+        snake.extend(c.to_lowercase());
+    }
+    // Naive English pluralization rules — match Laravel's
+    // `Str::plural` behavior for the common cases.
+    if snake.ends_with('y')
+        && !snake
+            .chars()
+            .nth_back(1)
+            .map(|c| "aeiou".contains(c))
+            .unwrap_or(false)
+    {
+        // consonant + y → ies (category → categories, but NOT day → daies)
+        snake.pop();
+        snake.push_str("ies");
+    } else if snake.ends_with('s')
+        || snake.ends_with('x')
+        || snake.ends_with('z')
+        || snake.ends_with("ch")
+        || snake.ends_with("sh")
+    {
+        snake.push_str("es");
+    } else {
+        snake.push('s');
+    }
+    snake
+}
+
+#[cfg(test)]
+mod tests;

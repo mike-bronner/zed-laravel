@@ -396,16 +396,58 @@ fn db_table_with_auto_paired_quotes_no_close_paren_resolves_to_table_completion(
     assert_eq!(ctx.effective_table.as_deref(), Some(""));
 }
 
-// ---- detect_chain_context_at: Eloquent (Phase 4+ — current expectation) -
+// ---- detect_chain_context_at: Eloquent static receivers (Phase 4) -------
 
 #[test]
-fn eloquent_receiver_returns_none_for_now() {
-    // Eloquent model resolution is async — Phase 3's sync detector returns
-    // None for Eloquent chains. Phase 4 will hook in the async resolver.
-    let ctx = detect("User::where('em|');");
+fn eloquent_static_receiver_resolves_to_builder_mode_with_model_set() {
+    // `User::where('em|')` — receiver is Eloquent::StaticModel. detect_in_chain
+    // populates `effective_model` with the class name and leaves
+    // `effective_table` as `None`; the handler is responsible for resolving
+    // the model file → table name via async I/O.
+    let ctx = detect("User::where('em|');")
+        .expect("Eloquent static receivers should produce a ChainContext in Phase 4+");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert!(
+        ctx.effective_table.is_none(),
+        "table is resolved at the handler, not in detect_in_chain"
+    );
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("User"),
+        "the FQCN (or short name if no `use`) should be preserved for the handler"
+    );
+}
+
+#[test]
+fn eloquent_static_receiver_with_use_alias_carries_fqcn() {
+    // `use App\Models\User;` in the file should make the receiver's class
+    // name fully qualified, so the handler can resolve it directly without
+    // re-running use-alias resolution.
+    let src = "<?php\nuse App\\Models\\User;\nUser::where('em|');";
+    let pos = src.find('|').expect("test fixture missing `|` marker");
+    let cleaned = src.replacen('|', "", 1);
+    let tree = crate::parser::parse_php(&cleaned).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> = crate::query_chain::extract_chains(&tree, &cleaned)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let ctx = detect_chain_context_at(&chains, pos).expect("ctx");
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("App\\Models\\User"),
+        "use-alias should produce the FQCN, not the short name"
+    );
+}
+
+#[test]
+fn eloquent_instance_receiver_still_returns_none_until_phase_9() {
+    // `$user->newQuery()->where('|')` — InstanceVar receiver still needs
+    // `@var` / typed-param scanning (Phase 9). For now, return None.
+    let ctx = detect("$user->newQuery()->where('em|');");
     assert!(
         ctx.is_none(),
-        "Phase 3 expects Eloquent chains to return None"
+        "instance-var receivers still return None until Phase 9 lands var-type resolution"
     );
 }
 

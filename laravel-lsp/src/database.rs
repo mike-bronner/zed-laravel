@@ -176,6 +176,17 @@ impl DatabaseSchemaProvider {
         }
     }
 
+    /// Test helper: seed the schema cache directly so tests can exercise
+    /// completion paths against a known schema without a live MySQL /
+    /// Postgres. The cache is the same one `get_schema` reads, so calls
+    /// to `get_tables` / `get_columns_with_types` will see this data
+    /// immediately. Gated to test builds — no production caller should
+    /// be poking the cache manually.
+    #[cfg(test)]
+    pub async fn set_test_schema(&self, schema: DatabaseSchema) {
+        *self.schema_cache.write().await = Some(schema);
+    }
+
     /// Get the last connection error, if any
     pub async fn get_last_error(&self) -> Option<DatabaseConnectionError> {
         self.last_error.read().await.clone()

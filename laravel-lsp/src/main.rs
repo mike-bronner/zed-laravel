@@ -2796,22 +2796,34 @@ impl LaravelLanguageServer {
             }
         };
 
-        // Mid-typing the file often has an unterminated quote at the cursor.
-        // Tree-sitter recovers poorly in that case (the `string` node swallows
-        // everything to the next quote anywhere downstream, producing nonsense
-        // spans). We can't trust Salsa's cached chains for this exact moment,
-        // and the in-memory cached version may be stale relative to the live
-        // documents map too. So: inject a matching close quote at the cursor
-        // if needed, then re-parse + re-extract chains from the fixed-up
-        // content. Per-completion cost is one tree-sitter parse on a small
-        // file (~1-5ms) — well within Mike's 200ms debounce.
-        let fixed_content = fixup_for_completion(content, byte_offset);
-        let parse_source: &str = fixed_content.as_deref().unwrap_or(content);
-        if fixed_content.is_some() {
-            info!(
-                "🔗 chain completion: injected close quote at byte {} to balance unterminated string",
-                byte_offset
-            );
+        // Mid-typing the file often has an unterminated quote at the cursor,
+        // OR has just had a `(` typed with no string arg yet (auto-pair
+        // hasn't synced to the LSP yet, or the editor doesn't auto-pair).
+        // Tree-sitter recovers poorly from either shape, and Salsa's
+        // cached chains can be stale relative to the live documents map.
+        // So: `fixup_for_completion` returns a `CompletionPrep` carrying
+        //   - `fixed_content`: source with a close quote OR `''` injected
+        //     at the cursor so the call parses as a well-formed string-arg
+        //     call expression
+        //   - `quote_for_insertion`: Some('\'') when WE synthesised the
+        //     quotes (cursor was after `(`, no quotes in source), so items
+        //     need to wrap their value with quotes; None when the source
+        //     already had the open quote (insert bare).
+        // Per-completion cost: one tree-sitter parse on the small file,
+        // well within the 200ms debounce.
+        let prep = fixup_for_completion(content, byte_offset);
+        let parse_source: &str = prep
+            .as_ref()
+            .map(|p| p.fixed_content.as_str())
+            .unwrap_or(content);
+        let wrap_with_quote: Option<char> = prep.as_ref().and_then(|p| p.quote_for_insertion);
+        if let Some(p) = prep.as_ref() {
+            if p.fixed_content != content {
+                info!(
+                    "🔗 chain completion: applied fixup at byte {} (wrap_with_quote={:?})",
+                    byte_offset, wrap_with_quote
+                );
+            }
         }
 
         let tree = match laravel_lsp::parser::parse_php(parse_source) {
@@ -2937,13 +2949,13 @@ impl LaravelLanguageServer {
 
         let items = match (ctx.mode, ctx.expecting) {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
-                eloquent_completion::columns_raw(&ctx, db).await
+                eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
             }
-            // `DB::table('|')` — table-name completion. Mode is always
-            // BaseBuilder by the time the receiver is recognised, but we
-            // don't gate on it: even if a future receiver shape produced
-            // Table args in another mode, tables are tables.
-            (_, ArgKind::Table) => eloquent_completion::tables(db).await,
+            // `DB::table('|')` (or `DB::table(|`) — table-name completion.
+            // Mode is always BaseBuilder by the time the receiver is
+            // recognised, but we don't gate on it: even if a future receiver
+            // shape produced Table args in another mode, tables are tables.
+            (_, ArgKind::Table) => eloquent_completion::tables(db, wrap_with_quote).await,
             // Other (mode, expecting) combinations land in Phases 4-6.
             _ => Vec::new(),
         };

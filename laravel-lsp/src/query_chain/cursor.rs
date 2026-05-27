@@ -12,24 +12,56 @@
 use super::chain::*;
 use std::sync::Arc;
 
-/// At completion time the user is mid-typing and the file often has an
-/// unterminated string at the cursor (e.g., `DB::table('|`). Tree-sitter
-/// recovers by extending the `string` node up to the next quote anywhere in
-/// the file — which is usually thousands of bytes away and produces nonsense
-/// spans. Chain extraction sees this and ends up with `ChainArg::Other`
-/// instead of a real `StringLit`, so cursor detection fails.
+/// Result of preparing source content for chain-completion at the cursor.
+/// Carries the (possibly fixed) content to parse PLUS metadata the items
+/// builder needs to format `insert_text` correctly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionPrep {
+    /// Content to feed to tree-sitter for chain extraction. May be the
+    /// original `content` unchanged, or modified to balance an unterminated
+    /// string or to seed an empty-string arg right after an open paren.
+    pub fixed_content: String,
+    /// If `Some(q)`, the user is in a position where the source doesn't
+    /// yet have a quote pair around the string arg (typically immediately
+    /// after `(` was typed). Completion items should wrap their value with
+    /// `q` so the inserted text is a valid string literal.
+    ///
+    /// If `None`, the source already contains the quotes (the cursor is
+    /// inside an existing string, fixed-up or not), and items should be
+    /// inserted bare without extra quotes.
+    pub quote_for_insertion: Option<char>,
+}
+
+impl CompletionPrep {
+    fn unchanged(content: &str) -> Self {
+        Self {
+            fixed_content: content.to_string(),
+            quote_for_insertion: None,
+        }
+    }
+}
+
+/// Prepare the source for chain-completion at the cursor. Handles three
+/// cases the user might be in:
 ///
-/// This helper scans the line up to the cursor, tracks PHP single/double
-/// quote balance (with `\` escapes), and returns a content string with a
-/// matching closing quote injected at `byte_offset` if a quote is open.
-/// Returns `None` if no fixup is needed (the cursor isn't inside an
-/// unterminated string).
+/// 1. **Inside an unterminated string** (e.g. `DB::table('|`). Inject the
+///    matching close quote so tree-sitter doesn't extend the `string` node
+///    thousands of bytes downstream. Insertions stay bare.
+///
+/// 2. **Inside an already-closed empty/partial string** (e.g. the
+///    auto-paired `DB::table('|')`). No fixup — the source parses cleanly
+///    and the auto-paired close is right there. Insertions stay bare.
+///
+/// 3. **Right after `(` with no string yet** (e.g. `DB::table(|`). Inject
+///    `''` (or `''` plus `)` if no close paren exists) so the call expression
+///    parses with an empty-string first arg. Insertions wrap with `'` because
+///    the source doesn't have quotes around the would-be arg.
+///
+/// Anything else: content unchanged, no quote wrapping.
 ///
 /// We deliberately don't model heredocs/nowdocs — those don't appear in
-/// query chain arguments in any real code. We also stop the scan at the
-/// previous newline, so quotes that opened on prior lines don't confuse us
-/// (multi-line strings inside chain args are vanishingly rare).
-pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<String> {
+/// query chain arguments in any real code.
+pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<CompletionPrep> {
     if byte_offset > content.len() {
         return None;
     }
@@ -39,9 +71,7 @@ pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<String>
         .unwrap_or(0);
     let line_to_cursor = &content[line_start..byte_offset];
 
-    // Tiny state machine: `None` = not in a string, `Some(q)` = inside a
-    // string opened with quote `q`. Escapes consume the next character so
-    // `\'` and `\"` inside the matching quote style don't toggle the state.
+    // ---- Case 1/2: open quote at cursor? -----------------------------------
     let mut state: Option<char> = None;
     let mut iter = line_to_cursor.chars();
     while let Some(c) = iter.next() {
@@ -57,12 +87,49 @@ pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<String>
         }
     }
 
-    let unclosed = state?;
-    let mut result = String::with_capacity(content.len() + 1);
-    result.push_str(&content[..byte_offset]);
-    result.push(unclosed);
-    result.push_str(&content[byte_offset..]);
-    Some(result)
+    if let Some(unclosed) = state {
+        // Auto-pair safety: if the matching close quote is already at the
+        // cursor (the editor inserted it), don't inject another — that
+        // produces `'''` and breaks the parse worse than the original.
+        if content[byte_offset..].starts_with(unclosed) {
+            return Some(CompletionPrep::unchanged(content));
+        }
+
+        let mut fixed = String::with_capacity(content.len() + 1);
+        fixed.push_str(&content[..byte_offset]);
+        fixed.push(unclosed);
+        fixed.push_str(&content[byte_offset..]);
+        return Some(CompletionPrep {
+            fixed_content: fixed,
+            quote_for_insertion: None, // source already has the open quote
+        });
+    }
+
+    // ---- Case 3: cursor immediately after `(`? -----------------------------
+    // Scan back through any whitespace; if the previous non-whitespace char
+    // is `(`, we're in "user just opened the paren" territory. Inject `''`
+    // (and `)` if the paren is unclosed) so the parser sees a well-formed
+    // call expression with an empty-string first arg. Items will wrap with
+    // `'` since the source has no quotes around the arg.
+    let trimmed_before: &str = line_to_cursor.trim_end_matches([' ', '\t', '\r']);
+    if trimmed_before.ends_with('(') {
+        let after_cursor = content[byte_offset..].trim_start_matches([' ', '\t']);
+        let inject: &str = if after_cursor.starts_with(')') {
+            "''"
+        } else {
+            "'')"
+        };
+        let mut fixed = String::with_capacity(content.len() + inject.len());
+        fixed.push_str(&content[..byte_offset]);
+        fixed.push_str(inject);
+        fixed.push_str(&content[byte_offset..]);
+        return Some(CompletionPrep {
+            fixed_content: fixed,
+            quote_for_insertion: Some('\''),
+        });
+    }
+
+    None
 }
 
 /// Translate an LSP `Position` (0-based line + character) into a byte offset

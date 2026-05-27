@@ -37,73 +37,106 @@ fn detect(src_with_cursor: &str) -> Option<ChainContext> {
 // ---- fixup_for_completion ---------------------------------------------
 
 #[test]
-fn fixup_returns_none_when_no_open_quote() {
+fn fixup_returns_none_when_nothing_to_fix() {
     let src = "$x = 1;";
     assert!(fixup_for_completion(src, src.len()).is_none());
 }
 
 #[test]
-fn fixup_balanced_quotes_returns_none() {
-    let src = "DB::table('users')->where('";
-    // First `'`/`'` balanced (`'users'`), then a second `'` opened — that's
-    // unbalanced. But fixup_for_completion sees one open, no close, so it
-    // SHOULD return Some. Pin that.
-    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced");
-    assert_eq!(fixed, "DB::table('users')->where(''");
-}
-
-#[test]
-fn fixup_injects_single_quote_for_unterminated_db_table() {
+fn fixup_unterminated_quote_injects_close() {
     let src = "DB::table('";
-    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced single quote");
-    assert_eq!(fixed, "DB::table(''");
+    let prep = fixup_for_completion(src, src.len()).expect("unbalanced single quote");
+    assert_eq!(prep.fixed_content, "DB::table(''");
+    // Source already had an open quote, so insertion stays bare.
+    assert_eq!(prep.quote_for_insertion, None);
 }
 
 #[test]
-fn fixup_injects_double_quote_for_unterminated_double_string() {
+fn fixup_unterminated_double_quote_injects_close() {
     let src = "DB::table(\"";
-    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced double quote");
-    assert_eq!(fixed, "DB::table(\"\"");
+    let prep = fixup_for_completion(src, src.len()).expect("unbalanced double quote");
+    assert_eq!(prep.fixed_content, "DB::table(\"\"");
+    assert_eq!(prep.quote_for_insertion, None);
+}
+
+#[test]
+fn fixup_auto_paired_close_returns_unchanged_no_quoting() {
+    // Editor auto-paired: source is `DB::table('')` and cursor is between
+    // the two `'`. State scan sees one `'` open at cursor, but the next char
+    // IS `'` (auto-paired close), so don't double-inject.
+    let src = "DB::table('')";
+    let cursor_between_quotes = "DB::table('".len(); // byte right after the first `'`
+    let prep = fixup_for_completion(src, cursor_between_quotes)
+        .expect("should still return Some for the auto-pair case (just no fixup)");
+    assert_eq!(prep.fixed_content, src, "must NOT inject another quote");
+    assert_eq!(prep.quote_for_insertion, None);
+}
+
+#[test]
+fn fixup_after_open_paren_injects_empty_string_and_close_paren() {
+    // User just typed `(`. No quotes yet. Inject `'')` so the call parses
+    // with an empty-string first arg AND a closing paren.
+    let src = "DB::table(";
+    let prep = fixup_for_completion(src, src.len()).expect("after-paren case");
+    assert_eq!(prep.fixed_content, "DB::table('')");
+    // Source has no quotes, so items must wrap with `'`.
+    assert_eq!(prep.quote_for_insertion, Some('\''));
+}
+
+#[test]
+fn fixup_after_open_paren_with_existing_close_paren_injects_just_quotes() {
+    // `DB::table(|)` — the `)` is already there (editor auto-pair on `(`).
+    // Only inject `''`, not `'')`.
+    let src = "DB::table()";
+    let cursor_between_parens = "DB::table(".len();
+    let prep = fixup_for_completion(src, cursor_between_parens).expect("after-paren case");
+    assert_eq!(prep.fixed_content, "DB::table('')");
+    assert_eq!(prep.quote_for_insertion, Some('\''));
+}
+
+#[test]
+fn fixup_after_open_paren_with_whitespace_still_fires() {
+    // `DB::table(   |` — whitespace between `(` and cursor still counts.
+    let src = "DB::table(   ";
+    let prep = fixup_for_completion(src, src.len()).expect("after-paren w/ whitespace");
+    assert_eq!(prep.fixed_content, "DB::table(   '')");
+    assert_eq!(prep.quote_for_insertion, Some('\''));
 }
 
 #[test]
 fn fixup_respects_escapes() {
     // `\'` inside a `'`-string doesn't toggle the state.
     let src = "DB::table('it\\'s ";
-    let fixed = fixup_for_completion(src, src.len()).expect("still open after \\'");
-    assert_eq!(fixed, "DB::table('it\\'s '");
+    let prep = fixup_for_completion(src, src.len()).expect("still open after \\'");
+    assert_eq!(prep.fixed_content, "DB::table('it\\'s '");
+    assert_eq!(prep.quote_for_insertion, None);
 }
 
 #[test]
 fn fixup_stops_at_line_boundary() {
     // Quote opened on a previous line doesn't bleed into the current line.
-    // (We deliberately ignore those — multi-line strings in chain args are
-    // rare, and treating them per-line is safer than chasing arbitrary
-    // history.)
     let src = "'unterminated\nDB::table(";
-    // Cursor at end of `DB::table(` — current line has no opened quote,
-    // even though the previous line did.
-    let fixed = fixup_for_completion(src, src.len());
-    assert!(
-        fixed.is_none(),
-        "previous-line quote shouldn't trigger fixup, got: {:?}",
-        fixed
-    );
+    // Current line is `DB::table(` — no open quote on this line; after-paren
+    // case applies.
+    let prep = fixup_for_completion(src, src.len()).expect("after-paren on new line");
+    assert!(prep.fixed_content.ends_with("DB::table('')"));
+    assert_eq!(prep.quote_for_insertion, Some('\''));
 }
 
 #[test]
 fn fixup_handles_inner_double_inside_single() {
-    // `'has "double" inside'` — inner `"` doesn't toggle when we're inside `'`.
     let src = "echo 'a \"b\" c";
-    let fixed = fixup_for_completion(src, src.len()).expect("single still open");
-    assert_eq!(fixed, "echo 'a \"b\" c'");
+    let prep = fixup_for_completion(src, src.len()).expect("single still open");
+    assert_eq!(prep.fixed_content, "echo 'a \"b\" c'");
+    assert_eq!(prep.quote_for_insertion, None);
 }
 
 #[test]
 fn fixup_handles_inner_single_inside_double() {
     let src = "echo \"a 'b' c";
-    let fixed = fixup_for_completion(src, src.len()).expect("double still open");
-    assert_eq!(fixed, "echo \"a 'b' c\"");
+    let prep = fixup_for_completion(src, src.len()).expect("double still open");
+    assert_eq!(prep.fixed_content, "echo \"a 'b' c\"");
+    assert_eq!(prep.quote_for_insertion, None);
 }
 
 #[test]

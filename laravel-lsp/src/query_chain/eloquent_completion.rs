@@ -20,23 +20,36 @@ use super::chain::*;
 use crate::database::DatabaseSchemaProvider;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
-/// Build table-name completions for the cursor inside `DB::table('|')`.
-/// Reads `DatabaseSchema::get_tables()` and returns one item per table.
-/// Independent of `BuilderMode` — `DB::table` is always BaseBuilder by the
-/// time anything chains off it, but at this point in the chain we're
-/// completing the chain *entry* itself.
-pub async fn tables(db: &DatabaseSchemaProvider) -> Vec<CompletionItem> {
+/// Build table-name completions for the cursor inside `DB::table('|')` or
+/// right after `DB::table(|`. Reads `DatabaseSchema::get_tables()` and
+/// returns one item per table.
+///
+/// `wrap_with_quote` controls `insert_text` formatting:
+/// - `None` — the source already has quotes around the cursor (user typed
+///   `'` and we're inside it). Insert bare.
+/// - `Some(q)` — the source has no quotes (user just typed `(`). Insert
+///   wrapped: `q + name + q`.
+pub async fn tables(
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+) -> Vec<CompletionItem> {
     db.get_tables()
         .await
         .into_iter()
-        .map(|name| CompletionItem {
-            label: name.clone(),
-            kind: Some(CompletionItemKind::CLASS),
-            detail: Some("table".to_string()),
-            sort_text: Some(format!("1_{name}")),
-            filter_text: Some(name.clone()),
-            insert_text: Some(name),
-            ..Default::default()
+        .map(|name| {
+            let insert_text = match wrap_with_quote {
+                Some(q) => format!("{q}{name}{q}"),
+                None => name.clone(),
+            };
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::CLASS),
+                detail: Some("table".to_string()),
+                sort_text: Some(format!("1_{name}")),
+                filter_text: Some(name),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            }
         })
         .collect()
 }
@@ -49,7 +62,11 @@ pub async fn tables(db: &DatabaseSchemaProvider) -> Vec<CompletionItem> {
 ///   coming out of the cursor resolver, but guarded for safety)
 /// - The database schema isn't introspected yet (cold start, no DB connection,
 ///   or the table doesn't exist in the introspected schema)
-pub async fn columns_raw(ctx: &ChainContext, db: &DatabaseSchemaProvider) -> Vec<CompletionItem> {
+pub async fn columns_raw(
+    ctx: &ChainContext,
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+) -> Vec<CompletionItem> {
     let Some(table) = &ctx.effective_table else {
         return Vec::new();
     };
@@ -58,6 +75,10 @@ pub async fn columns_raw(ctx: &ChainContext, db: &DatabaseSchemaProvider) -> Vec
     columns
         .into_iter()
         .map(|(name, php_type)| {
+            let insert_text = match wrap_with_quote {
+                Some(q) => format!("{q}{name}{q}"),
+                None => name.clone(),
+            };
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
@@ -65,8 +86,8 @@ pub async fn columns_raw(ctx: &ChainContext, db: &DatabaseSchemaProvider) -> Vec
                 // DB columns rank first; later modes will add accessors at
                 // sort_text = "2_…" so columns still rank above them.
                 sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name.clone()),
-                insert_text: Some(name),
+                filter_text: Some(name),
+                insert_text: Some(insert_text),
                 ..Default::default()
             }
         })

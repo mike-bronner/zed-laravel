@@ -2995,6 +2995,46 @@ impl LaravelLanguageServer {
             ctx
         };
 
+        // Phase 6 post-toBase normalization: `User::where(...)->toBase()`
+        // flips the chain mode to BaseBuilder, but we still know which
+        // model was on the other side. effective_table stays None until
+        // we resolve it from the model. Doing this BEFORE dispatch means
+        // the `(BaseBuilder, Column)` arm runs columns_raw cleanly with
+        // a known table — same shape as a `DB::table('x')->where('|')`
+        // chain. Bonus: no casts/accessors get applied (Base = schema
+        // only), which is correct for what `->toBase()` returns.
+        let ctx = match (ctx.mode, ctx.effective_table.as_ref(), ctx.effective_model.clone()) {
+            (BuilderMode::BaseBuilder, None, Some(model)) => {
+                let root_clone = self.initialized_root.read().await.clone();
+                match root_clone {
+                    Some(root) => {
+                        match eloquent_completion::resolve_table_for_model(&model, &root).await {
+                            Some(table) => {
+                                info!(
+                                    "🔗 post-toBase: resolved model {:?} → table {:?}",
+                                    model, table
+                                );
+                                laravel_lsp::query_chain::ChainContext {
+                                    effective_table: Some(table),
+                                    ..ctx
+                                }
+                            }
+                            None => {
+                                info!(
+                                    "🔗 post-toBase: couldn't resolve table for model {:?} \
+                                     (file missing or no `$table` and snake_pluralize failed)",
+                                    model
+                                );
+                                ctx
+                            }
+                        }
+                    }
+                    None => ctx,
+                }
+            }
+            _ => ctx,
+        };
+
         let items = match (ctx.mode, ctx.expecting) {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
                 eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
@@ -3049,12 +3089,53 @@ impl LaravelLanguageServer {
             // would teach the user something untrue. Stay quiet.
             (BuilderMode::BaseBuilder, ArgKind::Relation)
             | (BuilderMode::BaseBuilder, ArgKind::ClosureCarrier) => Vec::new(),
+            // Phase 6: `User::all()->where('|')` / `->get()->where('|')` etc.
+            // — Collection mode. Result is a hydrated Collection<Model>; its
+            // `where()` filters in memory against model property access,
+            // which means accessors are valid args too (they're not in
+            // the DB but they ARE on the model instance). `columns_for_collection`
+            // returns DB columns + accessors, ranked so DB columns appear first.
+            (BuilderMode::EloquentCollection, ArgKind::Column) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::columns_for_collection(
+                            &ctx,
+                            db,
+                            wrap_with_quote,
+                            &root,
+                        )
+                        .await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve Collection-mode columns"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            // Collection's `load('|')` / `loadMissing('|')` work just like
+            // Builder's `with('|')` — they take relation names. ClosureCarrier
+            // also applies (Collection still supports keyed-array constraints
+            // through some helpers).
+            (BuilderMode::EloquentCollection, ArgKind::Relation)
+            | (BuilderMode::EloquentCollection, ArgKind::ClosureCarrier) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::relations(&ctx, wrap_with_quote, &root).await
+                    }
+                    None => Vec::new(),
+                }
+            }
             // `DB::table('|')` (or `DB::table(|`) — table-name completion.
             // Mode is always BaseBuilder by the time the receiver is
             // recognised, but we don't gate on it: even if a future receiver
             // shape produced Table args in another mode, tables are tables.
             (_, ArgKind::Table) => eloquent_completion::tables(db, wrap_with_quote).await,
-            // Other (mode, expecting) combinations land in Phases 6-9.
+            // Other (mode, expecting) combinations land in Phases 7-9.
             _ => Vec::new(),
         };
 

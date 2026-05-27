@@ -578,6 +578,85 @@ fn closure_scope_with_unrelated_var_returns_none() {
     );
 }
 
+// ---- Mode flips: toBase / Collection terminators (Phase 6) -------------
+
+#[test]
+fn to_base_flips_mode_to_base_builder() {
+    // `User::where(...)->toBase()->where('|')` — after toBase, the chain
+    // is operating on a Query Builder. Mode should be BaseBuilder; the
+    // model is still known (handler resolves the table from it).
+    let ctx = detect("User::where('a', 1)->toBase()->where('em|', 2);")
+        .expect("cursor after ->toBase() should still resolve");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(
+        ctx.effective_model.as_deref(),
+        Some("User"),
+        "model is preserved across toBase() — handler resolves table from it"
+    );
+}
+
+#[test]
+fn to_base_then_with_returns_none_no_relations_on_base() {
+    // `User::where(...)->toBase()->with('|')` — Query Builder has no
+    // relation methods, so `with` would fail at runtime. The walker
+    // detects expecting=Relation in BaseBuilder mode and the handler
+    // returns empty.
+    let ctx = detect("User::where('a', 1)->toBase()->with('po|');").expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+    // (The HANDLER returns empty for this combo; cursor just reports
+    // the mode + expecting accurately.)
+}
+
+#[test]
+fn get_terminator_flips_to_collection_mode() {
+    // `User::where(...)->get()->where('|')` — get() is a CollectionTerminator,
+    // so the chain is now operating on a Collection. Same model.
+    let ctx = detect("User::where('a', 1)->get()->where('em|', 2);").expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn all_static_starter_flips_to_collection_mode() {
+    // `User::all()->where('|')` — `all` is a Collection terminator at
+    // the static-call entry point. Mode should be EloquentCollection
+    // (not EloquentBuilder) by the time the cursor's link runs.
+    let ctx = detect("User::all()->where('na|me', 'jim');").expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn collection_load_resolves_to_relation() {
+    // Collection's `load('|')` takes relation names, same as Builder's
+    // `with('|')`. expecting should be Relation, mode EloquentCollection.
+    let ctx = detect("User::all()->load('po|sts');").expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::EloquentCollection);
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+}
+
+#[test]
+fn chain_terminator_count_kills_further_completion() {
+    // `count` is a ChainTerminator — it returns an int, so any chained
+    // method that follows can't be a builder operation. detect_in_chain
+    // returns None for cursors past a terminator.
+    let ctx = detect("User::where('a', 1)->count()->where('em|', 2);");
+    assert!(
+        ctx.is_none(),
+        "chain terminator should prevent further completion; got {ctx:?}"
+    );
+}
+
+#[test]
+fn chain_terminator_first_kills_further_completion() {
+    // `first` returns a Model|null, not a builder. Subsequent chained
+    // calls aren't builder ops either; completion stops.
+    let ctx = detect("User::where('a', 1)->first()->where('em|', 2);");
+    assert!(ctx.is_none(), "first() terminates the chain");
+}
+
 // ---- Chain terminators end completion -----------------------------------
 
 #[test]

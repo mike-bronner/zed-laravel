@@ -386,6 +386,105 @@ pub async fn resolve_related_model(
     rel.related_model
 }
 
+/// Phase 6 helper: resolve a model class to its table name.
+///
+/// Used for the post-`->toBase()` case where the chain has flipped to
+/// `BuilderMode::BaseBuilder` but `effective_table` is still `None` —
+/// we know the model, we just haven't asked which table it points at.
+///
+/// Reads `ModelMetadata` (with inheritance walking, so subclasses of a
+/// vendor model inherit the parent's `$table`), then either returns the
+/// explicit `$table` or falls back to snake_pluralize of the class
+/// basename.
+pub async fn resolve_table_for_model(class: &str, project_root: &Path) -> Option<String> {
+    let path = find_php_class_file(class, project_root)?;
+    let path_clone = path.clone();
+    let root_clone = project_root.to_path_buf();
+    let metadata = tokio::task::spawn_blocking(move || {
+        ModelMetadata::from_file_with_inheritance(&path_clone, &root_clone)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    let simple_class = class.rsplit('\\').next().unwrap_or(class);
+    Some(
+        metadata
+            .table_name
+            .unwrap_or_else(|| snake_pluralize(simple_class)),
+    )
+}
+
+/// Phase 6: column completion for an `EloquentCollection` chain — a
+/// chain that's been executed via `->get()` / `->all()` / `->pluck()` /
+/// `->cursor()` etc. After execution, the result is a hydrated
+/// `Collection<Model>` and Collection's `where()` filters in MEMORY
+/// against model property access — not SQL. That means accessors
+/// (`getFullNameAttribute`, `Attribute::make(get:)`) are valid `where()`
+/// args even though they don't exist as DB columns.
+///
+/// Returns DB columns (with cast-aware types) FIRST, then accessor items
+/// after them via sort_text ordering. Accessors are kinded as `PROPERTY`
+/// to visually distinguish them from `FIELD` DB columns.
+pub async fn columns_for_collection(
+    ctx: &ChainContext,
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+    project_root: &Path,
+) -> Vec<CompletionItem> {
+    // Start with DB columns + cast-aware types — same set the builder
+    // mode returns. Collection adds to this; doesn't replace.
+    let mut items = columns_for_builder(ctx, db, wrap_with_quote, project_root).await;
+
+    // Add accessors. Read metadata again (cheap: OS cache + tokio
+    // blocking pool); we don't plumb metadata through columns_for_builder's
+    // return since the helper's signature is shaped for the pre-execution
+    // case where accessors don't apply.
+    let Some(class) = &ctx.effective_model else {
+        return items;
+    };
+    let Some(path) = find_php_class_file(class, project_root) else {
+        return items;
+    };
+    let path_clone = path.clone();
+    let root_clone = project_root.to_path_buf();
+    let metadata = match tokio::task::spawn_blocking(move || {
+        ModelMetadata::from_file_with_inheritance(&path_clone, &root_clone)
+    })
+    .await
+    {
+        Ok(Some(m)) => m,
+        _ => return items,
+    };
+
+    for accessor in metadata.accessors {
+        let name = accessor.property_name;
+        let php_type = accessor.return_type.unwrap_or_else(|| "mixed".to_string());
+        let insert_text = match wrap_with_quote {
+            Some(q) => format!("{q}{name}{q}"),
+            None => name.clone(),
+        };
+        items.push(CompletionItem {
+            label: name.clone(),
+            // PROPERTY kind — semantically "computed property of the
+            // hydrated model", distinct from FIELD (DB column).
+            kind: Some(CompletionItemKind::PROPERTY),
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(format!("  {php_type}")),
+                description: Some("accessor".to_string()),
+            }),
+            detail: Some(format!("{php_type} (accessor)")),
+            // Sort AFTER DB columns (which use "1_…"). When the popup
+            // is fuzzy-filtered the explicit DB columns rank first.
+            sort_text: Some(format!("2_{name}")),
+            filter_text: Some(name),
+            insert_text: Some(insert_text),
+            ..Default::default()
+        });
+    }
+
+    items
+}
+
 /// Convert a PascalCase class basename to Laravel's default table name:
 /// snake_case + naive pluralization. Models with non-standard pluralization
 /// (people, octopi, child → children) declare `$table` explicitly; this

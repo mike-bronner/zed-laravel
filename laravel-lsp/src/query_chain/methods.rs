@@ -135,10 +135,13 @@ pub const MODE_FLIP_TO_BASE: &[&str] = &["toBase", "getQuery"];
 /// After these, the chain is operating on a hydrated `Collection`, so
 /// accessors and cast names join DB columns as valid `where` arguments.
 ///
-/// Note: `all()` is a Collection-returning static starter (`User::all()`) but
-/// only appears as the chain entry point; handled at the receiver level rather
-/// than as a mid-chain terminator.
+/// `all()` is included here even though it's usually the static-call entry
+/// point on a model (`User::all()`). It still occupies a link in the chain
+/// (the first one) and the walker applies the effect AFTER that link runs
+/// — so the cursor at `User::all()->where('|')` correctly sees mode flipped
+/// to EloquentCollection.
 pub const COLLECTION_TERMINATORS: &[&str] = &[
+    "all",
     "get",
     "pluck",
     "cursor",

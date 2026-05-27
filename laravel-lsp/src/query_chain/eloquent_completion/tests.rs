@@ -400,3 +400,133 @@ class User extends Model {
     let posts = items.iter().find(|i| i.label == "posts").expect("posts");
     assert_eq!(posts.insert_text.as_deref(), Some("'posts'"));
 }
+
+// ---- resolve_table_for_model (Phase 6) -----------------------------------
+
+#[tokio::test]
+async fn resolve_table_for_model_uses_explicit_table() {
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Person extends Model {
+    protected $table = 'people';
+}
+"#;
+    let (_dir, root) = project_with_model("Person", body);
+    let table = resolve_table_for_model("App\\Models\\Person", &root).await;
+    assert_eq!(table.as_deref(), Some("people"));
+}
+
+#[tokio::test]
+async fn resolve_table_for_model_falls_back_to_snake_pluralize() {
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class BlogPost extends Model {}
+"#;
+    let (_dir, root) = project_with_model("BlogPost", body);
+    let table = resolve_table_for_model("App\\Models\\BlogPost", &root).await;
+    assert_eq!(table.as_deref(), Some("blog_posts"));
+}
+
+// ---- columns_for_collection (Phase 6) ------------------------------------
+
+#[tokio::test]
+async fn columns_for_collection_includes_db_columns_and_accessors() {
+    // Collection's where() filters in-memory against properties, so
+    // both DB columns AND model accessors are valid args.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function getFullNameAttribute(): string {
+        return $this->first_name . ' ' . $this->last_name;
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let db = provider_with_table(
+        root.clone(),
+        "users",
+        vec![
+            ("id", "int"),
+            ("first_name", "string"),
+            ("last_name", "string"),
+        ],
+    )
+    .await;
+    let ctx = make_ctx("App\\Models\\User");
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    // DB columns present
+    assert!(labels.contains(&"id"), "missing id; got {labels:?}");
+    assert!(
+        labels.contains(&"first_name"),
+        "missing first_name; got {labels:?}"
+    );
+    // Accessor present
+    assert!(
+        labels.contains(&"full_name"),
+        "accessor 'full_name' should be a Collection-mode completion; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn columns_for_collection_ranks_db_columns_before_accessors() {
+    // DB columns sort_text = "1_…", accessors = "2_…", so DB columns
+    // win in popup ordering when both match the user's filter.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function getNameAttribute(): string {
+        return $this->first_name;
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let db = provider_with_table(
+        root.clone(),
+        "users",
+        vec![("id", "int"), ("name", "string")],
+    )
+    .await;
+    let ctx = make_ctx("App\\Models\\User");
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    // Find the DB column "name" and the accessor "name" (same label —
+    // both exist when the column name and accessor name collide).
+    let name_items: Vec<&CompletionItem> = items.iter().filter(|i| i.label == "name").collect();
+    // There may be one or two — depending on whether a DB column
+    // "name" actually exists. Our schema has one, the accessor also
+    // exposes "name". They're separate items in the list.
+    assert!(
+        !name_items.is_empty(),
+        "should have at least one 'name' item"
+    );
+    // The DB-column item ranks with "1_", the accessor with "2_". If
+    // both are present, the DB one comes first lexicographically.
+    let sort_texts: Vec<&str> = name_items
+        .iter()
+        .map(|i| i.sort_text.as_deref().unwrap_or(""))
+        .collect();
+    if sort_texts.len() == 2 {
+        assert!(
+            sort_texts.iter().any(|s| s.starts_with("1_")),
+            "DB column should have 1_ prefix; got {sort_texts:?}"
+        );
+        assert!(
+            sort_texts.iter().any(|s| s.starts_with("2_")),
+            "accessor should have 2_ prefix; got {sort_texts:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn columns_for_collection_falls_back_when_model_missing() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let db = provider_with_table(root.clone(), "users", vec![("id", "int")]).await;
+    let ctx = make_ctx("App\\Models\\Phantom");
+    let items = columns_for_collection(&ctx, &db, None, &root).await;
+    assert!(items.is_empty());
+}

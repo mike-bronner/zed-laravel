@@ -159,13 +159,14 @@ impl ModelMetadata {
                 let parent_fqcn =
                     Self::resolve_to_fqcn(&parent_raw, file_namespace.as_deref(), &use_aliases);
 
-                let parent_path = Self::find_class_file_by_fqcn(&parent_fqcn, project_root)
-                    .or_else(|| {
-                        crate::class_locator::find_php_class_file_in_app_or_vendor(
-                            &parent_fqcn,
-                            project_root,
-                        )
-                    });
+                // Single call covers both PSR-4 paths (App\ and vendor/)
+                // and falls back to basename walk if neither shape exists.
+                // The PSR-4 ordering inside `find_php_class_file_in_app_or_vendor`
+                // means project-local classes shadow vendor classes.
+                let parent_path = crate::class_locator::find_php_class_file_in_app_or_vendor(
+                    &parent_fqcn,
+                    project_root,
+                );
 
                 if let Some(parent_path) = parent_path {
                     if let Some(parent_meta) =
@@ -254,69 +255,12 @@ impl ModelMetadata {
         name.to_string()
     }
 
-    /// Map a fully-qualified class name to its source file path using
-    /// Laravel/Composer conventions:
-    ///
-    /// - `App\Models\User` → `app/Models/User.php`
-    ///   (or `src/...` if the project uses `src/` for app code)
-    /// - `Laravel\Passport\Token` →
-    ///   `vendor/laravel/passport/src/Token.php`
-    ///   (lowercased vendor + package, then `src/`, then remaining
-    ///   segments as path)
-    /// - `Spatie\Permission\Models\Role` →
-    ///   `vendor/spatie/permission/src/Models/Role.php`
-    ///
-    /// Returns `None` if none of the candidate paths exist on disk.
-    /// The caller then falls back to a basename walk via class_locator.
-    fn find_class_file_by_fqcn(fqcn: &str, project_root: &Path) -> Option<PathBuf> {
-        let segments: Vec<&str> = fqcn.split('\\').filter(|s| !s.is_empty()).collect();
-        if segments.is_empty() {
-            return None;
-        }
-        let class_name = *segments.last().unwrap();
-        let ns_segments = &segments[..segments.len() - 1];
-
-        // App\Models\User → app/Models/User.php (and src/ alternative)
-        if ns_segments.first().map(|s| s.to_ascii_lowercase()) == Some("app".to_string()) {
-            let rest = &ns_segments[1..];
-            for app_dir in ["app", "src"] {
-                let mut path = project_root.join(app_dir);
-                for seg in rest {
-                    path = path.join(seg);
-                }
-                path = path.join(format!("{class_name}.php"));
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-
-        // Vendor convention: lowercase first two segments → package
-        // directory; remaining segments are paths under `src/` (or
-        // under the package root if `src/` doesn't exist for this
-        // particular package).
-        if ns_segments.len() >= 2 {
-            let vendor = ns_segments[0].to_ascii_lowercase();
-            let pkg = ns_segments[1].to_ascii_lowercase();
-            let rest = &ns_segments[2..];
-
-            for src_segment in ["src", ""] {
-                let mut path = project_root.join("vendor").join(&vendor).join(&pkg);
-                if !src_segment.is_empty() {
-                    path = path.join(src_segment);
-                }
-                for seg in rest {
-                    path = path.join(seg);
-                }
-                path = path.join(format!("{class_name}.php"));
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-
-        None
-    }
+    // `find_class_file_by_fqcn` lived here until Phase 5.9, then moved
+    // into class_locator so non-inheritance callers (columns_for_builder,
+    // relations, resolve_related_model) also benefit. The inheritance
+    // walker now calls `class_locator::find_php_class_file_in_app_or_vendor`
+    // directly — it already chains the FQCN-aware lookup with the
+    // basename-walk fallback.
 
     /// Extract the parent class name from `class X extends Y`. Returns
     /// the parent as written (may be a simple name like `Token` or a

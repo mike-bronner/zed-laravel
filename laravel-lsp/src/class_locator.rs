@@ -29,6 +29,14 @@ use walkdir::WalkDir;
 /// found. Does not parse the file to verify the class name inside — relies on
 /// Laravel's strong convention that file basename matches class name.
 pub fn find_php_class_file(class_name: &str, root: &Path) -> Option<PathBuf> {
+    // Try the namespace-aware path mapping first — `App\Models\User`
+    // should land at `app/Models/User.php`, not at the first `User.php`
+    // we happen to walk into (which could be `app/Nova/User.php` or
+    // similar). Falls back to a basename walk under app/ if the FQCN
+    // doesn't map to an existing file.
+    if let Some(path) = find_php_class_file_by_fqcn(class_name, root, false) {
+        return Some(path);
+    }
     find_php_class_file_impl(class_name, root, false)
 }
 
@@ -42,13 +50,95 @@ pub fn find_php_class_file(class_name: &str, root: &Path) -> Option<PathBuf> {
 /// (≤10 levels) and the result is cached behind ModelMetadata anyway.
 /// app/-side definitions still win — they're checked first.
 pub fn find_php_class_file_in_app_or_vendor(class_name: &str, root: &Path) -> Option<PathBuf> {
-    // Check app/src first — a project-local class always shadows a vendor
-    // class of the same basename. Only fall back to vendor when nothing
-    // matched in app/.
+    // Try FQCN-aware lookup across app/ AND vendor/ first. If neither
+    // PSR-4-shaped path exists, fall through to a basename walk —
+    // again preferring app/ over vendor/ since project classes shadow
+    // vendor classes with matching basenames.
+    if let Some(path) = find_php_class_file_by_fqcn(class_name, root, false) {
+        return Some(path);
+    }
+    if let Some(path) = find_php_class_file_by_fqcn(class_name, root, true) {
+        return Some(path);
+    }
     if let Some(path) = find_php_class_file_impl(class_name, root, false) {
         return Some(path);
     }
     find_php_class_file_impl(class_name, root, true)
+}
+
+/// Map a fully-qualified class name to its source file path using
+/// Laravel/Composer conventions:
+///
+/// - `App\Models\User` → `app/Models/User.php` (or `src/Models/User.php`
+///   for projects that use `src/` for app code)
+/// - `Laravel\Passport\Token` → `vendor/laravel/passport/src/Token.php`
+///   (lowercased vendor + package, then `src/`, then remaining
+///   namespace segments as path components)
+/// - `Spatie\Permission\Models\Role` →
+///   `vendor/spatie/permission/src/Models/Role.php`
+///
+/// `search_vendor`: when `true`, only consider the vendor/ mapping;
+/// when `false`, only consider the App/ mapping. Callers chain both
+/// modes to cover the realistic search space.
+///
+/// Returns `None` if no candidate path exists on disk. The caller then
+/// falls back to a basename walk so we still resolve unconventional
+/// PSR-4 layouts.
+fn find_php_class_file_by_fqcn(
+    fqcn: &str,
+    project_root: &Path,
+    search_vendor: bool,
+) -> Option<PathBuf> {
+    let segments: Vec<&str> = fqcn.split('\\').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let class_name = *segments.last().unwrap();
+    let ns_segments = &segments[..segments.len() - 1];
+
+    if !search_vendor {
+        // App\Models\User → app/Models/User.php (and src/ alternative for
+        // projects that use src/ for app code).
+        if ns_segments.first().map(|s| s.to_ascii_lowercase()) == Some("app".to_string()) {
+            let rest = &ns_segments[1..];
+            for app_dir in ["app", "src"] {
+                let mut path = project_root.join(app_dir);
+                for seg in rest {
+                    path = path.join(seg);
+                }
+                path = path.join(format!("{class_name}.php"));
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+        return None;
+    }
+
+    // Vendor convention: lowercase first two segments → package
+    // directory; remaining segments are paths under `src/` (or under
+    // the package root if `src/` doesn't exist for this package).
+    if ns_segments.len() < 2 {
+        return None;
+    }
+    let vendor = ns_segments[0].to_ascii_lowercase();
+    let pkg = ns_segments[1].to_ascii_lowercase();
+    let rest = &ns_segments[2..];
+
+    for src_segment in ["src", ""] {
+        let mut path = project_root.join("vendor").join(&vendor).join(&pkg);
+        if !src_segment.is_empty() {
+            path = path.join(src_segment);
+        }
+        for seg in rest {
+            path = path.join(seg);
+        }
+        path = path.join(format!("{class_name}.php"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn find_php_class_file_impl(class_name: &str, root: &Path, search_vendor: bool) -> Option<PathBuf> {
@@ -95,4 +185,102 @@ fn find_php_class_file_impl(class_name: &str, root: &Path, search_vendor: bool) 
 /// some projects also use `src/` for libraries living alongside the app.
 fn search_roots(root: &Path) -> Vec<PathBuf> {
     vec![root.join("app"), root.join("src")]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Spin up a Laravel-shaped tempdir with the given (path, body)
+    /// pairs. Paths are relative to the project root.
+    fn project_with_files(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        for (relpath, body) in files {
+            let full = dir.path().join(relpath);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, body).unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    #[test]
+    fn fqcn_aware_lookup_prefers_namespace_shape_match() {
+        // Mike's crossbible-vapor case: TWO files named Version.php live
+        // in the project. The FQCN `App\Models\Version` should map to
+        // `app/Models/Version.php`, NOT to `app/Nova/Filters/Version.php`
+        // even though the latter is also a Version.php with the same
+        // basename.
+        let (_dir, root) = project_with_files(&[
+            (
+                "app/Models/Version.php",
+                "<?php\nnamespace App\\Models;\nclass Version {}",
+            ),
+            (
+                "app/Nova/Filters/Version.php",
+                "<?php\nnamespace App\\Nova\\Filters;\nclass Version {}",
+            ),
+        ]);
+        let path =
+            find_php_class_file("App\\Models\\Version", &root).expect("should find the model");
+        assert!(
+            path.ends_with("app/Models/Version.php"),
+            "should pick the namespace-matching file; got: {path:?}"
+        );
+    }
+
+    #[test]
+    fn fqcn_aware_lookup_falls_back_to_basename_when_no_shape_match() {
+        // If only one Version.php exists in the project (no PSR-4 match
+        // possible), the basename walk still finds it.
+        let (_dir, root) =
+            project_with_files(&[("app/SomeOtherPlace/Version.php", "<?php\nclass Version {}")]);
+        let path = find_php_class_file("App\\Models\\Version", &root).expect("fallback walk");
+        assert!(path.ends_with("app/SomeOtherPlace/Version.php"));
+    }
+
+    #[test]
+    fn fqcn_lookup_routes_vendor_classes_to_psr4_path() {
+        // `Laravel\Passport\Token` should resolve to the standard
+        // Composer PSR-4 path. Note: only `find_php_class_file_in_app_or_vendor`
+        // searches vendor — `find_php_class_file` stays app-side only.
+        let (_dir, root) = project_with_files(&[(
+            "vendor/laravel/passport/src/Token.php",
+            "<?php\nnamespace Laravel\\Passport;\nclass Token {}",
+        )]);
+        let path = find_php_class_file_in_app_or_vendor("Laravel\\Passport\\Token", &root)
+            .expect("vendor PSR-4 lookup");
+        assert!(path.ends_with("vendor/laravel/passport/src/Token.php"));
+    }
+
+    #[test]
+    fn fqcn_lookup_app_class_shadows_vendor_match() {
+        // Both an app/-side and a vendor/-side file with the same FQCN
+        // exist? App wins (matches PSR-4 autoload behavior).
+        let (_dir, root) = project_with_files(&[
+            (
+                "app/Models/Token.php",
+                "<?php\nnamespace App\\Models;\nclass Token {}",
+            ),
+            (
+                "vendor/laravel/passport/src/Token.php",
+                "<?php\nnamespace Laravel\\Passport;\nclass Token {}",
+            ),
+        ]);
+        let path = find_php_class_file_in_app_or_vendor("App\\Models\\Token", &root).unwrap();
+        assert!(
+            path.ends_with("app/Models/Token.php"),
+            "App\\Models\\Token should resolve to the project file; got {path:?}"
+        );
+    }
+
+    #[test]
+    fn bare_class_name_with_no_namespace_still_uses_basename_walk() {
+        // `Foo` (no namespace) doesn't have a PSR-4 shape — should fall
+        // through to basename walking.
+        let (_dir, root) = project_with_files(&[("app/Services/Foo.php", "<?php\nclass Foo {}")]);
+        let path = find_php_class_file("Foo", &root).expect("bare-name walk");
+        assert!(path.ends_with("app/Services/Foo.php"));
+    }
 }

@@ -145,6 +145,91 @@ fn fqcn_db_facade_recognised() {
     }
 }
 
+// ---- use-alias resolution -----------------------------------------------
+
+#[test]
+fn use_aliased_db_facade_recognised() {
+    // `use ... as Database; Database::table('users')` — receiver name in
+    // source isn't `DB`, but the alias resolves to the DB facade FQCN.
+    let chains = extract(
+        "use Illuminate\\Support\\Facades\\DB as Database;\n\
+         Database::table('users')->where('email', 1);",
+    );
+    let db_chain = chains
+        .iter()
+        .find(|c| matches!(&c.receiver, ChainReceiver::DbTable { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "aliased DB facade not recognised; got receivers {:?}",
+                chains.iter().map(|c| &c.receiver).collect::<Vec<_>>()
+            )
+        });
+    match &db_chain.receiver {
+        ChainReceiver::DbTable { table, .. } => assert_eq!(table, "users"),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn use_imported_db_no_alias_still_recognised() {
+    // `use Illuminate\Support\Facades\DB; DB::table('users')` — the
+    // canonical Laravel import. Resolution maps `DB` → the FQCN; basename
+    // check still picks it up.
+    let chains = extract(
+        "use Illuminate\\Support\\Facades\\DB;\n\
+         DB::table('users')->where('email', 1);",
+    );
+    assert!(
+        chains
+            .iter()
+            .any(|c| matches!(&c.receiver, ChainReceiver::DbTable { .. })),
+        "imported DB facade not recognised; got {:?}",
+        chains.iter().map(|c| &c.receiver).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn use_aliased_eloquent_model_resolves_to_fqcn() {
+    // `use App\Models\User as MyUser; MyUser::where(...)` — the receiver
+    // string in source is `MyUser`, but the chain's receiver should hold
+    // the resolved FQCN. Phase 4's model resolver will find the file there.
+    let chains = extract(
+        "use App\\Models\\User as MyUser;\n\
+         MyUser::where('email', $e)->get();",
+    );
+    let model_chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::StaticModel(_))
+            )
+        })
+        .unwrap();
+    match &model_chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(name)) => {
+            assert_eq!(name, "App\\Models\\User");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn shadowing_alias_does_not_match_db_facade() {
+    // `use Some\Other\Klass as DB;` — `DB` in source refers to
+    // Some\Other\Klass, NOT the facade. Don't classify as DbTable.
+    let chains = extract(
+        "use Some\\Other\\Klass as DB;\n\
+         DB::table('users')->where('email', 1);",
+    );
+    let chain = chains.first().expect("chain expected");
+    assert!(
+        !matches!(chain.receiver, ChainReceiver::DbTable { .. }),
+        "shadowed DB shouldn't be classified as facade; receiver: {:?}",
+        chain.receiver
+    );
+}
+
 // ---- Link classification ------------------------------------------------
 
 #[test]

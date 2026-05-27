@@ -22,6 +22,7 @@
 
 use super::chain::*;
 use super::methods::{arg_kind, chain_effect};
+use super::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
 use tree_sitter::{Node, Tree};
 
 /// Shift every byte range in a chain by `(byte_offset - wrapper_prefix_len)`.
@@ -76,14 +77,19 @@ pub fn shift_chain_byte_ranges(
 /// Extract every builder chain in the file. Order of return is depth-first
 /// pre-order across the AST — callers that need positional lookup should
 /// build their own index.
+///
+/// `use` statement aliases are resolved as part of this pass so chains like
+/// `Database::table(...)` (when imported as `use ... DB as Database;`) get
+/// classified as `DbTable` receivers, not Eloquent models.
 pub fn extract_chains(tree: &Tree, source: &str) -> Vec<BuilderChain> {
     let bytes = source.as_bytes();
+    let aliases = extract_use_aliases(tree, source);
     let mut chains = Vec::new();
     let mut stack: Vec<Node> = vec![tree.root_node()];
 
     while let Some(node) = stack.pop() {
         if is_chain_root(node) {
-            if let Some(chain) = build_chain_from_root(node, bytes) {
+            if let Some(chain) = build_chain_from_root(node, bytes, &aliases) {
                 chains.push(chain);
             }
         }
@@ -128,7 +134,7 @@ fn is_chain_root(node: Node) -> bool {
 /// Walk down the `object` chain from `root`, collecting links in reverse, then
 /// reverse to source order. Returns `None` if the chain receiver can't be
 /// identified at all (the chain is then uninteresting for completion).
-fn build_chain_from_root(root: Node, bytes: &[u8]) -> Option<BuilderChain> {
+fn build_chain_from_root(root: Node, bytes: &[u8], aliases: &UseAliases) -> Option<BuilderChain> {
     let span_byte_range = (root.start_byte(), root.end_byte());
 
     // Collect links bottom-up: start at `root`, walk its `object` until we
@@ -148,7 +154,7 @@ fn build_chain_from_root(root: Node, bytes: &[u8]) -> Option<BuilderChain> {
             // the scope is the receiver, not another call).
             if kind == "scoped_call_expression" {
                 // Bottom of the chain. The scope is the receiver.
-                let receiver = scoped_call_receiver(node, bytes, &links_reversed);
+                let receiver = scoped_call_receiver(node, bytes, &links_reversed, aliases);
 
                 // For `DB::table('|')`, the bottom link's first string arg
                 // names a table. Annotate it so the cursor resolver can
@@ -310,22 +316,32 @@ fn closure_body_range(closure: Node) -> Option<(usize, usize)> {
 /// call (the one whose scope is the receiver) sits at `links_reversed.last()`.
 /// That's the link we inspect to spot `DB::table('users')`: scope is `DB`,
 /// method is `table`, first arg is a string literal naming the table.
+///
+/// `aliases` lets us resolve `use ... as Foo; Foo::table(...)` — without it
+/// aliased imports of the DB facade would slip through as Eloquent models.
 fn scoped_call_receiver(
     call_node: Node,
     bytes: &[u8],
     links_reversed: &[ChainLink],
+    aliases: &UseAliases,
 ) -> ChainReceiver {
     let Some(scope_node) = call_node.child_by_field_name("scope") else {
         return ChainReceiver::Unknown;
     };
-    let Some(class_name) = node_text(scope_node, bytes) else {
+    let Some(class_name_raw) = node_text(scope_node, bytes) else {
         return ChainReceiver::Unknown;
     };
+
+    // Resolve the class name through `use` aliases. Examples:
+    //   `Database::table` with `use ... DB as Database;` → `Illuminate\...\DB`
+    //   `DB::table` with `use Illuminate\...\DB;` → `Illuminate\...\DB`
+    //   `DB::table` with no `use` → `DB` (unchanged; Laravel's global alias)
+    let resolved = resolve_class_name(class_name_raw, aliases);
 
     // PHP class names are case-insensitive — `db::table()` and `DB::table()`
     // resolve to the same class at runtime. Match accordingly so `db::`
     // chains aren't silently misclassified as Eloquent models.
-    if is_db_facade(class_name) {
+    if is_db_facade(&resolved) {
         if let Some(bottom_link) = links_reversed.last() {
             if bottom_link.method.eq_ignore_ascii_case("table") {
                 if let Some(ChainArg::StringLit {
@@ -343,11 +359,12 @@ fn scoped_call_receiver(
         }
     }
 
-    // Strip a leading backslash so `\App\Models\User` and `User` produce the
-    // same `StaticModel("User")` — receiver resolution later in the pipeline
-    // does the actual class lookup.
-    let class_name = class_name.trim_start_matches('\\').to_string();
-    ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class_name))
+    // Not the DB facade — emit an Eloquent model receiver using the
+    // *resolved* class name. This means `use App\Models\User as MyUser;
+    // MyUser::query()` will land as `StaticModel("App\Models\User")`, which
+    // resolves cleanly in later phases. The leading backslash is already
+    // stripped by `resolve_class_name`.
+    ChainReceiver::Eloquent(EloquentReceiver::StaticModel(resolved))
 }
 
 /// Whether `class_name` (as it appears in the source — possibly with `\`

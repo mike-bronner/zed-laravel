@@ -865,25 +865,124 @@ impl DatabaseSchemaProvider {
         }
         match sqlx::query("SHOW DATABASES").fetch_all(&pool).await {
             Ok(rows) => {
+                let row_count = rows.len();
+                // Try by column name first (`Database` is the standard for
+                // SHOW DATABASES output) then fall back to positional index.
+                // The two-tier helps when sqlx and the server disagree on
+                // the column type or name.
                 let dbs: Vec<String> = rows
                     .into_iter()
-                    .filter_map(|r| r.try_get::<String, _>(0).ok())
+                    .filter_map(|r| {
+                        r.try_get::<String, _>("Database")
+                            .or_else(|_| r.try_get::<String, _>(0))
+                            .ok()
+                    })
                     .collect();
-                info!("MySQL probe — visible databases = {:?}", dbs);
+                info!(
+                    "MySQL probe — SHOW DATABASES returned {} rows, parsed {}: {:?}",
+                    row_count,
+                    dbs.len(),
+                    dbs
+                );
             }
             Err(e) => {
                 warn!("MySQL probe (SHOW DATABASES) failed: {}", e);
             }
         }
 
-        // Get tables
-        let tables: Vec<String> = sqlx::query("SHOW TABLES")
+        // What grants does the connected user actually have? If the LSP user
+        // turns out to be different from the app's user (e.g., wildcard vs
+        // host-specific user shadowing), this output makes it obvious.
+        match sqlx::query("SHOW GRANTS FOR CURRENT_USER()")
             .fetch_all(&pool)
             .await
-            .ok()?
+        {
+            Ok(rows) => {
+                let grants: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| r.try_get::<String, _>(0).ok())
+                    .collect();
+                info!(
+                    "MySQL probe — SHOW GRANTS for current user ({} grants): {:?}",
+                    grants.len(),
+                    grants
+                );
+            }
+            Err(e) => {
+                warn!("MySQL probe (SHOW GRANTS) failed: {}", e);
+            }
+        }
+
+        // information_schema cross-check probe — bypasses SHOW commands
+        // entirely. If this returns a non-zero count but SHOW TABLES below
+        // returns zero, we know the problem is specific to SHOW (driver
+        // quirk, connection state, etc.) and not actual visibility.
+        match sqlx::query(&format!(
+            "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = '{}'",
+            config.database.replace('\'', "''")
+        ))
+        .fetch_one(&pool)
+        .await
+        {
+            Ok(row) => {
+                let n: i64 = row.try_get("n").unwrap_or(-1);
+                info!(
+                    "MySQL probe — information_schema.tables count for {:?} = {}",
+                    config.database, n
+                );
+            }
+            Err(e) => {
+                warn!("MySQL probe (information_schema count) failed: {}", e);
+            }
+        }
+        // Also try listing them via information_schema, so we can compare
+        // shape against SHOW TABLES below.
+        match sqlx::query(&format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = '{}' LIMIT 5",
+            config.database.replace('\'', "''")
+        ))
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => {
+                let names: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        r.try_get::<String, _>("table_name")
+                            .or_else(|_| r.try_get::<String, _>(0))
+                            .ok()
+                    })
+                    .collect();
+                info!(
+                    "MySQL probe — first 5 tables via information_schema = {:?}",
+                    names
+                );
+            }
+            Err(e) => {
+                warn!("MySQL probe (information_schema sample) failed: {}", e);
+            }
+        }
+
+        // Get tables. Log row count + parsed count separately so we can
+        // tell "MySQL returned 0 rows" (privilege issue / empty DB) from
+        // "we failed to parse the column" (sqlx / driver weirdness).
+        let table_rows = match sqlx::query("SHOW TABLES").fetch_all(&pool).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("MySQL: SHOW TABLES failed: {}", e);
+                return None;
+            }
+        };
+        let row_count = table_rows.len();
+        let tables: Vec<String> = table_rows
             .into_iter()
             .filter_map(|row| row.try_get::<String, _>(0).ok())
             .collect();
+        info!(
+            "MySQL: SHOW TABLES returned {} rows, parsed {} table names",
+            row_count,
+            tables.len()
+        );
 
         // Get columns for each table (with types)
         let mut columns = HashMap::new();

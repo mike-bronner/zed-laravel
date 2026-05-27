@@ -2819,18 +2819,59 @@ impl LaravelLanguageServer {
         };
 
         if items.is_empty() {
-            info!(
-                "🔗 chain completion: matched {:?} but produced 0 items — \
-                 likely DB unreachable or table/columns not in introspected schema. \
-                 Check the database WARN above; .env DB_HOST may not resolve \
-                 outside of Docker/Sail.",
-                ctx.expecting
-            );
+            // Distinguish two empty-result causes for the log/diagnostic:
+            // (a) DB is unreachable — actionable, user can fix .env. Show a
+            //     one-time INFO toast so they discover the dependency.
+            // (b) DB is reachable but the specific table/columns aren't in
+            //     the introspected schema (e.g., user typed a typo, table
+            //     was dropped, schema cache stale). Stay silent — toasting
+            //     every time would be noisy.
+            let connection_error = db.get_last_error().await;
+            drop(db_guard);
+
+            if let Some(error) = connection_error {
+                info!(
+                    "🔗 chain completion: matched {:?} but produced 0 items — \
+                     DB connection error: {}",
+                    ctx.expecting, error.message
+                );
+                self.maybe_notify_db_unreachable(&error.message).await;
+            } else {
+                info!(
+                    "🔗 chain completion: matched {:?} but produced 0 items — \
+                     schema reachable but table/columns absent",
+                    ctx.expecting
+                );
+            }
         } else {
             info!("🔗 chain completion: returning {} items", items.len());
         }
 
         Some(items)
+    }
+
+    /// Send a one-time `window/showMessage` informing the user that table
+    /// and column autocomplete requires a working DB connection. Shares the
+    /// `database_diagnostic_shown` flag with the existing exists:/unique:
+    /// diagnostic path, so the user only sees ONE notification per LSP
+    /// session no matter how they hit the unreachable DB.
+    async fn maybe_notify_db_unreachable(&self, error_message: &str) {
+        let mut shown = self.database_diagnostic_shown.write().await;
+        if *shown {
+            return;
+        }
+        *shown = true;
+        drop(shown);
+
+        let message = format!(
+            "Laravel LSP: Database is unreachable, so table and column \
+             autocompletion is disabled. Fix DB connectivity in .env \
+             (DB_HOST / DB_PORT / credentials) and reload the window to \
+             enable. Error: {error_message}"
+        );
+        self.client
+            .show_message(tower_lsp::lsp_types::MessageType::INFO, message)
+            .await;
     }
 
     fn new(client: Client) -> Self {

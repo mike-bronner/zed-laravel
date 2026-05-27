@@ -662,12 +662,136 @@ $rows = DB::table('users')
 }
 
 #[test]
-fn unknown_receiver_classified_as_unknown() {
-    // `($qb)` — parenthesised expression as receiver. We don't try to
-    // resolve these in Phase 2; the chain just gets ChainReceiver::Unknown.
+fn parenthesized_var_receiver_unwraps_to_instance_var() {
+    // `($qb)->where('a', 1);` — parens are syntactic noise around a
+    // variable receiver. Phase 5.1 unwraps the parens and treats it the
+    // same as the un-parenthesised form. Phase 9's var-type resolution
+    // will then fill in `php_type` from a docblock / typed param if it
+    // can find one.
     let chains = extract("($qb)->where('a', 1);");
-    // The extractor still produces a chain (the chain root exists), but the
-    // receiver is Unknown.
+    assert_eq!(chains.len(), 1);
+    match &chains[0].receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type }) => {
+            assert_eq!(var, "qb");
+            assert!(php_type.is_none());
+        }
+        other => panic!("expected InstanceVar through parens, got {other:?}"),
+    }
+}
+
+// ---- (new ClassName) / (new self) receivers (Phase 5.1) ------------------
+
+#[test]
+fn new_class_name_receiver_resolves_to_static_model() {
+    // `(new User)->where('|')` — common Laravel pattern. Treat the
+    // freshly-constructed instance as if it were `User::where('|')`.
+    let chains = extract("(new User)->where('email', $e);");
+    assert_eq!(chains.len(), 1);
+    match &chains[0].receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+            assert_eq!(class, "User");
+        }
+        other => panic!("expected StaticModel(User), got {other:?}"),
+    }
+}
+
+#[test]
+fn new_class_name_resolves_through_use_aliases() {
+    // With `use App\Models\User;`, the receiver's class should be
+    // fully-qualified before it reaches downstream handlers — same as
+    // `User::where(...)`.
+    let chains = extract("use App\\Models\\User;\n(new User)->where('email', $e);");
+    let chain = chains
+        .iter()
+        .find(|c| !c.links.is_empty() && c.links[0].method == "where")
+        .expect("expected a chain with where()");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+            assert_eq!(class, "App\\Models\\User");
+        }
+        other => panic!("expected StaticModel(App\\Models\\User), got {other:?}"),
+    }
+}
+
+#[test]
+fn new_self_resolves_against_enclosing_class() {
+    // `(new self)->with(...)` inside a class — `self` refers to that
+    // class. We extract the enclosing class name so the receiver is the
+    // same as `(new ClassName)->`.
+    let src = "class User { \
+               public static function active() { \
+                 return (new self)->where('active', 1)->with('roles'); \
+               } \
+             }";
+    let chains = extract(src);
+    let chain = chains
+        .iter()
+        .find(|c| c.links.iter().any(|l| l.method == "where"))
+        .expect("chain not found");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+            assert_eq!(class, "User", "self should resolve to the enclosing class");
+        }
+        other => panic!("expected StaticModel(User) from self, got {other:?}"),
+    }
+}
+
+#[test]
+fn new_static_resolves_against_enclosing_class() {
+    // `new static` behaves the same as `new self` for our purposes (we
+    // don't track late static binding's runtime semantics). Resolve to
+    // the enclosing class.
+    let src = "class Post { \
+               public static function published() { \
+                 return (new static)->where('published', true); \
+               } \
+             }";
+    let chains = extract(src);
+    let chain = chains
+        .iter()
+        .find(|c| c.links.iter().any(|l| l.method == "where"))
+        .expect("chain not found");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+            assert_eq!(class, "Post");
+        }
+        other => panic!("expected StaticModel(Post) from static, got {other:?}"),
+    }
+}
+
+#[test]
+fn new_self_outside_class_returns_unknown() {
+    // `(new self)` at the top level (no enclosing class) can't be
+    // resolved — `self` is meaningless. Return Unknown rather than
+    // guessing.
+    let chains = extract("(new self)->where('a', 1);");
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0].receiver, ChainReceiver::Unknown);
+}
+
+#[test]
+fn new_parent_returns_unknown_for_now() {
+    // `(new parent)` needs cross-file resolution (we'd have to read the
+    // parent class file). Punt for now; Phase 9's var-type work can pick
+    // this up.
+    let src = "class User extends BaseModel { \
+               public static function scope() { \
+                 return (new parent)->where('a', 1); \
+               } \
+             }";
+    let chains = extract(src);
+    let chain = chains
+        .iter()
+        .find(|c| c.links.iter().any(|l| l.method == "where"))
+        .expect("chain not found");
+    assert_eq!(chain.receiver, ChainReceiver::Unknown);
+}
+
+#[test]
+fn unknown_receiver_falls_through_when_inner_is_unhandled() {
+    // A parenthesised expression whose inner shape we don't recognise
+    // (e.g., a method call result) should still resolve to Unknown.
+    let chains = extract("(foo())->where('a', 1);");
     assert_eq!(chains.len(), 1);
     assert_eq!(chains[0].receiver, ChainReceiver::Unknown);
 }

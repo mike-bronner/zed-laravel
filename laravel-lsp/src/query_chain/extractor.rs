@@ -182,7 +182,7 @@ fn build_chain_from_root(root: Node, bytes: &[u8], aliases: &UseAliases) -> Opti
         } else {
             // We've descended past the calls. The current node is the
             // receiver expression (variable, parenthesised expr, etc.).
-            let receiver = member_chain_receiver(node, bytes);
+            let receiver = member_chain_receiver(node, bytes, aliases);
             links_reversed.reverse();
             return Some(BuilderChain {
                 receiver,
@@ -380,7 +380,7 @@ fn is_db_facade(class_name: &str) -> bool {
 /// against something that isn't itself a call — most commonly a `$var`. For
 /// anything we don't recognise, return `Unknown`; completion will silently
 /// no-op rather than guess.
-fn member_chain_receiver(node: Node, bytes: &[u8]) -> ChainReceiver {
+fn member_chain_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> ChainReceiver {
     match node.kind() {
         "variable_name" => {
             let Some(raw) = node_text(node, bytes) else {
@@ -392,11 +392,103 @@ fn member_chain_receiver(node: Node, bytes: &[u8]) -> ChainReceiver {
                 php_type: None, // var_type::resolve fills this in later
             })
         }
-        // (Future) parenthesised expressions, `$this->prop->...`, etc. fall
-        // through. Phase 2 keeps the receiver detection conservative; richer
-        // shapes land alongside the var-type resolver in Phase 9.
+        // `(new self)->with(...)` / `(new User)->where(...)` etc. — the
+        // common Laravel pattern of starting a chain from a freshly-
+        // constructed model instance. Unwrap the parens and try the inner
+        // expression. If it's an object_creation_expression, resolve the
+        // class name (including self/static against the enclosing class
+        // declaration) and route through the same EloquentBuilder path as
+        // static calls.
+        "parenthesized_expression" => parenthesized_receiver(node, bytes, aliases),
+        // (Future) `$this->prop->...`, `$obj->method()->...`, etc. fall
+        // through. Lands alongside the var-type resolver in Phase 9.
         _ => ChainReceiver::Unknown,
     }
+}
+
+/// Resolve `(new X)->...` style receivers. The parens wrap exactly one
+/// inner expression — we look at its first named child. For an
+/// `object_creation_expression`, we extract the class name and return an
+/// Eloquent static receiver pointing at it. For anything else (a paren'd
+/// variable, a method call, etc.) we recurse so `($var)->method()` still
+/// resolves like `$var->method()`.
+fn parenthesized_receiver(node: Node, bytes: &[u8], aliases: &UseAliases) -> ChainReceiver {
+    let Some(inner) = node.named_child(0) else {
+        return ChainReceiver::Unknown;
+    };
+    if inner.kind() == "object_creation_expression" {
+        // Extract the class-name node. PHP tree-sitter gives this back via
+        // a `name`, `qualified_name`, or — for `self`/`static`/`parent` —
+        // as the relevant keyword node. Walk the named children looking
+        // for whichever shape appears.
+        let mut class_text: Option<String> = None;
+        let mut cursor = inner.walk();
+        for child in inner.named_children(&mut cursor) {
+            match child.kind() {
+                "name" | "qualified_name" | "relative_name" => {
+                    class_text = node_text(child, bytes).map(|s| s.to_string());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // `new self`, `new static`, `new parent` — these are anonymous in
+        // some tree-sitter PHP grammar versions (no `name` named-child;
+        // the keyword sits as an unnamed child). Fall back to scanning the
+        // raw text of the object_creation_expression node.
+        if class_text.is_none() {
+            if let Some(raw) = node_text(inner, bytes) {
+                let after_new = raw.trim_start_matches("new").trim_start();
+                let token = after_new
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '\\')
+                    .collect::<String>();
+                if !token.is_empty() {
+                    class_text = Some(token);
+                }
+            }
+        }
+        let Some(raw_class) = class_text else {
+            return ChainReceiver::Unknown;
+        };
+
+        // Resolve self / static / parent against the enclosing class
+        // declaration. `self` and `static` map to the containing class.
+        // `parent` would map to its parent class — that needs cross-file
+        // resolution, so for now we punt and return Unknown.
+        let resolved = match raw_class.as_str() {
+            "self" | "static" => match enclosing_class_name(inner, bytes) {
+                Some(cls) => cls,
+                None => return ChainReceiver::Unknown,
+            },
+            "parent" => return ChainReceiver::Unknown,
+            other => super::use_aliases::resolve_class_name(other, aliases),
+        };
+
+        return ChainReceiver::Eloquent(EloquentReceiver::StaticModel(resolved));
+    }
+    // `($var)->method()` — the parens are syntactic noise around a
+    // variable receiver. Recurse so var-type resolution (Phase 9) can
+    // still kick in.
+    member_chain_receiver(inner, bytes, aliases)
+}
+
+/// Walk up the syntax tree from `node` looking for the nearest enclosing
+/// `class_declaration`. Returns the class's short name (no namespace) on
+/// success — that's what `self` / `static` refer to within the class body.
+/// Callers can then push the short name through `resolve_class_name` to
+/// get the FQCN if the file's namespace declaration is in scope.
+fn enclosing_class_name(node: Node, bytes: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "class_declaration" {
+            // The `name` field holds the class identifier.
+            let name_node = n.child_by_field_name("name")?;
+            return node_text(name_node, bytes).map(|s| s.to_string());
+        }
+        current = n.parent();
+    }
+    None
 }
 
 /// Extract a single-quoted string's content. Returns `(value, '\'')` on

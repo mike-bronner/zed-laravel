@@ -15322,7 +15322,10 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("========================================");
-        info!("🚀 Laravel LSP: INITIALIZED - spawning background work");
+        info!(
+            "🚀 Laravel LSP: INITIALIZED (build {}) - spawning background work",
+            env!("LARAVEL_LSP_GIT_HASH")
+        );
         info!("========================================");
 
         // Get root path

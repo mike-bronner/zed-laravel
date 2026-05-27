@@ -44,9 +44,11 @@ fn fixup_returns_none_when_nothing_to_fix() {
 
 #[test]
 fn fixup_unterminated_quote_injects_close() {
+    // No `)` either, so the fixup injects both quote and paren to keep
+    // tree-sitter from extending the call expression downstream.
     let src = "DB::table('";
     let prep = fixup_for_completion(src, src.len()).expect("unbalanced single quote");
-    assert_eq!(prep.fixed_content, "DB::table(''");
+    assert_eq!(prep.fixed_content, "DB::table('')");
     // Source already had an open quote, so insertion stays bare.
     assert_eq!(prep.quote_for_insertion, None);
 }
@@ -55,7 +57,7 @@ fn fixup_unterminated_quote_injects_close() {
 fn fixup_unterminated_double_quote_injects_close() {
     let src = "DB::table(\"";
     let prep = fixup_for_completion(src, src.len()).expect("unbalanced double quote");
-    assert_eq!(prep.fixed_content, "DB::table(\"\"");
+    assert_eq!(prep.fixed_content, "DB::table(\"\")");
     assert_eq!(prep.quote_for_insertion, None);
 }
 
@@ -96,6 +98,42 @@ fn fixup_auto_paired_quotes_but_unclosed_paren_injects_close_paren() {
         "got: {:?}",
         prep.fixed_content
     );
+}
+
+#[test]
+fn fixup_unterminated_quote_also_injects_close_paren_when_unbalanced() {
+    // The delete-from-end case: user backspaced to `DB::table('trua` and
+    // kept typing. No close quote, no `)`. Case-1b previously only
+    // injected the `'`, leaving the `(` dangling and tree-sitter free to
+    // extend the call expression downstream. The fixup must now also
+    // inject `)` after the close quote when the line's parens are
+    // unbalanced.
+    let src = "DB::table('trua\n        return 0;\n";
+    let cursor = "DB::table('trua".len();
+    let prep =
+        fixup_for_completion(src, cursor).expect("unterminated quote + unbalanced paren fixup");
+    // Both `'` and `)` should land — `DB::table('trua')` — so the call
+    // terminates on this line.
+    assert!(
+        prep.fixed_content.starts_with("DB::table('trua')"),
+        "expected close quote + close paren injected; got: {:?}",
+        prep.fixed_content
+    );
+    // Source has the open quote; insertion goes in bare.
+    assert_eq!(prep.quote_for_insertion, None);
+}
+
+#[test]
+fn fixup_unterminated_quote_only_when_parens_already_balanced() {
+    // If the call's parens are already balanced (e.g. the `)` is on the
+    // same line later because the editor auto-paired it), don't
+    // double-inject `)`.
+    let src = "DB::table('trua)";
+    let cursor = "DB::table('trua".len();
+    let prep = fixup_for_completion(src, cursor).expect("unterminated quote only");
+    // Just `'` — no extra `)` since the line already has a closing paren.
+    assert_eq!(prep.fixed_content, "DB::table('trua')");
+    assert_eq!(prep.quote_for_insertion, None);
 }
 
 #[test]
@@ -143,10 +181,11 @@ fn fixup_after_open_paren_with_whitespace_still_fires() {
 
 #[test]
 fn fixup_respects_escapes() {
-    // `\'` inside a `'`-string doesn't toggle the state.
+    // `\'` inside a `'`-string doesn't toggle the state. Line still has an
+    // unbalanced `(`, so the fixup injects both `'` and `)`.
     let src = "DB::table('it\\'s ";
     let prep = fixup_for_completion(src, src.len()).expect("still open after \\'");
-    assert_eq!(prep.fixed_content, "DB::table('it\\'s '");
+    assert_eq!(prep.fixed_content, "DB::table('it\\'s ')");
     assert_eq!(prep.quote_for_insertion, None);
 }
 
@@ -273,6 +312,28 @@ fn db_table_cursor_outside_string_returns_none() {
     // Cursor on the method name `wher|e` — not inside a string arg.
     let ctx = detect("DB::table('users')->wher|e('a', 1);");
     assert!(ctx.is_none());
+}
+
+#[test]
+fn db_table_with_open_quote_and_partial_text_no_close_paren_resolves() {
+    // The delete-from-end case end-to-end: source line is `DB::table('trua`
+    // with cursor at the end. No close quote, no `)`. After fixup, the
+    // chain should resolve to a Table completion with the partial text
+    // `trua` as the effective_table prefix.
+    let raw = "<?php\nDB::table('trua\n        return 0;\n";
+    let cursor_byte = "<?php\nDB::table('trua".len();
+    let prep = fixup_for_completion(raw, cursor_byte).expect("quote + paren fixup");
+    let tree = crate::parser::parse_php(&prep.fixed_content).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> =
+        crate::query_chain::extract_chains(&tree, &prep.fixed_content)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+    let ctx = detect_chain_context_at(&chains, cursor_byte)
+        .expect("after fixup the chain should resolve to a Table completion context");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Table);
+    assert_eq!(ctx.effective_table.as_deref(), Some("trua"));
 }
 
 #[test]

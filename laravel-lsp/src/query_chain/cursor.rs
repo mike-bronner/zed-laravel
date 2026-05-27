@@ -105,7 +105,7 @@ pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<Complet
                 .map(|n| line_start + n)
                 .unwrap_or(content.len());
             let full_line = &content[line_start..line_end];
-            if line_paren_balance_outside_strings(full_line) > 0 {
+            if line_paren_balance(full_line) > 0 {
                 // Insertion point: one byte past the auto-paired close quote.
                 let insert_at = byte_offset + unclosed.len_utf8();
                 let mut fixed = String::with_capacity(content.len() + 1);
@@ -122,9 +122,27 @@ pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<Complet
             return Some(CompletionPrep::unchanged(content));
         }
 
-        let mut fixed = String::with_capacity(content.len() + 1);
+        // The matching close quote isn't at the cursor — inject it. While
+        // we're at it, also check whether the cursor's line has unbalanced
+        // parens (e.g. user deleted back to `DB::table('trua` — no close
+        // quote, no `)`). If so, inject `)` after the close quote so the
+        // call expression terminates cleanly. Without the paren patch
+        // tree-sitter recovers by extending the call across the next
+        // statement, and the string arg falls out of the argument list.
+        let line_end = content[line_start..]
+            .find('\n')
+            .map(|n| line_start + n)
+            .unwrap_or(content.len());
+        let full_line = &content[line_start..line_end];
+        let needs_close_paren = line_paren_balance(full_line) > 0;
+
+        let mut fixed =
+            String::with_capacity(content.len() + if needs_close_paren { 2 } else { 1 });
         fixed.push_str(&content[..byte_offset]);
         fixed.push(unclosed);
+        if needs_close_paren {
+            fixed.push(')');
+        }
         fixed.push_str(&content[byte_offset..]);
         return Some(CompletionPrep {
             fixed_content: fixed,
@@ -343,28 +361,21 @@ fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, ())> {
     None
 }
 
-/// Count `(` minus `)` on a single line, skipping over the contents of
-/// single- and double-quoted string literals. Backslash escapes inside a
-/// string are honored so `'\'')'` doesn't terminate the string early.
-///
-/// Used by the auto-pair-safety branch of [`fixup_for_completion`] to
-/// decide whether the call expression still needs a `)` injected after the
-/// editor's auto-paired close quote.
-fn line_paren_balance_outside_strings(line: &str) -> i32 {
+/// Count literal `(` minus `)` on a single line. Does NOT try to skip
+/// string contents — when the cursor is inside an unclosed string, a
+/// string-aware counter treats the rest of the line as "in string" and
+/// ignores any `)` there, leading us to inject an unwanted second close
+/// paren. The literal count is dumber but more robust: if the line has
+/// any `)` at all, even one nominally inside a string, we won't
+/// double-inject. The edge case where someone writes `'foo)'` with an
+/// unmatched outer paren is rare; worst case we leave the source as-is
+/// (degraded behavior, not wrong behavior).
+fn line_paren_balance(line: &str) -> i32 {
     let mut balance: i32 = 0;
-    let mut in_string: Option<char> = None;
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (in_string, c) {
-            (Some(_), '\\') => {
-                // Skip the next char (escaped).
-                chars.next();
-            }
-            (Some(q), c) if c == q => in_string = None,
-            (None, '\'') => in_string = Some('\''),
-            (None, '"') => in_string = Some('"'),
-            (None, '(') => balance += 1,
-            (None, ')') => balance -= 1,
+    for c in line.chars() {
+        match c {
+            '(' => balance += 1,
+            ')' => balance -= 1,
             _ => {}
         }
     }

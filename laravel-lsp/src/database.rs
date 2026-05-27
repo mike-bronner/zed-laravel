@@ -664,25 +664,72 @@ impl DatabaseSchemaProvider {
         use sqlx::mysql::MySqlPoolOptions;
         use sqlx::Row;
 
-        let url = format!(
-            "mysql://{}:{}@{}:{}/{}",
-            config.username, config.password, config.host, config.port, config.database
-        );
+        // Sail / Docker Compose use service hostnames like `mysql`, `pgsql`,
+        // `redis` etc. that only resolve inside the Docker network. The LSP
+        // runs outside Docker (it's a local binary), so `mysql` fails DNS.
+        // Sail's default `docker-compose.yml` maps the container's 3306 to
+        // the host's 3306, so `127.0.0.1:3306` reaches the same database.
+        // Try the configured host first; if that fails AND the host looks
+        // like a Docker service name (no dots, not localhost), retry with
+        // `127.0.0.1`. Most Sail projects Just Work after this fallback.
+        let host_candidates = Self::host_candidates(&config.host);
 
-        let pool = match MySqlPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&url)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!("MySQL connection failed: {}. Check DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env", e);
+        let mut last_err: Option<String> = None;
+        let mut pool_opt = None;
+        let mut used_fallback_host: Option<&str> = None;
+        for host in &host_candidates {
+            let url = format!(
+                "mysql://{}:{}@{}:{}/{}",
+                config.username, config.password, host, config.port, config.database
+            );
+            match MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => {
+                    if host != &config.host {
+                        info!(
+                            "MySQL: connected via fallback host '{}' (configured host '{}' didn't resolve). \
+                             Looks like a Sail / Docker Compose setup — the LSP runs outside Docker, so \
+                             the service hostname doesn't work, but the mapped host port does.",
+                            host, config.host
+                        );
+                        used_fallback_host = Some(host);
+                    }
+                    pool_opt = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    if host_candidates.len() > 1 && host == &config.host {
+                        info!(
+                            "MySQL: primary host '{}' didn't connect ({}). Trying fallback...",
+                            host, e
+                        );
+                    }
+                    last_err = Some(format!("host='{host}': {e}"));
+                }
+            }
+        }
+
+        let pool = match pool_opt {
+            Some(p) => p,
+            None => {
+                let msg = format!(
+                    "MySQL connection failed. Tried hosts: [{}]. Last error: {}. \
+                     Check DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD in .env. \
+                     If using Sail/Docker Compose, ensure the container is running and the \
+                     port is mapped to your host (run `./vendor/bin/sail up -d`).",
+                    host_candidates.join(", "),
+                    last_err.unwrap_or_else(|| "(no error captured)".to_string())
+                );
                 warn!("{}", msg);
                 self.set_error("mysql", &msg).await;
                 return None;
             }
         };
+        let _ = used_fallback_host; // documented in info! above
 
         // Get tables
         let tables: Vec<String> = sqlx::query("SHOW TABLES")
@@ -728,25 +775,70 @@ impl DatabaseSchemaProvider {
         })
     }
 
+    /// Build the ordered list of host candidates to try. The primary
+    /// (configured) host is always first; if it looks like a Docker Compose
+    /// service name (no dots, not `localhost`) we add `127.0.0.1` as a
+    /// fallback so Sail / Docker Compose setups work without the LSP needing
+    /// to be inside the Docker network.
+    fn host_candidates(primary: &str) -> Vec<String> {
+        let mut candidates = vec![primary.to_string()];
+        if !primary.is_empty()
+            && !primary.contains('.')
+            && !primary.eq_ignore_ascii_case("localhost")
+            && primary != "127.0.0.1"
+        {
+            candidates.push("127.0.0.1".to_string());
+        }
+        candidates
+    }
+
     /// Fetch schema from PostgreSQL
     async fn fetch_postgres_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
         use sqlx::postgres::PgPoolOptions;
         use sqlx::Row;
 
-        let url = format!(
-            "postgres://{}:{}@{}:{}/{}",
-            config.username, config.password, config.host, config.port, config.database
-        );
+        // Same Sail/Docker fallback story as MySQL — see `fetch_mysql_schema`
+        // for the rationale.
+        let host_candidates = Self::host_candidates(&config.host);
+        let mut last_err: Option<String> = None;
+        let mut pool_opt = None;
+        for host in &host_candidates {
+            let url = format!(
+                "postgres://{}:{}@{}:{}/{}",
+                config.username, config.password, host, config.port, config.database
+            );
+            match PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => {
+                    if host != &config.host {
+                        info!(
+                            "PostgreSQL: connected via fallback host '{}' (configured host '{}' didn't resolve).",
+                            host, config.host
+                        );
+                    }
+                    pool_opt = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format!("host='{host}': {e}"));
+                }
+            }
+        }
 
-        let pool = match PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&url)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!("PostgreSQL connection failed: {}. Check DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env", e);
+        let pool = match pool_opt {
+            Some(p) => p,
+            None => {
+                let msg = format!(
+                    "PostgreSQL connection failed. Tried hosts: [{}]. Last error: {}. \
+                     Check DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD in .env. \
+                     If using Sail/Docker Compose, ensure the container is running.",
+                    host_candidates.join(", "),
+                    last_err.unwrap_or_else(|| "(no error captured)".to_string())
+                );
                 warn!("{}", msg);
                 self.set_error("pgsql", &msg).await;
                 return None;

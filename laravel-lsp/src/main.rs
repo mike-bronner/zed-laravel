@@ -2992,11 +2992,16 @@ impl LaravelLanguageServer {
         Some(items)
     }
 
-    /// Send a one-time `window/showMessage` informing the user that table
-    /// and column autocomplete requires a working DB connection. Shares the
+    /// Send a one-time notification informing the user that table and
+    /// column autocomplete requires a working DB connection. Shares the
     /// `database_diagnostic_shown` flag with the existing exists:/unique:
     /// diagnostic path, so the user only sees ONE notification per LSP
     /// session no matter how they hit the unreachable DB.
+    ///
+    /// Uses `window/showMessageRequest` (with a Dismiss action) rather than
+    /// `window/showMessage` because the latter auto-dismisses after a few
+    /// seconds — the user may not even see it if they're typing. With an
+    /// action button, the notification stays until they explicitly click it.
     async fn maybe_notify_db_unreachable(&self, error_message: &str) {
         let mut shown = self.database_diagnostic_shown.write().await;
         if *shown {
@@ -3011,8 +3016,20 @@ impl LaravelLanguageServer {
              (DB_HOST / DB_PORT / credentials) and reload the window to \
              enable. Error: {error_message}"
         );
-        self.client
-            .show_message(tower_lsp::lsp_types::MessageType::INFO, message)
+        let actions = vec![tower_lsp::lsp_types::MessageActionItem {
+            title: "Dismiss".to_string(),
+            properties: Default::default(),
+        }];
+        // We don't care about the response — the only action is "Dismiss".
+        // The point of using show_message_request is that the notification
+        // persists until the user clicks.
+        let _ = self
+            .client
+            .show_message_request(
+                tower_lsp::lsp_types::MessageType::WARNING,
+                message,
+                Some(actions),
+            )
             .await;
     }
 

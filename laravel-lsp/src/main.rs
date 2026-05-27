@@ -2751,6 +2751,50 @@ use laravel_lsp::livewire_resolver::{
 };
 
 impl LaravelLanguageServer {
+    /// Eloquent / DB query builder chain completion entry point.
+    ///
+    /// Resolves the cursor to a `ChainContext`, dispatches on
+    /// `(BuilderMode, ArgKind)` to the appropriate completion-items helper,
+    /// and returns the items (or `None` if no chain covers the cursor / the
+    /// chain receiver is unresolved at this phase).
+    ///
+    /// Phase 3 implements `(BaseBuilder, Column)` only — Eloquent receivers
+    /// short-circuit in [`laravel_lsp::query_chain::detect_chain_context_at`]
+    /// because model resolution is async I/O and lands in later phases.
+    async fn try_query_chain_completion(
+        &self,
+        content: &str,
+        position: tower_lsp::lsp_types::Position,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> Option<Vec<CompletionItem>> {
+        use laravel_lsp::query_chain::{
+            detect_chain_context_at, eloquent_completion, position_to_byte_offset, ArgKind,
+            BuilderMode,
+        };
+
+        let file_path = uri.to_file_path().ok()?;
+        let patterns = self.salsa.get_patterns(file_path).await.ok().flatten()?;
+        if patterns.chains.is_empty() {
+            return None;
+        }
+
+        let byte_offset = position_to_byte_offset(content, position.line, position.character)?;
+        let ctx = detect_chain_context_at(&patterns.chains, byte_offset)?;
+
+        let db_guard = self.database_schema.read().await;
+        let db = db_guard.as_ref()?;
+
+        let items = match (ctx.mode, ctx.expecting) {
+            (BuilderMode::BaseBuilder, ArgKind::Column) => {
+                eloquent_completion::columns_raw(&ctx, db).await
+            }
+            // Other (mode, expecting) combinations land in Phases 4-6.
+            _ => Vec::new(),
+        };
+
+        Some(items)
+    }
+
     fn new(client: Client) -> Self {
         Self {
             client,
@@ -16748,6 +16792,24 @@ impl LanguageServer for LaravelLanguageServer {
 
         // In PHP/Blade files, check for various contexts
         if is_php_or_blade {
+            // Eloquent / DB query builder chain completion. No line-local
+            // pre-filter: chains can span multiple lines (the `->` may live
+            // on a different line than the cursor), and the helper itself
+            // short-circuits fast (single Arc::clone + emptiness check) when
+            // the file has no chains. Files with chains pay an O(chains)
+            // walk which is in the tens.
+            if let Some(items) = self
+                .try_query_chain_completion(&content, position, uri)
+                .await
+            {
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: false,
+                        items,
+                    })));
+                }
+            }
+
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {

@@ -11,6 +11,49 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Read a string column from a sqlx Row, falling back to a `Vec<u8>` +
+/// lossy UTF-8 decode if the direct `String` decoder rejects the value.
+///
+/// This exists because sqlx-mysql sometimes returns result columns with
+/// binary collation (especially from `SHOW DATABASES`, `SHOW TABLES`,
+/// `SHOW COLUMNS`, and `information_schema.*` against MySQL 8.0). The
+/// `String` decoder bails on those, but the bytes are valid UTF-8 — we
+/// just need to take the manual path. `from_utf8_lossy` is total, so any
+/// stray invalid bytes become U+FFFD rather than a parse error.
+///
+/// Usage: `read_string(&row, "column_name")` or `read_string(&row, 0)`
+/// (by-name overload via the `Idx` trait).
+fn read_string<I>(row: &sqlx::mysql::MySqlRow, index: I) -> Option<String>
+where
+    I: sqlx::ColumnIndex<sqlx::mysql::MySqlRow> + Copy,
+{
+    use sqlx::Row;
+    if let Ok(s) = row.try_get::<String, _>(index) {
+        return Some(s);
+    }
+    if let Ok(bytes) = row.try_get::<Vec<u8>, _>(index) {
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    None
+}
+
+/// Same as [`read_string`] but for PostgreSQL rows. Postgres doesn't have
+/// the same binary-collation issue MySQL does, but symmetry is easier to
+/// maintain across the two drivers.
+fn read_string_pg<I>(row: &sqlx::postgres::PgRow, index: I) -> Option<String>
+where
+    I: sqlx::ColumnIndex<sqlx::postgres::PgRow> + Copy,
+{
+    use sqlx::Row;
+    if let Ok(s) = row.try_get::<String, _>(index) {
+        return Some(s);
+    }
+    if let Ok(bytes) = row.try_get::<Vec<u8>, _>(index) {
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    None
+}
+
 /// Mask the password in a database URL for safe logging. Matches the
 /// standard shape `driver://user:pass@host:...` and replaces the password
 /// segment with `***`. If no password is present (or the URL doesn't match
@@ -850,10 +893,14 @@ impl DatabaseSchemaProvider {
         .await
         {
             Ok(row) => {
-                let db_name: String = row.try_get("db").unwrap_or_default();
-                let hostname: String = row.try_get("hostname").unwrap_or_default();
-                let user: String = row.try_get("user").unwrap_or_default();
-                let version: String = row.try_get("version").unwrap_or_default();
+                // Use read_string everywhere so binary-collation columns
+                // from MySQL 8.0's SHOW/information_schema responses decode
+                // cleanly. Without this, every "string" column came back as
+                // empty and silently dropped — the bug we just isolated.
+                let db_name = read_string(&row, "db").unwrap_or_default();
+                let hostname = read_string(&row, "hostname").unwrap_or_default();
+                let user = read_string(&row, "user").unwrap_or_default();
+                let version = read_string(&row, "version").unwrap_or_default();
                 info!(
                     "MySQL probe — db={:?} server_hostname={:?} user={:?} version={:?}",
                     db_name, hostname, user, version
@@ -872,11 +919,7 @@ impl DatabaseSchemaProvider {
                 // the column type or name.
                 let dbs: Vec<String> = rows
                     .into_iter()
-                    .filter_map(|r| {
-                        r.try_get::<String, _>("Database")
-                            .or_else(|_| r.try_get::<String, _>(0))
-                            .ok()
-                    })
+                    .filter_map(|r| read_string(&r, "Database").or_else(|| read_string(&r, 0)))
                     .collect();
                 info!(
                     "MySQL probe — SHOW DATABASES returned {} rows, parsed {}: {:?}",
@@ -900,7 +943,7 @@ impl DatabaseSchemaProvider {
             Ok(rows) => {
                 let grants: Vec<String> = rows
                     .into_iter()
-                    .filter_map(|r| r.try_get::<String, _>(0).ok())
+                    .filter_map(|r| read_string(&r, 0))
                     .collect();
                 info!(
                     "MySQL probe — SHOW GRANTS for current user ({} grants): {:?}",
@@ -947,11 +990,7 @@ impl DatabaseSchemaProvider {
             Ok(rows) => {
                 let names: Vec<String> = rows
                     .into_iter()
-                    .filter_map(|r| {
-                        r.try_get::<String, _>("table_name")
-                            .or_else(|_| r.try_get::<String, _>(0))
-                            .ok()
-                    })
+                    .filter_map(|r| read_string(&r, "table_name").or_else(|| read_string(&r, 0)))
                     .collect();
                 info!(
                     "MySQL probe — first 5 tables via information_schema = {:?}",
@@ -976,7 +1015,7 @@ impl DatabaseSchemaProvider {
         let row_count = table_rows.len();
         let tables: Vec<String> = table_rows
             .into_iter()
-            .filter_map(|row| row.try_get::<String, _>(0).ok())
+            .filter_map(|row| read_string(&row, 0))
             .collect();
         info!(
             "MySQL: SHOW TABLES returned {} rows, parsed {} table names",
@@ -997,8 +1036,8 @@ impl DatabaseSchemaProvider {
             let mut col_types = Vec::new();
 
             for row in rows {
-                if let Ok(field) = row.try_get::<String, _>("Field") {
-                    let sql_type = row.try_get::<String, _>("Type").unwrap_or_default();
+                if let Some(field) = read_string(&row, "Field") {
+                    let sql_type = read_string(&row, "Type").unwrap_or_default();
                     let php_type = Self::map_sql_type_to_php(&sql_type);
                     col_names.push(field.clone());
                     col_types.push((field, php_type));
@@ -1150,7 +1189,6 @@ impl DatabaseSchemaProvider {
     /// `fetch_mysql_schema`: DB_URL → unix_socket → TCP with Sail fallback.
     async fn fetch_postgres_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
         use sqlx::postgres::PgPoolOptions;
-        use sqlx::Row;
 
         let candidates = self.build_postgres_candidates(config);
         let mut last_err: Option<String> = None;
@@ -1213,7 +1251,7 @@ impl DatabaseSchemaProvider {
         .await
         .ok()?
         .into_iter()
-        .filter_map(|row| row.try_get::<String, _>("table_name").ok())
+        .filter_map(|row| read_string_pg(&row, "table_name"))
         .collect();
 
         // Get columns for each table (with types)
@@ -1232,8 +1270,8 @@ impl DatabaseSchemaProvider {
             let mut col_types = Vec::new();
 
             for row in rows {
-                if let Ok(col_name) = row.try_get::<String, _>("column_name") {
-                    let sql_type = row.try_get::<String, _>("data_type").unwrap_or_default();
+                if let Some(col_name) = read_string_pg(&row, "column_name") {
+                    let sql_type = read_string_pg(&row, "data_type").unwrap_or_default();
                     let php_type = Self::map_sql_type_to_php(&sql_type);
                     col_names.push(col_name.clone());
                     col_types.push((col_name, php_type));

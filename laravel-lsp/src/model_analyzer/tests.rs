@@ -686,3 +686,93 @@ class Grandparent extends Model {
     let metadata = ModelMetadata::from_file_with_inheritance(&path, dir.path()).unwrap();
     assert_eq!(metadata.table_name.as_deref(), Some("grandparent_table"));
 }
+
+#[test]
+fn extends_eloquent_model_recognizes_direct_extends() {
+    // The simplest case: `class Foo extends Model` — true.
+    let dir = project_with_models(&[(
+        "Direct",
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Direct extends Model {}
+"#,
+    )]);
+    let path = dir.path().join("app/Models/Direct.php");
+    assert!(ModelMetadata::extends_eloquent_model(&path, dir.path()));
+}
+
+#[test]
+fn extends_eloquent_model_walks_through_intermediate_base_classes() {
+    // The crossbible-vapor shape: `Version extends BaseModel` where
+    // BaseModel itself extends Model via several hops. The literal
+    // "extends Model" regex misses this — the inheritance walk catches
+    // it. This is the exact case Phase 9.1 fixes.
+    let dir = project_with_models(&[
+        (
+            "Version",
+            r#"<?php
+namespace App\Models;
+use App\Concerns\BaseModel;
+class Version extends BaseModel {}
+"#,
+        ),
+        (
+            "BaseModel",
+            r#"<?php
+namespace App\Concerns;
+use Illuminate\Database\Eloquent\Model;
+class BaseModel extends Model {
+    protected $connection = 'tenant';
+}
+"#,
+        ),
+    ]);
+    // BaseModel lives in app/Concerns/, not app/Models/. Place it there.
+    std::fs::create_dir_all(dir.path().join("app/Concerns")).unwrap();
+    std::fs::rename(
+        dir.path().join("app/Models/BaseModel.php"),
+        dir.path().join("app/Concerns/BaseModel.php"),
+    )
+    .unwrap();
+    let path = dir.path().join("app/Models/Version.php");
+    assert!(
+        ModelMetadata::extends_eloquent_model(&path, dir.path()),
+        "two-level inheritance through BaseModel should still be Eloquent"
+    );
+}
+
+#[test]
+fn extends_eloquent_model_false_for_non_eloquent_classes() {
+    // A Livewire Form (extends Form) should NOT be classified as
+    // Eloquent — `extract_generic_class_properties` is the right
+    // fallback for these.
+    let dir = project_with_models(&[(
+        "ContactForm",
+        r#"<?php
+namespace App\Livewire\Forms;
+use Livewire\Form;
+class ContactForm extends Form {
+    public string $name = '';
+}
+"#,
+    )]);
+    let path = dir.path().join("app/Models/ContactForm.php");
+    assert!(!ModelMetadata::extends_eloquent_model(&path, dir.path()));
+}
+
+#[test]
+fn extends_eloquent_model_false_when_no_extends_clause() {
+    // Plain old class with no extends — definitely not Eloquent.
+    let dir = project_with_models(&[(
+        "Plain",
+        r#"<?php
+namespace App\Models;
+class Plain {
+    public string $foo = '';
+}
+"#,
+    )]);
+    let path = dir.path().join("app/Models/Plain.php");
+    assert!(!ModelMetadata::extends_eloquent_model(&path, dir.path()));
+}

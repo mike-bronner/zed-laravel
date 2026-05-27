@@ -10532,18 +10532,6 @@ impl LaravelLanguageServer {
         result
     }
 
-    /// Heuristic check: does `content` define a class that extends Laravel's
-    /// `Model`? Used by `get_class_properties` to decide whether to run the
-    /// Eloquent-rich flow (DB schema, casts, relationships) or fall back to
-    /// the generic public-property scan that works for any PHP class.
-    fn content_extends_model(content: &str) -> bool {
-        let pattern = r"class\s+\w+\s+extends\s+\\?(?:Illuminate\\Database\\Eloquent\\)?Model\b";
-        regex::Regex::new(pattern)
-            .ok()
-            .map(|re| re.is_match(content))
-            .unwrap_or(false)
-    }
-
     /// Locate any PHP class file under `app/` (or `src/`) and return its
     /// `public Type $foo` declarations. Used as the generic fallback when a
     /// class isn't an Eloquent model — Livewire Forms, Livewire components,
@@ -10573,31 +10561,6 @@ impl LaravelLanguageServer {
         props
     }
 
-    /// Find the model file path for a given class name
-    /// Searches in app/Models/ directory
-    fn find_model_file(
-        &self,
-        root: &std::path::Path,
-        class_name: &str,
-    ) -> Option<std::path::PathBuf> {
-        // Try app/Models/ClassName.php first (Laravel 8+)
-        let model_path = root
-            .join("app")
-            .join("Models")
-            .join(format!("{}.php", class_name));
-        if model_path.exists() {
-            return Some(model_path);
-        }
-
-        // Try app/ClassName.php (older Laravel)
-        let old_model_path = root.join("app").join(format!("{}.php", class_name));
-        if old_model_path.exists() {
-            return Some(old_model_path);
-        }
-
-        None
-    }
-
     /// Get all properties for a class. Returns Eloquent-rich data (DB columns,
     /// casts, accessors, relationships) when the class lives in a standard
     /// model location AND extends `Model`; otherwise falls back to a generic
@@ -10619,15 +10582,16 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Try the model paths first (`app/Models/X.php`, `app/X.php`). When the
-        // file is there AND it actually extends `Model`, run the full Eloquent
-        // resolution. Anything else (Livewire Forms, DTOs, etc.) falls through
-        // to the generic public-property scan below.
-        let model_path = self.find_model_file(&root, class_name);
+        // Locate the class file via Composer autoload (PSR-4 aware, handles
+        // hyphenated vendor packages). If the class's `extends` chain
+        // reaches Eloquent's `Model` — possibly through several intermediate
+        // base classes — surface the full Eloquent property set. Otherwise
+        // fall back to the generic public-property scan, which works for
+        // Livewire Forms, DTOs, value objects, etc.
+        let model_path = laravel_lsp::class_locator::find_php_class_file(class_name, &root);
         let appears_to_be_model = model_path
             .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|content| Self::content_extends_model(&content))
+            .map(|p| ModelMetadata::extends_eloquent_model(p, &root))
             .unwrap_or(false);
 
         if !appears_to_be_model {
@@ -10639,13 +10603,15 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Read and parse the model file
-        let content = match std::fs::read_to_string(&model_path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+        // Walk inheritance so children pick up the parent's `$table`,
+        // casts, accessors, and relationships — same machinery the chain
+        // path uses (Phase 5.6+). Without this, an empty subclass like
+        // `App\Models\Version extends BaseModel` would surface no
+        // properties even when the vendor parent declares them.
+        let metadata = match ModelMetadata::from_file_with_inheritance(&model_path, &root) {
+            Some(m) => m,
+            None => return Vec::new(),
         };
-
-        let metadata = ModelMetadata::from_content(&content);
 
         // Determine the table name (either from $table property or by convention)
         let table_name = metadata.table_name.clone().unwrap_or_else(|| {

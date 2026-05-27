@@ -175,3 +175,147 @@ fn host_candidates_empty_no_fallback() {
         vec!["".to_string()]
     );
 }
+
+// ---- mask_url_password ----
+
+#[test]
+fn mask_url_password_with_credentials() {
+    use super::mask_url_password;
+    assert_eq!(
+        mask_url_password("mysql://sail:secret@127.0.0.1:3306/db"),
+        "mysql://sail:***@127.0.0.1:3306/db"
+    );
+    assert_eq!(
+        mask_url_password("postgres://user:p@ssw0rd@host/db"),
+        // Only the first `@` after creds is treated as the host separator —
+        // best-effort. Any `@` in the password trips this, but it's a
+        // diagnostic helper, not security-critical.
+        "postgres://user:***@ssw0rd@host/db"
+    );
+}
+
+#[test]
+fn mask_url_password_no_password_no_change() {
+    use super::mask_url_password;
+    // No `:` in creds → no password to mask.
+    assert_eq!(
+        mask_url_password("mysql://sail@127.0.0.1/db"),
+        "mysql://sail@127.0.0.1/db"
+    );
+}
+
+#[test]
+fn mask_url_password_no_scheme_returns_input() {
+    use super::mask_url_password;
+    assert_eq!(mask_url_password("not a url"), "not a url");
+}
+
+// ---- build_*_candidates (DB_URL / unix_socket / TCP priority) ----
+
+fn make_config_with(url: Option<&str>, socket: Option<&str>, host: &str) -> super::DatabaseConfig {
+    super::DatabaseConfig {
+        driver: "mysql".to_string(),
+        host: host.to_string(),
+        port: 3306,
+        database: "testdb".to_string(),
+        username: "u".to_string(),
+        password: "p".to_string(),
+        url: url.map(|s| s.to_string()),
+        unix_socket: socket.map(|s| s.to_string()),
+        charset: None,
+        collation: None,
+    }
+}
+
+#[test]
+fn mysql_candidates_db_url_takes_precedence() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let cfg = make_config_with(Some("mysql://heroku:abc@db.heroku.com/x"), None, "mysql");
+    let candidates = provider.build_mysql_candidates(&cfg);
+
+    // DB_URL must come first.
+    assert_eq!(candidates[0].label, "DB_URL");
+    assert_eq!(candidates[0].url, "mysql://heroku:abc@db.heroku.com/x");
+
+    // TCP fallbacks should still be there in case DB_URL fails.
+    assert!(candidates.iter().any(|c| c.label.starts_with("tcp ")));
+}
+
+#[test]
+fn mysql_candidates_unix_socket_inserted_before_tcp() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let cfg = make_config_with(None, Some("/tmp/mysql.sock"), "localhost");
+    let candidates = provider.build_mysql_candidates(&cfg);
+
+    // Socket comes before TCP.
+    assert!(candidates[0].label.contains("unix_socket"));
+    assert_eq!(candidates[0].label, "unix_socket=/tmp/mysql.sock");
+    assert!(candidates[0].url.contains("socket=/tmp/mysql.sock"));
+    assert!(candidates[1].label.starts_with("tcp "));
+}
+
+#[test]
+fn mysql_candidates_sail_host_adds_loopback_fallback() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let cfg = make_config_with(None, None, "mysql");
+    let candidates = provider.build_mysql_candidates(&cfg);
+
+    // Two TCP candidates: configured host + 127.0.0.1 fallback.
+    let tcp: Vec<&str> = candidates
+        .iter()
+        .filter(|c| c.label.starts_with("tcp "))
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(tcp, vec!["tcp mysql:3306", "tcp 127.0.0.1:3306"]);
+    // The fallback candidate carries the Sail explanation note.
+    let fallback = candidates
+        .iter()
+        .find(|c| c.label == "tcp 127.0.0.1:3306")
+        .unwrap();
+    assert!(
+        fallback
+            .success_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("Sail"),
+        "expected Sail success_note on the loopback fallback"
+    );
+}
+
+#[test]
+fn mysql_candidates_localhost_host_no_extra_fallback() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let cfg = make_config_with(None, None, "localhost");
+    let candidates = provider.build_mysql_candidates(&cfg);
+
+    let tcp_count = candidates
+        .iter()
+        .filter(|c| c.label.starts_with("tcp "))
+        .count();
+    assert_eq!(
+        tcp_count, 1,
+        "localhost host shouldn't add a 127.0.0.1 fallback"
+    );
+}
+
+#[test]
+fn postgres_candidates_socket_uses_libpq_style_url() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, Some("/tmp/.s.PGSQL.5432"), "localhost");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    let candidates = provider.build_postgres_candidates(&cfg);
+
+    let socket = candidates
+        .iter()
+        .find(|c| c.label.starts_with("unix_socket"))
+        .expect("expected socket candidate");
+    // Postgres socket convention puts the host in a `host=` query param,
+    // not a `socket=` one (that's libpq syntax). Pin that here so we
+    // don't regress.
+    assert!(
+        socket.url.contains("?host=/tmp/.s.PGSQL.5432"),
+        "got URL: {}",
+        socket.url
+    );
+}

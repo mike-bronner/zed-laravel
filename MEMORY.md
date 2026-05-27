@@ -1,0 +1,1 @@
+- [Session 2026-05-27: Issue #11 chain completion](../../../.claude/projects/-Users-mike-Developer-zed-laravel/memory/session_chain_completion_2026-05-27.md) — Multi-phase Eloquent builder completion work, draft PR#21, 12 commits

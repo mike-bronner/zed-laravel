@@ -11,6 +11,48 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Mask the password in a database URL for safe logging. Matches the
+/// standard shape `driver://user:pass@host:...` and replaces the password
+/// segment with `***`. If no password is present (or the URL doesn't match
+/// the expected shape), returns the input unchanged.
+///
+/// This is best-effort — failing gracefully is safer than failing hard,
+/// since logging shouldn't crash the LSP.
+fn mask_url_password(url: &str) -> String {
+    // Find the `://` separator, then the `@` that ends the credentials.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let creds_start = scheme_end + 3;
+    let Some(at_offset) = url[creds_start..].find('@') else {
+        return url.to_string();
+    };
+    let creds_end = creds_start + at_offset;
+    let creds = &url[creds_start..creds_end];
+    // Credentials are `user[:password]`. Only mask if there's a `:`.
+    let Some(colon_offset) = creds.find(':') else {
+        return url.to_string();
+    };
+    let user_end = creds_start + colon_offset;
+    let mut masked = String::with_capacity(url.len());
+    masked.push_str(&url[..user_end + 1]); // up to and including the `:`
+    masked.push_str("***");
+    masked.push_str(&url[creds_end..]); // from `@` onwards
+    masked
+}
+
+/// One thing the connector should attempt: a URL to connect with, a short
+/// human-readable label for logs, and an optional explanatory note shown
+/// when this candidate is the one that finally succeeded (after earlier
+/// ones failed). The label MUST mask any sensitive bits — the full URL is
+/// in `url` for the driver, never logged directly.
+#[derive(Debug, Clone)]
+struct ConnCandidate {
+    label: String,
+    url: String,
+    success_note: Option<String>,
+}
+
 /// Cached database schema with expiration
 #[derive(Debug, Clone)]
 pub struct DatabaseSchema {
@@ -31,7 +73,11 @@ impl DatabaseSchema {
     }
 }
 
-/// Database connection configuration
+/// Database connection configuration. Mirrors the keys Laravel's default
+/// `config/database.php` exposes for the active connection driver. The
+/// LSP reads each key with the same `env(NAME, DEFAULT)` fallback chain
+/// Laravel itself uses, so even projects that haven't populated `.env`
+/// at all (relying purely on config defaults) connect correctly.
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub driver: String,
@@ -40,6 +86,18 @@ pub struct DatabaseConfig {
     pub database: String,
     pub username: String,
     pub password: String,
+    /// A full database URL like `mysql://user:pass@host:port/db`. When
+    /// present, it takes precedence over the individual host/port/etc.
+    /// fields. Laravel's `DB_URL` env var maps here.
+    pub url: Option<String>,
+    /// Unix socket path (e.g., `/tmp/mysql.sock`, `/var/run/mysqld/mysqld.sock`).
+    /// Common on Mac local dev where MySQL/Postgres expose a socket alongside
+    /// TCP. When set, drivers should prefer socket over TCP.
+    pub unix_socket: Option<String>,
+    /// Connection charset (MySQL/Postgres). Defaults to `utf8mb4` for MySQL.
+    pub charset: Option<String>,
+    /// Connection collation (MySQL). Defaults to `utf8mb4_unicode_ci`.
+    pub collation: Option<String>,
 }
 
 /// Database connection error information
@@ -378,7 +436,10 @@ impl DatabaseSchemaProvider {
         let block = connection_block.unwrap_or_default();
         info!("🗄️  Found connection block ({} chars)", block.len());
 
-        // Step 3: Parse settings from the connection block
+        // Step 3: Parse settings from the connection block. Each call honors
+        // Laravel's `env(NAME, DEFAULT)` chain: if the env var is set we use
+        // it, otherwise the default in `config/database.php`, otherwise the
+        // hard-coded fallback below.
         let host = self.parse_env_setting(&block, "host", "127.0.0.1");
         let port_str =
             self.parse_env_setting(&block, "port", &self.default_port(&driver).to_string());
@@ -386,6 +447,13 @@ impl DatabaseSchemaProvider {
         let database = self.parse_env_setting(&block, "database", "laravel");
         let username = self.parse_env_setting(&block, "username", "root");
         let password = self.parse_env_setting(&block, "password", "");
+
+        // Optional / less common settings. Empty / unset → None so the
+        // connection logic can skip them rather than send empty strings.
+        let url = self.parse_optional_setting(&block, "url");
+        let unix_socket = self.parse_optional_setting(&block, "unix_socket");
+        let charset = self.parse_optional_setting(&block, "charset");
+        let collation = self.parse_optional_setting(&block, "collation");
 
         info!("🗄️  Parsed database config:");
         info!("🗄️    driver: {}", driver);
@@ -401,6 +469,20 @@ impl DatabaseSchemaProvider {
                 "(set)"
             }
         );
+        if let Some(u) = &url {
+            // Mask the password in the URL when logging — common shape is
+            // `driver://user:pass@host:port/db`. Best-effort, fail-open.
+            info!("🗄️    url: {}", mask_url_password(u));
+        }
+        if let Some(s) = &unix_socket {
+            info!("🗄️    unix_socket: {}", s);
+        }
+        if let Some(c) = &charset {
+            info!("🗄️    charset: {}", c);
+        }
+        if let Some(c) = &collation {
+            info!("🗄️    collation: {}", c);
+        }
 
         // For SQLite, check if file exists
         if driver == "sqlite" {
@@ -423,6 +505,10 @@ impl DatabaseSchemaProvider {
             database,
             username,
             password,
+            url,
+            unix_socket,
+            charset,
+            collation,
         })
     }
 
@@ -457,6 +543,20 @@ impl DatabaseSchemaProvider {
             Some(remaining[..end_pos].to_string())
         } else {
             None
+        }
+    }
+
+    /// Parse an optional setting from the connection block. Same env() chain
+    /// as [`Self::parse_env_setting`] but returns `None` when the resolved
+    /// value is empty (no env, empty default, or empty string literal). Use
+    /// for settings that shouldn't be passed to the driver when missing —
+    /// e.g., empty `unix_socket` should NOT trigger socket-mode.
+    fn parse_optional_setting(&self, block: &str, key: &str) -> Option<String> {
+        let value = self.parse_env_setting(block, key, "");
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
         }
     }
 
@@ -659,56 +759,56 @@ impl DatabaseSchemaProvider {
         result
     }
 
-    /// Fetch schema from MySQL/MariaDB
+    /// Fetch schema from MySQL/MariaDB. Tries connection candidates in
+    /// priority order:
+    /// 1. **`DB_URL`** — managed cloud providers (Heroku, Render, AWS)
+    ///    deliver a full connection string. When set, this overrides
+    ///    everything else, exactly as Laravel's `ConfigurationUrlParser`
+    ///    does.
+    /// 2. **`unix_socket`** — common on Mac local dev (Homebrew MySQL),
+    ///    where the daemon exposes both TCP and a `.sock` file.
+    /// 3. **TCP** with the configured host, plus a `127.0.0.1` fallback
+    ///    for Sail / Docker Compose setups where the configured host is a
+    ///    container service name unresolvable from outside Docker.
     async fn fetch_mysql_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
         use sqlx::mysql::MySqlPoolOptions;
         use sqlx::Row;
 
-        // Sail / Docker Compose use service hostnames like `mysql`, `pgsql`,
-        // `redis` etc. that only resolve inside the Docker network. The LSP
-        // runs outside Docker (it's a local binary), so `mysql` fails DNS.
-        // Sail's default `docker-compose.yml` maps the container's 3306 to
-        // the host's 3306, so `127.0.0.1:3306` reaches the same database.
-        // Try the configured host first; if that fails AND the host looks
-        // like a Docker service name (no dots, not localhost), retry with
-        // `127.0.0.1`. Most Sail projects Just Work after this fallback.
-        let host_candidates = Self::host_candidates(&config.host);
-
+        let candidates = self.build_mysql_candidates(config);
         let mut last_err: Option<String> = None;
         let mut pool_opt = None;
-        let mut used_fallback_host: Option<&str> = None;
-        for host in &host_candidates {
-            let url = format!(
-                "mysql://{}:{}@{}:{}/{}",
-                config.username, config.password, host, config.port, config.database
-            );
+        let primary_label = candidates.first().map(|c| c.label.clone());
+
+        for cand in &candidates {
             match MySqlPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(Duration::from_secs(5))
-                .connect(&url)
+                .connect(&cand.url)
                 .await
             {
                 Ok(p) => {
-                    if host != &config.host {
+                    if Some(&cand.label) != primary_label.as_ref() {
                         info!(
-                            "MySQL: connected via fallback host '{}' (configured host '{}' didn't resolve). \
-                             Looks like a Sail / Docker Compose setup — the LSP runs outside Docker, so \
-                             the service hostname doesn't work, but the mapped host port does.",
-                            host, config.host
+                            "MySQL: connected via fallback '{}' (primary '{}' failed). \
+                             {}",
+                            cand.label,
+                            primary_label.as_deref().unwrap_or("?"),
+                            cand.success_note.as_deref().unwrap_or("")
                         );
-                        used_fallback_host = Some(host);
+                    } else {
+                        info!("MySQL: connected via {}", cand.label);
                     }
                     pool_opt = Some(p);
                     break;
                 }
                 Err(e) => {
-                    if host_candidates.len() > 1 && host == &config.host {
+                    if candidates.len() > 1 && Some(&cand.label) == primary_label.as_ref() {
                         info!(
-                            "MySQL: primary host '{}' didn't connect ({}). Trying fallback...",
-                            host, e
+                            "MySQL: primary candidate '{}' didn't connect ({}). Trying fallback...",
+                            cand.label, e
                         );
                     }
-                    last_err = Some(format!("host='{host}': {e}"));
+                    last_err = Some(format!("{}: {}", cand.label, e));
                 }
             }
         }
@@ -717,11 +817,15 @@ impl DatabaseSchemaProvider {
             Some(p) => p,
             None => {
                 let msg = format!(
-                    "MySQL connection failed. Tried hosts: [{}]. Last error: {}. \
-                     Check DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD in .env. \
-                     If using Sail/Docker Compose, ensure the container is running and the \
-                     port is mapped to your host (run `./vendor/bin/sail up -d`).",
-                    host_candidates.join(", "),
+                    "MySQL connection failed. Tried candidates: [{}]. Last error: {}. \
+                     Check DB_URL / DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD / \
+                     DB_SOCKET in .env. If using Sail/Docker Compose, ensure the container is \
+                     running and the port is mapped to your host (run `./vendor/bin/sail up -d`).",
+                    candidates
+                        .iter()
+                        .map(|c| c.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     last_err.unwrap_or_else(|| "(no error captured)".to_string())
                 );
                 warn!("{}", msg);
@@ -729,7 +833,6 @@ impl DatabaseSchemaProvider {
                 return None;
             }
         };
-        let _ = used_fallback_host; // documented in info! above
 
         // Diagnostic identity probe — when SHOW TABLES returns 0 rows but
         // the user knows the DB has tables, the connection probably landed
@@ -820,39 +923,150 @@ impl DatabaseSchemaProvider {
         candidates
     }
 
-    /// Fetch schema from PostgreSQL
+    /// Build the ordered list of MySQL connection candidates. Priority:
+    /// 1. `DB_URL` (full connection string, used by managed cloud providers)
+    /// 2. `unix_socket` (local dev, e.g. Homebrew MySQL exposing `.sock`)
+    /// 3. TCP via configured host + 127.0.0.1 Sail/Docker fallback
+    ///
+    /// All sources of credentials/database come from `config` — the URL/socket
+    /// don't carry their own credentials; we splice them in.
+    fn build_mysql_candidates(&self, config: &DatabaseConfig) -> Vec<ConnCandidate> {
+        let mut out = Vec::new();
+
+        if let Some(url) = &config.url {
+            // Pass DB_URL through verbatim — managed providers (Heroku, Render,
+            // AWS RDS proxy, etc.) bake credentials AND host into the URL and
+            // expect the driver to honor it as-is.
+            out.push(ConnCandidate {
+                label: "DB_URL".to_string(),
+                url: url.clone(),
+                success_note: Some(
+                    "Configured via DB_URL (typical for managed cloud providers).".to_string(),
+                ),
+            });
+        }
+
+        if let Some(socket) = &config.unix_socket {
+            // sqlx-mysql honors the `socket` query parameter — point host at
+            // `localhost` (ignored when socket is present, but required for
+            // URL syntax) and tack the socket on. Real-world socket paths
+            // (`/tmp/mysql.sock`, `/var/run/mysqld/mysqld.sock`) have no
+            // characters that need URL-encoding, so we splice raw.
+            out.push(ConnCandidate {
+                label: format!("unix_socket={socket}"),
+                url: format!(
+                    "mysql://{}:{}@localhost/{}?socket={}",
+                    config.username, config.password, config.database, socket
+                ),
+                success_note: Some(
+                    "Configured via unix_socket — bypasses TCP entirely.".to_string(),
+                ),
+            });
+        }
+
+        // TCP candidates. Always added — these are the fallback path when
+        // neither URL nor socket are configured, OR when those fail.
+        for host in Self::host_candidates(&config.host) {
+            let is_sail_fallback = host == "127.0.0.1" && host != config.host;
+            out.push(ConnCandidate {
+                label: format!("tcp {}:{}", host, config.port),
+                url: format!(
+                    "mysql://{}:{}@{}:{}/{}",
+                    config.username, config.password, host, config.port, config.database
+                ),
+                success_note: if is_sail_fallback {
+                    Some(
+                        "Looks like a Sail / Docker Compose setup — the LSP runs outside Docker, \
+                         so the service hostname doesn't work, but the mapped host port does."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
+            });
+        }
+
+        out
+    }
+
+    /// Build the ordered list of PostgreSQL connection candidates. Same
+    /// priority as MySQL: DB_URL → unix_socket → TCP with host fallback.
+    fn build_postgres_candidates(&self, config: &DatabaseConfig) -> Vec<ConnCandidate> {
+        let mut out = Vec::new();
+
+        if let Some(url) = &config.url {
+            out.push(ConnCandidate {
+                label: "DB_URL".to_string(),
+                url: url.clone(),
+                success_note: Some("Configured via DB_URL.".to_string()),
+            });
+        }
+
+        if let Some(socket) = &config.unix_socket {
+            // libpq-style socket connection: `postgres://user:pass@/db?host=/path`.
+            out.push(ConnCandidate {
+                label: format!("unix_socket={socket}"),
+                url: format!(
+                    "postgres://{}:{}@/{}?host={}",
+                    config.username, config.password, config.database, socket
+                ),
+                success_note: Some("Configured via unix_socket.".to_string()),
+            });
+        }
+
+        for host in Self::host_candidates(&config.host) {
+            let is_sail_fallback = host == "127.0.0.1" && host != config.host;
+            out.push(ConnCandidate {
+                label: format!("tcp {}:{}", host, config.port),
+                url: format!(
+                    "postgres://{}:{}@{}:{}/{}",
+                    config.username, config.password, host, config.port, config.database
+                ),
+                success_note: if is_sail_fallback {
+                    Some("Sail / Docker Compose fallback to 127.0.0.1.".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+
+        out
+    }
+
+    /// Fetch schema from PostgreSQL. Same candidate priority as
+    /// `fetch_mysql_schema`: DB_URL → unix_socket → TCP with Sail fallback.
     async fn fetch_postgres_schema(&self, config: &DatabaseConfig) -> Option<DatabaseSchema> {
         use sqlx::postgres::PgPoolOptions;
         use sqlx::Row;
 
-        // Same Sail/Docker fallback story as MySQL — see `fetch_mysql_schema`
-        // for the rationale.
-        let host_candidates = Self::host_candidates(&config.host);
+        let candidates = self.build_postgres_candidates(config);
         let mut last_err: Option<String> = None;
         let mut pool_opt = None;
-        for host in &host_candidates {
-            let url = format!(
-                "postgres://{}:{}@{}:{}/{}",
-                config.username, config.password, host, config.port, config.database
-            );
+        let primary_label = candidates.first().map(|c| c.label.clone());
+
+        for cand in &candidates {
             match PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(Duration::from_secs(5))
-                .connect(&url)
+                .connect(&cand.url)
                 .await
             {
                 Ok(p) => {
-                    if host != &config.host {
+                    if Some(&cand.label) != primary_label.as_ref() {
                         info!(
-                            "PostgreSQL: connected via fallback host '{}' (configured host '{}' didn't resolve).",
-                            host, config.host
+                            "PostgreSQL: connected via fallback '{}' (primary '{}' failed). {}",
+                            cand.label,
+                            primary_label.as_deref().unwrap_or("?"),
+                            cand.success_note.as_deref().unwrap_or("")
                         );
+                    } else {
+                        info!("PostgreSQL: connected via {}", cand.label);
                     }
                     pool_opt = Some(p);
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(format!("host='{host}': {e}"));
+                    last_err = Some(format!("{}: {}", cand.label, e));
                 }
             }
         }
@@ -861,10 +1075,15 @@ impl DatabaseSchemaProvider {
             Some(p) => p,
             None => {
                 let msg = format!(
-                    "PostgreSQL connection failed. Tried hosts: [{}]. Last error: {}. \
-                     Check DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD in .env. \
-                     If using Sail/Docker Compose, ensure the container is running.",
-                    host_candidates.join(", "),
+                    "PostgreSQL connection failed. Tried candidates: [{}]. Last error: {}. \
+                     Check DB_URL / DB_HOST / DB_PORT / DB_DATABASE / DB_USERNAME / DB_PASSWORD / \
+                     DB_SOCKET in .env. If using Sail/Docker Compose, ensure the container is \
+                     running.",
+                    candidates
+                        .iter()
+                        .map(|c| c.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     last_err.unwrap_or_else(|| "(no error captured)".to_string())
                 );
                 warn!("{}", msg);

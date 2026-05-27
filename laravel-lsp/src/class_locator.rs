@@ -29,14 +29,34 @@ use walkdir::WalkDir;
 /// found. Does not parse the file to verify the class name inside — relies on
 /// Laravel's strong convention that file basename matches class name.
 pub fn find_php_class_file(class_name: &str, root: &Path) -> Option<PathBuf> {
-    // Try the namespace-aware path mapping first — `App\Models\User`
-    // should land at `app/Models/User.php`, not at the first `User.php`
-    // we happen to walk into (which could be `app/Nova/User.php` or
-    // similar). Falls back to a basename walk under app/ if the FQCN
-    // doesn't map to an existing file.
+    // Composer autoload is the authoritative source for any FQCN with
+    // a declared PSR-4 prefix. If it resolves the class — whether to
+    // an app-side or vendor-side path — trust it. A vendor FQCN like
+    // `CrossBibleInc\BibleModels\Models\Book` MUST route to vendor;
+    // falling back to a basename walk under `app/` for such an FQCN
+    // would land on the first same-named file (e.g.
+    // `app/Nova/Filters/Book.php`), which is the wrong class.
+    let autoload = crate::composer_autoload::ComposerAutoload::for_project(root);
+    if let Some(path) = autoload.resolve(class_name) {
+        return Some(path);
+    }
+
+    // Composer doesn't know the FQCN. Try the heuristic mappings for
+    // projects without an installed.json (or for namespaces the user
+    // hasn't declared in composer.json). Cheap App and vendor PSR-4
+    // shape checks, no walking.
     if let Some(path) = find_php_class_file_by_fqcn(class_name, root, false) {
         return Some(path);
     }
+    if let Some(path) = find_php_class_file_by_fqcn(class_name, root, true) {
+        return Some(path);
+    }
+
+    // Last resort: basename walk under `app/` (and `src/`). Vendor is
+    // intentionally not walked here — it's huge and the Composer
+    // step above already handles all conventionally-installed
+    // packages. Inheritance walking, which can legitimately need to
+    // scan vendor by basename, calls `find_php_class_file_in_app_or_vendor`.
     find_php_class_file_impl(class_name, root, false)
 }
 
@@ -50,65 +70,53 @@ pub fn find_php_class_file(class_name: &str, root: &Path) -> Option<PathBuf> {
 /// (≤10 levels) and the result is cached behind ModelMetadata anyway.
 /// app/-side definitions still win — they're checked first.
 pub fn find_php_class_file_in_app_or_vendor(class_name: &str, root: &Path) -> Option<PathBuf> {
-    // Try FQCN-aware lookup across app/ AND vendor/ first. If neither
-    // PSR-4-shaped path exists, fall through to a basename walk —
-    // again preferring app/ over vendor/ since project classes shadow
-    // vendor classes with matching basenames.
+    // Composer first (same reasoning as `find_php_class_file`). For
+    // the inheritance walker this is normally enough — parent classes
+    // declared in any installed package land via PSR-4.
+    let autoload = crate::composer_autoload::ComposerAutoload::for_project(root);
+    if let Some(path) = autoload.resolve(class_name) {
+        return Some(path);
+    }
+
+    // Heuristic fallbacks for projects without installed.json.
     if let Some(path) = find_php_class_file_by_fqcn(class_name, root, false) {
         return Some(path);
     }
     if let Some(path) = find_php_class_file_by_fqcn(class_name, root, true) {
         return Some(path);
     }
+
+    // Last resort: basename walk app/, then vendor/. The vendor walk
+    // is reserved for this app-or-vendor entry point because the
+    // inheritance walker is bounded in depth and cached.
     if let Some(path) = find_php_class_file_impl(class_name, root, false) {
         return Some(path);
     }
     find_php_class_file_impl(class_name, root, true)
 }
 
-/// Map a fully-qualified class name to its source file path.
+/// Heuristic FQCN → file path mapping for projects without an
+/// `installed.json` (or where the user hasn't declared an autoload
+/// entry in `composer.json`). Used as a *fallback* below the
+/// Composer autoload step in the public lookup functions.
 ///
-/// Resolution order:
+/// Mappings:
+/// - `App\Models\User` → `app/Models/User.php` (or `src/Models/User.php`
+///   for projects that use `src/` for app code)
+/// - `Laravel\Passport\Token` → `vendor/laravel/passport/src/Token.php`
+///   (lowercased vendor + package, then `src/`, then remaining
+///   namespace segments). Misses for hyphenated package dirs —
+///   Composer autoload (the step above) handles those correctly.
 ///
-/// 1. **Real Composer PSR-4 data** ([`crate::composer_autoload::ComposerAutoload`])
-///    — reads the project's `composer.json` + `vendor/composer/installed.json`
-///    and uses the actual declared PSR-4 prefix → directory mappings.
-///    This handles packages whose directory name is hyphenated even
-///    though the namespace isn't (e.g. `CrossBibleInc\BibleModels\` →
-///    `vendor/crossbibleinc/bible-models/src/`).
-/// 2. **Conventional heuristic fallback** — for projects without an
-///    `installed.json` (rare), the original mapping kicks in:
-///    - `App\Models\User` → `app/Models/User.php` (or `src/Models/User.php`)
-///    - `Laravel\Passport\Token` → `vendor/laravel/passport/src/Token.php`
-///      (lowercased vendor + package, then `src/`)
+/// `search_vendor`: `true` consults the vendor heuristic only;
+/// `false` the App heuristic only. Callers chain both.
 ///
-/// `search_vendor`: when `true`, only consider the vendor/ mapping;
-/// when `false`, only consider the App/ mapping. Callers chain both
-/// modes to cover the realistic search space. The Composer step
-/// honors this split too — it segregates project-rooted and
-/// vendor-rooted entries.
-///
-/// Returns `None` if neither strategy finds a file on disk. The caller
-/// then falls back to a basename walk so we still resolve
-/// unconventional PSR-4 layouts.
+/// Returns `None` if no candidate path exists on disk.
 fn find_php_class_file_by_fqcn(
     fqcn: &str,
     project_root: &Path,
     search_vendor: bool,
 ) -> Option<PathBuf> {
-    // Try the real Composer PSR-4 map first. Filter results by
-    // whether the resolved path is under vendor/ so the caller's
-    // app-vs-vendor segregation still holds.
-    let autoload = crate::composer_autoload::ComposerAutoload::for_project(project_root);
-    if let Some(path) = autoload.resolve(fqcn) {
-        let is_vendor = path.starts_with(project_root.join("vendor"));
-        if is_vendor == search_vendor {
-            return Some(path);
-        }
-        // Path exists but on the wrong side of the app/vendor split
-        // for this call. Fall through to the heuristic — the OTHER
-        // call (with the flipped flag) will pick up the Composer hit.
-    }
     let segments: Vec<&str> = fqcn.split('\\').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return None;
@@ -292,6 +300,46 @@ mod tests {
         assert!(
             path.ends_with("app/Models/Token.php"),
             "App\\Models\\Token should resolve to the project file; got {path:?}"
+        );
+    }
+
+    #[test]
+    fn find_php_class_file_routes_vendor_fqcn_via_composer_autoload() {
+        // Phase 5.12: the dotted-walker hands `find_php_class_file` a
+        // vendor FQCN (Phase 5.11 made related_model store FQCNs).
+        // Composer autoload knows the real PSR-4 mapping, including for
+        // hyphenated package dirs. We must trust it even when the
+        // lookup is "app-side" — falling back to a basename walk under
+        // app/ for a vendor FQCN finds a same-named app file (e.g.
+        // app/Nova/Filters/Book.php), which is the wrong class.
+        let installed = r#"{
+            "packages": [
+                {
+                    "name": "crossbibleinc/bible-models",
+                    "autoload": {
+                        "psr-4": { "CrossBibleInc\\BibleModels\\": "src/" }
+                    },
+                    "install-path": "../crossbibleinc/bible-models"
+                }
+            ]
+        }"#;
+        let (_dir, root) = project_with_files(&[
+            ("vendor/composer/installed.json", installed),
+            (
+                "vendor/crossbibleinc/bible-models/src/Models/Book.php",
+                "<?php\nnamespace CrossBibleInc\\BibleModels\\Models;\nclass Book {}",
+            ),
+            (
+                // Same-basename app file — must NOT be picked.
+                "app/Nova/Filters/Book.php",
+                "<?php\nnamespace App\\Nova\\Filters;\nclass Book {}",
+            ),
+        ]);
+        let path = find_php_class_file("CrossBibleInc\\BibleModels\\Models\\Book", &root)
+            .expect("Composer autoload should route the vendor FQCN");
+        assert!(
+            path.ends_with("vendor/crossbibleinc/bible-models/src/Models/Book.php"),
+            "vendor FQCN must resolve to the vendor file via Composer autoload; got {path:?}"
         );
     }
 

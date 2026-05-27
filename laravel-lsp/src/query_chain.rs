@@ -26,8 +26,8 @@ pub mod use_aliases;
 
 pub use chain::*;
 pub use cursor::{
-    detect_chain_context_at, detect_chain_context_at_diagnostic, position_to_byte_offset,
-    ChainResolveFailure,
+    detect_chain_context_at, detect_chain_context_at_diagnostic, fixup_for_completion,
+    position_to_byte_offset, ChainResolveFailure,
 };
 pub use extractor::extract_chains;
 pub use use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};

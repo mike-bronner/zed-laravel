@@ -12,6 +12,59 @@
 use super::chain::*;
 use std::sync::Arc;
 
+/// At completion time the user is mid-typing and the file often has an
+/// unterminated string at the cursor (e.g., `DB::table('|`). Tree-sitter
+/// recovers by extending the `string` node up to the next quote anywhere in
+/// the file — which is usually thousands of bytes away and produces nonsense
+/// spans. Chain extraction sees this and ends up with `ChainArg::Other`
+/// instead of a real `StringLit`, so cursor detection fails.
+///
+/// This helper scans the line up to the cursor, tracks PHP single/double
+/// quote balance (with `\` escapes), and returns a content string with a
+/// matching closing quote injected at `byte_offset` if a quote is open.
+/// Returns `None` if no fixup is needed (the cursor isn't inside an
+/// unterminated string).
+///
+/// We deliberately don't model heredocs/nowdocs — those don't appear in
+/// query chain arguments in any real code. We also stop the scan at the
+/// previous newline, so quotes that opened on prior lines don't confuse us
+/// (multi-line strings inside chain args are vanishingly rare).
+pub fn fixup_for_completion(content: &str, byte_offset: usize) -> Option<String> {
+    if byte_offset > content.len() {
+        return None;
+    }
+    let line_start = content[..byte_offset]
+        .rfind('\n')
+        .map(|n| n + 1)
+        .unwrap_or(0);
+    let line_to_cursor = &content[line_start..byte_offset];
+
+    // Tiny state machine: `None` = not in a string, `Some(q)` = inside a
+    // string opened with quote `q`. Escapes consume the next character so
+    // `\'` and `\"` inside the matching quote style don't toggle the state.
+    let mut state: Option<char> = None;
+    let mut iter = line_to_cursor.chars();
+    while let Some(c) = iter.next() {
+        match (state, c) {
+            (None, '\'') => state = Some('\''),
+            (None, '"') => state = Some('"'),
+            (Some(_), '\\') => {
+                // Skip the next char (escaped).
+                iter.next();
+            }
+            (Some(open), close) if open == close => state = None,
+            _ => {}
+        }
+    }
+
+    let unclosed = state?;
+    let mut result = String::with_capacity(content.len() + 1);
+    result.push_str(&content[..byte_offset]);
+    result.push(unclosed);
+    result.push_str(&content[byte_offset..]);
+    Some(result)
+}
+
 /// Translate an LSP `Position` (0-based line + character) into a byte offset
 /// inside `content`. Characters are treated as Unicode code points, not
 /// UTF-16 code units — this matches every existing position handler in the

@@ -2768,9 +2768,11 @@ impl LaravelLanguageServer {
         uri: &tower_lsp::lsp_types::Url,
     ) -> Option<Vec<CompletionItem>> {
         use laravel_lsp::query_chain::{
-            detect_chain_context_at_diagnostic, eloquent_completion, position_to_byte_offset,
-            ArgKind, BuilderMode, ChainResolveFailure,
+            detect_chain_context_at_diagnostic, eloquent_completion, extract_chains,
+            fixup_for_completion, position_to_byte_offset, ArgKind, BuilderChain, BuilderMode,
+            ChainResolveFailure,
         };
+        use std::sync::Arc;
 
         // Diagnostic marker — fires unconditionally for every completion request
         // in a .php/.blade.php file. If this line doesn't appear in the LSP
@@ -2781,34 +2783,6 @@ impl LaravelLanguageServer {
             position.line,
             position.character
         );
-
-        let file_path = match uri.to_file_path() {
-            Ok(p) => p,
-            Err(_) => {
-                info!("🔗 chain completion: uri.to_file_path() failed for {}", uri);
-                return None;
-            }
-        };
-        let patterns = match self.salsa.get_patterns(file_path).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                info!("🔗 chain completion: salsa.get_patterns returned None");
-                return None;
-            }
-            Err(e) => {
-                info!("🔗 chain completion: salsa.get_patterns failed: {}", e);
-                return None;
-            }
-        };
-        if patterns.chains.is_empty() {
-            info!(
-                "🔗 chain completion: 0 chains cached for this file — file may have \
-                 been parsed by an older binary (the disk cache survives builds). \
-                 Try editing the file (add a space, save) to force re-extraction."
-            );
-            return None;
-        }
-        info!("🔗 chain completion: {} chains in file", patterns.chains.len());
 
         let byte_offset = match position_to_byte_offset(content, position.line, position.character)
         {
@@ -2821,7 +2795,53 @@ impl LaravelLanguageServer {
                 return None;
             }
         };
-        let ctx = match detect_chain_context_at_diagnostic(&patterns.chains, byte_offset) {
+
+        // Mid-typing the file often has an unterminated quote at the cursor.
+        // Tree-sitter recovers poorly in that case (the `string` node swallows
+        // everything to the next quote anywhere downstream, producing nonsense
+        // spans). We can't trust Salsa's cached chains for this exact moment,
+        // and the in-memory cached version may be stale relative to the live
+        // documents map too. So: inject a matching close quote at the cursor
+        // if needed, then re-parse + re-extract chains from the fixed-up
+        // content. Per-completion cost is one tree-sitter parse on a small
+        // file (~1-5ms) — well within Mike's 200ms debounce.
+        let fixed_content = fixup_for_completion(content, byte_offset);
+        let parse_source: &str = fixed_content.as_deref().unwrap_or(content);
+        if fixed_content.is_some() {
+            info!(
+                "🔗 chain completion: injected close quote at byte {} to balance unterminated string",
+                byte_offset
+            );
+        }
+
+        let tree = match laravel_lsp::parser::parse_php(parse_source) {
+            Ok(t) => t,
+            Err(e) => {
+                info!(
+                    "🔗 chain completion: parse_php failed on fixed-up content: {}",
+                    e
+                );
+                return None;
+            }
+        };
+        let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, parse_source)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+
+        if chains.is_empty() {
+            info!("🔗 chain completion: 0 chains in (fixed-up) file at completion time");
+            return None;
+        }
+        info!(
+            "🔗 chain completion: {} chains in (fixed-up) file",
+            chains.len()
+        );
+
+        // file_path is still needed downstream for diagnostics. Resolve once.
+        let _file_path = uri.to_file_path().ok();
+
+        let ctx = match detect_chain_context_at_diagnostic(&chains, byte_offset) {
             Ok(c) => c,
             Err(ChainResolveFailure::NoChainAtCursor { chains }) => {
                 // Dump every chain's span so we can see why none contained
@@ -2840,10 +2860,7 @@ impl LaravelLanguageServer {
                             .join("->");
                         format!(
                             "{}-{} (recv={:?} :: {})",
-                            c.span_byte_range.0,
-                            c.span_byte_range.1,
-                            c.receiver,
-                            method_summary
+                            c.span_byte_range.0, c.span_byte_range.1, c.receiver, method_summary
                         )
                     })
                     .collect();

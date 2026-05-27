@@ -34,6 +34,84 @@ fn detect(src_with_cursor: &str) -> Option<ChainContext> {
     detect_chain_context_at(&chains, byte_offset)
 }
 
+// ---- fixup_for_completion ---------------------------------------------
+
+#[test]
+fn fixup_returns_none_when_no_open_quote() {
+    let src = "$x = 1;";
+    assert!(fixup_for_completion(src, src.len()).is_none());
+}
+
+#[test]
+fn fixup_balanced_quotes_returns_none() {
+    let src = "DB::table('users')->where('";
+    // First `'`/`'` balanced (`'users'`), then a second `'` opened — that's
+    // unbalanced. But fixup_for_completion sees one open, no close, so it
+    // SHOULD return Some. Pin that.
+    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced");
+    assert_eq!(fixed, "DB::table('users')->where(''");
+}
+
+#[test]
+fn fixup_injects_single_quote_for_unterminated_db_table() {
+    let src = "DB::table('";
+    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced single quote");
+    assert_eq!(fixed, "DB::table(''");
+}
+
+#[test]
+fn fixup_injects_double_quote_for_unterminated_double_string() {
+    let src = "DB::table(\"";
+    let fixed = fixup_for_completion(src, src.len()).expect("unbalanced double quote");
+    assert_eq!(fixed, "DB::table(\"\"");
+}
+
+#[test]
+fn fixup_respects_escapes() {
+    // `\'` inside a `'`-string doesn't toggle the state.
+    let src = "DB::table('it\\'s ";
+    let fixed = fixup_for_completion(src, src.len()).expect("still open after \\'");
+    assert_eq!(fixed, "DB::table('it\\'s '");
+}
+
+#[test]
+fn fixup_stops_at_line_boundary() {
+    // Quote opened on a previous line doesn't bleed into the current line.
+    // (We deliberately ignore those — multi-line strings in chain args are
+    // rare, and treating them per-line is safer than chasing arbitrary
+    // history.)
+    let src = "'unterminated\nDB::table(";
+    // Cursor at end of `DB::table(` — current line has no opened quote,
+    // even though the previous line did.
+    let fixed = fixup_for_completion(src, src.len());
+    assert!(
+        fixed.is_none(),
+        "previous-line quote shouldn't trigger fixup, got: {:?}",
+        fixed
+    );
+}
+
+#[test]
+fn fixup_handles_inner_double_inside_single() {
+    // `'has "double" inside'` — inner `"` doesn't toggle when we're inside `'`.
+    let src = "echo 'a \"b\" c";
+    let fixed = fixup_for_completion(src, src.len()).expect("single still open");
+    assert_eq!(fixed, "echo 'a \"b\" c'");
+}
+
+#[test]
+fn fixup_handles_inner_single_inside_double() {
+    let src = "echo \"a 'b' c";
+    let fixed = fixup_for_completion(src, src.len()).expect("double still open");
+    assert_eq!(fixed, "echo \"a 'b' c\"");
+}
+
+#[test]
+fn fixup_offset_beyond_eof_returns_none() {
+    let src = "abc";
+    assert!(fixup_for_completion(src, 100).is_none());
+}
+
 // ---- position_to_byte_offset ------------------------------------------
 
 #[test]

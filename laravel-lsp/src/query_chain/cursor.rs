@@ -63,6 +63,32 @@ pub fn detect_chain_context_at(
     detect_in_chain(chain, byte_offset)
 }
 
+/// Diagnostic variant of [`detect_chain_context_at`] that also returns a
+/// reason string describing why resolution failed. Used by the LSP handler
+/// to emit specific INFO logs (chain not found vs. cursor outside a string
+/// arg vs. unsupported receiver). Same logic, just plumbed-through reasons.
+pub fn detect_chain_context_at_diagnostic<'a>(
+    chains: &'a [Arc<BuilderChain>],
+    byte_offset: usize,
+) -> Result<ChainContext, ChainResolveFailure<'a>> {
+    let chain = find_chain_containing(chains, byte_offset)
+        .ok_or(ChainResolveFailure::NoChainAtCursor { chains })?;
+    detect_in_chain(chain, byte_offset).ok_or(ChainResolveFailure::InChain { chain })
+}
+
+/// Why `detect_chain_context_at_diagnostic` returned no context.
+#[derive(Debug)]
+pub enum ChainResolveFailure<'a> {
+    /// No chain in the file's chain list has a span containing the cursor.
+    /// The full chain list is returned so the caller can log spans for
+    /// comparison against the cursor byte.
+    NoChainAtCursor { chains: &'a [Arc<BuilderChain>] },
+    /// A chain contains the cursor but the cursor isn't in a completable
+    /// position within it (e.g., between method tokens, or the receiver is
+    /// an Eloquent model we can't resolve synchronously yet).
+    InChain { chain: &'a BuilderChain },
+}
+
 fn find_chain_containing(
     chains: &[Arc<BuilderChain>],
     byte_offset: usize,

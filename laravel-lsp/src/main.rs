@@ -2768,8 +2768,8 @@ impl LaravelLanguageServer {
         uri: &tower_lsp::lsp_types::Url,
     ) -> Option<Vec<CompletionItem>> {
         use laravel_lsp::query_chain::{
-            detect_chain_context_at, eloquent_completion, position_to_byte_offset, ArgKind,
-            BuilderMode,
+            detect_chain_context_at_diagnostic, eloquent_completion, position_to_byte_offset,
+            ArgKind, BuilderMode, ChainResolveFailure,
         };
 
         // Diagnostic marker — fires unconditionally for every completion request
@@ -2821,13 +2821,85 @@ impl LaravelLanguageServer {
                 return None;
             }
         };
-        let ctx = match detect_chain_context_at(&patterns.chains, byte_offset) {
-            Some(c) => c,
-            None => {
+        let ctx = match detect_chain_context_at_diagnostic(&patterns.chains, byte_offset) {
+            Ok(c) => c,
+            Err(ChainResolveFailure::NoChainAtCursor { chains }) => {
+                // Dump every chain's span so we can see why none contained
+                // the cursor. Most likely culprits: byte offset translated
+                // wrong (UTF-16 vs UTF-8?), file content out of sync between
+                // documents cache and Salsa, chain extractor producing
+                // wrong spans.
+                let spans: Vec<String> = chains
+                    .iter()
+                    .map(|c| {
+                        let method_summary: String = c
+                            .links
+                            .iter()
+                            .map(|l| l.method.as_str())
+                            .collect::<Vec<_>>()
+                            .join("->");
+                        format!(
+                            "{}-{} (recv={:?} :: {})",
+                            c.span_byte_range.0,
+                            c.span_byte_range.1,
+                            c.receiver,
+                            method_summary
+                        )
+                    })
+                    .collect();
                 info!(
-                    "🔗 chain completion: cursor at byte {} matched no chain link arg \
-                     (cursor isn't inside a string arg of a chain we recognise)",
-                    byte_offset
+                    "🔗 chain completion: cursor at byte {} doesn't fall inside any chain span. \
+                     Chains: [{}]",
+                    byte_offset,
+                    spans.join(", ")
+                );
+                return None;
+            }
+            Err(ChainResolveFailure::InChain { chain }) => {
+                let arg_summary: Vec<String> = chain
+                    .links
+                    .iter()
+                    .map(|l| {
+                        let arg_spans: Vec<String> = l
+                            .args
+                            .iter()
+                            .map(|a| match a {
+                                laravel_lsp::query_chain::ChainArg::StringLit {
+                                    quote,
+                                    span_byte_range,
+                                    value,
+                                } => format!(
+                                    "Str{{{:?},{}..{},val={:?}}}",
+                                    quote, span_byte_range.0, span_byte_range.1, value
+                                ),
+                                laravel_lsp::query_chain::ChainArg::Closure {
+                                    body_byte_range,
+                                    ..
+                                } => format!(
+                                    "Closure{{body={}..{}}}",
+                                    body_byte_range.0, body_byte_range.1
+                                ),
+                                laravel_lsp::query_chain::ChainArg::Other => "Other".to_string(),
+                            })
+                            .collect();
+                        format!(
+                            "{}@{}-{}[arg={:?}, args=[{}]]",
+                            l.method,
+                            l.span_byte_range.0,
+                            l.span_byte_range.1,
+                            l.arg,
+                            arg_spans.join(", ")
+                        )
+                    })
+                    .collect();
+                info!(
+                    "🔗 chain completion: cursor at byte {} is INSIDE chain {}..{} (recv={:?}) but \
+                     not inside a recognised string arg. Links: [{}]",
+                    byte_offset,
+                    chain.span_byte_range.0,
+                    chain.span_byte_range.1,
+                    chain.receiver,
+                    arg_summary.join(", ")
                 );
                 return None;
             }

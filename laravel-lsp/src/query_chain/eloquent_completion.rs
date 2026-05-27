@@ -19,7 +19,7 @@
 use super::chain::*;
 use crate::class_locator::find_php_class_file;
 use crate::database::DatabaseSchemaProvider;
-use crate::model_analyzer::{map_cast_to_php_type, ModelMetadata};
+use crate::model_analyzer::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
 use std::path::Path;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use tracing::info;
@@ -225,6 +225,96 @@ pub async fn columns_for_builder(
                     description: Some(table.clone()),
                 }),
                 detail: Some(format!("{php_type}{detail_suffix} ({table})")),
+                sort_text: Some(format!("1_{name}")),
+                filter_text: Some(name),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Build relation completions for an `EloquentBuilder` chain — the first
+/// string arg of methods like `with('|')`, `whereHas('|', closure)`,
+/// `load('|')`, `withCount('|')`, etc.
+///
+/// Reads the model's `ModelMetadata::relationships` (already extracted by
+/// the existing model analyzer — same source the property completion path
+/// uses) and surfaces one item per relationship method, with a
+/// Laravel-aware return type like `HasMany<Post>` or `BelongsTo<User>` in
+/// the popup detail. Items use `CompletionItemKind::REFERENCE` so the
+/// icon matches what users expect for "method that returns something
+/// related."
+///
+/// Returns an empty `Vec` when the model file isn't found or the model
+/// has no relationships. Same failure-mode pattern as
+/// [`columns_for_builder`]: log INFO and yield empty so the LSP log is
+/// the source of truth.
+///
+/// Base-builder chains (`DB::table(...)`) never reach here — the handler
+/// dispatch returns empty for `(BaseBuilder, Relation)`. That's
+/// load-bearing: Query Builder doesn't have relation methods, so a `with`
+/// on a `DB::table()` chain is user error and we shouldn't pretend
+/// otherwise by listing relations.
+pub async fn relations(
+    ctx: &ChainContext,
+    wrap_with_quote: Option<char>,
+    project_root: &Path,
+) -> Vec<CompletionItem> {
+    let Some(class) = &ctx.effective_model else {
+        info!("🔗 relations: ctx.effective_model is None — returning 0 items");
+        return Vec::new();
+    };
+
+    let Some(path) = find_php_class_file(class, project_root) else {
+        info!(
+            "🔗 relations: no PHP file found for class {:?} under {:?}",
+            class, project_root
+        );
+        return Vec::new();
+    };
+
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(err) => {
+            info!("🔗 relations: failed to read {:?}: {}", path, err);
+            return Vec::new();
+        }
+    };
+    let metadata = ModelMetadata::from_content(&content);
+
+    if metadata.relationships.is_empty() {
+        info!(
+            "🔗 relations: model {:?} (file {:?}) has no relationships extracted",
+            class, path
+        );
+    }
+
+    metadata
+        .relationships
+        .into_iter()
+        .map(|rel| {
+            let php_type =
+                relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+            let name = rel.method_name;
+            let insert_text = match wrap_with_quote {
+                Some(q) => format!("{q}{name}{q}"),
+                None => name.clone(),
+            };
+            CompletionItem {
+                label: name.clone(),
+                // REFERENCE icon — semantically "this points to another
+                // entity," which matches relationships better than FIELD
+                // (column) or CLASS (table).
+                kind: Some(CompletionItemKind::REFERENCE),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: Some(format!("  {php_type}")),
+                    description: Some(rel.relationship_type.clone()),
+                }),
+                detail: Some(format!("{php_type} ({})", rel.relationship_type)),
+                // Same `1_` prefix as columns so when both are surfaced
+                // (different ArgKind branches in the handler, so they
+                // shouldn't collide in practice) they rank together.
                 sort_text: Some(format!("1_{name}")),
                 filter_text: Some(name),
                 insert_text: Some(insert_text),

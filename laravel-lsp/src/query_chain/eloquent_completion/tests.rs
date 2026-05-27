@@ -243,3 +243,116 @@ class User extends Model {}
     let item = items.iter().find(|i| i.label == "email").expect("email");
     assert_eq!(item.insert_text.as_deref(), Some("'email'"));
 }
+
+// ---- relations: Eloquent relation-name completion (Phase 5) -------------
+
+#[tokio::test]
+async fn relations_surfaces_model_relationships() {
+    // Standard relationship shapes: hasMany, belongsTo, hasOne. The
+    // existing ModelMetadata extractor finds all three; the helper just
+    // formats them as completion items.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() {
+        return $this->hasMany(Post::class);
+    }
+    public function company() {
+        return $this->belongsTo(Company::class);
+    }
+    public function profile() {
+        return $this->hasOne(Profile::class);
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let ctx = make_ctx("App\\Models\\User");
+    let items = relations(&ctx, None, &root).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"posts"),
+        "expected `posts`; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"company"),
+        "expected `company`; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"profile"),
+        "expected `profile`; got {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn relations_includes_related_model_in_detail() {
+    // The completion item's detail should surface the related model class
+    // (e.g., `HasMany<Post>`) so the user can tell at a glance what the
+    // relation points to.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() {
+        return $this->hasMany(Post::class);
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let ctx = make_ctx("App\\Models\\User");
+    let items = relations(&ctx, None, &root).await;
+    let posts = items.iter().find(|i| i.label == "posts").expect("posts");
+    let detail = posts.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("Post"),
+        "related model should appear in detail; got {detail:?}"
+    );
+    assert!(
+        detail.contains("hasMany"),
+        "relationship type should appear in detail; got {detail:?}"
+    );
+}
+
+#[tokio::test]
+async fn relations_returns_empty_when_model_file_missing() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let ctx = make_ctx("App\\Models\\Phantom");
+    let items = relations(&ctx, None, &root).await;
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn relations_returns_empty_when_model_has_no_relationships() {
+    // Plain model — no relationship methods defined. Should yield empty,
+    // not crash, not pretend.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Bare extends Model {}
+"#;
+    let (_dir, root) = project_with_model("Bare", body);
+    let ctx = make_ctx("App\\Models\\Bare");
+    let items = relations(&ctx, None, &root).await;
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn relations_wraps_insert_text_when_no_source_quotes() {
+    // Same shape as columns_for_builder — wrap with quotes when the
+    // source has none (case-3 fixup path).
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function posts() {
+        return $this->hasMany(Post::class);
+    }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let ctx = make_ctx("App\\Models\\User");
+    let items = relations(&ctx, Some('\''), &root).await;
+    let posts = items.iter().find(|i| i.label == "posts").expect("posts");
+    assert_eq!(posts.insert_text.as_deref(), Some("'posts'"));
+}

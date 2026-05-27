@@ -441,6 +441,42 @@ fn eloquent_static_receiver_with_use_alias_carries_fqcn() {
 }
 
 #[test]
+fn eloquent_static_with_first_arg_resolves_to_relation_completion() {
+    // `User::with('po|')` — `with` is a RELATION_METHOD, so the cursor's
+    // arg kind is Relation. Handler reads the model's relationships.
+    let ctx = detect("User::with('po|');")
+        .expect("Eloquent with() arg should produce a ChainContext expecting=Relation");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Relation);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn eloquent_static_where_has_first_arg_resolves_to_closure_carrier() {
+    // `User::whereHas('po|', closure)` — `whereHas` is in CLOSURE_CARRIERS
+    // which wins precedence over RELATION_METHODS in arg_kind(). For the
+    // first string arg the meaning is identical (a relation name), so the
+    // handler accepts both Relation and ClosureCarrier as relation-name
+    // positions.
+    let ctx = detect("User::whereHas('po|', function ($q) {});")
+        .expect("whereHas() first arg should produce a ChainContext");
+    assert_eq!(ctx.mode, BuilderMode::EloquentBuilder);
+    assert_eq!(ctx.expecting, ArgKind::ClosureCarrier);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn eloquent_static_load_first_arg_resolves_to_relation() {
+    // `User::load(...)` doesn't actually exist as a static (load is on the
+    // model instance / collection), but `loadCount` and similar are on
+    // builder. Use `with` as the canonical static-position relation method
+    // and `withCount` for the closure-carrier-on-Eloquent-builder shape.
+    let ctx = detect("User::withCount('po|');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::ClosureCarrier);
+    assert_eq!(ctx.effective_model.as_deref(), Some("User"));
+}
+
+#[test]
 fn eloquent_instance_receiver_still_returns_none_until_phase_9() {
     // `$user->newQuery()->where('|')` — InstanceVar receiver still needs
     // `@var` / typed-param scanning (Phase 9). For now, return None.

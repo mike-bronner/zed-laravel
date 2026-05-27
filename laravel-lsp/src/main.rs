@@ -2973,12 +2973,40 @@ impl LaravelLanguageServer {
                     }
                 }
             }
+            // `User::with('|')` / `User::whereHas('|', closure)` /
+            // `User::load('|')` etc. — Eloquent relation-name completion.
+            // ArgKind::ClosureCarrier wins over ArgKind::Relation in the
+            // method classifier, so we accept both — for the first string
+            // arg they mean the same thing (a relationship method name on
+            // the current model). Inside the closure body the cursor would
+            // resolve to a *different* chain anyway (Phase 8 closure scope).
+            (BuilderMode::EloquentBuilder, ArgKind::Relation)
+            | (BuilderMode::EloquentBuilder, ArgKind::ClosureCarrier) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::relations(&ctx, wrap_with_quote, &root).await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve relations"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            // Load-bearing: `DB::table('users')->with('|')` is user error —
+            // Query Builder has no relation methods, so listing relations
+            // would teach the user something untrue. Stay quiet.
+            (BuilderMode::BaseBuilder, ArgKind::Relation)
+            | (BuilderMode::BaseBuilder, ArgKind::ClosureCarrier) => Vec::new(),
             // `DB::table('|')` (or `DB::table(|`) — table-name completion.
             // Mode is always BaseBuilder by the time the receiver is
             // recognised, but we don't gate on it: even if a future receiver
             // shape produced Table args in another mode, tables are tables.
             (_, ArgKind::Table) => eloquent_completion::tables(db, wrap_with_quote).await,
-            // Other (mode, expecting) combinations land in Phases 5-9.
+            // Other (mode, expecting) combinations land in Phases 6-9.
             _ => Vec::new(),
         };
 

@@ -54,6 +54,30 @@ where
     None
 }
 
+/// Build the `user[:password]` userinfo segment of a `driver://userinfo@…`
+/// connection URL.
+///
+/// When the password is empty, returns just `user` (no trailing `:`).
+/// This matters: `mysql://root:@host/db` (with the `:`) tells sqlx
+/// "empty password specified" and sqlx will send the auth handshake
+/// including an empty password — MySQL responds with `using password: YES`
+/// and may reject the connection (especially against `auth_socket` plugin
+/// setups, or `root@localhost` configurations that require socket auth).
+/// `mysql://root@host/db` (without the `:`) tells sqlx "no password" and
+/// the handshake skips the password packet entirely — accepted by more
+/// permissive MySQL configs.
+///
+/// Special-character escaping is the caller's concern — Laravel's
+/// `.env` values don't typically need URL-encoding in production
+/// credentials, and adding it here would risk double-encoding.
+fn userinfo(user: &str, password: &str) -> String {
+    if password.is_empty() {
+        user.to_string()
+    } else {
+        format!("{user}:{password}")
+    }
+}
+
 /// Mask the password in a database URL for safe logging. Matches the
 /// standard shape `driver://user:pass@host:...` and replaces the password
 /// segment with `***`. If no password is present (or the URL doesn't match
@@ -1118,8 +1142,10 @@ impl DatabaseSchemaProvider {
             out.push(ConnCandidate {
                 label: format!("unix_socket={socket}"),
                 url: format!(
-                    "mysql://{}:{}@localhost/{}?socket={}",
-                    config.username, config.password, config.database, socket
+                    "mysql://{}@localhost/{}?socket={}",
+                    userinfo(&config.username, &config.password),
+                    config.database,
+                    socket
                 ),
                 success_note: Some(
                     "Configured via unix_socket — bypasses TCP entirely.".to_string(),
@@ -1134,8 +1160,11 @@ impl DatabaseSchemaProvider {
             out.push(ConnCandidate {
                 label: format!("tcp {}:{}", host, config.port),
                 url: format!(
-                    "mysql://{}:{}@{}:{}/{}",
-                    config.username, config.password, host, config.port, config.database
+                    "mysql://{}@{}:{}/{}",
+                    userinfo(&config.username, &config.password),
+                    host,
+                    config.port,
+                    config.database
                 ),
                 success_note: if is_sail_fallback {
                     Some(
@@ -1166,12 +1195,14 @@ impl DatabaseSchemaProvider {
         }
 
         if let Some(socket) = &config.unix_socket {
-            // libpq-style socket connection: `postgres://user:pass@/db?host=/path`.
+            // libpq-style socket connection: `postgres://user[:pass]@/db?host=/path`.
             out.push(ConnCandidate {
                 label: format!("unix_socket={socket}"),
                 url: format!(
-                    "postgres://{}:{}@/{}?host={}",
-                    config.username, config.password, config.database, socket
+                    "postgres://{}@/{}?host={}",
+                    userinfo(&config.username, &config.password),
+                    config.database,
+                    socket
                 ),
                 success_note: Some("Configured via unix_socket.".to_string()),
             });
@@ -1182,8 +1213,11 @@ impl DatabaseSchemaProvider {
             out.push(ConnCandidate {
                 label: format!("tcp {}:{}", host, config.port),
                 url: format!(
-                    "postgres://{}:{}@{}:{}/{}",
-                    config.username, config.password, host, config.port, config.database
+                    "postgres://{}@{}:{}/{}",
+                    userinfo(&config.username, &config.password),
+                    host,
+                    config.port,
+                    config.database
                 ),
                 success_note: if is_sail_fallback {
                     Some("Sail / Docker Compose fallback to 127.0.0.1.".to_string())

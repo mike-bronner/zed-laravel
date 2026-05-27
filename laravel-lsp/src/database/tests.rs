@@ -319,3 +319,87 @@ fn postgres_candidates_socket_uses_libpq_style_url() {
         socket.url
     );
 }
+
+// ---- userinfo / empty-password URL shape (Phase 5.4) --------------------
+
+#[test]
+fn userinfo_with_password_uses_colon() {
+    use super::userinfo;
+    assert_eq!(userinfo("sail", "password"), "sail:password");
+}
+
+#[test]
+fn userinfo_with_empty_password_omits_colon() {
+    use super::userinfo;
+    // `user:` would tell sqlx "empty password supplied" and MySQL responds
+    // with `using password: YES`. `user` (no colon) tells sqlx "no
+    // password" and the handshake omits the password packet — accepted by
+    // permissive setups like passwordless `root@localhost`.
+    assert_eq!(userinfo("root", ""), "root");
+}
+
+#[test]
+fn mysql_candidates_empty_password_url_has_no_colon() {
+    // The full smoke test: with DB_PASSWORD empty, the resulting connection
+    // URL should be `mysql://user@host/...` (no `:` before `@`), not
+    // `mysql://user:@host/...`. This makes sqlx skip sending the password
+    // packet, which lets passwordless MySQL setups accept the connection.
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, None, "127.0.0.1");
+    cfg.username = "root".to_string();
+    cfg.password = "".to_string();
+    let candidates = provider.build_mysql_candidates(&cfg);
+    let tcp = candidates
+        .iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate");
+    assert!(
+        tcp.url.starts_with("mysql://root@"),
+        "empty password should produce `user@host`, not `user:@host`; got: {}",
+        tcp.url
+    );
+    assert!(
+        !tcp.url.contains(":@"),
+        "URL must not contain `:@` (empty-password specifier); got: {}",
+        tcp.url
+    );
+}
+
+#[test]
+fn mysql_candidates_non_empty_password_keeps_colon() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, None, "127.0.0.1");
+    cfg.username = "sail".to_string();
+    cfg.password = "secret".to_string();
+    let candidates = provider.build_mysql_candidates(&cfg);
+    let tcp = candidates
+        .iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate");
+    assert!(
+        tcp.url.starts_with("mysql://sail:secret@"),
+        "non-empty password should use the user:pass@ shape; got: {}",
+        tcp.url
+    );
+}
+
+#[test]
+fn postgres_candidates_empty_password_url_has_no_colon() {
+    let provider = DatabaseSchemaProvider::new(std::path::PathBuf::from("/tmp"));
+    let mut cfg = make_config_with(None, None, "127.0.0.1");
+    cfg.driver = "pgsql".to_string();
+    cfg.port = 5432;
+    cfg.username = "postgres".to_string();
+    cfg.password = "".to_string();
+    let candidates = provider.build_postgres_candidates(&cfg);
+    let tcp = candidates
+        .iter()
+        .find(|c| c.label.starts_with("tcp "))
+        .expect("tcp candidate");
+    assert!(
+        tcp.url.starts_with("postgres://postgres@"),
+        "got: {}",
+        tcp.url
+    );
+    assert!(!tcp.url.contains(":@"), "got: {}", tcp.url);
+}

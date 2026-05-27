@@ -2527,6 +2527,12 @@ pub struct ParsedPatternsData {
     /// as route/url/action/feature refs (see [`crate::query_chain::extractor`]).
     /// Stored alongside the other patterns rather than as a `ParsedPatterns`
     /// field because that struct is at Salsa's 12-element tuple-Hash cap.
+    ///
+    /// `#[serde(default)]` so disk-cache entries written by older builds (which
+    /// lacked this field) deserialize with an empty chains list rather than
+    /// failing the whole entry. The next file edit re-runs extraction and
+    /// populates chains properly.
+    #[serde(default)]
     pub chains: Vec<Arc<crate::query_chain::BuilderChain>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk

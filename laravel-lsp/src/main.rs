@@ -2772,20 +2772,61 @@ impl LaravelLanguageServer {
             BuilderMode,
         };
 
-        let file_path = uri.to_file_path().ok()?;
-        let patterns = self.salsa.get_patterns(file_path).await.ok().flatten()?;
+        // Diagnostic marker — fires unconditionally for every completion request
+        // in a .php/.blade.php file. If this line doesn't appear in the LSP
+        // log, the new binary isn't being run.
+        info!(
+            "🔗 chain completion: ENTERED ({}:{}:{})",
+            uri.path(),
+            position.line,
+            position.character
+        );
+
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => {
+                info!("🔗 chain completion: uri.to_file_path() failed for {}", uri);
+                return None;
+            }
+        };
+        let patterns = match self.salsa.get_patterns(file_path).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                info!("🔗 chain completion: salsa.get_patterns returned None");
+                return None;
+            }
+            Err(e) => {
+                info!("🔗 chain completion: salsa.get_patterns failed: {}", e);
+                return None;
+            }
+        };
         if patterns.chains.is_empty() {
-            debug!("🔗 chain completion: no chains cached for this file");
+            info!(
+                "🔗 chain completion: 0 chains cached for this file — file may have \
+                 been parsed by an older binary (the disk cache survives builds). \
+                 Try editing the file (add a space, save) to force re-extraction."
+            );
             return None;
         }
-        debug!("🔗 chain completion: {} chains in file", patterns.chains.len());
+        info!("🔗 chain completion: {} chains in file", patterns.chains.len());
 
-        let byte_offset = position_to_byte_offset(content, position.line, position.character)?;
+        let byte_offset = match position_to_byte_offset(content, position.line, position.character)
+        {
+            Some(b) => b,
+            None => {
+                info!(
+                    "🔗 chain completion: position {}:{} out of file bounds",
+                    position.line, position.character
+                );
+                return None;
+            }
+        };
         let ctx = match detect_chain_context_at(&patterns.chains, byte_offset) {
             Some(c) => c,
             None => {
-                debug!(
-                    "🔗 chain completion: cursor at byte {} matched no chain link arg",
+                info!(
+                    "🔗 chain completion: cursor at byte {} matched no chain link arg \
+                     (cursor isn't inside a string arg of a chain we recognise)",
                     byte_offset
                 );
                 return None;

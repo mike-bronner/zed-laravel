@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 // Use the library crate for all modules
+use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::cache_manager::{
     BindingEntry, CacheManager, CachedEnvVars, CachedLaravelConfig, MiddlewareEntry, RescanType,
     ScanResult,
@@ -1867,6 +1868,26 @@ struct LaravelLanguageServer {
     /// Wrapped in `Arc` so clones share memory across hover calls.
     vendor_translation_namespaces: Arc<RwLock<Option<Arc<HashMap<String, PathBuf>>>>>,
 
+    /// Cache of parsed Laravel framework Builder + Query/Builder method
+    /// surfaces, keyed by project root. Populated lazily on the first
+    /// `Model::|` completion that asks for it; reused for every subsequent
+    /// completion in the same session. Vendor parses are slow enough
+    /// (~10K lines of PHP across two files) that doing them on each
+    /// keystroke is untenable.
+    ///
+    /// Not invalidated on file change — `composer update` mid-session
+    /// requires an extension reload to pick up new methods. Acceptable
+    /// for now; can switch to file-watcher invalidation if it becomes
+    /// painful in practice.
+    builder_method_index_cache: Arc<
+        RwLock<
+            HashMap<
+                PathBuf,
+                Arc<laravel_lsp::method_name_completion::BuilderMethodIndex>,
+            >,
+        >,
+    >,
+
     /// Per-route-file cache of [`route_name_locator`] output, keyed by
     /// mtime. Find-references on a route runs route_name_locator on every
     /// file in `routes/` — without this cache, every invocation re-parses
@@ -3184,6 +3205,122 @@ impl LaravelLanguageServer {
         Some(items)
     }
 
+    /// Method-name completion at `Model::|` (and partial-typed variants
+    /// like `Model::wher|`).
+    ///
+    /// Orchestrates the full pipeline:
+    ///
+    /// 1. Detect cursor position via [`detect_method_name_position`]. Bail
+    ///    if it's not a static-receiver position (instance positions yield
+    ///    to the PHP LSP).
+    /// 2. Resolve the receiver name to an FQCN through the current file's
+    ///    `use` aliases.
+    /// 3. Resolve the FQCN to a file path on disk (vendor or project).
+    /// 4. Verify the resolved class transitively extends
+    ///    `Illuminate\Database\Eloquent\Model`. This is the gate that
+    ///    keeps `Carbon::|`, `Str::|`, etc. from getting Builder methods
+    ///    they have no business with.
+    /// 5. Fetch (or populate) the per-project-root cache of parsed Builder
+    ///    methods via [`laravel_lsp::method_name_completion::vendor_parser::parse_builder_methods`].
+    /// 6. Render the merged surface into `CompletionItem`s.
+    ///
+    /// Returns `None` whenever any step bails — the completion handler
+    /// then falls through to other paths (or yields to the PHP LSP). This
+    /// is the silent-failure mode the LSP protocol expects; we don't want
+    /// to interrupt typing with errors when the most likely cause is "user
+    /// is typing in a context we don't handle yet."
+    async fn try_method_name_completion(
+        &self,
+        content: &str,
+        line_text: &str,
+        cursor_col: usize,
+        _uri: &Url,
+    ) -> Option<Vec<CompletionItem>> {
+        use laravel_lsp::method_name_completion::{
+            build_items_from_index, detect_method_name_position, vendor_parser, MethodNameContext,
+        };
+        use laravel_lsp::model_analyzer::ModelMetadata;
+        use laravel_lsp::query_chain::{extract_use_aliases, resolve_class_name};
+
+        // 1. Cursor at a static-receiver position?
+        let receiver = match detect_method_name_position(line_text, cursor_col)? {
+            MethodNameContext::Static { receiver } => receiver,
+            // Instance position — Eloquent\Builder's @mixin makes the
+            // chain visible to the PHP LSP. Yield.
+            MethodNameContext::Instance => return None,
+        };
+
+        // 2. Resolve receiver through the current file's use aliases.
+        // Parse the file once to extract its `use` map, then map the bare
+        // receiver name (or namespaced one) to its FQCN.
+        let tree = laravel_lsp::parser::parse_php(content).ok()?;
+        let aliases = extract_use_aliases(&tree, content);
+        let fqcn = resolve_class_name(&receiver, &aliases);
+
+        // 3. Resolve FQCN → file path. Need the project root for both
+        // PSR-4 resolution and the Eloquent-extends check.
+        let root = {
+            let guard = self.root_path.read().await;
+            guard.clone()?
+        };
+        let class_path = resolve_class_to_vendor_file(&fqcn, &root)?;
+        if !class_path.exists() {
+            return None;
+        }
+
+        // 4. Eloquent gate. `extends_eloquent_model` walks the inheritance
+        // chain (up to 10 deep, cycle-safe) and returns true only when the
+        // chain ends at `Illuminate\Database\Eloquent\Model`. Filters out
+        // `Carbon::|`, `Str::|`, `Cache::|`, etc.
+        let is_eloquent = tokio::task::spawn_blocking({
+            let class_path = class_path.clone();
+            let root = root.clone();
+            move || ModelMetadata::extends_eloquent_model(&class_path, &root)
+        })
+        .await
+        .ok()?;
+        if !is_eloquent {
+            return None;
+        }
+
+        // 5. Fetch (or populate) the per-project-root builder method index.
+        // First check the read lock; on miss, parse synchronously off the
+        // executor thread, then take the write lock to insert. Two
+        // concurrent first-misses can race — the second parse is wasted
+        // work but the insert overwrites cleanly, so correctness is fine.
+        let index = {
+            let cache = self.builder_method_index_cache.read().await;
+            cache.get(&root).cloned()
+        };
+        let index = match index {
+            Some(arc) => arc,
+            None => {
+                let root_for_parse = root.clone();
+                let parsed = tokio::task::spawn_blocking(move || {
+                    vendor_parser::parse_builder_methods(&root_for_parse)
+                })
+                .await
+                .ok()
+                .flatten()?;
+                let arc = Arc::new(parsed);
+                self.builder_method_index_cache
+                    .write()
+                    .await
+                    .insert(root.clone(), arc.clone());
+                arc
+            }
+        };
+
+        // 6. Render items. Empty surface → return None so the caller falls
+        // through (no point returning an empty list).
+        let items = build_items_from_index(&index);
+        if items.is_empty() {
+            None
+        } else {
+            Some(items)
+        }
+    }
+
     /// Send a one-time notification informing the user that table and
     /// column autocomplete requires a working DB connection. Shares the
     /// `database_diagnostic_shown` flag with the existing exists:/unique:
@@ -3251,6 +3388,7 @@ impl LaravelLanguageServer {
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
+            builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -9359,9 +9497,12 @@ impl LaravelLanguageServer {
                         label: field.clone(),
                         kind: Some(CompletionItemKind::FIELD),
                         detail: Some("validation field".to_string()),
-                        documentation: Some(Documentation::String(
-                            "Reference to another field in the validation array".to_string(),
-                        )),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&field)
+                                .summary("Reference to another field in the validation array.")
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect()
@@ -9461,10 +9602,12 @@ impl LaravelLanguageServer {
                                         label: table.clone(),
                                         kind: Some(CompletionItemKind::CLASS),
                                         detail: Some("database table".to_string()),
-                                        documentation: Some(Documentation::String(format!(
-                                            "Table: {}",
-                                            table
-                                        ))),
+                                        documentation: Some(
+                                            CompletionDoc::new()
+                                                .header(&table)
+                                                .summary("Database table.")
+                                                .into_documentation(),
+                                        ),
                                         ..Default::default()
                                     })
                                     .collect()
@@ -9486,10 +9629,13 @@ impl LaravelLanguageServer {
                                             label: conn.clone(),
                                             kind: Some(CompletionItemKind::FOLDER),
                                             detail: Some("database connection".to_string()),
-                                            documentation: Some(Documentation::String(format!(
-                                                "Connection: {} (type '.' for tables)",
-                                                conn
-                                            ))),
+                                            documentation: Some(
+                                                CompletionDoc::new()
+                                                    .header(&conn)
+                                                    .summary("Database connection.")
+                                                    .section("Type `.` after the connection name to autocomplete its tables.")
+                                                    .into_documentation(),
+                                            ),
                                             ..Default::default()
                                         });
                                     }
@@ -9502,10 +9648,12 @@ impl LaravelLanguageServer {
                                             label: table.clone(),
                                             kind: Some(CompletionItemKind::CLASS),
                                             detail: Some("database table".to_string()),
-                                            documentation: Some(Documentation::String(format!(
-                                                "Table: {}",
-                                                table
-                                            ))),
+                                            documentation: Some(
+                                                CompletionDoc::new()
+                                                    .header(&table)
+                                                    .summary("Database table.")
+                                                    .into_documentation(),
+                                            ),
                                             ..Default::default()
                                         });
                                     }
@@ -9543,10 +9691,12 @@ impl LaravelLanguageServer {
                                         label: col.clone(),
                                         kind: Some(CompletionItemKind::FIELD),
                                         detail: Some(format!("{}.{}", table_name, col)),
-                                        documentation: Some(Documentation::String(format!(
-                                            "Column: {}.{}",
-                                            table_name, col
-                                        ))),
+                                        documentation: Some(
+                                            CompletionDoc::new()
+                                                .header(format!("{}.{}", table_name, col))
+                                                .summary("Database column.")
+                                                .into_documentation(),
+                                        ),
                                         ..Default::default()
                                     })
                                     .collect()
@@ -9592,10 +9742,15 @@ impl LaravelLanguageServer {
                             insert_text: Some(label),
                             kind: Some(CompletionItemKind::PROPERTY),
                             detail: Some("dimension constraint".to_string()),
-                            documentation: Some(Documentation::String(format!(
-                                "Set {} constraint for image dimensions",
-                                opt
-                            ))),
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(format!("{}=", opt))
+                                    .summary(format!(
+                                        "Image dimension constraint — set the `{}` value to enforce on uploaded images.",
+                                        opt
+                                    ))
+                                    .into_documentation(),
+                            ),
                             ..Default::default()
                         }
                     })
@@ -9614,10 +9769,15 @@ impl LaravelLanguageServer {
                         label: ext.clone(),
                         kind: Some(CompletionItemKind::VALUE),
                         detail: Some("file extension".to_string()),
-                        documentation: Some(Documentation::String(format!(
-                            "Allow files with .{} extension",
-                            ext
-                        ))),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!(".{}", ext))
+                                .summary(format!(
+                                    "Allow uploaded files with the `.{}` extension.",
+                                    ext
+                                ))
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect()
@@ -9635,10 +9795,12 @@ impl LaravelLanguageServer {
                         label: mt.clone(),
                         kind: Some(CompletionItemKind::VALUE),
                         detail: Some("MIME type".to_string()),
-                        documentation: Some(Documentation::String(format!(
-                            "Allow files with {} MIME type",
-                            mt
-                        ))),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&mt)
+                                .summary(format!("Allow uploaded files with the `{}` MIME type.", mt))
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect()
@@ -9655,10 +9817,12 @@ impl LaravelLanguageServer {
                         label: tz.clone(),
                         kind: Some(CompletionItemKind::VALUE),
                         detail: Some("timezone".to_string()),
-                        documentation: Some(Documentation::String(format!(
-                            "Timezone identifier: {}",
-                            tz
-                        ))),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&tz)
+                                .summary("IANA timezone identifier.")
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect()
@@ -12868,6 +13032,7 @@ return [
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
+            builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
         }
     }
@@ -15379,13 +15544,15 @@ impl LanguageServer for LaravelLanguageServer {
             //
             // If the client doesn't support work-done-progress, `begin`
             // returns None and the rest of the flow just skips reports.
-            // Status bar stays brand-clean — `🚀 Laravel — Starting
-            // indexer…`. The build hash lives in the startup banner
-            // (LSP logs) only; it's a developer-debug detail, not
-            // something to clutter the editor chrome with.
+            // Status bar stays brand-clean — `Laravel — Starting indexer…`.
+            // No emoji prefix: other status-bar entries don't carry one,
+            // and a 🚀 here would stand out as gaudy rather than help.
+            // The build hash lives in the startup banner (LSP logs) only;
+            // it's a developer-debug detail, not something to clutter the
+            // editor chrome with.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
-                "🚀 Laravel",
+                "Laravel",
                 "Starting indexer…",
             )
             .await;
@@ -17223,6 +17390,30 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             }
 
+            // Method-name completion at `Model::|`. Sibling to the chain-arg
+            // completion above; they don't overlap because chain-arg only
+            // fires inside a string literal and method-name only fires
+            // immediately after `::`.
+            //
+            // Phase 1 scope: static `::` position only, gated on the receiver
+            // resolving to a class that extends Eloquent\Model. Instance
+            // (`->`) positions yield to the PHP LSP — Eloquent\Builder's
+            // `@mixin Query\Builder` annotation makes the method chain
+            // visible to static analysis there, so we have nothing to add.
+            //
+            // See module docs in `method_name_completion` for the rationale
+            // (Model.php has no @method tags or @mixin, so __callStatic
+            // forwarding is invisible to PHP LSPs at the static position).
+            if let Some(items) = self
+                .try_method_name_completion(&content, line_text, position.character as usize, uri)
+                .await
+            {
+                return Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: false,
+                    items,
+                })));
+            }
+
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {
@@ -17252,7 +17443,13 @@ impl LanguageServer for LaravelLanguageServer {
                                 kind: Some(CompletionItemKind::VARIABLE),
                                 detail: Some(format!("{} ({})", v.php_type, v.source)),
                                 insert_text: Some(v.name.clone()), // Insert without $ since user already typed it
-                                documentation: None,
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(format!("${}", v.name))
+                                        .summary(format!("Blade variable of type `{}`.", v.php_type))
+                                        .section(format!("Source: {}", v.source))
+                                        .into_documentation(),
+                                ),
                                 ..Default::default()
                             }
                         })
@@ -17314,12 +17511,18 @@ impl LanguageServer for LaravelLanguageServer {
                             };
 
                             CompletionItem {
-                                label,
+                                label: label.clone(),
                                 kind: Some(CompletionItemKind::KEYWORD),
                                 detail: Some(format!("{} ({})", d.description, d.source)),
                                 insert_text: Some(insert_text),
                                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                                documentation: None,
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(&label)
+                                        .summary(&d.description)
+                                        .section(format!("Source: {}", d.source))
+                                        .into_documentation(),
+                                ),
                                 ..Default::default()
                             }
                         })
@@ -17399,10 +17602,17 @@ impl LanguageServer for LaravelLanguageServer {
                         .iter()
                         .filter(|(trigger, _, _)| trigger.starts_with(typed_prefix))
                         .map(|(trigger, snippet, description)| {
+                            let label = snippet.replace(" $0 ", " ... ");
                             CompletionItem {
-                                label: snippet.replace(" $0 ", " ... "),
+                                label: label.clone(),
                                 kind: Some(CompletionItemKind::SNIPPET),
                                 detail: Some(description.to_string()),
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(&label)
+                                        .summary(*description)
+                                        .into_documentation(),
+                                ),
                                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                                 text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                                     range: Range {
@@ -17514,7 +17724,13 @@ impl LanguageServer for LaravelLanguageServer {
                                 label: p.name.clone(),
                                 kind: Some(kind),
                                 detail: Some(detail),
-                                documentation: None,
+                                documentation: Some(
+                                    CompletionDoc::new()
+                                        .header(&p.name)
+                                        .summary(format!("Property of type `{}`.", p.php_type))
+                                        .section(format!("Source: {}", p.source))
+                                        .into_documentation(),
+                                ),
                                 ..Default::default()
                             }
                         })
@@ -17551,11 +17767,22 @@ impl LanguageServer for LaravelLanguageServer {
                             format!("{} ({})", c.value, c.source)
                         };
 
+                        let doc = {
+                            let mut d = CompletionDoc::new().header(&c.key);
+                            if !c.value.is_empty() {
+                                d = d.code(laravel_lsp::completion_format::CodeBlock::new(
+                                    "php",
+                                    format!("return {};", c.value),
+                                ));
+                            }
+                            d.section(format!("Source: {}", c.source))
+                                .into_documentation()
+                        };
                         CompletionItem {
                             label: c.key.clone(),
                             kind: Some(CompletionItemKind::CONSTANT),
                             detail: Some(detail),
-                            documentation: None,
+                            documentation: Some(doc),
                             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                                 range: Range {
                                     start: Position {
@@ -17601,8 +17828,14 @@ impl LanguageServer for LaravelLanguageServer {
                     .map(|v| CompletionItem {
                         label: v.name.clone(),
                         kind: Some(CompletionItemKind::FILE),
-                        detail: Some(v.path),
-                        documentation: None,
+                        detail: Some(v.path.clone()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&v.name)
+                                .summary("Blade view template.")
+                                .section(format!("Source: {}", v.path))
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -17652,8 +17885,14 @@ impl LanguageServer for LaravelLanguageServer {
                     .map(|c| CompletionItem {
                         label: c.name.clone(),
                         kind: Some(CompletionItemKind::CLASS),
-                        detail: Some(c.path),
-                        documentation: None,
+                        detail: Some(c.path.clone()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("<x-{}>", c.name))
+                                .summary("Blade component.")
+                                .section(format!("Source: {}", c.path))
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -17706,8 +17945,14 @@ impl LanguageServer for LaravelLanguageServer {
                     .map(|c| CompletionItem {
                         label: c.name.clone(),
                         kind: Some(CompletionItemKind::CLASS),
-                        detail: Some(c.path),
-                        documentation: None,
+                        detail: Some(c.path.clone()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(format!("<livewire:{}>", c.name))
+                                .summary("Livewire component.")
+                                .section(format!("Source: {}", c.path))
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect();
@@ -17748,7 +17993,13 @@ impl LanguageServer for LaravelLanguageServer {
                         label: f.path.clone(),
                         kind: Some(CompletionItemKind::FILE),
                         detail: Some("public/".to_string() + &f.path),
-                        documentation: None,
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&f.path)
+                                .summary("Public asset.")
+                                .section(format!("Source: public/{}", f.path))
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -17805,8 +18056,13 @@ impl LanguageServer for LaravelLanguageServer {
                     .map(|path| CompletionItem {
                         label: path.clone(),
                         kind: Some(CompletionItemKind::FILE),
-                        detail: None,
-                        documentation: None,
+                        detail: Some("vite entry".to_string()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&path)
+                                .summary("Vite entry point.")
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -17861,8 +18117,13 @@ impl LanguageServer for LaravelLanguageServer {
                     .map(|f| CompletionItem {
                         label: f.path.clone(),
                         kind: Some(CompletionItemKind::FILE),
-                        detail: None,
-                        documentation: None,
+                        detail: Some("path helper".to_string()),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&f.path)
+                                .summary("Project file path.")
+                                .into_documentation(),
+                        ),
                         ..Default::default()
                     })
                     .collect();
@@ -17912,7 +18173,13 @@ impl LanguageServer for LaravelLanguageServer {
                             label: b.abstract_name.clone(),
                             kind: Some(CompletionItemKind::CLASS),
                             detail: Some(format!("{} ({})", b.concrete_class, source)),
-                            documentation: None,
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(&b.abstract_name)
+                                    .summary(format!("Container binding to `{}`.", b.concrete_class))
+                                    .section(format!("Source: {}", source))
+                                    .into_documentation(),
+                            ),
                             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                                 range: Range {
                                     start: Position {
@@ -17958,7 +18225,13 @@ impl LanguageServer for LaravelLanguageServer {
                         label: r.name.clone(),
                         kind: Some(CompletionItemKind::CONSTANT),
                         detail: Some(format!("({})", r.source)),
-                        documentation: None,
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&r.name)
+                                .summary("Named route.")
+                                .section(format!("Source: {}", r.source))
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -18029,7 +18302,13 @@ impl LanguageServer for LaravelLanguageServer {
                             label: m.alias.clone(),
                             kind: Some(CompletionItemKind::MODULE),
                             detail: Some(format!("{} ({})", m.class_name, source)),
-                            documentation: None,
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(&m.alias)
+                                    .summary(format!("Middleware alias for `{}`.", m.class_name))
+                                    .section(format!("Source: {}", source))
+                                    .into_documentation(),
+                            ),
                             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                                 range: Range {
                                     start: Position {
@@ -18095,7 +18374,13 @@ impl LanguageServer for LaravelLanguageServer {
                         label: f.feature_key.clone(),
                         kind: Some(CompletionItemKind::CLASS),
                         detail: Some(format!("Feature: {}", f.class_name)),
-                        documentation: Some(Documentation::String(f.full_class.clone())),
+                        documentation: Some(
+                            CompletionDoc::new()
+                                .header(&f.feature_key)
+                                .summary(format!("Pennant feature `{}`.", f.class_name))
+                                .section(format!("Class: `{}`", f.full_class))
+                                .into_documentation(),
+                        ),
                         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                             range: Range {
                                 start: Position {
@@ -18148,11 +18433,21 @@ impl LanguageServer for LaravelLanguageServer {
                             format!("{} ({})", t.value, t.source)
                         };
 
+                        let doc = {
+                            let mut d = CompletionDoc::new().header(&t.key);
+                            if !t.value.is_empty() {
+                                d = d.summary(&t.value);
+                            } else {
+                                d = d.summary("Translation key.");
+                            }
+                            d.section(format!("Source: {}", t.source))
+                                .into_documentation()
+                        };
                         CompletionItem {
                             label: t.key.clone(),
                             kind: Some(CompletionItemKind::TEXT),
                             detail: Some(detail),
-                            documentation: None,
+                            documentation: Some(doc),
                             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                                 range: Range {
                                     start: Position {
@@ -18283,10 +18578,16 @@ impl LanguageServer for LaravelLanguageServer {
                         };
 
                         CompletionItem {
-                            label,
+                            label: label.clone(),
                             kind: Some(CompletionItemKind::KEYWORD),
                             detail: Some(format!("({})", r.source)),
-                            documentation: Some(Documentation::String(r.description)),
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(&label)
+                                    .summary(&r.description)
+                                    .section(format!("Source: {}", r.source))
+                                    .into_documentation(),
+                            ),
                             insert_text: Some(r.name.clone()),
                             ..Default::default()
                         }
@@ -18341,10 +18642,16 @@ impl LanguageServer for LaravelLanguageServer {
                         };
 
                         CompletionItem {
-                            label,
+                            label: label.clone(),
                             kind: Some(CompletionItemKind::KEYWORD),
                             detail: Some(format!("({})", c.source)),
-                            documentation: Some(Documentation::String(c.description)),
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(&label)
+                                    .summary(&c.description)
+                                    .section(format!("Source: {}", c.source))
+                                    .into_documentation(),
+                            ),
                             insert_text: Some(c.name.clone()),
                             ..Default::default()
                         }
@@ -18431,7 +18738,17 @@ impl LanguageServer for LaravelLanguageServer {
                     label: v.name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
                     detail: Some(format!("{} (from {})", v.value, source_file)),
-                    documentation: None,
+                    documentation: Some(
+                        CompletionDoc::new()
+                            .header(&v.name)
+                            .summary(if v.value.is_empty() {
+                                "(empty)".to_string()
+                            } else {
+                                v.value.clone()
+                            })
+                            .section(format!("Source: {}", source_file))
+                            .into_documentation(),
+                    ),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: edit_range,
                         new_text: v.name.clone(),
@@ -18444,11 +18761,20 @@ impl LanguageServer for LaravelLanguageServer {
         // Then, add system env vars (lower priority, only if not already in .env)
         for (name, value) in std::env::vars() {
             if !seen_names.contains(&name) && name.to_uppercase().starts_with(&filter_upper) {
+                let doc = CompletionDoc::new()
+                    .header(&name)
+                    .summary(if value.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        value.clone()
+                    })
+                    .section("Source: system environment")
+                    .into_documentation();
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
                     detail: Some(format!("{} (from system)", value)),
-                    documentation: None,
+                    documentation: Some(doc),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: edit_range,
                         new_text: name,

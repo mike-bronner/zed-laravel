@@ -35,6 +35,13 @@ pub struct BladePhpRegion {
     pub content: String,
     pub row: u32,
     pub column: u32,
+    /// Byte offset of the **content** in the outer Blade file — the first
+    /// byte of `content` lives at `source[byte_offset]`. Used by features
+    /// (e.g. chain extraction) that need to translate snippet-local byte
+    /// ranges back to outer-file coordinates: a token at snippet byte `N`
+    /// (after the `<?php ` wrapper) lives at outer byte
+    /// `byte_offset + (N - PHP_WRAPPER_PREFIX_LEN)`.
+    pub byte_offset: usize,
 }
 
 /// Extract every PHP region from a Blade source. Returns regions in source
@@ -53,6 +60,7 @@ pub fn extract_php_regions(source: &str) -> Vec<BladePhpRegion> {
                     content: echo.php_content.to_string(),
                     row: echo.row as u32,
                     column: echo.column as u32,
+                    byte_offset: echo.byte_start,
                 });
             }
         }
@@ -60,11 +68,26 @@ pub fn extract_php_regions(source: &str) -> Vec<BladePhpRegion> {
 
     // `@php ... @endphp` blocks. The Blade grammar's representation here is
     // uneven across tree-sitter-blade versions, so we lean on regex to get
-    // byte-accurate body positions. The body's first character sits on the
-    // line AFTER the `@php` directive (when written as a block); inline
-    // `@php(...)` form is captured too.
+    // byte-accurate body positions.
     regions.extend(extract_php_block_regions(source));
 
+    // `@php(...)` inline form. Needs a balanced-paren walker because the
+    // body may contain its own parens (`@php($x = route('home', ['a']))`).
+    // Regex can't do this; the walker is small and self-contained.
+    regions.extend(extract_php_inline_regions(source));
+
+    // Dedupe by byte_offset: tree-sitter-blade's `_raw` rule (which fires
+    // for `@php ... @endphp` blocks) also produces a `php_only` node, so
+    // the tree-sitter pass above AND the regex pass below both capture the
+    // same block region. Without dedup, downstream consumers re-process
+    // the same content twice — historically harmless for routes/views but
+    // problematic for chain extraction, where duplicate chains pollute the
+    // position index. Keep the first occurrence (typically the tree-sitter
+    // one, which has the same content but is captured earlier here).
+    regions.sort_by_key(|r| (r.byte_offset, r.content.len()));
+    regions.dedup_by(|a, b| a.byte_offset == b.byte_offset);
+
+    // Stable sort by row/column for the public ordering contract.
     regions.sort_by_key(|r| (r.row, r.column));
     regions
 }
@@ -118,9 +141,107 @@ fn extract_php_block_regions(source: &str) -> Vec<BladePhpRegion> {
             content: body_match.as_str().to_string(),
             row,
             column: col,
+            byte_offset: body_match.start(),
         });
     }
     regions
+}
+
+/// Find `@php(expression)` inline regions. Walks balanced parentheses so
+/// inner parens (`@php($x = route('home', ['a']))`) are matched correctly.
+/// String content is paren-skipped so embedded `(` / `)` inside `'...'` or
+/// `"..."` don't throw off the counter. Escapes inside strings are honoured.
+///
+/// Returns the PHP body (the expression between `@php(` and the matching
+/// `)`), along with its row/column/byte_offset in the Blade source.
+fn extract_php_inline_regions(source: &str) -> Vec<BladePhpRegion> {
+    let bytes = source.as_bytes();
+    let needle = b"@php(";
+    let mut regions = Vec::new();
+    let mut search_from = 0usize;
+
+    while let Some(rel) = find_subslice(bytes, needle, search_from) {
+        let body_start = rel + needle.len();
+        let Some(body_end) = match_balanced_paren_close(bytes, body_start) else {
+            // Unmatched paren — skip this `@php(` and keep searching.
+            search_from = body_start;
+            continue;
+        };
+        // Skip if body is empty — nothing to parse.
+        if body_end > body_start {
+            let content = source[body_start..body_end].to_string();
+            let (row, col) = byte_offset_to_row_col(source, body_start);
+            regions.push(BladePhpRegion {
+                content,
+                row,
+                column: col,
+                byte_offset: body_start,
+            });
+        }
+        // Continue scanning after the closing `)` so nested `@php(` calls
+        // (rare but legal) are still found.
+        search_from = body_end + 1;
+    }
+
+    regions
+}
+
+/// Find the first occurrence of `needle` in `haystack` starting at `from`.
+/// Returns the byte offset of the first byte of the match.
+fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// Walk forward from `start` (the byte AFTER an opening `(`) looking for the
+/// matching `)` at depth zero. Single/double quoted strings are treated as
+/// opaque blocks — parens inside them don't affect depth, and backslash
+/// escapes inside double-quoted strings advance past the next byte.
+fn match_balanced_paren_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth: i32 = 1;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' => {
+                // Single-quoted string: only `\'` and `\\` are escapes in PHP.
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                // Double-quoted string: more escape sequences, but for paren
+                // matching we only care about skipping the string contents.
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Convert a UTF-8 byte offset into a `(row, column)` tuple, both 0-based.

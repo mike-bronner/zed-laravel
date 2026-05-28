@@ -10,6 +10,12 @@ fn main() {
     // Tell Cargo to re-run this build script if it changes
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Emit build-time metadata so the LSP startup banner can identify
+    // which binary is actually running. Useful when "did Zed pick up
+    // the new build?" comes up — the user matches the short hash to
+    // a known commit.
+    emit_build_metadata();
+
     // Get the output directory where Cargo puts build artifacts
     // OUT_DIR is set by Cargo and points to target/debug/build/<package>/out
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -27,6 +33,40 @@ fn main() {
 
     // Compile the Blade grammar's C code
     compile_blade_grammar(&grammar_dir);
+}
+
+/// Capture the current git short-hash + dirty-state at build time and
+/// expose them through `env!()` for inclusion in the startup banner.
+fn emit_build_metadata() {
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short=5", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|out| !out.stdout.is_empty())
+        .unwrap_or(false);
+
+    let suffix = if dirty { "-dirty" } else { "" };
+    println!("cargo:rustc-env=LARAVEL_LSP_GIT_HASH={git_hash}{suffix}");
+
+    // Best-effort re-run triggers. Cargo can't depend on "is the
+    // working tree dirty," but `.git/HEAD` and `.git/index` cover
+    // commits and `git add`. Out-of-band edits won't bust the cache
+    // — full clean builds will pick them up.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
 }
 
 /// Downloads the tree-sitter-blade grammar from GitHub and extracts it

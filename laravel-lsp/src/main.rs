@@ -215,11 +215,20 @@ struct FilePathCompletion {
 
 /// A model property for autocomplete (used by $model->)
 struct ModelPropertyCompletion {
-    /// The property name (e.g., "id", "email", "first_name")
+    /// The property name (e.g., "id", "email", "first_name"). For the
+    /// method-call form of a relationship, the name includes the
+    /// trailing `()` (e.g., "posts()") so completion inserts the
+    /// callable shape.
     name: String,
     /// The PHP type (e.g., "int", "string", "Carbon", "Collection<Post>")
     php_type: String,
-    /// Source of the property (database, cast, accessor, relationship)
+    /// Source of the property. Known values:
+    /// - `database` / `cast` / `accessor`: model attribute shapes
+    /// - `relationship`: relation accessed as a property (lazy-loaded
+    ///   result — Collection or related Model)
+    /// - `relationship query`: relation called as a method (returns the
+    ///   Relation/Builder, chainable via `->where(...)`)
+    /// - `class` / `blade-loop`: generic public-property scans
     source: String,
 }
 
@@ -2751,6 +2760,471 @@ use laravel_lsp::livewire_resolver::{
 };
 
 impl LaravelLanguageServer {
+    /// Eloquent / DB query builder chain completion entry point.
+    ///
+    /// Resolves the cursor to a `ChainContext`, dispatches on
+    /// `(BuilderMode, ArgKind)` to the appropriate completion-items helper,
+    /// and returns the items (or `None` if no chain covers the cursor / the
+    /// chain receiver is unresolved at this phase).
+    ///
+    /// Phase 3 implements `(BaseBuilder, Column)` only — Eloquent receivers
+    /// short-circuit in [`laravel_lsp::query_chain::detect_chain_context_at`]
+    /// because model resolution is async I/O and lands in later phases.
+    async fn try_query_chain_completion(
+        &self,
+        content: &str,
+        position: tower_lsp::lsp_types::Position,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> Option<Vec<CompletionItem>> {
+        use laravel_lsp::query_chain::{
+            detect_chain_context_at_diagnostic, eloquent_completion, extract_chains,
+            fixup_for_completion, position_to_byte_offset, ArgKind, BuilderChain, BuilderMode,
+            ChainResolveFailure,
+        };
+        use std::sync::Arc;
+
+        // Diagnostic marker — fires unconditionally for every completion request
+        // in a .php/.blade.php file. If this line doesn't appear in the LSP
+        // log, the new binary isn't being run.
+        info!(
+            "🔗 chain completion: ENTERED ({}:{}:{})",
+            uri.path(),
+            position.line,
+            position.character
+        );
+
+        let byte_offset = match position_to_byte_offset(content, position.line, position.character)
+        {
+            Some(b) => b,
+            None => {
+                info!(
+                    "🔗 chain completion: position {}:{} out of file bounds",
+                    position.line, position.character
+                );
+                return None;
+            }
+        };
+
+        // Mid-typing the file often has an unterminated quote at the cursor,
+        // OR has just had a `(` typed with no string arg yet (auto-pair
+        // hasn't synced to the LSP yet, or the editor doesn't auto-pair).
+        // Tree-sitter recovers poorly from either shape, and Salsa's
+        // cached chains can be stale relative to the live documents map.
+        // So: `fixup_for_completion` returns a `CompletionPrep` carrying
+        //   - `fixed_content`: source with a close quote OR `''` injected
+        //     at the cursor so the call parses as a well-formed string-arg
+        //     call expression
+        //   - `quote_for_insertion`: Some('\'') when WE synthesised the
+        //     quotes (cursor was after `(`, no quotes in source), so items
+        //     need to wrap their value with quotes; None when the source
+        //     already had the open quote (insert bare).
+        // Per-completion cost: one tree-sitter parse on the small file,
+        // well within the 200ms debounce.
+        let prep = fixup_for_completion(content, byte_offset);
+        let parse_source: &str = prep
+            .as_ref()
+            .map(|p| p.fixed_content.as_str())
+            .unwrap_or(content);
+        let wrap_with_quote: Option<char> = prep.as_ref().and_then(|p| p.quote_for_insertion);
+        if let Some(p) = prep.as_ref() {
+            if p.fixed_content != content {
+                info!(
+                    "🔗 chain completion: applied fixup at byte {} (wrap_with_quote={:?})",
+                    byte_offset, wrap_with_quote
+                );
+            }
+        }
+
+        let tree = match laravel_lsp::parser::parse_php(parse_source) {
+            Ok(t) => t,
+            Err(e) => {
+                info!(
+                    "🔗 chain completion: parse_php failed on fixed-up content: {}",
+                    e
+                );
+                return None;
+            }
+        };
+        let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, parse_source)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+
+        if chains.is_empty() {
+            info!("🔗 chain completion: 0 chains in (fixed-up) file at completion time");
+            return None;
+        }
+        info!(
+            "🔗 chain completion: {} chains in (fixed-up) file",
+            chains.len()
+        );
+
+        // file_path is still needed downstream for diagnostics. Resolve once.
+        let _file_path = uri.to_file_path().ok();
+
+        let ctx = match detect_chain_context_at_diagnostic(&chains, byte_offset) {
+            Ok(c) => c,
+            Err(ChainResolveFailure::NoChainAtCursor { chains }) => {
+                // Dump every chain's span so we can see why none contained
+                // the cursor. Most likely culprits: byte offset translated
+                // wrong (UTF-16 vs UTF-8?), file content out of sync between
+                // documents cache and Salsa, chain extractor producing
+                // wrong spans.
+                let spans: Vec<String> = chains
+                    .iter()
+                    .map(|c| {
+                        let method_summary: String = c
+                            .links
+                            .iter()
+                            .map(|l| l.method.as_str())
+                            .collect::<Vec<_>>()
+                            .join("->");
+                        format!(
+                            "{}-{} (recv={:?} :: {})",
+                            c.span_byte_range.0, c.span_byte_range.1, c.receiver, method_summary
+                        )
+                    })
+                    .collect();
+                info!(
+                    "🔗 chain completion: cursor at byte {} doesn't fall inside any chain span. \
+                     Chains: [{}]",
+                    byte_offset,
+                    spans.join(", ")
+                );
+                return None;
+            }
+            Err(ChainResolveFailure::InChain { chain }) => {
+                let arg_summary: Vec<String> = chain
+                    .links
+                    .iter()
+                    .map(|l| {
+                        let arg_spans: Vec<String> = l
+                            .args
+                            .iter()
+                            .map(|a| match a {
+                                laravel_lsp::query_chain::ChainArg::StringLit {
+                                    quote,
+                                    span_byte_range,
+                                    value,
+                                } => format!(
+                                    "Str{{{:?},{}..{},val={:?}}}",
+                                    quote, span_byte_range.0, span_byte_range.1, value
+                                ),
+                                laravel_lsp::query_chain::ChainArg::Closure {
+                                    body_byte_range,
+                                    ..
+                                } => format!(
+                                    "Closure{{body={}..{}}}",
+                                    body_byte_range.0, body_byte_range.1
+                                ),
+                                laravel_lsp::query_chain::ChainArg::Array {
+                                    elements,
+                                    span_byte_range,
+                                } => format!(
+                                    "Array{{{}..{},n={}}}",
+                                    span_byte_range.0,
+                                    span_byte_range.1,
+                                    elements.len()
+                                ),
+                                laravel_lsp::query_chain::ChainArg::Other => "Other".to_string(),
+                            })
+                            .collect();
+                        format!(
+                            "{}@{}-{}[arg={:?}, args=[{}]]",
+                            l.method,
+                            l.span_byte_range.0,
+                            l.span_byte_range.1,
+                            l.arg,
+                            arg_spans.join(", ")
+                        )
+                    })
+                    .collect();
+                info!(
+                    "🔗 chain completion: cursor at byte {} is INSIDE chain {}..{} (recv={:?}) but \
+                     not inside a recognised string arg. Links: [{}]",
+                    byte_offset,
+                    chain.span_byte_range.0,
+                    chain.span_byte_range.1,
+                    chain.receiver,
+                    arg_summary.join(", ")
+                );
+                return None;
+            }
+        };
+        info!(
+            "🔗 chain completion: cursor in chain — mode={:?} expecting={:?} table={:?} model={:?} closure_hop={:?}",
+            ctx.mode, ctx.expecting, ctx.effective_table, ctx.effective_model, ctx.closure_relation_hop
+        );
+
+        let db_guard = self.database_schema.read().await;
+        let db = match db_guard.as_ref() {
+            Some(db) => db,
+            None => {
+                info!("🔗 chain completion: database_schema not initialised yet");
+                return None;
+            }
+        };
+
+        // Phase 8: if the cursor is inside a relation closure
+        // (`whereHas('rel', fn ($q) => $q->where('|'))` or
+        // `with(['rel' => fn ($q) => …])`), resolve one relation hop on
+        // the parent model BEFORE dispatching. effective_model flips
+        // from parent → related; the rest of the dispatch runs as if
+        // the cursor were inside a direct chain on the related model.
+        let ctx = if let Some(rel) = ctx.closure_relation_hop.clone() {
+            let root_clone = self.initialized_root.read().await.clone();
+            let Some(root) = root_clone else {
+                info!(
+                    "🔗 chain completion: closure-scope hop needs project root, not yet initialised"
+                );
+                return None;
+            };
+            let Some(parent_class) = ctx.effective_model.clone() else {
+                info!("🔗 chain completion: closure_relation_hop set but no parent model");
+                return None;
+            };
+            match eloquent_completion::resolve_related_model(&parent_class, &rel, &root).await {
+                Some(related) => {
+                    info!("🔗 closure-scope: resolved {parent_class}::{rel} → {related}");
+                    laravel_lsp::query_chain::ChainContext {
+                        effective_model: Some(related),
+                        closure_relation_hop: None,
+                        ..ctx
+                    }
+                }
+                None => {
+                    info!(
+                        "🔗 chain completion: couldn't resolve {parent_class}::{rel} \
+                         for closure-scope hop (relation missing or no related_model)"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            ctx
+        };
+
+        // Phase 6 post-toBase normalization: `User::where(...)->toBase()`
+        // flips the chain mode to BaseBuilder, but we still know which
+        // model was on the other side. effective_table stays None until
+        // we resolve it from the model. Doing this BEFORE dispatch means
+        // the `(BaseBuilder, Column)` arm runs columns_raw cleanly with
+        // a known table — same shape as a `DB::table('x')->where('|')`
+        // chain. Bonus: no casts/accessors get applied (Base = schema
+        // only), which is correct for what `->toBase()` returns.
+        let ctx = match (
+            ctx.mode,
+            ctx.effective_table.as_ref(),
+            ctx.effective_model.clone(),
+        ) {
+            (BuilderMode::BaseBuilder, None, Some(model)) => {
+                let root_clone = self.initialized_root.read().await.clone();
+                match root_clone {
+                    Some(root) => {
+                        match eloquent_completion::resolve_table_for_model(&model, &root).await {
+                            Some(table) => {
+                                info!(
+                                    "🔗 post-toBase: resolved model {:?} → table {:?}",
+                                    model, table
+                                );
+                                laravel_lsp::query_chain::ChainContext {
+                                    effective_table: Some(table),
+                                    ..ctx
+                                }
+                            }
+                            None => {
+                                info!(
+                                    "🔗 post-toBase: couldn't resolve table for model {:?} \
+                                     (file missing or no `$table` and snake_pluralize failed)",
+                                    model
+                                );
+                                ctx
+                            }
+                        }
+                    }
+                    None => ctx,
+                }
+            }
+            _ => ctx,
+        };
+
+        let items = match (ctx.mode, ctx.expecting) {
+            (BuilderMode::BaseBuilder, ArgKind::Column) => {
+                eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
+            }
+            // `User::where('|')` and friends — Eloquent static-receiver
+            // column completion. Resolves the model class FQCN to a model
+            // file (async I/O), reads `ModelMetadata` for `$table` + casts,
+            // and returns DB columns with cast-aware PHP types in detail.
+            // Needs the project root for class-file lookup — cloned out of
+            // the shared lock so we don't hold it across the model parse.
+            (BuilderMode::EloquentBuilder, ArgKind::Column) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::columns_for_builder(&ctx, db, wrap_with_quote, &root)
+                            .await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve Eloquent model class"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            // `User::with('|')` / `User::whereHas('|', closure)` /
+            // `User::load('|')` etc. — Eloquent relation-name completion.
+            // ArgKind::ClosureCarrier wins over ArgKind::Relation in the
+            // method classifier, so we accept both — for the first string
+            // arg they mean the same thing (a relationship method name on
+            // the current model). Inside the closure body the cursor would
+            // resolve to a *different* chain anyway (Phase 8 closure scope).
+            (BuilderMode::EloquentBuilder, ArgKind::Relation)
+            | (BuilderMode::EloquentBuilder, ArgKind::ClosureCarrier) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::relations(&ctx, wrap_with_quote, &root).await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve relations"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            // Load-bearing: `DB::table('users')->with('|')` is user error —
+            // Query Builder has no relation methods, so listing relations
+            // would teach the user something untrue. Stay quiet.
+            (BuilderMode::BaseBuilder, ArgKind::Relation)
+            | (BuilderMode::BaseBuilder, ArgKind::ClosureCarrier) => Vec::new(),
+            // Phase 6: `User::all()->where('|')` / `->get()->where('|')` etc.
+            // — Collection mode. Result is a hydrated Collection<Model>; its
+            // `where()` filters in memory against model property access,
+            // which means accessors are valid args too (they're not in
+            // the DB but they ARE on the model instance). `columns_for_collection`
+            // returns DB columns + accessors, ranked so DB columns appear first.
+            (BuilderMode::EloquentCollection, ArgKind::Column) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::columns_for_collection(
+                            &ctx,
+                            db,
+                            wrap_with_quote,
+                            &root,
+                        )
+                        .await
+                    }
+                    None => {
+                        info!(
+                            "🔗 chain completion: project root not yet initialised — \
+                             can't resolve Collection-mode columns"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            // Collection's `load('|')` / `loadMissing('|')` work just like
+            // Builder's `with('|')` — they take relation names. ClosureCarrier
+            // also applies (Collection still supports keyed-array constraints
+            // through some helpers).
+            (BuilderMode::EloquentCollection, ArgKind::Relation)
+            | (BuilderMode::EloquentCollection, ArgKind::ClosureCarrier) => {
+                let root = self.initialized_root.read().await.clone();
+                match root {
+                    Some(root) => {
+                        eloquent_completion::relations(&ctx, wrap_with_quote, &root).await
+                    }
+                    None => Vec::new(),
+                }
+            }
+            // `DB::table('|')` (or `DB::table(|`) — table-name completion.
+            // Mode is always BaseBuilder by the time the receiver is
+            // recognised, but we don't gate on it: even if a future receiver
+            // shape produced Table args in another mode, tables are tables.
+            (_, ArgKind::Table) => eloquent_completion::tables(db, wrap_with_quote).await,
+            // Other (mode, expecting) combinations land in Phases 7-9.
+            _ => Vec::new(),
+        };
+
+        if items.is_empty() {
+            // Distinguish two empty-result causes for the log/diagnostic:
+            // (a) DB is unreachable — actionable, user can fix .env. Show a
+            //     one-time INFO toast so they discover the dependency.
+            // (b) DB is reachable but the specific table/columns aren't in
+            //     the introspected schema (e.g., user typed a typo, table
+            //     was dropped, schema cache stale). Stay silent — toasting
+            //     every time would be noisy.
+            let connection_error = db.get_last_error().await;
+            drop(db_guard);
+
+            if let Some(error) = connection_error {
+                info!(
+                    "🔗 chain completion: matched {:?} but produced 0 items — \
+                     DB connection error: {}",
+                    ctx.expecting, error.message
+                );
+                self.maybe_notify_db_unreachable(&error.message).await;
+            } else {
+                info!(
+                    "🔗 chain completion: matched {:?} but produced 0 items — \
+                     schema reachable but table/columns absent",
+                    ctx.expecting
+                );
+            }
+        } else {
+            info!("🔗 chain completion: returning {} items", items.len());
+        }
+
+        Some(items)
+    }
+
+    /// Send a one-time notification informing the user that table and
+    /// column autocomplete requires a working DB connection. Shares the
+    /// `database_diagnostic_shown` flag with the existing exists:/unique:
+    /// diagnostic path, so the user only sees ONE notification per LSP
+    /// session no matter how they hit the unreachable DB.
+    ///
+    /// Uses `window/showMessageRequest` (with a Dismiss action) rather than
+    /// `window/showMessage` because the latter auto-dismisses after a few
+    /// seconds — the user may not even see it if they're typing. With an
+    /// action button, the notification stays until they explicitly click it.
+    async fn maybe_notify_db_unreachable(&self, error_message: &str) {
+        let mut shown = self.database_diagnostic_shown.write().await;
+        if *shown {
+            return;
+        }
+        *shown = true;
+        drop(shown);
+
+        let message = format!(
+            "Laravel: Database is unreachable, so table and column \
+             autocompletion is disabled. Fix DB connectivity in .env \
+             (DB_HOST / DB_PORT / credentials) and reload the window to \
+             enable. Error: {error_message}"
+        );
+        let actions = vec![tower_lsp::lsp_types::MessageActionItem {
+            title: "Dismiss".to_string(),
+            properties: Default::default(),
+        }];
+        // We don't care about the response — the only action is "Dismiss".
+        // The point of using show_message_request is that the notification
+        // persists until the user clicks.
+        let _ = self
+            .client
+            .show_message_request(
+                tower_lsp::lsp_types::MessageType::WARNING,
+                message,
+                Some(actions),
+            )
+            .await;
+    }
+
     fn new(client: Client) -> Self {
         Self {
             client,
@@ -2920,7 +3394,7 @@ impl LaravelLanguageServer {
         {
             debug!("Failed to register config files with Salsa: {}", e);
         } else {
-            info!("Laravel LSP: Config files registered with Salsa for incremental caching");
+            info!("Laravel: Config files registered with Salsa for incremental caching");
         }
     }
 
@@ -2993,7 +3467,7 @@ impl LaravelLanguageServer {
             return;
         }
 
-        info!("Laravel LSP: Project files registered with Salsa for reference finding");
+        info!("Laravel: Project files registered with Salsa for reference finding");
 
         // Disk-cache restore. Loads previously-parsed patterns into the
         // shared pattern_cache, dropping any entry whose on-disk mtime
@@ -3256,7 +3730,7 @@ impl LaravelLanguageServer {
 
             let elapsed = started_at.elapsed();
             info!(
-                "🔥 Laravel LSP: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
+                "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",
                 imported, cached_hits, total, elapsed
             );
 
@@ -3330,11 +3804,11 @@ impl LaravelLanguageServer {
             let content = if let Ok(env_uri) = Url::from_file_path(&env_path) {
                 if let Some((buffer_content, _version)) = documents.get(&env_uri) {
                     // Use editor buffer content (includes unsaved changes)
-                    debug!("Laravel LSP: Registering .env from buffer: {:?}", env_path);
+                    debug!("Laravel: Registering .env from buffer: {:?}", env_path);
                     Some(buffer_content.clone())
                 } else if env_path.exists() {
                     // Read from disk
-                    debug!("Laravel LSP: Registering .env from disk: {:?}", env_path);
+                    debug!("Laravel: Registering .env from disk: {:?}", env_path);
                     std::fs::read_to_string(&env_path).ok()
                 } else {
                     None
@@ -3363,7 +3837,7 @@ impl LaravelLanguageServer {
 
         if registered_count > 0 {
             info!(
-                "Laravel LSP: {} env files registered with Salsa",
+                "Laravel: {} env files registered with Salsa",
                 registered_count
             );
         }
@@ -3614,7 +4088,7 @@ impl LaravelLanguageServer {
 
         if registered_count > 0 {
             info!(
-                "Laravel LSP: {} service provider files registered with Salsa",
+                "Laravel: {} service provider files registered with Salsa",
                 registered_count
             );
         }
@@ -4318,7 +4792,7 @@ impl LaravelLanguageServer {
                     .await;
 
                 // Re-validate all open documents since config changed (view paths, component paths, etc.)
-                info!("Laravel LSP: Re-validating all open documents due to config change");
+                info!("Laravel: Re-validating all open documents due to config change");
                 let documents = self.documents.read().await;
                 for (doc_uri, (doc_text, _version)) in documents.iter() {
                     self.validate_and_publish_diagnostics(doc_uri, doc_text)
@@ -4766,17 +5240,52 @@ impl LaravelLanguageServer {
 
         // Log config status but always store provider
         // Errors will be handled when completions are requested
-        if let Some(config) = provider.get_database_config().await {
+        let has_config = if let Some(config) = provider.get_database_config().await {
             info!(
                 "   🗄️  Database config found: {} @ {}:{}",
                 config.driver, config.host, config.port
             );
+            true
         } else {
             debug!("warn:  Database config not found - will show diagnostic on first use");
-        }
+            false
+        };
 
         // Always store provider - errors handled when completions requested
         *self.database_schema.write().await = Some(provider);
+
+        // Pre-warm the schema cache in the background. The cold fetch costs
+        // ~50ms for SHOW TABLES + ~4ms per table for SHOW COLUMNS — on a
+        // 600-table schema that's ~2.5s. Doing it here, in parallel with
+        // vendor/app provider rescans and pattern cache warming, means the
+        // user's first `DB::table('|')` completion hits a warm cache and
+        // returns instantly. Skipped when there's no config (nothing to
+        // introspect and the toast would be noise).
+        if has_config {
+            let db = self.database_schema.clone();
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                info!("🔥 Pre-warming database schema cache...");
+                let schema = {
+                    let guard = db.read().await;
+                    match guard.as_ref() {
+                        Some(provider) => provider.get_schema().await,
+                        None => None,
+                    }
+                };
+                match schema {
+                    Some(s) => info!(
+                        "🔥 Database schema cache warmed: {} tables in {:?}",
+                        s.tables.len(),
+                        start.elapsed()
+                    ),
+                    None => info!(
+                        "🔥 Database schema pre-warm failed ({:?}) — will retry on first completion",
+                        start.elapsed()
+                    ),
+                }
+            });
+        }
     }
 
     /// Check if a file exists with async I/O and TTL caching
@@ -6374,12 +6883,25 @@ impl LaravelLanguageServer {
     /// 1. Variable access: `$user->` where we need to resolve $user's type
     /// 2. Static chain: `User::find(1)->` or `User::where(...)->first()->` where we extract the class
     ///
+    /// `file_content` is consulted to resolve bare class names against the
+    /// file's `use` statements. Without that step, `Version::first()->` in
+    /// a file with `use App\Models\Version;` ends up as the bare hint
+    /// `"Version"`, which then basename-matches the first `Version.php` on
+    /// disk — frequently the wrong file when a Nova filter or Livewire
+    /// component shares the name. With the use-statement step, the hint
+    /// becomes `App\Models\Version` and Composer autoload routes the
+    /// lookup correctly.
+    ///
     /// Examples:
     /// - `$user->` returns Some(("$user", ""))
     /// - `$user->na` returns Some(("$user", "na"))
-    /// - `User::find(1)->` returns Some(("User", ""))
-    /// - `User::find(1)->ema` returns Some(("User", "ema"))
-    fn get_model_property_context(line_text: &str, character: u32) -> Option<(String, String)> {
+    /// - `User::find(1)->` with `use App\Models\User;` returns Some(("App\\Models\\User", ""))
+    /// - `User::find(1)->ema` ditto plus prefix "ema"
+    fn get_model_property_context(
+        line_text: &str,
+        character: u32,
+        file_content: &str,
+    ) -> Option<(String, String)> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -6401,8 +6923,10 @@ impl LaravelLanguageServer {
         // Get the part before `->`
         let before_arrow = &before_cursor[..arrow_pos];
 
-        // Try to extract the class/variable that the arrow is on
-        let class_hint = Self::extract_model_class_hint(before_arrow)?;
+        // Try to extract the class/variable that the arrow is on, then
+        // resolve bare class names through the file's use aliases +
+        // namespace so downstream lookup gets a FQCN.
+        let class_hint = Self::extract_model_class_hint(before_arrow, file_content)?;
 
         Some((class_hint, typed_prefix))
     }
@@ -6411,13 +6935,23 @@ impl LaravelLanguageServer {
     ///
     /// Handles:
     /// - `$variable` -> returns "$variable" (caller will resolve type)
-    /// - `User::find(1)` -> returns "User"
-    /// - `User::where(...)->first()` -> returns "User"
+    /// - `User::find(1)` -> returns the FQCN (`App\Models\User`) if the
+    ///   file imports it via `use`, else the bare name
+    /// - `User::where(...)->first()` -> ditto
     /// - `$this` -> returns "$this" (for use inside a model)
-    fn extract_model_class_hint(before_arrow: &str) -> Option<String> {
+    ///
+    /// `file_content` is scanned for `use` statements + the file's own
+    /// namespace so that a bare class reference becomes a FQCN. This
+    /// is what makes Composer-autoload-driven file lookup reliable
+    /// downstream — without it, a same-basename collision (e.g. a Nova
+    /// filter named like a model) wins by accident.
+    fn extract_model_class_hint(before_arrow: &str, file_content: &str) -> Option<String> {
+        use laravel_lsp::model_analyzer::ModelMetadata;
         let trimmed = before_arrow.trim_end();
 
-        // Case 1: Ends with a variable like $user or $this
+        // Case 1: Ends with a variable like $user or $this — return as-is,
+        // the caller resolves $var's type separately (typed param +
+        // docblock scan).
         if let Some(var_match) = regex::Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)$")
             .ok()
             .and_then(|re| re.find(trimmed))
@@ -6425,32 +6959,28 @@ impl LaravelLanguageServer {
             return Some(var_match.as_str().to_string());
         }
 
-        // Case 2: Ends with a method call on a static class like User::find(1) or User::where(...)->first()
-        // Look for the class name at the start of a static chain
-        // Pattern: ClassName::method(...) or ClassName::method(...)->other(...)
-        if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make|findOr|sole|firstOr|firstWhere|findMany)\s*\(")
-            .ok()
-            .and_then(|re| re.captures(trimmed))
-        {
-            if let Some(class) = caps.get(1) {
-                return Some(class.as_str().to_string());
-            }
-        }
+        // Case 2: Static call on a class — `User::find(...)`,
+        // `User::where(...)->first()`, etc. Extract the leading class
+        // name from the first `Foo::method(` we find.
+        let static_chain_re = regex::Regex::new(
+            r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make|findOr|sole|firstOr|firstWhere|findMany)\s*\(",
+        )
+        .ok()?;
+        let bare = static_chain_re
+            .captures(trimmed)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))?;
 
-        // Case 3: Ends with a method call like ->first(), ->find(), etc. - try to find class earlier in chain
-        if trimmed.ends_with(')') {
-            // Look backwards for a class name in a static call pattern
-            if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make)\s*\(")
-                .ok()
-                .and_then(|re| re.captures(trimmed))
-            {
-                if let Some(class) = caps.get(1) {
-                    return Some(class.as_str().to_string());
-                }
-            }
-        }
-
-        None
+        // Resolve the bare class name through the file's `use` statements
+        // and namespace, yielding a FQCN. `resolve_to_fqcn` falls through
+        // to the bare name if no use alias matches and no namespace is
+        // declared — so we always return something usable.
+        let aliases = ModelMetadata::extract_use_aliases_from_php(file_content);
+        let namespace = ModelMetadata::extract_namespace(file_content);
+        Some(ModelMetadata::resolve_to_fqcn(
+            &bare,
+            namespace.as_deref(),
+            &aliases,
+        ))
     }
 
     /// Resolve a variable name to its model class type by analyzing the file content
@@ -8732,8 +9262,11 @@ impl LaravelLanguageServer {
         context: &ValidationParamContext,
         content: &str,
         cursor_line: usize,
-        uri: &Url,
-        position: Position,
+        // `uri` and `position` were used by the inline DB-error diagnostic
+        // we removed in Phase 5.3; the toast doesn't need them. Kept in
+        // the signature so callers don't have to change.
+        _uri: &Url,
+        _position: Position,
     ) -> Vec<CompletionItem> {
         use laravel_lsp::validation_rules::{LaravelRulesParser, ParamType};
 
@@ -8864,39 +9397,13 @@ impl LaravelLanguageServer {
                     if tables.is_empty() {
                         if let Some(error) = provider.get_last_error().await {
                             info!("   ❌ Database connection error: {}", error.message);
-
-                            // Check if we've already shown this diagnostic
-                            let mut shown = self.database_diagnostic_shown.write().await;
-                            if !*shown {
-                                *shown = true;
-
-                                // Publish diagnostic at the validation rule position
-                                let diagnostic = Diagnostic {
-                                    range: Range {
-                                        start: position,
-                                        end: Position {
-                                            line: position.line,
-                                            character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
-                                        },
-                                    },
-                                    severity: Some(DiagnosticSeverity::INFORMATION),
-                                    code: None,
-                                    source: Some("laravel".to_string()),
-                                    message: format!(
-                                        "Database connection failed: {}\n\nConfigure these in .env for exists:/unique: autocomplete:\n- DB_CONNECTION\n- DB_HOST\n- DB_DATABASE\n- DB_USERNAME\n- DB_PASSWORD",
-                                        error.message
-                                    ),
-                                    related_information: None,
-                                    tags: None,
-                                    code_description: None,
-                                    data: None,
-                                };
-
-                                self.client
-                                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
-                                    .await;
-                            }
-
+                            // Surface the unreachable-DB notification via the
+                            // single persistent toast. The previous inline
+                            // diagnostic at the rule position used the same
+                            // one-shot flag as the toast, so whichever fired
+                            // first hid the other. One channel = one signal,
+                            // and toast persists until the user dismisses it.
+                            self.maybe_notify_db_unreachable(&error.message).await;
                             // Return empty - no completions available
                             return Vec::new();
                         }
@@ -9058,36 +9565,14 @@ impl LaravelLanguageServer {
                     }
                 } else {
                     debug!("warn:  Database schema provider not initialized");
-
-                    // Publish diagnostic at the validation rule position
-                    let mut shown = self.database_diagnostic_shown.write().await;
-                    if !*shown {
-                        *shown = true;
-
-                        let diagnostic = Diagnostic {
-                            range: Range {
-                                start: position,
-                                end: Position {
-                                    line: position.line,
-                                    character: position.character + context.rule_name.len() as u32 + 1, // +1 for colon
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::INFORMATION),
-                            code: None,
-                            source: Some("laravel".to_string()),
-                            message: "Database not configured. Set DB_CONNECTION, DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env for exists:/unique: autocomplete.".to_string(),
-                            related_information: None,
-                            tags: None,
-                            code_description: None,
-                            data: None,
-                        };
-
-                        self.client
-                            .publish_diagnostics(uri.clone(), vec![diagnostic], None)
-                            .await;
-                    }
-
-                    // Return empty - no completions available
+                    // Same persistent-toast channel as the unreachable-DB
+                    // path above. "Provider not initialised" means no .env
+                    // (or no detection of one); say so explicitly.
+                    self.maybe_notify_db_unreachable(
+                        "Database not configured. Set DB_CONNECTION, DB_HOST, \
+                         DB_DATABASE, DB_USERNAME, DB_PASSWORD in .env.",
+                    )
+                    .await;
                     Vec::new()
                 }
             }
@@ -10077,18 +10562,6 @@ impl LaravelLanguageServer {
         result
     }
 
-    /// Heuristic check: does `content` define a class that extends Laravel's
-    /// `Model`? Used by `get_class_properties` to decide whether to run the
-    /// Eloquent-rich flow (DB schema, casts, relationships) or fall back to
-    /// the generic public-property scan that works for any PHP class.
-    fn content_extends_model(content: &str) -> bool {
-        let pattern = r"class\s+\w+\s+extends\s+\\?(?:Illuminate\\Database\\Eloquent\\)?Model\b";
-        regex::Regex::new(pattern)
-            .ok()
-            .map(|re| re.is_match(content))
-            .unwrap_or(false)
-    }
-
     /// Locate any PHP class file under `app/` (or `src/`) and return its
     /// `public Type $foo` declarations. Used as the generic fallback when a
     /// class isn't an Eloquent model — Livewire Forms, Livewire components,
@@ -10118,31 +10591,6 @@ impl LaravelLanguageServer {
         props
     }
 
-    /// Find the model file path for a given class name
-    /// Searches in app/Models/ directory
-    fn find_model_file(
-        &self,
-        root: &std::path::Path,
-        class_name: &str,
-    ) -> Option<std::path::PathBuf> {
-        // Try app/Models/ClassName.php first (Laravel 8+)
-        let model_path = root
-            .join("app")
-            .join("Models")
-            .join(format!("{}.php", class_name));
-        if model_path.exists() {
-            return Some(model_path);
-        }
-
-        // Try app/ClassName.php (older Laravel)
-        let old_model_path = root.join("app").join(format!("{}.php", class_name));
-        if old_model_path.exists() {
-            return Some(old_model_path);
-        }
-
-        None
-    }
-
     /// Get all properties for a class. Returns Eloquent-rich data (DB columns,
     /// casts, accessors, relationships) when the class lives in a standard
     /// model location AND extends `Model`; otherwise falls back to a generic
@@ -10164,16 +10612,20 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Try the model paths first (`app/Models/X.php`, `app/X.php`). When the
-        // file is there AND it actually extends `Model`, run the full Eloquent
-        // resolution. Anything else (Livewire Forms, DTOs, etc.) falls through
-        // to the generic public-property scan below.
-        let model_path = self.find_model_file(&root, class_name);
+        // Locate the class file via Composer autoload (PSR-4 aware, handles
+        // hyphenated vendor packages). If the class's `extends` chain
+        // reaches Eloquent's `Model` — possibly through several intermediate
+        // base classes — surface the full Eloquent property set. Otherwise
+        // fall back to the generic public-property scan, which works for
+        // Livewire Forms, DTOs, value objects, etc.
+        let model_path = laravel_lsp::class_locator::find_php_class_file(class_name, &root);
         let appears_to_be_model = model_path
             .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|content| Self::content_extends_model(&content))
+            .map(|p| ModelMetadata::extends_eloquent_model(p, &root))
             .unwrap_or(false);
+        info!(
+            "   📦 get_class_properties: class={class_name:?} file={model_path:?} is_eloquent={appears_to_be_model}"
+        );
 
         if !appears_to_be_model {
             return Self::extract_generic_class_properties(&root, class_name);
@@ -10184,13 +10636,15 @@ impl LaravelLanguageServer {
             None => return Vec::new(),
         };
 
-        // Read and parse the model file
-        let content = match std::fs::read_to_string(&model_path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+        // Walk inheritance so children pick up the parent's `$table`,
+        // casts, accessors, and relationships — same machinery the chain
+        // path uses (Phase 5.6+). Without this, an empty subclass like
+        // `App\Models\Version extends BaseModel` would surface no
+        // properties even when the vendor parent declares them.
+        let metadata = match ModelMetadata::from_file_with_inheritance(&model_path, &root) {
+            Some(m) => m,
+            None => return Vec::new(),
         };
-
-        let metadata = ModelMetadata::from_content(&content);
 
         // Determine the table name (either from $table property or by convention)
         let table_name = metadata.table_name.clone().unwrap_or_else(|| {
@@ -10248,15 +10702,41 @@ impl LaravelLanguageServer {
             }
         }
 
-        // 4. Add relationships
+        // 4. Add relationships — TWO entries per relation so the user
+        //    can pick the right shape:
+        //
+        //    a) `posts`   → kind=PROPERTY, returns the lazy-loaded
+        //       Collection/Model. Type label `Collection<Post>` /
+        //       `?Post`. This is what `$model->posts` evaluates to.
+        //    b) `posts()` → kind=METHOD, returns the Relation/Builder.
+        //       Type label `HasMany<Post>`, etc. This is the query
+        //       hook (`$model->posts()->where('published', true)`).
+        //
+        //    The two share `seen_names` against the bare method name —
+        //    we register the property form first, then unconditionally
+        //    push the method form. The method form's `name` carries
+        //    the trailing `()` so the completion handler picks it up
+        //    as the method shape without an extra flag on the struct.
         for rel in &metadata.relationships {
+            let result_type =
+                relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+            let relation_type = format!(
+                "{}<{}>",
+                rel.relationship_type,
+                rel.related_model.as_deref().unwrap_or("Model"),
+            );
             if seen_names.insert(rel.method_name.clone()) {
-                let php_type =
-                    relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+                // Property form: lazy-loaded result.
                 properties.push(ModelPropertyCompletion {
                     name: rel.method_name.clone(),
-                    php_type,
+                    php_type: result_type,
                     source: "relationship".to_string(),
+                });
+                // Query hook: relation builder, chain `->where(...)` etc.
+                properties.push(ModelPropertyCompletion {
+                    name: format!("{}()", rel.method_name),
+                    php_type: relation_type,
+                    source: "relationship query".to_string(),
                 });
             }
         }
@@ -12361,46 +12841,6 @@ return [
         })
     }
 
-    /// Check if database connection has failed and return an Info diagnostic if so
-    /// This diagnostic is shown once per session when exists:/unique: validation rules are used
-    /// but the database cannot be connected
-    async fn get_database_error_diagnostic(&self) -> Option<Diagnostic> {
-        // Check if we've already shown this diagnostic
-        let mut shown = self.database_diagnostic_shown.write().await;
-        if *shown {
-            return None;
-        }
-
-        // Check if database schema provider exists and has an error
-        let schema_guard = self.database_schema.read().await;
-        if let Some(ref provider) = *schema_guard {
-            if let Some(error) = provider.get_last_error().await {
-                // Mark as shown so we don't show it again
-                *shown = true;
-
-                return Some(Diagnostic {
-                    range: Range {
-                        start: Position { line: 0, character: 0 },
-                        end: Position { line: 0, character: 0 },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    code: None,
-                    source: Some("laravel".to_string()),
-                    message: format!(
-                        "Database connection failed: {}\nConfigure database settings in .env for exists:/unique: validation autocomplete.",
-                        error.message
-                    ),
-                    related_information: None,
-                    tags: None,
-                    code_description: None,
-                    data: None,
-                });
-            }
-        }
-
-        None
-    }
-
     /// Clone server for spawning async tasks
     fn clone_for_spawn(&self) -> Self {
         LaravelLanguageServer {
@@ -12448,10 +12888,15 @@ return [
             diagnostics.push(vendor_diag);
         }
 
-        // Check for database connection error diagnostic (shows once per session)
-        if let Some(db_diag) = self.get_database_error_diagnostic().await {
-            diagnostics.push(db_diag);
-        }
+        // Database-unreachable notifications go through the persistent
+        // toast (`maybe_notify_db_unreachable`) — driven from the chain
+        // completion handler when an LSP-completing path actually needs
+        // the DB and finds it unavailable. We deliberately don't publish
+        // a diagnostic from here: a 0:0 diagnostic on whatever file
+        // happened to be open is awkward, and emitting both a diagnostic
+        // AND a toast meant whichever fired first stole the
+        // `database_diagnostic_shown` flag and suppressed the other.
+        // Toast wins; diagnostic is gone.
 
         // Get the Laravel config (checks memory cache first, then Salsa)
         let t_config = std::time::Instant::now();
@@ -12755,7 +13200,7 @@ return [
                         }
                     } else {
                         // Middleware not in registry - try to resolve it by convention
-                        info!("Laravel LSP: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
+                        info!("Laravel: Middleware '{}' NOT found in registry, attempting resolution by convention", middleware_name);
 
                         // Strip parameters (e.g., 'auth:sanctum' -> 'auth') before converting,
                         // otherwise PascalCase produces invalid class names like 'Auth:Sanctum'.
@@ -12767,11 +13212,11 @@ return [
 
                         // Try to resolve as App\Http\Middleware\{ClassName}
                         if let Some(mw_file_path) = resolve_class_to_file(&app_class, root) {
-                            info!("Laravel LSP: Attempting to resolve middleware '{}' as class '{}' at {:?}", middleware_name, app_class, mw_file_path);
+                            info!("Laravel: Attempting to resolve middleware '{}' as class '{}' at {:?}", middleware_name, app_class, mw_file_path);
 
                             if !mw_file_path.exists() {
                                 // ERROR - middleware not in config and class file doesn't exist
-                                info!("Laravel LSP: Creating ERROR diagnostic for unresolved middleware: {}", middleware_name);
+                                info!("Laravel: Creating ERROR diagnostic for unresolved middleware: {}", middleware_name);
                                 let diagnostic = Diagnostic {
                                     range: Range {
                                         start: Position {
@@ -12798,11 +13243,11 @@ return [
                                 };
                                 diagnostics.push(diagnostic);
                             } else {
-                                info!("Laravel LSP: Middleware '{}' resolved by convention, file exists at {:?}", middleware_name, mw_file_path);
+                                info!("Laravel: Middleware '{}' resolved by convention, file exists at {:?}", middleware_name, mw_file_path);
                             }
                         } else {
                             // Can't resolve - show INFO as we don't know where to check
-                            info!("Laravel LSP: Middleware '{}' NOT found in registry and can't resolve file path, creating INFO diagnostic", middleware_name);
+                            info!("Laravel: Middleware '{}' NOT found in registry and can't resolve file path, creating INFO diagnostic", middleware_name);
                             let diagnostic = Diagnostic {
                                 range: Range {
                                     start: Position {
@@ -12887,7 +13332,7 @@ return [
                             if let Some(ref bind_file_path) = binding_data.file_path {
                                 if !bind_file_path.exists() {
                                     // ERROR - binding exists but class file is missing
-                                    info!("Laravel LSP: Creating ERROR diagnostic for binding with missing class: {}", binding_name);
+                                    info!("Laravel: Creating ERROR diagnostic for binding with missing class: {}", binding_name);
 
                                     // Build the diagnostic message with registration location
                                     let mut message = format!(
@@ -12980,7 +13425,10 @@ return [
                                 }
 
                                 // ERROR - binding not found and not a known framework binding
-                                info!("Laravel LSP: Creating ERROR diagnostic for undefined binding: {}", binding_name);
+                                info!(
+                                    "Laravel: Creating ERROR diagnostic for undefined binding: {}",
+                                    binding_name
+                                );
                                 let diagnostic = Diagnostic {
                                     range: Range {
                                         start: Position {
@@ -14726,7 +15174,7 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         let init_start = std::time::Instant::now();
-        info!("Laravel LSP: INITIALIZE");
+        info!("Laravel: INITIALIZE");
 
         // Read initial settings from initialization_options (if provided)
         // These can be overridden at runtime via did_change_configuration
@@ -14747,7 +15195,7 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(root_uri) = params.root_uri {
             if let Ok(path) = root_uri.to_file_path() {
                 *self.root_path.write().await = Some(path.clone());
-                info!("✅ Laravel LSP: Root path set to {:?}", path);
+                info!("✅ Laravel: Root path set to {:?}", path);
 
                 // Load ALL cached data (config, middleware, bindings, env) using batch registration (fast)
                 // This uses 2 round-trips instead of N round-trips for N entries
@@ -14902,7 +15350,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("========================================");
-        info!("🚀 Laravel LSP: INITIALIZED - spawning background work");
+        info!("🚀 Laravel ({}) initialized", env!("LARAVEL_LSP_GIT_HASH"));
         info!("========================================");
 
         // Get root path
@@ -14931,9 +15379,13 @@ impl LanguageServer for LaravelLanguageServer {
             //
             // If the client doesn't support work-done-progress, `begin`
             // returns None and the rest of the flow just skips reports.
+            // Status bar stays brand-clean — `🚀 Laravel — Starting
+            // indexer…`. The build hash lives in the startup banner
+            // (LSP logs) only; it's a developer-debug detail, not
+            // something to clutter the editor chrome with.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
-                "Laravel",
+                "🚀 Laravel",
                 "Starting indexer…",
             )
             .await;
@@ -15016,7 +15468,7 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
-        info!("Laravel LSP: Shutting down - cleaning up resources");
+        info!("Laravel: Shutting down - cleaning up resources");
 
         // Cancel all pending diagnostic tasks
         {
@@ -15038,7 +15490,7 @@ impl LanguageServer for LaravelLanguageServer {
             debug!("Salsa actor shutdown: {}", e);
         }
 
-        info!("Laravel LSP: Shutdown complete");
+        info!("Laravel: Shutdown complete");
         Ok(())
     }
 
@@ -15122,10 +15574,7 @@ impl LanguageServer for LaravelLanguageServer {
         let version = params.text_document.version;
 
         if let Some(change) = params.content_changes.into_iter().next() {
-            debug!(
-                "Laravel LSP: Document changed: {} (version: {})",
-                uri, version
-            );
+            debug!("Laravel: Document changed: {} (version: {})", uri, version);
 
             // Store in documents buffer immediately (for goto_definition during debounce)
             self.documents
@@ -15144,7 +15593,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
-        info!("🔔 Laravel LSP: did_save called for {}", uri);
+        info!("🔔 Laravel: did_save called for {}", uri);
 
         // Check for lock file changes that trigger rescans
         if let Ok(path) = uri.to_file_path() {
@@ -15210,7 +15659,7 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        debug!("Laravel LSP: Document closed: {}", uri);
+        debug!("Laravel: Document closed: {}", uri);
 
         // Cancel any pending debounced diagnostics
         if let Some(handle) = self.pending_diagnostics.write().await.remove(&uri) {
@@ -15443,11 +15892,11 @@ impl LanguageServer for LaravelLanguageServer {
         let patterns = match self.salsa.get_patterns(file_path).await {
             Ok(Some(p)) => p,
             Ok(None) => {
-                debug!("Laravel LSP: No patterns cached for file");
+                debug!("Laravel: No patterns cached for file");
                 return Ok(None);
             }
             Err(e) => {
-                debug!("Laravel LSP: Error getting patterns: {:?}", e);
+                debug!("Laravel: Error getting patterns: {:?}", e);
                 return Ok(None);
             }
         };
@@ -15490,30 +15939,30 @@ impl LanguageServer for LaravelLanguageServer {
         // Create location based on pattern type
         let location = match pattern {
             PatternAtPosition::View(view) => {
-                debug!("Laravel LSP: Found view: {}", view.name);
+                debug!("Laravel: Found view: {}", view.name);
                 self.create_view_location_from_salsa(&view).await
             }
             PatternAtPosition::Component(comp) => {
-                debug!("Laravel LSP: Found component: {}", comp.name);
+                debug!("Laravel: Found component: {}", comp.name);
                 self.create_component_location_from_salsa(&comp).await
             }
             PatternAtPosition::Livewire(lw) => {
-                debug!("Laravel LSP: Found livewire: {}", lw.name);
+                debug!("Laravel: Found livewire: {}", lw.name);
                 self.create_livewire_location_from_salsa(&lw).await
             }
             PatternAtPosition::Directive(dir) => {
                 info!(
-                    "🎯 Laravel LSP: Found directive: {} with args {:?} at {}:{}-{}",
+                    "🎯 Laravel: Found directive: {} with args {:?} at {}:{}-{}",
                     dir.name, dir.arguments, dir.line, dir.column, dir.end_column
                 );
                 self.create_directive_location_from_salsa(&dir).await
             }
             PatternAtPosition::EnvRef(env) => {
-                debug!("Laravel LSP: Found env: {}", env.name);
+                debug!("Laravel: Found env: {}", env.name);
                 self.create_env_location_from_salsa(&env).await
             }
             PatternAtPosition::ConfigRef(config) => {
-                debug!("Laravel LSP: Found config: {}", config.key);
+                debug!("Laravel: Found config: {}", config.key);
                 self.create_config_location_from_salsa(&config).await
             }
             PatternAtPosition::Middleware(mw) => {
@@ -15532,39 +15981,39 @@ impl LanguageServer for LaravelLanguageServer {
             }
             PatternAtPosition::Translation(trans) => {
                 info!(
-                    "🎯 Laravel LSP: Found translation pattern: '{}' at {}:{}-{}",
+                    "🎯 Laravel: Found translation pattern: '{}' at {}:{}-{}",
                     trans.key, trans.line, trans.column, trans.end_column
                 );
                 self.create_translation_location_from_salsa(&trans).await
             }
             PatternAtPosition::Asset(asset) => {
-                debug!("Laravel LSP: Found asset: {}", asset.path);
+                debug!("Laravel: Found asset: {}", asset.path);
                 self.create_asset_location_from_salsa(&asset).await
             }
             PatternAtPosition::Binding(binding) => {
-                debug!("Laravel LSP: Found binding: {}", binding.name);
+                debug!("Laravel: Found binding: {}", binding.name);
                 self.create_binding_location_from_salsa(&binding).await
             }
             PatternAtPosition::Route(route) => {
-                debug!("Laravel LSP: Found route: {}", route.name);
+                debug!("Laravel: Found route: {}", route.name);
                 self.create_route_location_from_salsa(&route).await
             }
             PatternAtPosition::Url(url) => {
-                debug!("Laravel LSP: Found url: {}", url.path);
+                debug!("Laravel: Found url: {}", url.path);
                 self.create_url_location_from_salsa(&url).await
             }
             PatternAtPosition::Action(action) => {
-                debug!("Laravel LSP: Found action: {}", action.action);
+                debug!("Laravel: Found action: {}", action.action);
                 self.create_action_location_from_salsa(&action).await
             }
             PatternAtPosition::Feature(feature) => {
-                debug!("Laravel LSP: Found feature: {}", feature.feature_name);
+                debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
             }
         };
 
         if location.is_none() {
-            debug!("Laravel LSP: Could not resolve location for pattern");
+            debug!("Laravel: Could not resolve location for pattern");
         }
 
         Ok(location)
@@ -16748,6 +17197,32 @@ impl LanguageServer for LaravelLanguageServer {
 
         // In PHP/Blade files, check for various contexts
         if is_php_or_blade {
+            // Eloquent / DB query builder chain completion. No line-local
+            // pre-filter: chains can span multiple lines (the `->` may live
+            // on a different line than the cursor), and the helper itself
+            // short-circuits fast (single Arc::clone + emptiness check) when
+            // the file has no chains. Files with chains pay an O(chains)
+            // walk which is in the tens.
+            if let Some(items) = self
+                .try_query_chain_completion(&content, position, uri)
+                .await
+            {
+                if !items.is_empty() {
+                    // `is_incomplete: true` hints the client that this list
+                    // depends on cursor state (which chain link the cursor
+                    // is in, what arg position, etc.) and may change as the
+                    // user types or deletes. Some clients (notably Zed) use
+                    // this to refetch more aggressively — including after a
+                    // delete/backspace that wouldn't otherwise re-trigger
+                    // completion. Cost is nil: schema is cached, the helper
+                    // short-circuits when no chain contains the cursor.
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
+                }
+            }
+
             // Check for variable name context in Blade files (typing $user, $u, etc.)
             // This must come BEFORE model property context to avoid conflicts
             if uri.path().ends_with(".blade.php") {
@@ -16967,10 +17442,10 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Check for model property context ($user-> or User::find()->)
             if let Some((class_hint, typed_prefix)) =
-                Self::get_model_property_context(line_text, position.character)
+                Self::get_model_property_context(line_text, position.character, &content)
             {
-                debug!(
-                    "   Model property context, class hint: '{}', typed prefix: '{}'",
+                info!(
+                    "   📦 Model property context, class hint: '{}', typed prefix: '{}'",
                     class_hint, typed_prefix
                 );
 
@@ -16990,19 +17465,36 @@ impl LanguageServer for LaravelLanguageServer {
                 };
 
                 if let Some(class_name) = model_class {
-                    debug!("   Resolved model class: {}", class_name);
+                    info!("   📦 Resolved model class: {}", class_name);
 
                     // Get model properties
                     let properties = self.get_class_properties(&class_name).await;
 
-                    // Build completion items, filtering by prefix
+                    // Build completion items, filtering by prefix. The
+                    // `relationship query` shape (`posts()`) is matched
+                    // by the bare prefix the user typed — they type
+                    // "post" and we want both `posts` and `posts()` to
+                    // surface — so we strip the trailing `()` before
+                    // comparing.
                     let prefix_lower = typed_prefix.to_lowercase();
                     let items: Vec<CompletionItem> = properties
                         .into_iter()
-                        .filter(|p| p.name.to_lowercase().starts_with(&prefix_lower))
+                        .filter(|p| {
+                            p.name
+                                .trim_end_matches("()")
+                                .to_lowercase()
+                                .starts_with(&prefix_lower)
+                        })
                         .map(|p| {
+                            // Relationship shapes:
+                            //   `relationship`       → kind=PROPERTY
+                            //       (`$model->posts` returns Collection)
+                            //   `relationship query` → kind=METHOD
+                            //       (`$model->posts()` returns the
+                            //       Relation, chainable via ->where)
                             let kind = match p.source.as_str() {
-                                "relationship" => CompletionItemKind::METHOD,
+                                "relationship" => CompletionItemKind::PROPERTY,
+                                "relationship query" => CompletionItemKind::METHOD,
                                 "accessor" => CompletionItemKind::PROPERTY,
                                 _ => CompletionItemKind::FIELD,
                             };
@@ -17028,8 +17520,8 @@ impl LanguageServer for LaravelLanguageServer {
                         })
                         .collect();
 
-                    debug!(
-                        "   Returning {} model property completion items",
+                    info!(
+                        "   📦 Returning {} model property completion items",
                         items.len()
                     );
 

@@ -7,7 +7,8 @@
 //! - Relationships (belongsTo, hasMany, etc.)
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// Source of a model property
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +89,280 @@ impl ModelMetadata {
             accessors,
             relationships,
         }
+    }
+
+    /// Parse a model file AND walk its `extends` chain, inheriting any
+    /// `$table`, casts, accessors, and relationships the child doesn't
+    /// declare itself.
+    ///
+    /// Real Laravel codebases often factor shared shape into a base
+    /// class — e.g. `OAuthAccessToken extends Token` where `Token`
+    /// declares `protected $table = 'oauth_access_tokens'`. Without
+    /// inheritance walking, the child's `ModelMetadata` has
+    /// `table_name = None` and we fall back to snake-pluralizing
+    /// "OAuthAccessToken" → "o_auth_access_tokens" (wrong) instead of
+    /// using the parent's explicit "oauth_access_tokens".
+    ///
+    /// PHP method/property resolution: child wins on conflict, parent
+    /// fills in what the child doesn't declare. We mirror that:
+    /// - `table_name`: child overrides; parent fills if child has none.
+    /// - `casts`: union; child entries take precedence per-key.
+    /// - `accessors` / `relationships`: appended from parent if not
+    ///   already declared by the same name on the child.
+    ///
+    /// Stops at Laravel's base `Model`, at any parent class file we
+    /// can't locate in the project (vendor classes without app/-side
+    /// shadowing aren't searched here yet), or at a 10-deep recursion
+    /// cap. Cycle-safe via a visited-set.
+    pub fn from_file_with_inheritance(path: &Path, project_root: &Path) -> Option<Self> {
+        let mut visited = HashSet::new();
+        Self::resolve_recursive(path, project_root, &mut visited, 0)
+    }
+
+    /// Walk the `extends` chain from `path` and return `true` if any
+    /// ancestor is Eloquent's base `Model`. Used to decide whether to
+    /// surface Eloquent-style property completions (DB columns + casts +
+    /// accessors + relationships) versus generic public-property scans.
+    ///
+    /// The chain may pass through any number of intermediate base classes
+    /// — `OAuthAccessToken extends Token extends BaseModel extends Model`
+    /// counts as Eloquent. A literal `extends Model` regex misses that
+    /// shape entirely.
+    ///
+    /// Bounded by the same 10-deep recursion cap as
+    /// [`from_file_with_inheritance`] and cycle-safe via a visited set.
+    /// Uses [`crate::class_locator::find_php_class_file_in_app_or_vendor`]
+    /// so vendor-side base classes (e.g. an SDK's `BaseModel`) are found
+    /// through Composer's autoload data.
+    pub fn extends_eloquent_model(path: &Path, project_root: &Path) -> bool {
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut current = Some(path.to_path_buf());
+        let mut depth = 0usize;
+        while let Some(p) = current.take() {
+            if depth > 10 {
+                return false;
+            }
+            depth += 1;
+            let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if !visited.insert(canonical) {
+                return false;
+            }
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                return false;
+            };
+            let Some(parent_raw) = Self::extract_parent_class(&content) else {
+                return false;
+            };
+            // Resolve the raw parent name through the file's use aliases
+            // FIRST, then check the basename. The raw name can be an alias
+            // (`use Illuminate\Database\Eloquent\Model as EloquentModel;`),
+            // in which case the basename of `parent_raw` is "EloquentModel"
+            // but the resolved FQCN ends in "Model" — that's what we want
+            // to match.
+            let aliases = Self::extract_use_aliases_from_php(&content);
+            let ns = Self::extract_namespace(&content);
+            let parent_fqcn = Self::resolve_to_fqcn(&parent_raw, ns.as_deref(), &aliases);
+            let resolved_basename = parent_fqcn.rsplit('\\').next().unwrap_or(&parent_fqcn);
+            if resolved_basename == "Model" {
+                // Confirmed an Eloquent ancestor. Stop walking — same
+                // sentinel `from_file_with_inheritance` uses.
+                return true;
+            }
+            current = crate::class_locator::find_php_class_file_in_app_or_vendor(
+                &parent_fqcn,
+                project_root,
+            );
+        }
+        false
+    }
+
+    fn resolve_recursive(
+        path: &Path,
+        project_root: &Path,
+        visited: &mut HashSet<PathBuf>,
+        depth: usize,
+    ) -> Option<Self> {
+        if depth > 10 {
+            return None;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !visited.insert(canonical) {
+            // Cycle — A extends B extends A. Shouldn't happen in valid
+            // PHP, but parsing is best-effort and we'd rather bail than
+            // recurse forever.
+            return None;
+        }
+
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut metadata = Self::from_content(&content);
+
+        if let Some(parent_raw) = Self::extract_parent_class(&content) {
+            // Stop at Eloquent's base class. Real Laravel models extend
+            // `Model` directly OR via `Authenticatable` (which itself
+            // extends Model). We only halt on Model — Authenticatable
+            // and Pivot etc. are worth walking into (they may declare
+            // their own $table fallbacks for specific use cases).
+            let basename = parent_raw.rsplit('\\').next().unwrap_or(&parent_raw);
+            if basename != "Model" {
+                // Resolve the parent through the child file's use
+                // statements + namespace so we get the actual FQCN
+                // (e.g. `Token` → `Laravel\Passport\Token`). Then map
+                // FQCN → file path via the Laravel/Composer
+                // convention. Falls back to a basename search if the
+                // FQCN path doesn't exist on disk — covers projects
+                // with non-standard PSR-4 layouts.
+                let use_aliases = Self::extract_use_aliases_from_php(&content);
+                let file_namespace = Self::extract_namespace(&content);
+                let parent_fqcn =
+                    Self::resolve_to_fqcn(&parent_raw, file_namespace.as_deref(), &use_aliases);
+
+                // Single call covers both PSR-4 paths (App\ and vendor/)
+                // and falls back to basename walk if neither shape exists.
+                // The PSR-4 ordering inside `find_php_class_file_in_app_or_vendor`
+                // means project-local classes shadow vendor classes.
+                let parent_path = crate::class_locator::find_php_class_file_in_app_or_vendor(
+                    &parent_fqcn,
+                    project_root,
+                );
+
+                if let Some(parent_path) = parent_path {
+                    if let Some(parent_meta) =
+                        Self::resolve_recursive(&parent_path, project_root, visited, depth + 1)
+                    {
+                        metadata.merge_inherited(parent_meta);
+                    }
+                }
+                // No parent file found: built-in PHP class, missing
+                // dependency, or unconventional autoload. Walking stops.
+            }
+        }
+
+        Some(metadata)
+    }
+
+    /// Extract `use Foo\Bar;` / `use Foo\Bar as Baz;` statements from
+    /// PHP source. Returns a `local_name → FQCN` map.
+    ///
+    /// Doesn't handle grouped uses (`use Foo\{Bar, Baz};`),
+    /// `use function`, or `use const` — none of those participate in
+    /// class inheritance, which is what this walker resolves.
+    pub fn extract_use_aliases_from_php(content: &str) -> HashMap<String, String> {
+        let re = match Regex::new(r"(?m)^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;") {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+        let mut aliases = HashMap::new();
+        for caps in re.captures_iter(content) {
+            let fqcn = caps[1].trim_start_matches('\\').to_string();
+            let local = caps
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string());
+            aliases.insert(local, fqcn);
+        }
+        aliases
+    }
+
+    /// Extract the `namespace Foo\Bar;` declaration. Returns the
+    /// namespace without the leading backslash. Returns `None` for
+    /// files without a namespace declaration (global namespace).
+    pub fn extract_namespace(content: &str) -> Option<String> {
+        let re = Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").ok()?;
+        re.captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// Resolve a class reference (as it appears in `extends`,
+    /// `implements`, etc.) to its fully-qualified class name.
+    ///
+    /// Resolution rules mirror PHP:
+    /// - `\Foo\Bar` (leading backslash) is already fully qualified —
+    ///   strip the backslash.
+    /// - `Foo\Bar` (no leading backslash, contains backslash) is
+    ///   partially qualified — first segment may be an aliased use,
+    ///   else prepend the file's namespace.
+    /// - `Bar` (unqualified) — look in use aliases first, else
+    ///   prepend the file's namespace.
+    pub fn resolve_to_fqcn(
+        name: &str,
+        file_namespace: Option<&str>,
+        use_aliases: &HashMap<String, String>,
+    ) -> String {
+        if let Some(stripped) = name.strip_prefix('\\') {
+            return stripped.to_string();
+        }
+        if name.contains('\\') {
+            let first = name.split('\\').next().unwrap_or("");
+            if let Some(prefix) = use_aliases.get(first) {
+                let rest = &name[first.len()..]; // includes leading `\`
+                return format!("{prefix}{rest}");
+            }
+            if let Some(ns) = file_namespace {
+                return format!("{ns}\\{name}");
+            }
+            return name.to_string();
+        }
+        if let Some(fqcn) = use_aliases.get(name) {
+            return fqcn.clone();
+        }
+        if let Some(ns) = file_namespace {
+            return format!("{ns}\\{name}");
+        }
+        name.to_string()
+    }
+
+    // `find_class_file_by_fqcn` lived here until Phase 5.9, then moved
+    // into class_locator so non-inheritance callers (columns_for_builder,
+    // relations, resolve_related_model) also benefit. The inheritance
+    // walker now calls `class_locator::find_php_class_file_in_app_or_vendor`
+    // directly — it already chains the FQCN-aware lookup with the
+    // basename-walk fallback.
+
+    /// Extract the parent class name from `class X extends Y`. Returns
+    /// the parent as written (may be a simple name like `Token` or a
+    /// qualified name like `\App\Models\Token`); the caller resolves
+    /// it to a file via `class_locator::find_php_class_file`, which
+    /// matches by basename.
+    fn extract_parent_class(content: &str) -> Option<String> {
+        let re = Regex::new(r"class\s+\w+\s+extends\s+([\w\\]+)").ok()?;
+        re.captures(content)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// PHP-style inheritance merge: child fields win, parent fills the
+    /// gaps. Called only after the parent's full chain is already
+    /// resolved (so grandparent fields are already merged into
+    /// `parent`).
+    fn merge_inherited(&mut self, parent: ModelMetadata) {
+        if self.table_name.is_none() {
+            self.table_name = parent.table_name;
+        }
+        for (k, v) in parent.casts {
+            self.casts.entry(k).or_insert(v);
+        }
+        for acc in parent.accessors {
+            if !self
+                .accessors
+                .iter()
+                .any(|a| a.property_name == acc.property_name)
+            {
+                self.accessors.push(acc);
+            }
+        }
+        for rel in parent.relationships {
+            if !self
+                .relationships
+                .iter()
+                .any(|r| r.method_name == rel.method_name)
+            {
+                self.relationships.push(rel);
+            }
+        }
+        // `class_name` always stays the child's — Laravel's
+        // `static::class` semantics inside model methods resolves to
+        // the concrete class, not its parents.
     }
 
     /// Extract the class name from the model file
@@ -214,6 +489,21 @@ impl ModelMetadata {
     fn extract_relationships(content: &str) -> Vec<RelationshipInfo> {
         let mut relationships = Vec::new();
 
+        // Resolve `Post::class` references through THIS file's namespace +
+        // use statements once, then reuse for every relationship. If we
+        // stored just the basename (`"Post"`), a later dotted-path hop
+        // would basename-walk and could land on the wrong file (e.g.
+        // `app/Nova/Filters/Post.php` instead of the actual model).
+        // Resolving to FQCN at extraction time fixes that — the
+        // basename `Post::class` inside `namespace App\Models;` becomes
+        // the full FQCN `App\Models\Post`, ready for Composer's PSR-4
+        // resolver to find the right file.
+        let file_namespace = Self::extract_namespace(content);
+        let use_aliases = Self::extract_use_aliases_from_php(content);
+        let resolve_class = |bare: String| -> String {
+            Self::resolve_to_fqcn(&bare, file_namespace.as_deref(), &use_aliases)
+        };
+
         // Common relationship types - ordered longest first to avoid partial matches
         let relationship_types = [
             "belongsToMany",
@@ -248,7 +538,8 @@ impl ModelMetadata {
                             let related_model = Self::extract_related_model_from_relationship(
                                 content,
                                 &method_name,
-                            );
+                            )
+                            .map(&resolve_class);
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -277,7 +568,8 @@ impl ModelMetadata {
                             let related_model = Self::extract_related_model_from_relationship(
                                 content,
                                 &method_name,
-                            );
+                            )
+                            .map(&resolve_class);
                             relationships.push(RelationshipInfo {
                                 method_name,
                                 relationship_type: rel_type.to_string(),
@@ -364,9 +656,15 @@ pub fn map_cast_to_php_type(cast: &str) -> String {
     }
 }
 
-/// Get the PHP type for a relationship
+/// Get the PHP type for a relationship.
+///
+/// `related_model` may be a FQCN (`App\Models\Post`) or a bare class
+/// name (`Post`). The displayed label always uses the simple name —
+/// completion details should be short, and the model's namespace
+/// rarely adds value at a glance.
 pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> String {
-    let model = related_model.unwrap_or("Model");
+    let model_full = related_model.unwrap_or("Model");
+    let model = model_full.rsplit('\\').next().unwrap_or(model_full);
 
     match rel_type {
         // Single model relationships

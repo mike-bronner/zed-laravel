@@ -2523,6 +2523,17 @@ pub struct ParsedPatternsData {
     pub url_refs: Vec<Arc<UrlReferenceData>>,
     pub action_refs: Vec<Arc<ActionReferenceData>>,
     pub feature_refs: Vec<Arc<FeatureReferenceData>>,
+    /// Eloquent / DB query builder chains extracted in the same PHP parse pass
+    /// as route/url/action/feature refs (see [`crate::query_chain::extractor`]).
+    /// Stored alongside the other patterns rather than as a `ParsedPatterns`
+    /// field because that struct is at Salsa's 12-element tuple-Hash cap.
+    ///
+    /// `#[serde(default)]` so disk-cache entries written by older builds (which
+    /// lacked this field) deserialize with an empty chains list rather than
+    /// failing the whole entry. The next file edit re-runs extraction and
+    /// populates chains properly.
+    #[serde(default)]
+    pub chains: Vec<Arc<crate::query_chain::BuilderChain>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -4835,6 +4846,7 @@ impl SalsaActor {
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
+        let mut chains: Vec<Arc<crate::query_chain::BuilderChain>> = Vec::new();
 
         // Skip the full-file PHP parse for Blade files — same rationale as
         // in parse_file_patterns above. Blade-embedded route/url/action/
@@ -4885,6 +4897,13 @@ impl SalsaActor {
                             end_column: f.end_column as u32,
                         }));
                     }
+                }
+
+                // Extract Eloquent / DB query builder chains from the same
+                // parsed tree. No second parse — we reuse the `tree` already
+                // produced above for route/url/action/feature extraction.
+                for chain in crate::query_chain::extract_chains(&tree, text) {
+                    chains.push(Arc::new(chain));
                 }
             }
         } // end if !path_is_blade
@@ -4989,6 +5008,21 @@ impl SalsaActor {
                         end_column: end_col,
                     }));
                 }
+
+                // Eloquent / DB query builder chains inside this Blade-
+                // embedded PHP region. Snippet-local byte ranges produced by
+                // the extractor reference the `<?php `-wrapped source; shift
+                // each range back into outer-file coordinates so the cursor
+                // resolver can find them by LSP byte offset.
+                use crate::blade_embedded_php::PHP_WRAPPER_PREFIX_LEN;
+                for mut chain in crate::query_chain::extract_chains(&snippet_tree, &wrapped) {
+                    crate::query_chain::extractor::shift_chain_byte_ranges(
+                        &mut chain,
+                        region.byte_offset,
+                        PHP_WRAPPER_PREFIX_LEN as usize,
+                    );
+                    chains.push(Arc::new(chain));
+                }
             }
         }
 
@@ -5007,6 +5041,7 @@ impl SalsaActor {
             url_refs,
             action_refs,
             feature_refs,
+            chains,
             sorted_positions: Vec::new(),
         };
 

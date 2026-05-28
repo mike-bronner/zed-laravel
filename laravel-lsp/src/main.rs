@@ -6874,12 +6874,25 @@ impl LaravelLanguageServer {
     /// 1. Variable access: `$user->` where we need to resolve $user's type
     /// 2. Static chain: `User::find(1)->` or `User::where(...)->first()->` where we extract the class
     ///
+    /// `file_content` is consulted to resolve bare class names against the
+    /// file's `use` statements. Without that step, `Version::first()->` in
+    /// a file with `use App\Models\Version;` ends up as the bare hint
+    /// `"Version"`, which then basename-matches the first `Version.php` on
+    /// disk — frequently the wrong file when a Nova filter or Livewire
+    /// component shares the name. With the use-statement step, the hint
+    /// becomes `App\Models\Version` and Composer autoload routes the
+    /// lookup correctly.
+    ///
     /// Examples:
     /// - `$user->` returns Some(("$user", ""))
     /// - `$user->na` returns Some(("$user", "na"))
-    /// - `User::find(1)->` returns Some(("User", ""))
-    /// - `User::find(1)->ema` returns Some(("User", "ema"))
-    fn get_model_property_context(line_text: &str, character: u32) -> Option<(String, String)> {
+    /// - `User::find(1)->` with `use App\Models\User;` returns Some(("App\\Models\\User", ""))
+    /// - `User::find(1)->ema` ditto plus prefix "ema"
+    fn get_model_property_context(
+        line_text: &str,
+        character: u32,
+        file_content: &str,
+    ) -> Option<(String, String)> {
         let cursor = character as usize;
         if cursor > line_text.len() {
             return None;
@@ -6901,8 +6914,10 @@ impl LaravelLanguageServer {
         // Get the part before `->`
         let before_arrow = &before_cursor[..arrow_pos];
 
-        // Try to extract the class/variable that the arrow is on
-        let class_hint = Self::extract_model_class_hint(before_arrow)?;
+        // Try to extract the class/variable that the arrow is on, then
+        // resolve bare class names through the file's use aliases +
+        // namespace so downstream lookup gets a FQCN.
+        let class_hint = Self::extract_model_class_hint(before_arrow, file_content)?;
 
         Some((class_hint, typed_prefix))
     }
@@ -6911,13 +6926,23 @@ impl LaravelLanguageServer {
     ///
     /// Handles:
     /// - `$variable` -> returns "$variable" (caller will resolve type)
-    /// - `User::find(1)` -> returns "User"
-    /// - `User::where(...)->first()` -> returns "User"
+    /// - `User::find(1)` -> returns the FQCN (`App\Models\User`) if the
+    ///   file imports it via `use`, else the bare name
+    /// - `User::where(...)->first()` -> ditto
     /// - `$this` -> returns "$this" (for use inside a model)
-    fn extract_model_class_hint(before_arrow: &str) -> Option<String> {
+    ///
+    /// `file_content` is scanned for `use` statements + the file's own
+    /// namespace so that a bare class reference becomes a FQCN. This
+    /// is what makes Composer-autoload-driven file lookup reliable
+    /// downstream — without it, a same-basename collision (e.g. a Nova
+    /// filter named like a model) wins by accident.
+    fn extract_model_class_hint(before_arrow: &str, file_content: &str) -> Option<String> {
+        use laravel_lsp::model_analyzer::ModelMetadata;
         let trimmed = before_arrow.trim_end();
 
-        // Case 1: Ends with a variable like $user or $this
+        // Case 1: Ends with a variable like $user or $this — return as-is,
+        // the caller resolves $var's type separately (typed param +
+        // docblock scan).
         if let Some(var_match) = regex::Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)$")
             .ok()
             .and_then(|re| re.find(trimmed))
@@ -6925,32 +6950,28 @@ impl LaravelLanguageServer {
             return Some(var_match.as_str().to_string());
         }
 
-        // Case 2: Ends with a method call on a static class like User::find(1) or User::where(...)->first()
-        // Look for the class name at the start of a static chain
-        // Pattern: ClassName::method(...) or ClassName::method(...)->other(...)
-        if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make|findOr|sole|firstOr|firstWhere|findMany)\s*\(")
-            .ok()
-            .and_then(|re| re.captures(trimmed))
-        {
-            if let Some(class) = caps.get(1) {
-                return Some(class.as_str().to_string());
-            }
-        }
+        // Case 2: Static call on a class — `User::find(...)`,
+        // `User::where(...)->first()`, etc. Extract the leading class
+        // name from the first `Foo::method(` we find.
+        let static_chain_re = regex::Regex::new(
+            r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make|findOr|sole|firstOr|firstWhere|findMany)\s*\(",
+        )
+        .ok()?;
+        let bare = static_chain_re
+            .captures(trimmed)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))?;
 
-        // Case 3: Ends with a method call like ->first(), ->find(), etc. - try to find class earlier in chain
-        if trimmed.ends_with(')') {
-            // Look backwards for a class name in a static call pattern
-            if let Some(caps) = regex::Regex::new(r"([A-Z][a-zA-Z0-9_]*)::(?:find|findOrFail|first|firstOrFail|where|query|all|get|create|make)\s*\(")
-                .ok()
-                .and_then(|re| re.captures(trimmed))
-            {
-                if let Some(class) = caps.get(1) {
-                    return Some(class.as_str().to_string());
-                }
-            }
-        }
-
-        None
+        // Resolve the bare class name through the file's `use` statements
+        // and namespace, yielding a FQCN. `resolve_to_fqcn` falls through
+        // to the bare name if no use alias matches and no namespace is
+        // declared — so we always return something usable.
+        let aliases = ModelMetadata::extract_use_aliases_from_php(file_content);
+        let namespace = ModelMetadata::extract_namespace(file_content);
+        Some(ModelMetadata::resolve_to_fqcn(
+            &bare,
+            namespace.as_deref(),
+            &aliases,
+        ))
     }
 
     /// Resolve a variable name to its model class type by analyzing the file content
@@ -10593,6 +10614,9 @@ impl LaravelLanguageServer {
             .as_deref()
             .map(|p| ModelMetadata::extends_eloquent_model(p, &root))
             .unwrap_or(false);
+        info!(
+            "   📦 get_class_properties: class={class_name:?} file={model_path:?} is_eloquent={appears_to_be_model}"
+        );
 
         if !appears_to_be_model {
             return Self::extract_generic_class_properties(&root, class_name);
@@ -17379,10 +17403,10 @@ impl LanguageServer for LaravelLanguageServer {
 
             // Check for model property context ($user-> or User::find()->)
             if let Some((class_hint, typed_prefix)) =
-                Self::get_model_property_context(line_text, position.character)
+                Self::get_model_property_context(line_text, position.character, &content)
             {
-                debug!(
-                    "   Model property context, class hint: '{}', typed prefix: '{}'",
+                info!(
+                    "   📦 Model property context, class hint: '{}', typed prefix: '{}'",
                     class_hint, typed_prefix
                 );
 
@@ -17402,7 +17426,7 @@ impl LanguageServer for LaravelLanguageServer {
                 };
 
                 if let Some(class_name) = model_class {
-                    debug!("   Resolved model class: {}", class_name);
+                    info!("   📦 Resolved model class: {}", class_name);
 
                     // Get model properties
                     let properties = self.get_class_properties(&class_name).await;
@@ -17440,8 +17464,8 @@ impl LanguageServer for LaravelLanguageServer {
                         })
                         .collect();
 
-                    debug!(
-                        "   Returning {} model property completion items",
+                    info!(
+                        "   📦 Returning {} model property completion items",
                         items.len()
                     );
 

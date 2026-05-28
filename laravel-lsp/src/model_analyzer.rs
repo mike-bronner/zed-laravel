@@ -246,7 +246,7 @@ impl ModelMetadata {
     /// Doesn't handle grouped uses (`use Foo\{Bar, Baz};`),
     /// `use function`, or `use const` — none of those participate in
     /// class inheritance, which is what this walker resolves.
-    fn extract_use_aliases_from_php(content: &str) -> HashMap<String, String> {
+    pub fn extract_use_aliases_from_php(content: &str) -> HashMap<String, String> {
         let re = match Regex::new(r"(?m)^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;") {
             Ok(r) => r,
             Err(_) => return HashMap::new(),
@@ -266,7 +266,7 @@ impl ModelMetadata {
     /// Extract the `namespace Foo\Bar;` declaration. Returns the
     /// namespace without the leading backslash. Returns `None` for
     /// files without a namespace declaration (global namespace).
-    fn extract_namespace(content: &str) -> Option<String> {
+    pub fn extract_namespace(content: &str) -> Option<String> {
         let re = Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").ok()?;
         re.captures(content)
             .and_then(|c| c.get(1))
@@ -284,7 +284,7 @@ impl ModelMetadata {
     ///   else prepend the file's namespace.
     /// - `Bar` (unqualified) — look in use aliases first, else
     ///   prepend the file's namespace.
-    fn resolve_to_fqcn(
+    pub fn resolve_to_fqcn(
         name: &str,
         file_namespace: Option<&str>,
         use_aliases: &HashMap<String, String>,

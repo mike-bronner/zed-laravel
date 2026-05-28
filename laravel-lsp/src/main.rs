@@ -15350,7 +15350,7 @@ impl LanguageServer for LaravelLanguageServer {
             // status bar answers without anyone opening the log panel.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
-                format!("Laravel ({})", env!("LARAVEL_LSP_GIT_HASH")),
+                format!("🚀 Laravel ({})", env!("LARAVEL_LSP_GIT_HASH")),
                 "Starting indexer…",
             )
             .await;

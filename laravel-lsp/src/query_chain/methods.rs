@@ -38,7 +38,6 @@ pub const COLUMN_METHODS: &[&str] = &[
     "oldest",
     "groupBy",
     "having",
-    "havingRaw",
     "select",
     "addSelect",
     "pluck",
@@ -52,6 +51,32 @@ pub const COLUMN_METHODS: &[&str] = &[
     "keyBy",
     "unique",
     "uniqueStrict",
+];
+
+/// Methods whose first string argument is **opaque SQL**, not a column name.
+/// They must never appear in `COLUMN_METHODS` — column completion at the
+/// cursor inside one of these would replace whatever SQL the user is typing
+/// with a single column name, which is actively destructive.
+///
+/// We deliberately don't classify these as `ArgKind::Column` (or any other
+/// kind). The absence makes [`arg_kind`] return [`ArgKind::None`], so our
+/// completion path returns nothing and the PHP LSP (Intelephense / PhpActor)
+/// is free to handle the raw SQL string — which is the right behaviour for
+/// opaque SQL.
+///
+/// Listed as a defensive constant so the regression tests can assert
+/// `RAW_METHODS ∩ COLUMN_METHODS == ∅`. That way nobody can accidentally
+/// re-introduce one of these in `COLUMN_METHODS` without CI catching it.
+pub const RAW_METHODS: &[&str] = &[
+    "whereRaw",
+    "orWhereRaw",
+    "havingRaw",
+    "orHavingRaw",
+    "orderByRaw",
+    "selectRaw",
+    "groupByRaw",
+    "fromRaw",
+    "raw", // DB::raw / Expression wrappers
 ];
 
 /// Methods whose first string argument is a relation name. Eloquent-only —

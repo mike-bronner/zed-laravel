@@ -188,3 +188,52 @@ fn chain_terminators_are_unique() {
         sorted
     );
 }
+
+// ---- raw SQL methods: first arg is opaque SQL, not a column ------------
+
+#[test]
+fn raw_methods_have_none_arg_kind() {
+    // Raw-SQL methods take an opaque SQL string as their first arg, not a
+    // column name. They must never trigger our column completion — if they
+    // did, accepting a suggestion would replace whatever SQL the user was
+    // typing with a single column name. The PHP LSP handles completion for
+    // raw SQL strings; we yield to it.
+    for &name in RAW_METHODS {
+        assert_eq!(
+            arg_kind(name),
+            ArgKind::None,
+            "{name} is a raw-SQL method; arg_kind must return None so our \
+             column-completion path doesn't fire."
+        );
+    }
+}
+
+#[test]
+fn raw_methods_are_not_in_column_methods() {
+    // Belt-and-suspenders for `raw_methods_have_none_arg_kind`: if a future
+    // contributor adds, say, `whereRaw` to COLUMN_METHODS, this test fires
+    // and names the invariant directly. Catches the regression that
+    // motivated this whole defensive pattern (havingRaw was historically
+    // in COLUMN_METHODS by mistake — see issue #22 / PR #27).
+    for &raw in RAW_METHODS {
+        assert!(
+            !COLUMN_METHODS.contains(&raw),
+            "{raw} is in COLUMN_METHODS but it's a raw-SQL method — \
+             column completion would clobber the user's SQL. Remove it from \
+             COLUMN_METHODS."
+        );
+    }
+}
+
+#[test]
+fn raw_methods_are_unique() {
+    let mut sorted = RAW_METHODS.to_vec();
+    sorted.sort();
+    let mut deduped = sorted.clone();
+    deduped.dedup();
+    assert_eq!(
+        sorted, deduped,
+        "RAW_METHODS contains duplicates: {:?}",
+        sorted
+    );
+}

@@ -1072,3 +1072,138 @@ fn unknown_receiver_falls_through_when_inner_is_unhandled() {
     assert_eq!(chains.len(), 1);
     assert_eq!(chains[0].receiver, ChainReceiver::Unknown);
 }
+
+// ---- Flow-tracked InstanceVar receivers (issue #23) --------------------
+//
+// The extractor calls `var_type::resolve` (which delegates to flow::resolve)
+// for every `member_chain_receiver` rooted at a variable. These tests
+// verify the end-to-end wiring: a multi-statement chain where the
+// receiver var is established by an earlier assignment ends up with
+// `php_type = Some(class)`.
+
+#[test]
+fn flow_tracks_var_seeded_from_static_query() {
+    // Single-function scope: $q is seeded from User::query(), used on a
+    // later line. The extractor sees the use site as the chain root
+    // and `var_type::resolve` walks back to the assignment.
+    let chains = extract(
+        r#"
+function search() {
+    $q = User::query();
+    $q->where('email', 'a@b.c');
+}
+"#,
+    );
+    let chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("should find an InstanceVar chain");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type }) => {
+            assert_eq!(var, "q");
+            assert_eq!(php_type.as_deref(), Some("User"));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn flow_tracks_var_through_self_reassignment() {
+    // The motivating example from issue #23: $query is rebuilt across
+    // conditional branches via $query = $query->where(...). The final
+    // use must still resolve to the original seed model.
+    let chains = extract(
+        r#"
+function search($activeOnly, $search) {
+    $query = User::query();
+
+    if ($activeOnly) {
+        $query = $query->where('active', true);
+    }
+
+    if ($search) {
+        $query = $query->where('name', 'like', '%foo%');
+    }
+
+    $query->orderBy('name');
+}
+"#,
+    );
+    // The final $query->orderBy('name') chain. Multiple InstanceVar
+    // chains exist (one per conditional branch's $query = $query->where);
+    // we want the LAST one in source order.
+    let last = chains
+        .iter()
+        .rfind(|c| matches!(&c.receiver, ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "query"))
+        .expect("should find $query chains");
+    match &last.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { php_type, .. }) => {
+            assert_eq!(php_type.as_deref(), Some("User"));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn flow_walks_into_outer_scope_via_use_clause() {
+    // The use site is inside an anonymous function with `use ($query)`.
+    // Flow resolution must walk out of the closure to find the outer
+    // scope's User::query() seed.
+    let chains = extract(
+        r#"
+function show() {
+    $query = User::query();
+    collect([])->each(function ($item) use ($query) {
+        $query->where('id', $item);
+    });
+}
+"#,
+    );
+    let inner = chains
+        .iter()
+        .rfind(|c| matches!(&c.receiver, ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "query"))
+        .expect("should find a $query chain inside the closure");
+    match &inner.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { php_type, .. }) => {
+            assert_eq!(php_type.as_deref(), Some("User"));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn flow_resolves_aliased_class_through_use_statement() {
+    // Reassignment from `Member::query()` where Member is an alias for
+    // App\Models\User. The flow-tracked class must be the FQCN, not
+    // the alias.
+    let chains = extract(
+        r#"
+use App\Models\User as Member;
+
+function search() {
+    $q = Member::query();
+    $q->where('email', 'a@b.c');
+}
+"#,
+    );
+    let chain = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { .. })
+            )
+        })
+        .expect("should find an InstanceVar chain");
+    match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { php_type, .. }) => {
+            assert_eq!(php_type.as_deref(), Some("App\\Models\\User"));
+        }
+        _ => unreachable!(),
+    }
+}

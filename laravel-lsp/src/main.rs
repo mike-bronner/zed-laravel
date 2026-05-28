@@ -215,11 +215,20 @@ struct FilePathCompletion {
 
 /// A model property for autocomplete (used by $model->)
 struct ModelPropertyCompletion {
-    /// The property name (e.g., "id", "email", "first_name")
+    /// The property name (e.g., "id", "email", "first_name"). For the
+    /// method-call form of a relationship, the name includes the
+    /// trailing `()` (e.g., "posts()") so completion inserts the
+    /// callable shape.
     name: String,
     /// The PHP type (e.g., "int", "string", "Carbon", "Collection<Post>")
     php_type: String,
-    /// Source of the property (database, cast, accessor, relationship)
+    /// Source of the property. Known values:
+    /// - `database` / `cast` / `accessor`: model attribute shapes
+    /// - `relationship`: relation accessed as a property (lazy-loaded
+    ///   result — Collection or related Model)
+    /// - `relationship_query`: relation called as a method (returns the
+    ///   Relation/Builder, chainable via `->where(...)`)
+    /// - `class` / `blade-loop`: generic public-property scans
     source: String,
 }
 
@@ -10693,15 +10702,41 @@ impl LaravelLanguageServer {
             }
         }
 
-        // 4. Add relationships
+        // 4. Add relationships — TWO entries per relation so the user
+        //    can pick the right shape:
+        //
+        //    a) `posts`   → kind=PROPERTY, returns the lazy-loaded
+        //       Collection/Model. Type label `Collection<Post>` /
+        //       `?Post`. This is what `$model->posts` evaluates to.
+        //    b) `posts()` → kind=METHOD, returns the Relation/Builder.
+        //       Type label `HasMany<Post>`, etc. This is the query
+        //       hook (`$model->posts()->where('published', true)`).
+        //
+        //    The two share `seen_names` against the bare method name —
+        //    we register the property form first, then unconditionally
+        //    push the method form. The method form's `name` carries
+        //    the trailing `()` so the completion handler picks it up
+        //    as the method shape without an extra flag on the struct.
         for rel in &metadata.relationships {
+            let result_type =
+                relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+            let relation_type = format!(
+                "{}<{}>",
+                rel.relationship_type,
+                rel.related_model.as_deref().unwrap_or("Model"),
+            );
             if seen_names.insert(rel.method_name.clone()) {
-                let php_type =
-                    relationship_to_php_type(&rel.relationship_type, rel.related_model.as_deref());
+                // Property form: lazy-loaded result.
                 properties.push(ModelPropertyCompletion {
                     name: rel.method_name.clone(),
-                    php_type,
+                    php_type: result_type,
                     source: "relationship".to_string(),
+                });
+                // Query hook: relation builder, chain `->where(...)` etc.
+                properties.push(ModelPropertyCompletion {
+                    name: format!("{}()", rel.method_name),
+                    php_type: relation_type,
+                    source: "relationship_query".to_string(),
                 });
             }
         }
@@ -15344,13 +15379,13 @@ impl LanguageServer for LaravelLanguageServer {
             //
             // If the client doesn't support work-done-progress, `begin`
             // returns None and the rest of the flow just skips reports.
-            // Title carries the build hash so the status bar reads
-            // `Laravel (bf280) — Starting indexer…`. Matches the startup
-            // banner: when "is the new binary loaded?" comes up, the
-            // status bar answers without anyone opening the log panel.
+            // Status bar stays brand-clean — `🚀 Laravel — Starting
+            // indexer…`. The build hash lives in the startup banner
+            // (LSP logs) only; it's a developer-debug detail, not
+            // something to clutter the editor chrome with.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
-                format!("🚀 Laravel ({})", env!("LARAVEL_LSP_GIT_HASH")),
+                "🚀 Laravel",
                 "Starting indexer…",
             )
             .await;
@@ -17435,14 +17470,31 @@ impl LanguageServer for LaravelLanguageServer {
                     // Get model properties
                     let properties = self.get_class_properties(&class_name).await;
 
-                    // Build completion items, filtering by prefix
+                    // Build completion items, filtering by prefix. The
+                    // `relationship_query` shape (`posts()`) is matched
+                    // by the bare prefix the user typed — they type
+                    // "post" and we want both `posts` and `posts()` to
+                    // surface — so we strip the trailing `()` before
+                    // comparing.
                     let prefix_lower = typed_prefix.to_lowercase();
                     let items: Vec<CompletionItem> = properties
                         .into_iter()
-                        .filter(|p| p.name.to_lowercase().starts_with(&prefix_lower))
+                        .filter(|p| {
+                            p.name
+                                .trim_end_matches("()")
+                                .to_lowercase()
+                                .starts_with(&prefix_lower)
+                        })
                         .map(|p| {
+                            // Relationship shapes:
+                            //   `relationship`       → kind=PROPERTY
+                            //       (`$model->posts` returns Collection)
+                            //   `relationship_query` → kind=METHOD
+                            //       (`$model->posts()` returns the
+                            //       Relation, chainable via ->where)
                             let kind = match p.source.as_str() {
-                                "relationship" => CompletionItemKind::METHOD,
+                                "relationship" => CompletionItemKind::PROPERTY,
+                                "relationship_query" => CompletionItemKind::METHOD,
                                 "accessor" => CompletionItemKind::PROPERTY,
                                 _ => CompletionItemKind::FIELD,
                             };

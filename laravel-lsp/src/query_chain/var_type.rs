@@ -2,70 +2,85 @@
 //!
 //! Used when a chain starts at an instance variable like `$user->newQuery()`.
 //! We need to know `$user` is a `User` to power column / relation completion
-//! against the right model. Two complementary strategies, tried in this order:
+//! against the right model. The resolution chain is layered:
 //!
-//! 1. **Typed function/method parameter.** `function show(User $user)` →
+//! 1. **Latest assignment in scope** (flow-tracked) — `$user = User::find($id);`
+//!    overrides any declared type for `$user`, because PHP allows free
+//!    reassignment. Lives in [`super::flow`].
+//!
+//! 2. **Typed function/method parameter.** `function show(User $user)` →
 //!    `$user`'s declared type is `User`. Covers the common case in
 //!    controllers and services where action methods take typed args.
 //!
-//! 2. **`@var` docblock.** PHPDoc allows `/** @var User $u */` immediately
+//! 3. **`@var` docblock.** PHPDoc allows `/** @var User $u */` immediately
 //!    above an assignment. Used in places where PHP's static type system
 //!    isn't sufficient (e.g. `$u = $repo->findOne(...);` whose return type
 //!    is too generic).
 //!
-//! Both strategies resolve the bare class name through the file's `use`
+//! All strategies resolve the bare class name through the file's `use`
 //! aliases via [`crate::query_chain::use_aliases::resolve_class_name`], so a
 //! parameter typed `Article` with `use App\Models\Post as Article;` returns
 //! `App\Models\Post` — ready to feed into Composer autoload.
+//!
+//! The actual scope-walking, flow analysis, and `use ($var)` capture
+//! traversal lives in [`super::flow`]. This module exposes the per-scope
+//! declared-type helpers (`typed_param_in`, `docblock_in`) that the flow
+//! resolver uses at each scope hop, plus the public `resolve` entry point
+//! which is now a thin wrapper around `flow::resolve`.
 //!
 //! Misses (no type info, ambiguous type, unresolvable name) return `None`
 //! rather than guessing. Better no completion than a wrong one.
 
 use tree_sitter::Node;
 
-use super::use_aliases::{resolve_class_name, UseAliases};
+use super::use_aliases::UseAliases;
 
-/// Return the resolved FQCN for `var_name` at `variable_node`'s position, or
-/// `None` if neither strategy yields a type. Caller stores the result in
+/// Return the resolved FQCN for `var_name` at `variable_node`'s position,
+/// or `None` if no strategy yields a type. Caller stores the result in
 /// `EloquentReceiver::InstanceVar::php_type` for later use by the cursor
 /// context resolver.
+///
+/// Delegates to [`super::flow::resolve`], which walks scope-by-scope
+/// applying flow > typed param > docblock, recursing into outer scopes
+/// via `use ($var)` capture.
 pub fn resolve(
     variable_node: Node,
     bytes: &[u8],
     var_name: &str,
     aliases: &UseAliases,
 ) -> Option<String> {
-    if let Some(raw_type) = typed_param_for(variable_node, bytes, var_name) {
-        return Some(resolve_class_name(&raw_type, aliases));
-    }
-    if let Some(raw_type) = var_docblock_for(variable_node, bytes, var_name) {
-        return Some(resolve_class_name(&raw_type, aliases));
-    }
-    None
+    super::flow::resolve(variable_node, bytes, var_name, aliases)
 }
 
-/// Walk up from `node` to the nearest function-like ancestor and scan its
-/// formal parameters for one named `var_name`. Returns the raw type string
-/// as written in source — caller handles use-alias resolution.
-fn typed_param_for(node: Node, bytes: &[u8], var_name: &str) -> Option<String> {
-    let mut cur = Some(node);
-    while let Some(n) = cur {
-        match n.kind() {
-            // Method on a class.
-            "method_declaration"
-            // Top-level function.
+/// Scan `scope`'s formal parameters for one named `var_name`. Returns the
+/// raw type string as written in source — caller handles use-alias
+/// resolution. `None` for untyped or missing parameters.
+///
+/// `scope` must be a function-like node (function_definition,
+/// method_declaration, anonymous_function, arrow_function). Caller is
+/// responsible for finding the right scope; this function does not walk
+/// up the tree.
+pub fn typed_param_in(scope: Node, bytes: &[u8], var_name: &str) -> Option<String> {
+    if !matches!(
+        scope.kind(),
+        "method_declaration"
             | "function_definition"
-            // `function () use (...) { ... }` — anonymous closure.
             | "anonymous_function_creation_expression"
             | "anonymous_function"
-            // `fn ($x) => ...` — short arrow.
-            | "arrow_function" => {
-                return scan_formal_parameters(n, bytes, var_name);
-            }
-            _ => cur = n.parent(),
-        }
+            | "arrow_function"
+    ) {
+        return None;
     }
-    None
+    scan_formal_parameters(scope, bytes, var_name)
+}
+
+/// Find a `@var $var_name <type>` (or `@var <type> $var_name`) docblock
+/// anywhere inside `scope`. `scope` is typically a function-like or
+/// `program` node. First match wins; we don't try to pick the "closest"
+/// docblock to a specific assignment — by convention PHP docblocks
+/// declare a variable once per scope.
+pub fn docblock_in(scope: Node, bytes: &[u8], var_name: &str) -> Option<String> {
+    scan_comments_for_var(scope, bytes, var_name)
 }
 
 /// Look at every direct child of the function's `parameters` (or
@@ -174,49 +189,6 @@ fn simplify_type(raw: String) -> Option<String> {
         return None;
     }
     Some(first.to_string())
-}
-
-/// Find a `@var` docblock declaring `var_name`'s type anywhere in the
-/// enclosing function-like scope. PHPDoc syntax:
-///
-/// ```php
-/// /** @var User $u */
-/// $u = $repo->findOne(...);
-/// $u->newQuery()->where('|');   // ← cursor here, docblock above the
-///                               //   assignment still applies.
-/// ```
-///
-/// We don't try to associate the docblock with a specific assignment —
-/// for Phase 9, any `@var Class $var` *in the same function* counts. PHP
-/// developers don't typically reassign the same variable to different
-/// types within one function; when they do, this picks the first
-/// declaration. Better than restricting to prev-sibling, which misses
-/// the common "docblock before assignment, var used several lines down"
-/// pattern.
-fn var_docblock_for(node: Node, bytes: &[u8], var_name: &str) -> Option<String> {
-    let scope = enclosing_scope(node)?;
-    scan_comments_for_var(scope, bytes, var_name)
-}
-
-/// Walk up to the closest function-like ancestor (or the file root if
-/// the variable lives at top level — rare but legal in scripts).
-fn enclosing_scope(node: Node) -> Option<Node> {
-    let mut cur = Some(node);
-    while let Some(n) = cur {
-        if matches!(
-            n.kind(),
-            "function_definition"
-                | "method_declaration"
-                | "anonymous_function"
-                | "anonymous_function_creation_expression"
-                | "arrow_function"
-                | "program"
-        ) {
-            return Some(n);
-        }
-        cur = n.parent();
-    }
-    None
 }
 
 /// DFS the scope's subtree for `comment` nodes containing a matching

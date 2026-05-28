@@ -21,6 +21,7 @@ pub mod chain;
 pub mod cursor;
 pub mod eloquent_completion;
 pub mod extractor;
+pub mod flow;
 pub mod methods;
 pub mod use_aliases;
 pub mod var_type;

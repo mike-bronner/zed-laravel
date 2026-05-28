@@ -762,6 +762,35 @@ class ContactForm extends Form {
 }
 
 #[test]
+fn extends_eloquent_model_resolves_aliased_model_class() {
+    // The crossbible-vapor vendor case: a base class extends
+    // `EloquentModel` which is `use Illuminate\Database\Eloquent\Model
+    // as EloquentModel`. Checking only the raw token (`EloquentModel`)
+    // misses — we have to resolve the alias and check the resolved
+    // FQCN's basename. Without this fix, the walker passes through
+    // and eventually returns false.
+    let dir = project_with_models(&[(
+        "BaseModel",
+        r#"<?php
+namespace App\Concerns;
+use Illuminate\Database\Eloquent\Model as EloquentModel;
+abstract class BaseModel extends EloquentModel {}
+"#,
+    )]);
+    std::fs::create_dir_all(dir.path().join("app/Concerns")).unwrap();
+    std::fs::rename(
+        dir.path().join("app/Models/BaseModel.php"),
+        dir.path().join("app/Concerns/BaseModel.php"),
+    )
+    .unwrap();
+    let path = dir.path().join("app/Concerns/BaseModel.php");
+    assert!(
+        ModelMetadata::extends_eloquent_model(&path, dir.path()),
+        "aliased `use Model as EloquentModel` should still resolve to Eloquent"
+    );
+}
+
+#[test]
 fn extends_eloquent_model_false_when_no_extends_clause() {
     // Plain old class with no extends — definitely not Eloquent.
     let dir = project_with_models(&[(

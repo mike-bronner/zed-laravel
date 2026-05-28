@@ -153,15 +153,21 @@ impl ModelMetadata {
             let Some(parent_raw) = Self::extract_parent_class(&content) else {
                 return false;
             };
-            let basename = parent_raw.rsplit('\\').next().unwrap_or(&parent_raw);
-            if basename == "Model" {
-                // Stop here — the walker that builds `ModelMetadata` does
-                // the same. We've confirmed an Eloquent ancestor exists.
-                return true;
-            }
+            // Resolve the raw parent name through the file's use aliases
+            // FIRST, then check the basename. The raw name can be an alias
+            // (`use Illuminate\Database\Eloquent\Model as EloquentModel;`),
+            // in which case the basename of `parent_raw` is "EloquentModel"
+            // but the resolved FQCN ends in "Model" — that's what we want
+            // to match.
             let aliases = Self::extract_use_aliases_from_php(&content);
             let ns = Self::extract_namespace(&content);
             let parent_fqcn = Self::resolve_to_fqcn(&parent_raw, ns.as_deref(), &aliases);
+            let resolved_basename = parent_fqcn.rsplit('\\').next().unwrap_or(&parent_fqcn);
+            if resolved_basename == "Model" {
+                // Confirmed an Eloquent ancestor. Stop walking — same
+                // sentinel `from_file_with_inheritance` uses.
+                return true;
+            }
             current = crate::class_locator::find_php_class_file_in_app_or_vendor(
                 &parent_fqcn,
                 project_root,

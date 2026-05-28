@@ -15344,9 +15344,13 @@ impl LanguageServer for LaravelLanguageServer {
             //
             // If the client doesn't support work-done-progress, `begin`
             // returns None and the rest of the flow just skips reports.
+            // Title carries the build hash so the status bar reads
+            // `Laravel (bf280) — Starting indexer…`. Matches the startup
+            // banner: when "is the new binary loaded?" comes up, the
+            // status bar answers without anyone opening the log panel.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
-                "Laravel",
+                format!("Laravel ({})", env!("LARAVEL_LSP_GIT_HASH")),
                 "Starting indexer…",
             )
             .await;

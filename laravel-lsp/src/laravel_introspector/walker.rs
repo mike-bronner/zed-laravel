@@ -80,6 +80,12 @@ pub struct PhpMethodInfo {
     /// model_analyzer's relationship detection looks for
     /// `return $this->hasMany(...)` patterns inside method bodies.
     pub body_source: Option<String>,
+    /// PHP attributes (`#[Foo]`, `#[Foo(args)]`) applied to the method,
+    /// in source order. Each entry is the attribute's name as written —
+    /// could be bare (`Scope`) or qualified (`\Illuminate\…\Scope`).
+    /// Callers that need an FQCN should resolve through the file's use
+    /// aliases. Argument lists are stripped.
+    pub attributes: Vec<String>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -235,7 +241,8 @@ fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<
             match member.kind() {
                 "method_declaration" => {
                     let docblock = previous_docblock(&body_children, idx, source);
-                    if let Some(m) = parse_method(*member, source, docblock) {
+                    let attributes = method_attributes(*member, source);
+                    if let Some(m) = parse_method(*member, source, docblock, attributes) {
                         methods.push(m);
                     }
                 }
@@ -307,6 +314,52 @@ fn collect_trait_uses(node: Node, source: &[u8], out: &mut Vec<String>) {
     }
 }
 
+/// Collect every PHP attribute applied to a method declaration. In
+/// tree-sitter-php, `attribute_list` nodes are CHILDREN of the
+/// `method_declaration`, not siblings — we walk the method's direct
+/// children for them.
+///
+/// Returns each attribute's name in source order. `#[Foo, Bar(arg)]`
+/// yields `["Foo", "Bar"]`. `#[\Ns\Foo]` yields `"\\Ns\\Foo"` — the
+/// caller resolves namespacing via the file's use aliases if it cares.
+fn method_attributes(method: Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = method.walk();
+    for child in method.children(&mut cursor) {
+        if child.kind() == "attribute_list" {
+            collect_attribute_names(child, source, &mut out);
+        }
+    }
+    out
+}
+
+/// Walk an `attribute_list` (`#[Foo, Bar(arg)]`) and append each
+/// attribute's name to `out`. Handles both bare names and qualified
+/// (`\Ns\Foo`) forms. Argument lists are ignored.
+fn collect_attribute_names(node: Node, source: &[u8], out: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // Tree-sitter-php structures: attribute_list → attribute_group
+        // → attribute → name / qualified_name + optional arguments.
+        // Recurse one level so we work across grammar versions.
+        match child.kind() {
+            "attribute" => {
+                let mut ac = child.walk();
+                for sub in child.children(&mut ac) {
+                    if matches!(sub.kind(), "name" | "qualified_name") {
+                        if let Ok(text) = sub.utf8_text(source) {
+                            out.push(text.to_string());
+                            break; // only the name; ignore arguments
+                        }
+                    }
+                }
+            }
+            "attribute_group" => collect_attribute_names(child, source, out),
+            _ => {}
+        }
+    }
+}
+
 /// Look backward from `idx - 1` for a `/** ... */` docblock immediately
 /// preceding the member, skipping over `attribute_list` nodes (PHP `#[…]`).
 /// Returns the body with `/**`, `*/`, and per-line `*` markers stripped.
@@ -350,7 +403,12 @@ fn strip_docblock_markers(docblock: &str) -> String {
         .to_string()
 }
 
-fn parse_method(node: Node, source: &[u8], docblock: Option<String>) -> Option<PhpMethodInfo> {
+fn parse_method(
+    node: Node,
+    source: &[u8],
+    docblock: Option<String>,
+    attributes: Vec<String>,
+) -> Option<PhpMethodInfo> {
     let name = field_text(node, "name", source)?;
     let visibility = parse_visibility(node, source);
     let is_static = has_static_modifier(node, source);
@@ -382,6 +440,7 @@ fn parse_method(node: Node, source: &[u8], docblock: Option<String>) -> Option<P
         raw_signature,
         docblock,
         body_source,
+        attributes,
         start_line,
         start_column,
         end_line,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::method_name_completion::vendor_parser::{BuilderMethodIndex, ParsedMethod};
+use crate::laravel_introspector::{BuilderMethodIndex, ParsedMethod};
 use tower_lsp::lsp_types::{Documentation, MarkupContent, MarkupKind};
 
 // ---- detect_method_name_position: static `::` --------------------------

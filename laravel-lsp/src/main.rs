@@ -3221,7 +3221,7 @@ impl LaravelLanguageServer {
     ///    keeps `Carbon::|`, `Str::|`, etc. from getting Builder methods
     ///    they have no business with.
     /// 5. Fetch (or populate) the per-project-root cache of parsed Builder
-    ///    methods via [`laravel_lsp::method_name_completion::vendor_parser::parse_builder_methods`].
+    ///    methods via [`laravel_lsp::method_name_completion::parse_builder_methods`].
     /// 6. Render the merged surface into `CompletionItem`s.
     ///
     /// Returns `None` whenever any step bails — the completion handler
@@ -3237,9 +3237,9 @@ impl LaravelLanguageServer {
         _uri: &Url,
     ) -> Option<Vec<CompletionItem>> {
         use laravel_lsp::method_name_completion::{
-            build_items_from_index, detect_method_name_position, vendor_parser, MethodNameContext,
+            build_items_from_index, detect_method_name_position, MethodNameContext,
         };
-        use laravel_lsp::model_analyzer::ModelMetadata;
+        use laravel_lsp::laravel_introspector::ModelMetadata;
         use laravel_lsp::query_chain::{extract_use_aliases, resolve_class_name};
 
         // 1. Cursor at a static-receiver position?
@@ -3297,7 +3297,7 @@ impl LaravelLanguageServer {
             None => {
                 let root_for_parse = root.clone();
                 let parsed = tokio::task::spawn_blocking(move || {
-                    vendor_parser::parse_builder_methods(&root_for_parse)
+                    laravel_lsp::laravel_introspector::parse_builder_methods(&root_for_parse)
                 })
                 .await
                 .ok()
@@ -3311,9 +3311,29 @@ impl LaravelLanguageServer {
             }
         };
 
-        // 6. Render items. Empty surface → return None so the caller falls
-        // through (no point returning an empty list).
-        let items = build_items_from_index(&index);
+        // 6. Render items. Builder methods + local scopes from the
+        // resolved model (and its parents/traits). Scope extraction
+        // runs off the executor since it touches the filesystem.
+        let mut items = build_items_from_index(&index);
+
+        // Local scopes (and any other Laravel-specific surfaces we add
+        // later) come from the unified Laravel-aware class walker.
+        let model_view = {
+            let model_path = class_path.clone();
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                laravel_lsp::laravel_introspector::analyze(&model_path, &root)
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        if let Some(view) = model_view {
+            for scope in &view.scopes {
+                items.push(laravel_lsp::method_name_completion::scope_to_item(scope));
+            }
+        }
+
         if items.is_empty() {
             None
         } else {
@@ -7084,7 +7104,7 @@ impl LaravelLanguageServer {
     /// downstream — without it, a same-basename collision (e.g. a Nova
     /// filter named like a model) wins by accident.
     fn extract_model_class_hint(before_arrow: &str, file_content: &str) -> Option<String> {
-        use laravel_lsp::model_analyzer::ModelMetadata;
+        use laravel_lsp::laravel_introspector::ModelMetadata;
         let trimmed = before_arrow.trim_end();
 
         // Case 1: Ends with a variable like $user or $this — return as-is,
@@ -10761,7 +10781,7 @@ impl LaravelLanguageServer {
     /// `public Type $foo` scan that works for Livewire components, Livewire
     /// Forms, DTOs, value objects — any class with public properties.
     async fn get_class_properties(&self, class_name: &str) -> Vec<ModelPropertyCompletion> {
-        use laravel_lsp::model_analyzer::{
+        use laravel_lsp::laravel_introspector::{
             map_cast_to_php_type, relationship_to_php_type, ModelMetadata,
         };
 

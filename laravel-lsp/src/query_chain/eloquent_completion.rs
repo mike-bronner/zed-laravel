@@ -20,7 +20,7 @@ use super::chain::*;
 use crate::class_locator::find_php_class_file;
 use crate::completion_format::CompletionDoc;
 use crate::database::DatabaseSchemaProvider;
-use crate::model_analyzer::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
+use crate::laravel_introspector::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
 use std::path::Path;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use tracing::info;

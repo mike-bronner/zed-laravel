@@ -45,13 +45,15 @@
 //!   Eloquent Builder"`, **no `sortText` override** — items sort
 //!   alphabetically alongside the PHP LSP's, no push-down
 
-pub mod vendor_parser;
+// vendor_parser was consolidated into `laravel_introspector::builder_index`.
+// Re-export the canonical type names so existing call sites that depended
+// on `method_name_completion::{BuilderMethodIndex, ParsedMethod}` keep
+// compiling while the migration completes.
+pub use crate::laravel_introspector::{BuilderMethodIndex, ParsedMethod};
 
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
 use crate::completion_format::{split_phpdoc, CodeBlock, CompletionDoc};
-
-pub use vendor_parser::{BuilderMethodIndex, ParsedMethod};
 
 /// Where the cursor sits relative to a `::` or `->` operator.
 ///
@@ -171,6 +173,46 @@ fn method_to_item(m: &ParsedMethod) -> CompletionItem {
         // keep it boring and let the editor compose.
         ..Default::default()
     }
+}
+
+/// Render a [`crate::laravel_introspector::ScopeInfo`] as a popup item — same
+/// visual treatment as a Builder method (`label`, `detail =
+/// Builder<static>`, Intelephense-style markdown panel), with the docs
+/// panel header pointing at the actual defining class
+/// (`App\Models\Portfolio::scopeActive` etc.) so users can tell scopes
+/// apart from framework Builder methods.
+///
+/// Scopes always return a Builder for chaining, so `detail` is always
+/// `Builder<static>` regardless of the underlying method's declared
+/// return type (which may be `void` for old-style scopes that mutate
+/// via `$query->where(…)` and return implicitly).
+pub fn scope_to_item(scope: &crate::laravel_introspector::ScopeInfo) -> CompletionItem {
+    CompletionItem {
+        label: scope.name.clone(),
+        kind: Some(CompletionItemKind::METHOD),
+        detail: Some("Builder<static>".to_string()),
+        documentation: Some(build_scope_documentation(scope).into_documentation()),
+        ..Default::default()
+    }
+}
+
+fn build_scope_documentation(scope: &crate::laravel_introspector::ScopeInfo) -> CompletionDoc {
+    let (summary, tags) = match &scope.doc_body {
+        Some(body) => split_phpdoc(body),
+        None => (scope.summary.clone(), Vec::new()),
+    };
+
+    // Header points at the defining class + the underlying method name
+    // so users hovering see exactly which class declares the scope and
+    // by which original method.
+    CompletionDoc::new()
+        .header(format!("{}::{}", scope.source_class, scope.name))
+        .summary_opt(summary.or_else(|| scope.summary.clone()))
+        .code(CodeBlock::new("php", scope.signature.clone()))
+        // Resolve $this/self/static in tags to match the row detail —
+        // scopes return Builder<static> the same way Builder methods do.
+        .resolve_self_for("Illuminate\\Database\\Eloquent\\Builder")
+        .sections(tags)
 }
 
 /// Assemble the [`CompletionDoc`] for a Builder method, matching

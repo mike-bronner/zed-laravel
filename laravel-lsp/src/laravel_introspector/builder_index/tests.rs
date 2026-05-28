@@ -247,6 +247,7 @@ fn extracts_return_type_from_php_declaration_when_no_phpdoc() {
         &dir,
         Some(
             r#"<?php
+namespace Illuminate\Database\Eloquent;
 class Builder {
     public function toBase(): \Illuminate\Database\Query\Builder
     {
@@ -275,6 +276,7 @@ fn returns_none_when_no_return_type_anywhere() {
         &dir,
         Some(
             r#"<?php
+namespace Illuminate\Database\Eloquent;
 class Builder {
     public function untyped($x) {}
 }"#,
@@ -342,6 +344,7 @@ fn method_without_docblock_has_no_summary() {
         &dir,
         Some(
             r#"<?php
+namespace Illuminate\Database\Eloquent;
 class Builder {
     public function bare() {}
 }"#,

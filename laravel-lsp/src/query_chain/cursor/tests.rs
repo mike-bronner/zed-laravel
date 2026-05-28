@@ -756,9 +756,8 @@ fn find_chain_containing_picks_innermost() {
         chains_of("DB::table('users')->where('exists', function ($q) { $q->where('a', 1); });");
     // Find offset of the inner `$q->where('a', 1)` — pick a byte inside
     // the inner where's args.
-    let wrapped = format!(
-        "<?php\nDB::table('users')->where('exists', function ($q) {{ $q->where('a', 1); }});"
-    );
+    let wrapped =
+        "<?php\nDB::table('users')->where('exists', function ($q) { $q->where('a', 1); });";
     // Look for the second occurrence of 'a' inside the chains
     let inner_offset = wrapped.rfind("'a'").unwrap() + 1; // mid 'a'
     let chain = find_chain_containing(&chains, inner_offset).expect("chain at inner offset");

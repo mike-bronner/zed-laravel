@@ -69,7 +69,7 @@ fn flat_use_with_as_alias() {
         Some("Illuminate\\Support\\Facades\\DB")
     );
     assert!(
-        aliases.get("DB").is_none(),
+        !aliases.contains_key("DB"),
         "aliased import shouldn't also bind the bare name"
     );
 }

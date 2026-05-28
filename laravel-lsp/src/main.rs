@@ -226,7 +226,7 @@ struct ModelPropertyCompletion {
     /// - `database` / `cast` / `accessor`: model attribute shapes
     /// - `relationship`: relation accessed as a property (lazy-loaded
     ///   result — Collection or related Model)
-    /// - `relationship_query`: relation called as a method (returns the
+    /// - `relationship query`: relation called as a method (returns the
     ///   Relation/Builder, chainable via `->where(...)`)
     /// - `class` / `blade-loop`: generic public-property scans
     source: String,
@@ -10736,7 +10736,7 @@ impl LaravelLanguageServer {
                 properties.push(ModelPropertyCompletion {
                     name: format!("{}()", rel.method_name),
                     php_type: relation_type,
-                    source: "relationship_query".to_string(),
+                    source: "relationship query".to_string(),
                 });
             }
         }
@@ -17471,7 +17471,7 @@ impl LanguageServer for LaravelLanguageServer {
                     let properties = self.get_class_properties(&class_name).await;
 
                     // Build completion items, filtering by prefix. The
-                    // `relationship_query` shape (`posts()`) is matched
+                    // `relationship query` shape (`posts()`) is matched
                     // by the bare prefix the user typed — they type
                     // "post" and we want both `posts` and `posts()` to
                     // surface — so we strip the trailing `()` before
@@ -17489,12 +17489,12 @@ impl LanguageServer for LaravelLanguageServer {
                             // Relationship shapes:
                             //   `relationship`       → kind=PROPERTY
                             //       (`$model->posts` returns Collection)
-                            //   `relationship_query` → kind=METHOD
+                            //   `relationship query` → kind=METHOD
                             //       (`$model->posts()` returns the
                             //       Relation, chainable via ->where)
                             let kind = match p.source.as_str() {
                                 "relationship" => CompletionItemKind::PROPERTY,
-                                "relationship_query" => CompletionItemKind::METHOD,
+                                "relationship query" => CompletionItemKind::METHOD,
                                 "accessor" => CompletionItemKind::PROPERTY,
                                 _ => CompletionItemKind::FIELD,
                             };

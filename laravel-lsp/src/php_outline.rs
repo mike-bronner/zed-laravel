@@ -16,6 +16,9 @@ use tree_sitter::Node;
 /// sentinel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PhpFileStructure {
+    /// File-level `namespace Foo\Bar;`, when present. Stripped of the
+    /// `namespace` keyword and trailing `;` — just the dotted name.
+    pub namespace: Option<String>,
     pub structures: Vec<PhpStructure>,
     pub functions: Vec<PhpFunctionInfo>,
 }
@@ -27,6 +30,14 @@ pub struct PhpStructure {
     pub name: String,
     /// Simplified `extends` target (final `\`-segment), if any.
     pub extends: Option<String>,
+    /// Raw `extends` target as it appears in source — preserves
+    /// namespace separators and leading `\` for FQCN resolution. `None`
+    /// when the class doesn't extend anything.
+    pub extends_raw: Option<String>,
+    /// Bare names of traits this structure composes via `use TraitName;`
+    /// inside the class/trait body. Top-level only — names inside the
+    /// conflict-resolution `{ ... }` block are not duplicated.
+    pub trait_uses: Vec<String>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -47,9 +58,28 @@ pub enum PhpStructureKind {
 pub struct PhpMethodInfo {
     pub name: String,
     pub visibility: PhpVisibility,
+    /// `true` when the method carries a `static` modifier.
+    pub is_static: bool,
     /// Simplified return type (final `\`-segment), if any.
     pub return_type: Option<String>,
+    /// Raw return type as it appears in source — preserves namespace
+    /// separators, generics, union syntax (`?Foo`, `Bar|null`).
+    pub return_type_raw: Option<String>,
     pub parameters: Vec<PhpParameter>,
+    /// The literal signature line from source, normalised to a single
+    /// line and with body braces stripped: `public function with($x = null)`.
+    /// Drives the syntax-highlighted code block in completion popups.
+    pub raw_signature: String,
+    /// PHPDoc body (`/** … */` with markers stripped) immediately
+    /// preceding the method declaration, when present.
+    pub docblock: Option<String>,
+    /// Raw source text of the method's body, including the outer `{}`
+    /// braces, when the method has one (abstract / interface methods
+    /// return `None`). Lets consumers run focused text/regex extraction
+    /// on a method's body without re-walking the tree — e.g.
+    /// model_analyzer's relationship detection looks for
+    /// `return $this->hasMany(...)` patterns inside method bodies.
+    pub body_source: Option<String>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -61,7 +91,18 @@ pub struct PhpPropertyInfo {
     /// Name without leading `$`.
     pub name: String,
     pub visibility: PhpVisibility,
+    /// `true` when the property carries a `static` modifier.
+    pub is_static: bool,
     pub property_type: Option<String>,
+    /// The default-value expression as it appears in source, e.g.
+    /// `"['col' => 'json', 'meta' => 'array']"`. `None` when the property
+    /// has no initialiser. Lets specialty parsers (model_analyzer's
+    /// `$casts` extraction, for instance) work off the literal text
+    /// without re-walking the tree.
+    pub default_value: Option<String>,
+    /// PHPDoc body immediately preceding the property declaration, with
+    /// markers stripped.
+    pub docblock: Option<String>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -140,15 +181,30 @@ fn walk_top_level(node: Node, source: &[u8], result: &mut PhpFileStructure) {
                     result.functions.push(f);
                 }
             }
+            // File-level `namespace Foo\Bar;` — capture the name. PHP's
+            // bracketed form (`namespace Foo { … }`) ALSO emits a
+            // `namespace_definition` node; both are handled here.
+            "namespace_definition" => {
+                if result.namespace.is_none() {
+                    if let Some(name_node) = child
+                        .child_by_field_name("name")
+                        .or_else(|| find_child_kind(child, &["namespace_name", "qualified_name"]))
+                    {
+                        if let Ok(text) = name_node.utf8_text(source) {
+                            result.namespace = Some(text.to_string());
+                        }
+                    }
+                }
+                walk_top_level(child, source, result);
+                continue;
+            }
             // Recurse into wrappers that commonly contain top-level
             // declarations:
-            //   - `namespace_definition` for `namespace Foo { class Bar {} }`
             //   - `compound_statement` for namespace / if-statement bodies
             //   - `if_statement` for the `function_exists` guard pattern
             //     common in Laravel helpers files
             //   - `else_clause` / `else_if_clause` for the same
-            "namespace_definition"
-            | "compound_statement"
+            "compound_statement"
             | "if_statement"
             | "else_clause"
             | "else_if_clause" => {
@@ -161,24 +217,34 @@ fn walk_top_level(node: Node, source: &[u8], result: &mut PhpFileStructure) {
 
 fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<PhpStructure> {
     let name = field_text(node, "name", source)?;
-    let extends = parse_extends(node, source);
+    let (extends, extends_raw) = parse_extends(node, source);
     let (start_line, start_column) = pos(node.start_position());
     let (end_line, end_column) = pos(node.end_position());
 
     let mut methods = Vec::new();
     let mut properties = Vec::new();
+    let mut trait_uses: Vec<String> = Vec::new();
 
     if let Some(body) = node.child_by_field_name("body") {
+        // Materialise children so each method/property can look back at
+        // its preceding `comment` sibling for the PHPDoc.
         let mut body_cursor = body.walk();
-        for member in body.children(&mut body_cursor) {
+        let body_children: Vec<Node> = body.children(&mut body_cursor).collect();
+
+        for (idx, member) in body_children.iter().enumerate() {
             match member.kind() {
                 "method_declaration" => {
-                    if let Some(m) = parse_method(member, source) {
+                    let docblock = previous_docblock(&body_children, idx, source);
+                    if let Some(m) = parse_method(*member, source, docblock) {
                         methods.push(m);
                     }
                 }
                 "property_declaration" => {
-                    properties.extend(parse_properties(member, source));
+                    let docblock = previous_docblock(&body_children, idx, source);
+                    properties.extend(parse_properties(*member, source, docblock));
+                }
+                "use_declaration" => {
+                    collect_trait_uses(*member, source, &mut trait_uses);
                 }
                 _ => {}
             }
@@ -189,6 +255,8 @@ fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<
         kind,
         name,
         extends,
+        extends_raw,
+        trait_uses,
         start_line,
         start_column,
         end_line,
@@ -198,7 +266,11 @@ fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<
     })
 }
 
-fn parse_extends(node: Node, source: &[u8]) -> Option<String> {
+/// Returns `(simplified_name, raw_text)` for the parent in `class X extends Y`.
+/// `simplified_name` is the basename (`Y` from `Foo\Y`); `raw_text` preserves
+/// namespace separators and leading backslash so callers can resolve to FQCN
+/// through file-level use aliases.
+fn parse_extends(node: Node, source: &[u8]) -> (Option<String>, Option<String>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "base_clause" {
@@ -207,34 +279,109 @@ fn parse_extends(node: Node, source: &[u8]) -> Option<String> {
                 let kind = bc_child.kind();
                 if kind == "name" || kind == "qualified_name" {
                     if let Ok(text) = bc_child.utf8_text(source) {
-                        return Some(simple_name(text));
+                        return (Some(simple_name(text)), Some(text.to_string()));
                     }
                 }
             }
         }
     }
+    (None, None)
+}
+
+/// Walk a class-body `use_declaration` (PHP trait composition syntax) and
+/// push each imported trait name onto `out`. Names inside the
+/// conflict-resolution `{ ... }` block are skipped — they reference traits
+/// already collected at the top level.
+fn collect_trait_uses(node: Node, source: &[u8], out: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "name" | "qualified_name" => {
+                if let Ok(text) = child.utf8_text(source) {
+                    out.push(text.to_string());
+                }
+            }
+            "declaration_list" => break,
+            _ => {}
+        }
+    }
+}
+
+/// Look backward from `idx - 1` for a `/** ... */` docblock immediately
+/// preceding the member, skipping over `attribute_list` nodes (PHP `#[…]`).
+/// Returns the body with `/**`, `*/`, and per-line `*` markers stripped.
+fn previous_docblock(children: &[Node], idx: usize, source: &[u8]) -> Option<String> {
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        let prev = children[i];
+        match prev.kind() {
+            "attribute_list" => continue,
+            "comment" => {
+                let text = prev.utf8_text(source).ok()?;
+                if !text.starts_with("/**") {
+                    return None;
+                }
+                return Some(strip_docblock_markers(text));
+            }
+            _ => return None,
+        }
+    }
     None
 }
 
-fn parse_method(node: Node, source: &[u8]) -> Option<PhpMethodInfo> {
+/// Strip `/**`, `*/`, and per-line leading `*` from a PHPDoc comment.
+fn strip_docblock_markers(docblock: &str) -> String {
+    let trimmed = docblock.trim();
+    let inner = trimmed
+        .strip_prefix("/**")
+        .unwrap_or(trimmed)
+        .strip_suffix("*/")
+        .unwrap_or(trimmed);
+    inner
+        .lines()
+        .map(|l| {
+            let l = l.trim();
+            l.strip_prefix('*').map(str::trim).unwrap_or(l)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn parse_method(node: Node, source: &[u8], docblock: Option<String>) -> Option<PhpMethodInfo> {
     let name = field_text(node, "name", source)?;
     let visibility = parse_visibility(node, source);
-    let return_type = node
+    let is_static = has_static_modifier(node, source);
+    let return_type_raw = node
         .child_by_field_name("return_type")
         .and_then(|n| n.utf8_text(source).ok())
-        .map(|s| simple_name(s.trim_start_matches([':', ' ']).trim()));
+        .map(|s| s.trim_start_matches([':', ' ']).trim().to_string());
+    let return_type = return_type_raw.as_deref().map(simple_name);
     let parameters = node
         .child_by_field_name("parameters")
         .map(|p| parse_parameters(p, source))
         .unwrap_or_default();
+    let raw_signature = extract_raw_signature(node, source);
+    let body_source = node.child_by_field_name("body").and_then(|b| {
+        std::str::from_utf8(&source[b.start_byte()..b.end_byte()])
+            .ok()
+            .map(str::to_string)
+    });
     let (start_line, start_column) = pos(node.start_position());
     let (end_line, end_column) = pos(node.end_position());
 
     Some(PhpMethodInfo {
         name,
         visibility,
+        is_static,
         return_type,
+        return_type_raw,
         parameters,
+        raw_signature,
+        docblock,
+        body_source,
         start_line,
         start_column,
         end_line,
@@ -242,8 +389,27 @@ fn parse_method(node: Node, source: &[u8]) -> Option<PhpMethodInfo> {
     })
 }
 
-fn parse_properties(node: Node, source: &[u8]) -> Vec<PhpPropertyInfo> {
+/// Extract a method's signature as a single normalised line, ending just
+/// before the body's opening `{` (or the trailing `;` for abstract/
+/// interface methods).
+fn extract_raw_signature(node: Node, source: &[u8]) -> String {
+    let start = node.start_byte();
+    let end = node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let raw = std::str::from_utf8(&source[start..end]).unwrap_or("");
+    let normalised = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalised.trim_end_matches(';').trim_end().to_string()
+}
+
+fn parse_properties(
+    node: Node,
+    source: &[u8],
+    docblock: Option<String>,
+) -> Vec<PhpPropertyInfo> {
     let visibility = parse_visibility(node, source);
+    let is_static = has_static_modifier(node, source);
     let property_type = node
         .child_by_field_name("type")
         .and_then(|n| n.utf8_text(source).ok())
@@ -255,6 +421,12 @@ fn parse_properties(node: Node, source: &[u8]) -> Vec<PhpPropertyInfo> {
         if child.kind() != "property_element" {
             continue;
         }
+        // Capture the default-value expression by source slice — tree-sitter
+        // exposes it via the `default_value` field, but the field name
+        // varies across grammar versions. Falling back to "everything after
+        // the `=`" is robust.
+        let default_value = property_default_value(child, source);
+
         let mut prop_cursor = child.walk();
         for pchild in child.children(&mut prop_cursor) {
             // `variable_name` wraps the `$name` token; some tree-sitter-php
@@ -266,7 +438,10 @@ fn parse_properties(node: Node, source: &[u8]) -> Vec<PhpPropertyInfo> {
                     props.push(PhpPropertyInfo {
                         name: text.trim_start_matches('$').to_string(),
                         visibility,
+                        is_static,
                         property_type: property_type.clone(),
+                        default_value: default_value.clone(),
+                        docblock: docblock.clone(),
                         start_line: line,
                         start_column: column,
                         end_line,
@@ -277,6 +452,58 @@ fn parse_properties(node: Node, source: &[u8]) -> Vec<PhpPropertyInfo> {
         }
     }
     props
+}
+
+/// First direct child whose node kind matches any of `kinds`. Used as a
+/// fallback when a node doesn't expose a named field — tree-sitter-php
+/// occasionally varies between versions on whether subexpressions are
+/// addressable by field name.
+fn find_child_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if kinds.contains(&child.kind()) {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// Look for a `default_value:` field on a `property_element`; if missing,
+/// fall back to "everything after the first `=` in the element's source".
+/// Returns `None` when the property has no initialiser.
+fn property_default_value(element: Node, source: &[u8]) -> Option<String> {
+    if let Some(dv) = element.child_by_field_name("default_value") {
+        if let Ok(text) = dv.utf8_text(source) {
+            return Some(text.trim().to_string());
+        }
+    }
+    // Fallback: slice the element's text after the first `=`.
+    let text = element.utf8_text(source).ok()?;
+    let eq_idx = text.find('=')?;
+    let after = text[eq_idx + 1..].trim().trim_end_matches(';').trim();
+    if after.is_empty() {
+        None
+    } else {
+        Some(after.to_string())
+    }
+}
+
+/// `true` when the declaration carries a `static` modifier. Checks both
+/// the typed `static_modifier` node and bare `static` tokens for
+/// tree-sitter-php version compatibility.
+fn has_static_modifier(node: Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "static_modifier" {
+            return true;
+        }
+        if let Ok(text) = child.utf8_text(source) {
+            if text == "static" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Look for a `visibility_modifier` child and read its keyword. PHP defaults

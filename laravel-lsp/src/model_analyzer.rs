@@ -6,9 +6,10 @@
 //! - Accessors (computed properties)
 //! - Relationships (belongsTo, hasMany, etc.)
 
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use crate::php_outline::{extract_php_structure, PhpFileStructure, PhpStructureKind};
 
 /// Source of a model property
 #[derive(Debug, Clone, PartialEq)]
@@ -243,34 +244,23 @@ impl ModelMetadata {
     /// Extract `use Foo\Bar;` / `use Foo\Bar as Baz;` statements from
     /// PHP source. Returns a `local_name → FQCN` map.
     ///
-    /// Doesn't handle grouped uses (`use Foo\{Bar, Baz};`),
-    /// `use function`, or `use const` — none of those participate in
-    /// class inheritance, which is what this walker resolves.
+    /// Backed by the AST-based [`crate::query_chain::extract_use_aliases`]
+    /// helper — same walker the chain extractor uses. Handles flat,
+    /// grouped, and aliased forms.
     pub fn extract_use_aliases_from_php(content: &str) -> HashMap<String, String> {
-        let re = match Regex::new(r"(?m)^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;") {
-            Ok(r) => r,
-            Err(_) => return HashMap::new(),
+        let Ok(tree) = crate::parser::parse_php(content) else {
+            return HashMap::new();
         };
-        let mut aliases = HashMap::new();
-        for caps in re.captures_iter(content) {
-            let fqcn = caps[1].trim_start_matches('\\').to_string();
-            let local = caps
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_else(|| fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string());
-            aliases.insert(local, fqcn);
-        }
-        aliases
+        crate::query_chain::extract_use_aliases(&tree, content)
     }
 
     /// Extract the `namespace Foo\Bar;` declaration. Returns the
     /// namespace without the leading backslash. Returns `None` for
     /// files without a namespace declaration (global namespace).
+    ///
+    /// Sourced from the shared structure walker.
     pub fn extract_namespace(content: &str) -> Option<String> {
-        let re = Regex::new(r"(?m)^\s*namespace\s+([\w\\]+)\s*;").ok()?;
-        re.captures(content)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string())
+        Self::parse_structure(content).namespace
     }
 
     /// Resolve a class reference (as it appears in `extends`,
@@ -325,10 +315,37 @@ impl ModelMetadata {
     /// it to a file via `class_locator::find_php_class_file`, which
     /// matches by basename.
     fn extract_parent_class(content: &str) -> Option<String> {
-        let re = Regex::new(r"class\s+\w+\s+extends\s+([\w\\]+)").ok()?;
-        re.captures(content)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
+        Self::first_class(&Self::parse_structure(content))?
+            .extends_raw
+            .clone()
+    }
+
+    /// Find the first `class` (not interface / trait / enum) structure in
+    /// a parsed file. Models are always classes; everything else is
+    /// ignored. Returns `None` for files that don't declare a class.
+    fn first_class(structure: &PhpFileStructure) -> Option<&crate::php_outline::PhpStructure> {
+        structure
+            .structures
+            .iter()
+            .find(|s| s.kind == PhpStructureKind::Class)
+    }
+
+    /// Wrapper over [`extract_php_structure`] that tolerates content
+    /// without a leading `<?php` tag. Tree-sitter-php treats everything
+    /// outside `<?php` tags as HTML text, so a snippet like
+    /// `class Foo extends Bar { … }` parses as text and yields zero
+    /// structures. Real model files always start with `<?php` so this
+    /// only matters for tests and ad-hoc analysis of code fragments.
+    fn parse_structure(content: &str) -> PhpFileStructure {
+        if content.trim_start().starts_with("<?php") {
+            extract_php_structure(content)
+        } else {
+            // Cheap: prepend the tag and parse the augmented string.
+            let mut prefixed = String::with_capacity(content.len() + 6);
+            prefixed.push_str("<?php\n");
+            prefixed.push_str(content);
+            extract_php_structure(&prefixed)
+        }
     }
 
     /// PHP-style inheritance merge: child fields win, parent fills the
@@ -365,21 +382,30 @@ impl ModelMetadata {
         // the concrete class, not its parents.
     }
 
-    /// Extract the class name from the model file
+    /// Extract the class name from the model file. Returns the name of
+    /// the first `class` declaration that has an `extends` clause —
+    /// model files always extend something (`Model`, a base class, etc.),
+    /// and skipping un-extended classes filters out incidental helper
+    /// classes that shouldn't be treated as models.
     fn extract_class_name(content: &str) -> Option<String> {
-        let re = Regex::new(r"class\s+(\w+)\s+extends").ok()?;
-        re.captures(content)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
+        let structure = Self::parse_structure(content);
+        structure
+            .structures
+            .iter()
+            .find(|s| s.kind == PhpStructureKind::Class && s.extends.is_some())
+            .map(|s| s.name.clone())
     }
 
-    /// Extract $table = 'table_name' from the model
+    /// Extract `$table = 'table_name'` from the model. Looks for a
+    /// property literally named `table` whose default value is a quoted
+    /// string. Visibility doesn't matter (Laravel uses `protected` but
+    /// `public`/`private` parses the same).
     fn extract_table_name(content: &str) -> Option<String> {
-        // Match: protected $table = 'table_name';
-        let re = Regex::new(r#"(?:protected|public)\s+\$table\s*=\s*['"]([^'"]+)['"]"#).ok()?;
-        re.captures(content)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
+        let structure = Self::parse_structure(content);
+        let class = Self::first_class(&structure)?;
+        let prop = class.properties.iter().find(|p| p.name == "table")?;
+        let default = prop.default_value.as_deref()?;
+        unquote_string_literal(default)
     }
 
     /// Extract casts from $casts property or casts() method
@@ -399,84 +425,112 @@ impl ModelMetadata {
         casts
     }
 
-    /// Extract casts from $casts = [...] property
+    /// Extract casts from `$casts = [...]` property.
+    ///
+    /// Reads the `casts` property's default-value expression from the
+    /// shared structure walker, then text-parses the inner array (PHP
+    /// array literals are well-bounded; `parse_cast_array` handles both
+    /// `'col' => 'json'` and `'col' => Cast::class` entries).
     fn extract_casts_property(content: &str) -> Option<HashMap<String, String>> {
-        // Find the $casts array
-        let re = Regex::new(r"(?s)\$casts\s*=\s*\[([^\]]*)\]").ok()?;
-        let caps = re.captures(content)?;
-        let array_content = caps.get(1)?.as_str();
-
-        Some(Self::parse_cast_array(array_content))
+        let structure = Self::parse_structure(content);
+        let class = Self::first_class(&structure)?;
+        let prop = class.properties.iter().find(|p| p.name == "casts")?;
+        let default = prop.default_value.as_deref()?;
+        let inner = array_literal_inner(default)?;
+        Some(Self::parse_cast_array(inner))
     }
 
-    /// Extract casts from casts(): array method
+    /// Extract casts from `casts(): array` method (Laravel 11+ style).
+    ///
+    /// Reads the body of the `casts` method from the shared structure
+    /// walker, then text-parses the `return [ ... ]` payload.
     fn extract_casts_method(content: &str) -> Option<HashMap<String, String>> {
-        // Find the casts() method and its return array
-        let re =
-            Regex::new(r"(?s)function\s+casts\s*\(\s*\)\s*:\s*array\s*\{\s*return\s*\[([^\]]*)\]")
-                .ok()?;
-        let caps = re.captures(content)?;
-        let array_content = caps.get(1)?.as_str();
-
-        Some(Self::parse_cast_array(array_content))
+        let structure = Self::parse_structure(content);
+        let class = Self::first_class(&structure)?;
+        let method = class
+            .methods
+            .iter()
+            .find(|m| m.name == "casts" && m.parameters.is_empty())?;
+        let body = method.body_source.as_deref()?;
+        // Body looks like `{ return [ … ]; }` — find the array literal
+        // following `return`.
+        let return_idx = body.find("return")?;
+        let after_return = &body[return_idx + "return".len()..];
+        let inner = array_literal_inner(after_return)?;
+        Some(Self::parse_cast_array(inner))
     }
 
-    /// Parse a PHP array of casts: 'key' => 'value' or 'key' => CastClass::class
+    /// Parse a PHP array of casts. `content` is the **inner text** of an
+    /// array literal — what comes between the outermost `[` and `]`. The
+    /// supported entry shapes are:
+    ///
+    /// - `'key' => 'value'` — string-keyed string cast (`'json'`, `'array'`, …)
+    /// - `'key' => SomeClass::class` — class-constant cast (`AsCollection::class`, …)
+    /// - `'key' => \Fully\Qualified\Class::class` — same, FQCN form
+    ///
+    /// Implementation parses the content through tree-sitter (wrapped in
+    /// `<?php $x = [content];` so it's a valid program) and walks the
+    /// resulting `array_creation_expression`. This is robust against
+    /// nested arrays, escaped quotes, and comments mid-entry — all of
+    /// which broke the previous regex approach.
     fn parse_cast_array(content: &str) -> HashMap<String, String> {
+        let wrapped = format!("<?php $x = [{}];", content);
+        let Ok(tree) = crate::parser::parse_php(&wrapped) else {
+            return HashMap::new();
+        };
+        let bytes = wrapped.as_bytes();
         let mut casts = HashMap::new();
-
-        // Match 'key' => 'value' or "key" => "value"
-        let string_re = Regex::new(r#"['"](\w+)['"]\s*=>\s*['"]([^'"]+)['"]"#).unwrap();
-        for caps in string_re.captures_iter(content) {
-            if let (Some(key), Some(value)) = (caps.get(1), caps.get(2)) {
-                casts.insert(key.as_str().to_string(), value.as_str().to_string());
-            }
-        }
-
-        // Match 'key' => SomeClass::class
-        let class_re = Regex::new(r#"['"](\w+)['"]\s*=>\s*(\w+)::class"#).unwrap();
-        for caps in class_re.captures_iter(content) {
-            if let (Some(key), Some(class)) = (caps.get(1), caps.get(2)) {
-                casts.insert(key.as_str().to_string(), class.as_str().to_string());
-            }
-        }
-
+        walk_for_first_array(tree.root_node(), bytes, &mut casts);
         casts
     }
 
-    /// Extract accessor methods from the model
+    /// Extract accessor methods from the model.
+    ///
+    /// Two flavours, both surfaced via the shared structure walker:
+    /// - **Old style**: `getFirstNameAttribute(): string` — magic method
+    ///   pattern; property name comes from stripping `get`/`Attribute`
+    ///   and snake_casing the middle.
+    /// - **New style**: `firstName(): Attribute` — Laravel 9+; any method
+    ///   whose PHP return type is `Attribute` becomes a property whose
+    ///   name is the method's camelCase name snake_cased.
     fn extract_accessors(content: &str) -> Vec<AccessorInfo> {
         let mut accessors = Vec::new();
+        let structure = Self::parse_structure(content);
+        let Some(class) = Self::first_class(&structure) else {
+            return accessors;
+        };
 
-        // Old-style: getFirstNameAttribute(): string
-        let old_style_re =
-            Regex::new(r"(?:public\s+)?function\s+get(\w+)Attribute\s*\([^)]*\)\s*(?::\s*(\w+))?")
-                .unwrap();
-
-        for caps in old_style_re.captures_iter(content) {
-            if let Some(name) = caps.get(1) {
-                let property_name = Self::pascal_to_snake(name.as_str());
-                let return_type = caps.get(2).map(|m| m.as_str().to_string());
-                accessors.push(AccessorInfo {
-                    property_name,
-                    return_type,
-                    is_attribute_style: false,
-                });
+        for m in &class.methods {
+            // Old style: `getXxxAttribute`
+            if let Some(middle) = m
+                .name
+                .strip_prefix("get")
+                .and_then(|s| s.strip_suffix("Attribute"))
+            {
+                if !middle.is_empty() {
+                    let property_name = Self::pascal_to_snake(middle);
+                    let return_type = m.return_type_raw.clone();
+                    accessors.push(AccessorInfo {
+                        property_name,
+                        return_type,
+                        is_attribute_style: false,
+                    });
+                    continue;
+                }
             }
-        }
-
-        // New-style: firstName(): Attribute
-        let new_style_re =
-            Regex::new(r"(?:public\s+)?function\s+(\w+)\s*\([^)]*\)\s*:\s*Attribute").unwrap();
-
-        for caps in new_style_re.captures_iter(content) {
-            if let Some(name) = caps.get(1) {
-                let method_name = name.as_str();
-                // New-style accessors use camelCase method names
-                let property_name = Self::camel_to_snake(method_name);
+            // New style: any method returning `Attribute` (possibly
+            // namespaced, e.g. `\Illuminate\Database\Eloquent\Casts\Attribute`).
+            // Check the raw return type's final segment.
+            let returns_attribute = m
+                .return_type_raw
+                .as_deref()
+                .map(|t| t.trim_start_matches('?').rsplit('\\').next().unwrap_or("") == "Attribute")
+                .unwrap_or(false);
+            if returns_attribute {
+                let property_name = Self::camel_to_snake(&m.name);
                 accessors.push(AccessorInfo {
                     property_name,
-                    return_type: None, // Type is defined in the Attribute::make() call
+                    return_type: None, // type lives inside the Attribute::make() call
                     is_attribute_style: true,
                 });
             }
@@ -485,119 +539,109 @@ impl ModelMetadata {
         accessors
     }
 
-    /// Extract relationship methods from the model
+    /// Extract relationship methods from the model.
+    ///
+    /// Iterates the class's methods (via the shared structure walker)
+    /// and identifies relationship methods two ways:
+    ///
+    /// - **By PHP return type**: `function posts(): HasMany` — the
+    ///   `return_type_raw` field's basename matches a known relationship
+    ///   kind (`HasMany`, `BelongsTo`, …; case-insensitive).
+    /// - **By body**: `function posts() { return $this->hasMany(Post::class); }`
+    ///   — the method body's `return $this->RELATIONSHIP(...)` call
+    ///   names one of the relationship kinds.
+    ///
+    /// Either way, the first `SomeModel::class` argument inside the body
+    /// becomes the related model (resolved to FQCN via the file's
+    /// namespace + use aliases).
     fn extract_relationships(content: &str) -> Vec<RelationshipInfo> {
-        let mut relationships = Vec::new();
+        let mut relationships: Vec<RelationshipInfo> = Vec::new();
+        let structure = Self::parse_structure(content);
+        let Some(class) = Self::first_class(&structure) else {
+            return relationships;
+        };
 
         // Resolve `Post::class` references through THIS file's namespace +
         // use statements once, then reuse for every relationship. If we
         // stored just the basename (`"Post"`), a later dotted-path hop
         // would basename-walk and could land on the wrong file (e.g.
         // `app/Nova/Filters/Post.php` instead of the actual model).
-        // Resolving to FQCN at extraction time fixes that — the
-        // basename `Post::class` inside `namespace App\Models;` becomes
-        // the full FQCN `App\Models\Post`, ready for Composer's PSR-4
-        // resolver to find the right file.
         let file_namespace = Self::extract_namespace(content);
         let use_aliases = Self::extract_use_aliases_from_php(content);
         let resolve_class = |bare: String| -> String {
             Self::resolve_to_fqcn(&bare, file_namespace.as_deref(), &use_aliases)
         };
 
-        // Common relationship types - ordered longest first to avoid partial matches
-        let relationship_types = [
+        // Known Eloquent relationship-builder method names. Recognised in
+        // any case (so `HasMany` as a return type matches `hasMany` as a
+        // method call). Longest-first to disambiguate `belongsToMany`
+        // from `belongsTo` when matching in body text.
+        const RELATIONSHIP_KINDS: &[&str] = &[
             "belongsToMany",
-            "belongsTo", // belongsToMany before belongsTo
+            "belongsTo",
             "hasManyThrough",
             "hasOneThrough",
             "hasMany",
-            "hasOne", // through variants first
+            "hasOne",
             "morphToMany",
             "morphedByMany",
             "morphMany",
             "morphOne",
-            "morphTo", // morph variants
+            "morphTo",
         ];
 
-        for rel_type in relationship_types {
-            // Match: function methodName(): RelationType (return type style)
-            let return_type_pattern = format!(
-                r"function\s+(\w+)\s*\([^)]*\)\s*:\s*(?:\w+\\)*{}\b",
-                regex::escape(rel_type)
-            );
+        for method in &class.methods {
+            // Determine the relationship kind, if any.
+            let mut kind: Option<&'static str> = None;
 
-            if let Ok(return_type_re) = Regex::new(&return_type_pattern) {
-                for caps in return_type_re.captures_iter(content) {
-                    if let Some(method) = caps.get(1) {
-                        let method_name = method.as_str().to_string();
-                        // Don't add duplicates
-                        if !relationships
-                            .iter()
-                            .any(|r: &RelationshipInfo| r.method_name == method_name)
-                        {
-                            let related_model = Self::extract_related_model_from_relationship(
-                                content,
-                                &method_name,
-                            )
-                            .map(&resolve_class);
-                            relationships.push(RelationshipInfo {
-                                method_name,
-                                relationship_type: rel_type.to_string(),
-                                related_model,
-                            });
-                        }
-                    }
+            // Strategy 1: PHP return-type declaration.
+            if let Some(ret) = method.return_type_raw.as_deref() {
+                let basename = ret
+                    .trim_start_matches('?')
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                kind = RELATIONSHIP_KINDS
+                    .iter()
+                    .find(|k| basename.eq_ignore_ascii_case(k))
+                    .copied();
+            }
+
+            // Strategy 2: body `return $this->KIND(...)` pattern.
+            if kind.is_none() {
+                if let Some(body) = method.body_source.as_deref() {
+                    kind = detect_relationship_kind_in_body(body, RELATIONSHIP_KINDS);
                 }
             }
 
-            // Also match by method body: $this->hasMany(...) etc.
-            let body_pattern = format!(
-                r"function\s+(\w+)\s*\([^)]*\)[^\{{]*\{{\s*return\s+\$this->{}",
-                regex::escape(rel_type)
-            );
+            let Some(rel_type) = kind else {
+                continue;
+            };
 
-            if let Ok(body_re) = Regex::new(&body_pattern) {
-                for caps in body_re.captures_iter(content) {
-                    if let Some(method) = caps.get(1) {
-                        let method_name = method.as_str().to_string();
-                        // Don't add duplicates
-                        if !relationships
-                            .iter()
-                            .any(|r: &RelationshipInfo| r.method_name == method_name)
-                        {
-                            let related_model = Self::extract_related_model_from_relationship(
-                                content,
-                                &method_name,
-                            )
-                            .map(&resolve_class);
-                            relationships.push(RelationshipInfo {
-                                method_name,
-                                relationship_type: rel_type.to_string(),
-                                related_model,
-                            });
-                        }
-                    }
-                }
+            // Dedup by method name (won't happen in valid PHP but be safe).
+            if relationships
+                .iter()
+                .any(|r| r.method_name == method.name)
+            {
+                continue;
             }
+
+            // Pull the first `SomeModel::class` argument out of the body.
+            let related_model = method
+                .body_source
+                .as_deref()
+                .and_then(first_class_constant_arg)
+                .map(&resolve_class);
+
+            relationships.push(RelationshipInfo {
+                method_name: method.name.clone(),
+                relationship_type: rel_type.to_string(),
+                related_model,
+            });
         }
 
         relationships
-    }
-
-    /// Extract the related model class from a relationship method
-    fn extract_related_model_from_relationship(content: &str, method_name: &str) -> Option<String> {
-        // Find the method body and extract the first argument to the relationship call
-        // e.g., $this->hasMany(Post::class) -> Post
-        let method_re = Regex::new(&format!(
-            r"function\s+{}\s*\([^)]*\)[^{{]*\{{\s*return\s+\$this->\w+\(\s*(\w+)::class",
-            regex::escape(method_name)
-        ))
-        .ok()?;
-
-        method_re
-            .captures(content)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
     }
 
     /// Convert PascalCase to snake_case
@@ -677,6 +721,237 @@ pub fn relationship_to_php_type(rel_type: &str, related_model: Option<&str>) -> 
             format!("Collection<{}>", model)
         }
         _ => "mixed".to_string(),
+    }
+}
+
+/// Walk a tree-sitter PHP tree looking for the first `array_creation_expression`
+/// and collect its key/value entries into `out`. Used by `parse_cast_array`
+/// after wrapping the source in `<?php $x = [...];` to get a parseable program.
+fn walk_for_first_array(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    out: &mut HashMap<String, String>,
+) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "array_creation_expression" {
+            collect_cast_entries(child, bytes, out);
+            return true;
+        }
+        if walk_for_first_array(child, bytes, out) {
+            return true;
+        }
+    }
+    false
+}
+
+/// For each `array_element_initializer` (key/value pair) child of an
+/// `array_creation_expression`, extract a string-literal key and a
+/// string-literal or class-constant value. Skips non-conforming entries
+/// silently — Laravel `$casts` arrays are well-shaped in practice and
+/// any unexpected entry just won't surface as a cast.
+fn collect_cast_entries(arr: tree_sitter::Node, bytes: &[u8], out: &mut HashMap<String, String>) {
+    let mut cursor = arr.walk();
+    for child in arr.children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        // Children of array_element_initializer are either [value] (for
+        // un-keyed entries) or [key, =>, value]. We collect the
+        // expression-like children in order; if we get exactly two, treat
+        // them as key + value.
+        let mut ec = child.walk();
+        let exprs: Vec<tree_sitter::Node> = child
+            .children(&mut ec)
+            .filter(|c| !matches!(c.kind(), "=>" | "comment"))
+            .collect();
+        let (key_node, value_node) = match exprs.as_slice() {
+            [k, v] => (*k, *v),
+            _ => continue,
+        };
+        let Some(key) = string_literal_text(key_node, bytes) else {
+            continue;
+        };
+        let Some(value) = string_literal_text(value_node, bytes)
+            .or_else(|| class_constant_basename(value_node, bytes))
+        else {
+            continue;
+        };
+        out.insert(key, value);
+    }
+}
+
+/// If `node` is a PHP string literal (`'foo'` / `"foo"`), return its
+/// content without the quotes. Returns `None` for non-string nodes.
+fn string_literal_text(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let kind = node.kind();
+    if kind != "string" && kind != "encapsed_string" {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[node.start_byte()..node.end_byte()]).ok()?;
+    unquote_string_literal(text)
+}
+
+/// If `node` is a `SomeClass::class` expression, return the class's
+/// basename (last `\`-segment). Returns `None` for other expressions.
+fn class_constant_basename(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if node.kind() != "class_constant_access_expression" {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[node.start_byte()..node.end_byte()]).ok()?;
+    let raw = text.strip_suffix("::class")?.trim();
+    Some(raw.rsplit('\\').next().unwrap_or(raw).to_string())
+}
+
+/// Scan a method body's source for `return $this->KIND(...)` where KIND
+/// is one of the recognised relationship builder names. Returns the
+/// matching kind (the literal name from the list, preserving its
+/// original casing) on first hit. Longest-first ordering in the list
+/// prevents `belongsTo` from matching a `belongsToMany` call.
+///
+/// The matching is loose by design — it doesn't require a strict
+/// `return $this->` prefix because Laravel devs sometimes write
+/// `return $this->hasMany(Post::class)->where(…)` or
+/// `return tap($this->hasMany(...), ...)`. We just need to know "this
+/// method builds a relationship of kind X."
+fn detect_relationship_kind_in_body(
+    body: &str,
+    kinds: &[&'static str],
+) -> Option<&'static str> {
+    for kind in kinds {
+        // `$this->kind(` — boundary-checked via the trailing `(` so
+        // `hasMany` doesn't match `hasManyThrough`.
+        let needle = format!("$this->{}(", kind);
+        if body.contains(&needle) {
+            return Some(*kind);
+        }
+    }
+    None
+}
+
+/// Find the first `SomeName::class` constant expression in `body` and
+/// return `SomeName`. Skips occurrences inside string literals. Used to
+/// pull the related-model class out of a relationship method body like
+/// `$this->hasMany(Post::class)`.
+fn first_class_constant_arg(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                in_str = Some(b);
+                i += 1;
+            }
+            b':' if i + 6 < bytes.len() && &bytes[i..i + 7] == b"::class" => {
+                // Walk backward from `i` over `[A-Za-z0-9_\\]` to find the
+                // class name.
+                let mut start = i;
+                while start > 0 {
+                    let c = bytes[start - 1];
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'\\' {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if start < i {
+                    let raw = std::str::from_utf8(&bytes[start..i]).ok()?;
+                    // The relationship API takes the BASENAME (e.g.
+                    // `Post::class` resolved via use statements), not
+                    // the fully-qualified form. Strip any namespace
+                    // prefix so the caller's FQCN resolver works.
+                    let bare = raw.rsplit('\\').next().unwrap_or(raw).to_string();
+                    return Some(bare);
+                }
+                i += 7;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Find the first PHP array literal in `expr` and return its inner
+/// contents (everything between the outermost matching `[` and `]`).
+/// Handles nested brackets via depth counting; ignores brackets inside
+/// single- or double-quoted strings.
+///
+/// Returns `None` if `expr` doesn't contain a `[…]` pair. Both
+/// long-array (`array(…)`) syntax and trailing-comma cases are out of
+/// scope — Laravel's `$casts` / `casts()` always use `[…]`.
+fn array_literal_inner(expr: &str) -> Option<&str> {
+    let bytes = expr.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut escape = false;
+    let mut start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_str {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'[' => {
+                if depth == 0 {
+                    start = Some(i + 1);
+                }
+                depth += 1;
+            }
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&expr[start?..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Strip surrounding single or double quotes from a string-literal
+/// expression as it appears in PHP source. Returns `None` for non-string
+/// expressions (`null`, `[]`, method calls, etc.) — the caller decides
+/// what to do with those.
+///
+/// Tolerant of whitespace around the literal: `"  'foo'  "` → `Some("foo")`.
+fn unquote_string_literal(expr: &str) -> Option<String> {
+    let trimmed = expr.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if (first == b'\'' || first == b'"') && first == last {
+        Some(trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        None
     }
 }
 

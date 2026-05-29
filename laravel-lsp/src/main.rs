@@ -297,6 +297,31 @@ struct CastTypeInfo {
     source: String,
 }
 
+/// Returns true when the source-derived column surface only contains
+/// framework conventions / parent-class implications — no
+/// `$fillable` / `$casts` / `$dates` / `$attributes` / trait signal.
+/// That's the developer-declared-nothing case (often `$guarded = []`)
+/// where the DB schema is the only real source of truth.
+///
+/// `ParentClass`-sourced columns (Authenticatable's name/email/etc.)
+/// count as conventions for this purpose — they're framework defaults,
+/// not user intent. We don't treat their presence as "rich enough."
+fn is_column_surface_sparse(
+    columns: &[laravel_lsp::laravel_introspector::ColumnInfo],
+) -> bool {
+    use laravel_lsp::laravel_introspector::ColumnSource;
+    !columns.iter().any(|c| {
+        matches!(
+            c.source,
+            ColumnSource::Fillable
+                | ColumnSource::Cast
+                | ColumnSource::Dates
+                | ColumnSource::Attributes
+                | ColumnSource::Trait
+        )
+    })
+}
+
 /// Laravel's built-in Eloquent cast types
 /// Reference: https://laravel.com/docs/12.x/eloquent-mutators#attribute-casting
 fn get_laravel_cast_types() -> Vec<CastTypeInfo> {
@@ -3332,6 +3357,44 @@ impl LaravelLanguageServer {
             for scope in &view.scopes {
                 items.push(laravel_lsp::method_name_completion::scope_to_item(scope));
             }
+
+            // Phase 3 — dynamic where{Column} / orWhere{Column} synthesis.
+            // Source-derived columns from the walker first; if the model
+            // is sparse (only conventions, no $fillable/$casts/$dates/
+            // $attributes/SoftDeletes signal), supplement with the live
+            // DB schema. Source always wins on column-name collision
+            // — its type info reflects user intent (cast overrides,
+            // explicit declarations).
+            let mut columns = view.column_surface.clone();
+            if is_column_surface_sparse(&columns) {
+                let db_guard = self.database_schema.read().await;
+                if let Some(db) = db_guard.as_ref() {
+                    let table = view.table_name.clone().unwrap_or_else(|| {
+                        let basename =
+                            view.fqcn.rsplit('\\').next().unwrap_or(&view.fqcn);
+                        laravel_lsp::query_chain::eloquent_completion::snake_pluralize(
+                            basename,
+                        )
+                    });
+                    let db_cols = db.get_columns_with_types(&table).await;
+                    use std::collections::HashSet;
+                    let existing: HashSet<String> =
+                        columns.iter().map(|c| c.name.clone()).collect();
+                    for (name, php_type) in db_cols {
+                        if existing.contains(&name) {
+                            continue;
+                        }
+                        columns.push(laravel_lsp::laravel_introspector::ColumnInfo {
+                            name,
+                            php_type,
+                            source: laravel_lsp::laravel_introspector::ColumnSource::DatabaseSchema,
+                        });
+                    }
+                }
+            }
+            items.extend(laravel_lsp::method_name_completion::dynamic_where_to_items(
+                &view, &index, &columns,
+            ));
         }
 
         if items.is_empty() {

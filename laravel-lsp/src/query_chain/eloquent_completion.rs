@@ -602,7 +602,7 @@ pub async fn columns_for_collection(
 ///   `BlogPost` → `blog_posts`
 ///   `Category` → `categories`
 ///   `Address` → `addresses`
-fn snake_pluralize(class_basename: &str) -> String {
+pub fn snake_pluralize(class_basename: &str) -> String {
     // PascalCase → snake_case.
     let mut snake = String::with_capacity(class_basename.len() + 4);
     for (i, c) in class_basename.chars().enumerate() {

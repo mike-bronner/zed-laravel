@@ -176,10 +176,10 @@ What you trade:
 
 | Excluded | Intelephense loses | `laravel-lsp` covers |
 |---|---|---|
-| `_ide_helper*.php` | Eloquent dynamic attributes/methods (`$user->name`, `User::find()`), facade resolution (`Auth::user()`) | Eloquent completion from the actual DB schema (more accurate than ide-helper docblocks). **Facades not covered.** |
+| `_ide_helper*.php` | Eloquent dynamic attributes/methods (`$user->name`, `User::find()`), plus extra methods added to facades by third-party packages (e.g. Scout, Telescope, Spatie permissions) | Eloquent completion from the actual DB schema (more accurate than ide-helper docblocks). **Core framework facade resolution (`Auth::user()`, `Cache::get()`, `Route::get()`, etc.) keeps working without ide-helper** — Intelephense reads the `@method` PHPDoc tags directly off the facade source files at `vendor/laravel/framework/src/Illuminate/Support/Facades/*.php`. |
 | `.phpstorm.meta.php` | Container-binding type narrowing (`app('cache')` → `CacheManager`) | Container-binding goto via the `Binding` pattern. |
 
-If you lean heavily on Intelephense's facade method completion (`Auth::`, `Cache::`, `Route::`...), keep `_ide_helper*.php` in.
+If you use packages that extend Laravel facades with their own methods (Scout adds `Searchable` methods, Telescope extends `Gate`, etc.), keep `_ide_helper*.php` in to retain completion for those package-added methods. Core Laravel facades resolve fine without it.
 
 ### Per-project
 

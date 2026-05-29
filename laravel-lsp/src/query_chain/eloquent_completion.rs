@@ -18,8 +18,9 @@
 
 use super::chain::*;
 use crate::class_locator::find_php_class_file;
+use crate::completion_format::CompletionDoc;
 use crate::database::DatabaseSchemaProvider;
-use crate::model_analyzer::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
+use crate::laravel_introspector::{map_cast_to_php_type, relationship_to_php_type, ModelMetadata};
 use std::path::Path;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails};
 use tracing::info;
@@ -56,8 +57,14 @@ pub async fn tables(
                     description: Some("table".to_string()),
                 }),
                 detail: Some("table".to_string()),
+                documentation: Some(
+                    CompletionDoc::new()
+                        .header(&name)
+                        .summary("Database table.")
+                        .into_documentation(),
+                ),
                 sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name),
+                filter_text: Some(name.clone()),
                 insert_text: Some(insert_text),
                 ..Default::default()
             }
@@ -113,10 +120,16 @@ pub async fn columns_raw(
                     description: Some(table.clone()),
                 }),
                 detail: Some(format!("{php_type} ({table})")),
+                documentation: Some(
+                    CompletionDoc::new()
+                        .header(format!("{}.{}", table, name))
+                        .summary(format!("Database column of type `{}`.", php_type))
+                        .into_documentation(),
+                ),
                 // DB columns rank first; later modes will add accessors at
                 // sort_text = "2_…" so columns still rank above them.
                 sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name),
+                filter_text: Some(name.clone()),
                 insert_text: Some(insert_text),
                 ..Default::default()
             }
@@ -232,6 +245,14 @@ pub async fn columns_for_builder(
             // Annotate cast-overridden types so the user can tell at a
             // glance which columns are model-cast vs raw DB-typed.
             let detail_suffix = if has_cast { " · cast" } else { "" };
+            let summary = if has_cast {
+                format!(
+                    "Database column of type `{}` (overridden by model cast).",
+                    php_type
+                )
+            } else {
+                format!("Database column of type `{}`.", php_type)
+            };
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
@@ -240,8 +261,14 @@ pub async fn columns_for_builder(
                     description: Some(table.clone()),
                 }),
                 detail: Some(format!("{php_type}{detail_suffix} ({table})")),
+                documentation: Some(
+                    CompletionDoc::new()
+                        .header(format!("{}.{}", table, name))
+                        .summary(summary)
+                        .into_documentation(),
+                ),
                 sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name),
+                filter_text: Some(name.clone()),
                 insert_text: Some(insert_text),
                 ..Default::default()
             }
@@ -356,6 +383,13 @@ pub async fn relations(
                 Some(q) => format!("{q}{name}{q}"),
                 None => name.clone(),
             };
+            let summary = match rel.related_model.as_deref() {
+                Some(related) => format!(
+                    "Eloquent `{}` relationship to `{}`.",
+                    rel.relationship_type, related
+                ),
+                None => format!("Eloquent `{}` relationship.", rel.relationship_type),
+            };
             CompletionItem {
                 label: name.clone(),
                 // REFERENCE icon — semantically "this points to another
@@ -367,11 +401,17 @@ pub async fn relations(
                     description: Some(rel.relationship_type.clone()),
                 }),
                 detail: Some(format!("{php_type} ({})", rel.relationship_type)),
+                documentation: Some(
+                    CompletionDoc::new()
+                        .header(&name)
+                        .summary(summary)
+                        .into_documentation(),
+                ),
                 // Same `1_` prefix as columns so when both are surfaced
                 // (different ArgKind branches in the handler, so they
                 // shouldn't collide in practice) they rank together.
                 sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name),
+                filter_text: Some(name.clone()),
                 insert_text: Some(insert_text),
                 ..Default::default()
             }
@@ -534,10 +574,16 @@ pub async fn columns_for_collection(
                 description: Some("accessor".to_string()),
             }),
             detail: Some(format!("{php_type} (accessor)")),
+            documentation: Some(
+                CompletionDoc::new()
+                    .header(&name)
+                    .summary(format!("Model accessor returning `{}`.", php_type))
+                    .into_documentation(),
+            ),
             // Sort AFTER DB columns (which use "1_…"). When the popup
             // is fuzzy-filtered the explicit DB columns rank first.
             sort_text: Some(format!("2_{name}")),
-            filter_text: Some(name),
+            filter_text: Some(name.clone()),
             insert_text: Some(insert_text),
             ..Default::default()
         });
@@ -556,7 +602,7 @@ pub async fn columns_for_collection(
 ///   `BlogPost` → `blog_posts`
 ///   `Category` → `categories`
 ///   `Address` → `addresses`
-fn snake_pluralize(class_basename: &str) -> String {
+pub fn snake_pluralize(class_basename: &str) -> String {
     // PascalCase → snake_case.
     let mut snake = String::with_capacity(class_basename.len() + 4);
     for (i, c) in class_basename.chars().enumerate() {

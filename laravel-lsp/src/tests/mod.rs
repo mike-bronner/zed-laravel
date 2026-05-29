@@ -1,6 +1,7 @@
 mod array_context_detection;
 mod cast_type_context;
 mod class_locator_and_properties;
+mod dynamic_where_sparseness;
 mod generic_type_parsing;
 mod livewire_component_resolution;
 mod loop_variable_resolution;

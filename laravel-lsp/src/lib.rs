@@ -16,6 +16,7 @@ pub mod blade_php_block;
 pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
+pub mod completion_format;
 pub mod component_declaration_locator;
 pub mod composer_autoload;
 pub mod config;
@@ -27,19 +28,22 @@ pub mod env_key_locator;
 pub mod file_watcher;
 pub mod hover;
 pub mod indexing_progress;
+pub mod laravel_introspector;
 pub mod livewire_config;
 pub mod livewire_declaration_locator;
 pub mod livewire_resolver;
 pub mod livewire_version;
+pub mod method_name_completion;
 pub mod middleware_binding_locator;
 pub mod middleware_parser;
-pub mod model_analyzer;
+// model_analyzer was consolidated into `laravel_introspector::model_metadata`.
+// Public API is re-exported as `laravel_introspector::ModelMetadata`.
 pub mod naming;
 pub mod parser;
 pub mod pattern_disk_cache;
 pub mod pattern_indexer;
 pub mod php_class;
-pub mod php_outline;
+// php_outline was consolidated into `laravel_introspector::walker`.
 pub mod queries;
 pub mod query_chain;
 pub mod references;

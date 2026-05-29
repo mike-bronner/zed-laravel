@@ -269,7 +269,9 @@ async fn legal_names(
             }
             names.extend(casts);
             names.extend(accessors);
-            Some((names, format!("table \"{table}\"")))
+            // Subject = the raw table name; `make_diagnostic` formats the
+            // message and the code-action layer reads it from `data.table`.
+            Some((names, table))
         }
         DiagKind::Relation => {
             // Relations only exist on Eloquent builders/collections. A relation
@@ -593,6 +595,11 @@ fn make_dynamic_where_diagnostic(
         message.push_str(&format!(" Did you mean `{fixed}`?"));
     }
 
+    // For the rename quick-fix: `range` covers the studly column portion of
+    // the method name, so the replacement is the studly form of the suggested
+    // column (`email` → `Email`), which turns `whereEmaaaail` into `whereEmail`.
+    // `replacementLabel` shows the whole corrected method in the action title.
+    let replacement = suggestion.as_ref().map(|s| snake_to_studly(s));
     let data = serde_json::json!({
         "kind": "column",
         "name": column,
@@ -601,6 +608,9 @@ fn make_dynamic_where_diagnostic(
         "prefix": prefix,
         "suggestion": suggestion,
         "suggestedMethod": fixed_method,
+        "replacement": replacement,
+        "replacementLabel": fixed_method,
+        "table": table,
     });
 
     Diagnostic {
@@ -726,26 +736,34 @@ fn make_diagnostic(
         end: byte_offset_to_position(content, content_end),
     };
 
-    let (code, kind_word, data_kind) = match kind {
-        DiagKind::Column => (CODE_UNKNOWN_COLUMN, "Column", "column"),
-        DiagKind::Relation => (CODE_UNKNOWN_RELATION, "Relation", "relation"),
-        DiagKind::Table => (CODE_UNKNOWN_TABLE, "Table", "table"),
+    let (code, data_kind) = match kind {
+        DiagKind::Column => (CODE_UNKNOWN_COLUMN, "column"),
+        DiagKind::Relation => (CODE_UNKNOWN_RELATION, "relation"),
+        DiagKind::Table => (CODE_UNKNOWN_TABLE, "table"),
     };
 
+    // `subject` is the raw table name (Column), the model FQCN (Relation), or
+    // unused (Table).
     let mut message = match kind {
-        DiagKind::Table => format!("{kind_word} \"{needle}\" does not exist."),
-        // subject = `table "users"` or the model FQCN.
-        _ => format!("{kind_word} \"{needle}\" does not exist on {subject}."),
+        DiagKind::Table => format!("Table \"{needle}\" does not exist."),
+        DiagKind::Column => format!("Column \"{needle}\" does not exist on table \"{subject}\"."),
+        DiagKind::Relation => format!("Relation \"{needle}\" does not exist on {subject}."),
     };
     if let Some(ref s) = suggestion {
         message.push_str(&format!(" Did you mean \"{s}\"?"));
     }
 
+    // `replacement` is the exact text the rename quick-fix puts in `range`
+    // (identical to the suggestion for these non-dynamic cases). `table` is
+    // present only for columns — it drives the create-migration action.
     let data = serde_json::json!({
         "kind": data_kind,
         "name": needle,
         "value": full_value,
         "suggestion": suggestion,
+        "replacement": suggestion,
+        "replacementLabel": suggestion,
+        "table": if kind == DiagKind::Column { Some(subject) } else { None },
     });
 
     Diagnostic {

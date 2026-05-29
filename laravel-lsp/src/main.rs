@@ -17503,6 +17503,31 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Process each diagnostic to see if we can offer a fix
         for diagnostic in &context.diagnostics {
+            // Query-chain diagnostics (source: laravel-lsp) carry a structured
+            // `data` payload — offer rename + create-migration quick-fixes.
+            if diagnostic.source.as_deref() == Some("laravel-lsp") {
+                if let Some(action) =
+                    laravel_lsp::query_chain::code_actions::rename_action(diagnostic, uri)
+                {
+                    actions.push(action);
+                }
+                if let Some(root) = root {
+                    let timestamp =
+                        laravel_lsp::query_chain::code_actions::format_migration_timestamp(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        );
+                    if let Some(action) = laravel_lsp::query_chain::code_actions::migration_action(
+                        diagnostic, root, &timestamp,
+                    ) {
+                        actions.push(action);
+                    }
+                }
+                continue;
+            }
+
             // Check if this is our diagnostic (source: laravel)
             if diagnostic.source.as_deref() != Some("laravel") {
                 continue;

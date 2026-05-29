@@ -735,3 +735,40 @@ async fn lints_each_method_call_independently() {
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
     assert_eq!(diags.len(), 2, "each bad call should flag: {diags:?}");
 }
+
+// ---- data payload contract (consumed by code_actions) ---------------------
+
+#[tokio::test]
+async fn column_diagnostic_data_carries_replacement_and_table() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::where('emaaail');\n";
+    let chains = chains_of(source);
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    let data = diags[0].data.as_ref().expect("data payload");
+    assert_eq!(data["kind"], "column");
+    assert_eq!(data["name"], "emaaail");
+    assert_eq!(data["replacement"], "email");
+    assert_eq!(data["table"], "users");
+}
+
+#[tokio::test]
+async fn dynamic_where_data_carries_studly_replacement_and_method_label() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::whereEmaaail('x');\n";
+    let chains = chains_of(source);
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    let data = diags[0].data.as_ref().expect("data payload");
+    assert_eq!(data["replacement"], "Email"); // studly, inserted into the method
+    assert_eq!(data["replacementLabel"], "whereEmail"); // shown in the action title
+    assert_eq!(data["table"], "users");
+}

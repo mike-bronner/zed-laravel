@@ -18,6 +18,7 @@
 //!   valid alongside DB columns.
 
 pub mod chain;
+pub mod code_actions;
 pub mod cursor;
 pub mod diagnostics;
 pub mod eloquent_completion;

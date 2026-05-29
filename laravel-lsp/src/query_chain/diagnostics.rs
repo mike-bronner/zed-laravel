@@ -254,40 +254,75 @@ async fn legal_names(
             Some((tables, String::new()))
         }
         DiagKind::Column => {
-            let (table, casts, accessors) = match ctx.mode {
-                BuilderMode::BaseBuilder => (ctx.effective_table.clone()?, Vec::new(), Vec::new()),
-                BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
-                    let model = ctx.effective_model.as_deref()?;
-                    let meta = load_metadata(model, root).await?;
-                    let simple = model.rsplit('\\').next().unwrap_or(model);
-                    let table = meta
-                        .table_name
-                        .clone()
-                        .unwrap_or_else(|| snake_pluralize(simple));
-                    let casts: Vec<String> = meta.casts.keys().cloned().collect();
-                    // Accessors are valid `where` args only post-execution, when
-                    // filtering happens in memory on a hydrated collection.
-                    let accessors: Vec<String> = if ctx.mode == BuilderMode::EloquentCollection {
-                        meta.accessors
-                            .iter()
-                            .map(|a| a.property_name.clone())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    (table, casts, accessors)
-                }
-            };
+            // Resolve the root (FROM) table plus, for Eloquent chains, the
+            // model's casts/accessors. A `from()` override redirects the root
+            // to a plain table; `fromRaw`/`fromSub` (Opaque) leaves no root.
+            let (root_table, casts, accessors): (Option<String>, Vec<String>, Vec<String>) =
+                match ctx.mode {
+                    BuilderMode::BaseBuilder => {
+                        let table = match &ctx.from_clause {
+                            FromClause::Replace(at) => Some(at.table.clone()),
+                            FromClause::Opaque => None,
+                            FromClause::Inherit => ctx.effective_table.clone(),
+                        };
+                        (table, Vec::new(), Vec::new())
+                    }
+                    BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
+                        let model = ctx.effective_model.as_deref()?;
+                        let meta = load_metadata(model, root).await?;
+                        let simple = model.rsplit('\\').next().unwrap_or(model);
+                        let table = meta
+                            .table_name
+                            .clone()
+                            .unwrap_or_else(|| snake_pluralize(simple));
+                        let casts: Vec<String> = meta.casts.keys().cloned().collect();
+                        // Accessors are valid `where` args only post-execution,
+                        // when filtering happens in memory on a hydrated
+                        // collection.
+                        let accessors: Vec<String> = if ctx.mode == BuilderMode::EloquentCollection
+                        {
+                            meta.accessors
+                                .iter()
+                                .map(|a| a.property_name.clone())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        (Some(table), casts, accessors)
+                    }
+                };
 
-            let mut names: Vec<String> = db
-                .get_columns_with_types(&table)
-                .await
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
-            if names.is_empty() {
-                // Table not in the introspected schema — can't validate. Note
-                // this fires BEFORE folding in casts/accessors, so a model with
+            // Union columns across every accessible table — the root plus any
+            // joined tables (issue #24). A bare column is legal if it exists on
+            // ANY of them, so a joined-table column doesn't false-positive.
+            // (Qualified columns like `orders.status` are skipped upstream by
+            // the `is_simple_identifier` guard.)
+            let mut names: Vec<String> = Vec::new();
+            let mut subject = String::new();
+            let mut found_columns = false;
+
+            if let Some(table) = &root_table {
+                let cols = db.get_columns_with_types(table).await;
+                if !cols.is_empty() {
+                    found_columns = true;
+                    names.extend(cols.into_iter().map(|(name, _)| name));
+                    subject = table.clone();
+                }
+            }
+            for jt in &ctx.joined_tables {
+                let cols = db.get_columns_with_types(&jt.table).await;
+                if !cols.is_empty() {
+                    found_columns = true;
+                    names.extend(cols.into_iter().map(|(name, _)| name));
+                    if subject.is_empty() {
+                        subject = jt.table.clone();
+                    }
+                }
+            }
+
+            if !found_columns {
+                // No accessible table resolved any columns — can't validate.
+                // Fires BEFORE folding in casts/accessors, so a model with
                 // casts but an unreachable table still stays quiet.
                 return None;
             }
@@ -295,7 +330,7 @@ async fn legal_names(
             names.extend(accessors);
             // Subject = the raw table name; `make_diagnostic` formats the
             // message and the code-action layer reads it from `data.table`.
-            Some((names, table))
+            Some((names, subject))
         }
         DiagKind::Relation => {
             // Relations only exist on Eloquent builders/collections. A relation

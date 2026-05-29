@@ -10,6 +10,7 @@
 //! later phases.
 
 use super::chain::*;
+use super::methods::{is_from_opaque, is_from_replace, is_table_join};
 use std::sync::Arc;
 use tower_lsp::lsp_types::Position;
 
@@ -402,6 +403,7 @@ pub fn chain_context_for_link(
         }
     }
     let arg = chain.links.get(link_idx)?.arg;
+    let (joined_tables, from_clause) = scan_accessible_tables(chain);
     Some(ChainContext {
         mode,
         effective_table,
@@ -410,6 +412,8 @@ pub fn chain_context_for_link(
         dotted_prefix: None,
         closure_relation_hop,
         quote: '\'',
+        joined_tables,
+        from_clause,
     })
 }
 
@@ -474,25 +478,32 @@ fn detect_target_in_chain(
     // we still complete inside its first arg.
     let (quote, string_value, value_span) = string_arg_at(cursor_link, byte_offset)?;
 
+    // Position-aware classification: most methods carry one ArgKind for the
+    // whole link, but join/`from` methods name a TABLE in their first string
+    // arg (`crossJoin('|')`, `from('|')`) — so we offer table completion there,
+    // just like `DB::table('|')`.
+    let expecting = expecting_at(cursor_link, byte_offset);
+
     if !matches!(
-        cursor_link.arg,
+        expecting,
         ArgKind::Column | ArgKind::Relation | ArgKind::ClosureCarrier | ArgKind::Table
     ) {
         return None;
     }
 
-    // Phase 7: dotted-relation paths in relation positions. For
-    // `with('posts.author.|')` the value is "posts.author." — everything
-    // before the LAST dot is the relation chain to walk
-    // ("posts" → Post, then "author" on Post → Author), and the portion
-    // after is the typing prefix that the editor uses for fuzzy
-    // filtering. Only meaningful for Relation / ClosureCarrier args
-    // — Column args don't follow dotted hops (`where('a.b')` isn't a
-    // thing) and Table args are single-segment.
-    let dotted_prefix = if matches!(cursor_link.arg, ArgKind::Relation | ArgKind::ClosureCarrier) {
-        // Find the last `.` in the string value. If present, return the
-        // substring up to (not including) that dot — those are the
-        // segments we walk.
+    // Dotted prefixes — everything before the LAST dot of the literal.
+    // - Relation / ClosureCarrier (`with('posts.author.|')`): the relation
+    //   chain to walk ("posts" → Post, then "author" on Post → Author).
+    // - Column (`where('orders.|')`): the table qualifier (alias or table
+    //   name) the column belongs to, so completion narrows to that one
+    //   table. Joins make qualified columns meaningful (`orders.status`);
+    //   without joins it's still harmless (the qualifier just matches the
+    //   root table or nothing).
+    // Table args stay single-segment.
+    let dotted_prefix = if matches!(
+        expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier | ArgKind::Column
+    ) {
         string_value
             .rfind('.')
             .map(|idx| string_value[..idx].to_string())
@@ -500,15 +511,19 @@ fn detect_target_in_chain(
         None
     };
 
+    let (joined_tables, from_clause) = scan_accessible_tables(chain);
+
     Some(ChainTarget {
         ctx: ChainContext {
             mode,
             effective_table,
             effective_model,
-            expecting: cursor_link.arg,
+            expecting,
             dotted_prefix,
             closure_relation_hop,
             quote,
+            joined_tables,
+            from_clause,
         },
         value: string_value,
         value_span,
@@ -566,6 +581,98 @@ fn parent_chain_eloquent_model(
         // produce StaticModel via Phase 5.1.
         _ => None,
     }
+}
+
+/// Scan ALL links in the chain and collect the tables made accessible by
+/// `join()`-family calls, plus any `from*()` root override.
+///
+/// Visibility is **global**: Laravel compiles the entire chain into one SQL
+/// query, so a join appearing anywhere in the chain makes its table
+/// referenceable from every column position — we don't gate on whether the
+/// join textually precedes the cursor. (Mode flips like `toBase()` stay
+/// positional; that's a separate concern handled by the link walk.)
+///
+/// The last `from*()` wins, mirroring Laravel's runtime where a later
+/// `from()` overrides an earlier FROM clause.
+fn scan_accessible_tables(chain: &BuilderChain) -> (Vec<AccessibleTable>, FromClause) {
+    let mut joined = Vec::new();
+    let mut from_clause = FromClause::Inherit;
+    for link in &chain.links {
+        let method = link.method.as_str();
+        if is_table_join(method) {
+            if let Some(table_ref) = first_string_arg_value(link) {
+                joined.push(parse_table_ref(&table_ref));
+            }
+        } else if is_from_replace(method) {
+            if let Some(table_ref) = first_string_arg_value(link) {
+                from_clause = FromClause::Replace(parse_table_ref(&table_ref));
+            }
+        } else if is_from_opaque(method) {
+            from_clause = FromClause::Opaque;
+        }
+    }
+    (joined, from_clause)
+}
+
+/// The value of a link's first `StringLit` argument, if any. Used to read the
+/// table name out of a `join('orders', …)` / `from('admins')` call. Closures
+/// and other arg shapes are skipped — `join('orders', fn ($j) => …)` still
+/// returns `"orders"` because the closure is a later arg.
+fn first_string_arg_value(link: &ChainLink) -> Option<String> {
+    link.args.iter().find_map(|arg| match arg {
+        ChainArg::StringLit { value, .. } => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// What the cursor's link expects at this byte position. Most links carry a
+/// single `ArgKind` for the whole call, but join/`from` methods are
+/// position-sensitive:
+///
+/// - **Join methods** (`join('orders', 'orders.user_id', '=', 'users.id')`):
+///   the FIRST string arg names a table → [`ArgKind::Table`] (table-name
+///   completion, like `DB::table('|')`). Every later arg is part of the ON
+///   condition, which references the accessible tables → [`ArgKind::Column`]
+///   (`join('orders', 'orders.|')` offers `orders` columns). The operator /
+///   value slots over-offer harmlessly, exactly as `where('x', '=', '|')`
+///   already does — the editor filters them out.
+/// - **`from('admins')`**: the first arg names the new root table →
+///   [`ArgKind::Table`]; any later arg (e.g. a connection name) →
+///   [`ArgKind::None`].
+///
+/// Non-join/from links fall through to the link's own `arg` classification.
+fn expecting_at(link: &ChainLink, byte_offset: usize) -> ArgKind {
+    if is_table_join(&link.method) {
+        return if cursor_in_first_string_arg(link, byte_offset) {
+            ArgKind::Table
+        } else {
+            ArgKind::Column
+        };
+    }
+    if is_from_replace(&link.method) {
+        return if cursor_in_first_string_arg(link, byte_offset) {
+            ArgKind::Table
+        } else {
+            ArgKind::None
+        };
+    }
+    link.arg
+}
+
+/// Whether `byte_offset` falls inside the link's FIRST string-literal arg —
+/// the table-name slot of a join/`from` call. A cursor in a later string arg
+/// (the join condition) returns `false`.
+fn cursor_in_first_string_arg(link: &ChainLink, byte_offset: usize) -> bool {
+    for arg in &link.args {
+        if let ChainArg::StringLit {
+            span_byte_range, ..
+        } = arg
+        {
+            let (start, end) = *span_byte_range;
+            return byte_offset >= start && byte_offset <= end;
+        }
+    }
+    false
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning

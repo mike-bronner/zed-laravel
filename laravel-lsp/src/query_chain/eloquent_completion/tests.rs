@@ -113,6 +113,8 @@ fn make_ctx(class: &str) -> ChainContext {
         dotted_prefix: None,
         closure_relation_hop: None,
         quote: '\'',
+        joined_tables: Vec::new(),
+        from_clause: FromClause::Inherit,
     }
 }
 
@@ -697,6 +699,8 @@ class Post extends Model {
         dotted_prefix: Some("posts".to_string()),
         closure_relation_hop: None,
         quote: '\'',
+        joined_tables: Vec::new(),
+        from_clause: FromClause::Inherit,
     };
     let items = relations(&ctx, None, &root).await;
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
@@ -731,7 +735,285 @@ class User extends Model {
         dotted_prefix: Some("nonexistent".to_string()),
         closure_relation_hop: None,
         quote: '\'',
+        joined_tables: Vec::new(),
+        from_clause: FromClause::Inherit,
     };
     let items = relations(&ctx, None, &root).await;
     assert!(items.is_empty(), "unresolvable hop should yield no items");
+}
+
+// ---- columns_raw: joined-table column completion (issue #24) -----------
+
+/// Seed a provider with multiple tables at once. Base-builder completion
+/// never touches the project root, so the path is just a placeholder.
+async fn provider_with_tables(
+    root: PathBuf,
+    tables: Vec<(&str, Vec<(&str, &str)>)>,
+) -> DatabaseSchemaProvider {
+    use crate::database::DatabaseSchema;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let mut columns_map = HashMap::new();
+    let mut columns_with_types = HashMap::new();
+    let mut table_names = Vec::new();
+    for (table, cols) in &tables {
+        table_names.push(table.to_string());
+        columns_map.insert(
+            table.to_string(),
+            cols.iter().map(|(n, _)| n.to_string()).collect(),
+        );
+        columns_with_types.insert(
+            table.to_string(),
+            cols.iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect(),
+        );
+    }
+    let schema = DatabaseSchema {
+        tables: table_names,
+        columns: columns_map,
+        columns_with_types,
+        cached_at: Instant::now(),
+    };
+    let provider = DatabaseSchemaProvider::new(root);
+    provider.set_test_schema(schema).await;
+    provider
+}
+
+/// Build a base-builder `ChainContext` for column completion tests.
+fn base_ctx(
+    effective_table: Option<&str>,
+    joined_tables: Vec<AccessibleTable>,
+    from_clause: FromClause,
+    dotted_prefix: Option<&str>,
+) -> ChainContext {
+    ChainContext {
+        mode: BuilderMode::BaseBuilder,
+        effective_table: effective_table.map(|s| s.to_string()),
+        effective_model: None,
+        expecting: ArgKind::Column,
+        dotted_prefix: dotted_prefix.map(|s| s.to_string()),
+        closure_relation_hop: None,
+        quote: '\'',
+        joined_tables,
+        from_clause,
+    }
+}
+
+fn labels(items: &[CompletionItem]) -> Vec<String> {
+    items.iter().map(|i| i.label.clone()).collect()
+}
+
+#[tokio::test]
+async fn columns_raw_no_joins_offers_only_bare() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![("users", vec![("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let ctx = base_ctx(Some("users"), Vec::new(), FromClause::Inherit, None);
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert!(got.contains(&"id".to_string()));
+    assert!(got.contains(&"email".to_string()));
+    // No joins → no qualified `users.id` noise.
+    assert!(
+        !got.iter().any(|l| l.contains('.')),
+        "single-table query should not emit qualified columns; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn columns_raw_with_join_offers_bare_root_and_qualified_both() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int"), ("name", "string")]),
+            ("orders", vec![("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    // Bare root columns.
+    assert!(got.contains(&"id".to_string()), "bare root id; got {got:?}");
+    assert!(got.contains(&"name".to_string()));
+    // Qualified root columns (issue #24 criterion 3: `users.id`).
+    assert!(got.contains(&"users.id".to_string()));
+    assert!(got.contains(&"users.name".to_string()));
+    // Qualified joined columns.
+    assert!(got.contains(&"orders.status".to_string()));
+    assert!(got.contains(&"orders.id".to_string()));
+    // Joined columns are NOT offered bare (only `orders.*`).
+    assert!(
+        !got.contains(&"status".to_string()),
+        "joined column should only be qualified; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn columns_raw_narrows_to_qualified_table() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int"), ("name", "string")]),
+            ("orders", vec![("status", "string"), ("total", "int")]),
+        ],
+    )
+    .await;
+    // User typed `orders.|` → dotted_prefix "orders".
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        Some("orders"),
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    // Only orders columns, inserted BARE (the `orders.` is already typed).
+    assert_eq!(
+        got.len(),
+        2,
+        "expected exactly orders' columns; got {got:?}"
+    );
+    assert!(got.contains(&"status".to_string()));
+    assert!(got.contains(&"total".to_string()));
+}
+
+#[tokio::test]
+async fn columns_raw_narrows_via_alias() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    // `join('orders as o', …)->where('o.|')` → qualifier "o" resolves to orders.
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable {
+            table: "orders".to_string(),
+            alias: Some("o".to_string()),
+        }],
+        FromClause::Inherit,
+        Some("o"),
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert_eq!(got, vec!["status".to_string()]);
+}
+
+#[tokio::test]
+async fn columns_raw_alias_qualifies_with_alias_not_table() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable {
+            table: "orders".to_string(),
+            alias: Some("o".to_string()),
+        }],
+        FromClause::Inherit,
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    // The qualifier is the ALIAS, not the real table name.
+    assert!(got.contains(&"o.status".to_string()), "got {got:?}");
+    assert!(!got.contains(&"orders.status".to_string()));
+}
+
+#[tokio::test]
+async fn columns_raw_from_replace_uses_new_table() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("admins", vec![("admin_id", "int"), ("level", "int")]),
+        ],
+    )
+    .await;
+    // `from('admins')` replaces the root — `effective_table` (users) is ignored.
+    let ctx = base_ctx(
+        Some("users"),
+        Vec::new(),
+        FromClause::Replace(AccessibleTable::bare("admins")),
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert!(got.contains(&"admin_id".to_string()));
+    assert!(got.contains(&"level".to_string()));
+    assert!(
+        !got.contains(&"id".to_string()),
+        "users is replaced; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn columns_raw_opaque_from_suppresses_root_but_keeps_joins() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    // `fromRaw(...)->join('orders', …)` → no bare root columns, joins still work.
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Opaque,
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert!(got.contains(&"orders.status".to_string()));
+    assert!(
+        !got.contains(&"id".to_string()),
+        "opaque root suppressed; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn columns_raw_wraps_qualified_insert_text() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        None,
+    );
+    // wrap_with_quote = Some('\'') → qualified insert text wraps the whole
+    // `orders.status` in quotes, not just the column.
+    let items = columns_raw(&ctx, &db, Some('\'')).await;
+    let qualified = items
+        .iter()
+        .find(|i| i.label == "orders.status")
+        .expect("qualified item");
+    assert_eq!(qualified.insert_text.as_deref(), Some("'orders.status'"));
 }

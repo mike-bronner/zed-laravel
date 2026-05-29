@@ -170,6 +170,88 @@ pub struct ClosureParam {
     pub php_type: Option<String>,
 }
 
+/// A table reachable for column references within a chain — either the root
+/// (the receiver, or a `from()` replacement) or one made available by a
+/// join. Carries the real schema name (used to fetch columns) separately
+/// from the alias the user types, so `join('users as u', …)` offers `u.*`
+/// while looking columns up under `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessibleTable {
+    /// Real table name as it appears in the database. May be schema-qualified
+    /// (`mydb.orders`) for cross-database joins; column lookup passes it
+    /// through to the schema provider, which resolves it best-effort.
+    pub table: String,
+    /// Alias the user references columns by — `u` from `users as u`, or a
+    /// subquery alias. `None` for a plain `join('orders', …)`, where the
+    /// qualifier IS the table name.
+    pub alias: Option<String>,
+}
+
+impl AccessibleTable {
+    /// Construct an unaliased accessible table from a bare name.
+    pub fn bare(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            alias: None,
+        }
+    }
+
+    /// The qualifier the user types before a column: the alias if present,
+    /// else the table name. For a schema-qualified table with no alias this
+    /// is the full `mydb.orders`.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table)
+    }
+}
+
+/// Parse a Laravel table reference string into an [`AccessibleTable`].
+///
+/// Handles the three shapes that appear in `join()` / `from()` arguments:
+/// - `'orders'` → table `orders`, no alias
+/// - `'mydb.orders'` → schema-qualified table `mydb.orders`, no alias
+/// - `'users as u'` / `'users AS u'` → table `users`, alias `u`
+/// - `'users u'` → implicit alias (MySQL-style), table `users`, alias `u`
+///
+/// The `as` keyword is matched case-insensitively. The table portion is kept
+/// verbatim (dots and all) so schema qualifiers survive to the column lookup.
+pub fn parse_table_ref(raw: &str) -> AccessibleTable {
+    let trimmed = raw.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    match tokens.as_slice() {
+        // `table as alias`
+        [table, kw, alias] if kw.eq_ignore_ascii_case("as") => AccessibleTable {
+            table: (*table).to_string(),
+            alias: Some((*alias).to_string()),
+        },
+        // `table alias` (implicit alias)
+        [table, alias] => AccessibleTable {
+            table: (*table).to_string(),
+            alias: Some((*alias).to_string()),
+        },
+        // `table` (no alias) — also the fallback for any unexpected shape,
+        // where keeping the whole trimmed string as the table name is the
+        // least-surprising behavior.
+        _ => AccessibleTable::bare(trimmed.to_string()),
+    }
+}
+
+/// How the chain's root (FROM) table is determined, after accounting for any
+/// receiver-replacing `from*()` call in the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromClause {
+    /// No `from*()` override — the root is the receiver's table (`DB::table`)
+    /// or the model's table (Eloquent).
+    Inherit,
+    /// `from('admins')` / `from('admins as a')` replaced the root with a
+    /// concrete table. Columns come from the schema only (no model casts —
+    /// the model→table mapping no longer applies once `from()` redirects it).
+    Replace(AccessibleTable),
+    /// `fromRaw(...)` (and, until Phase 4, `fromSub(...)`) made the root an
+    /// opaque expression — no bare root columns can be offered, though any
+    /// joined tables remain valid.
+    Opaque,
+}
+
 /// Completion-time context produced fresh from a `BuilderChain` plus a cursor
 /// position. Not stored — recomputed on each completion request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,10 +268,23 @@ pub struct ChainContext {
     /// completion; `ClosureCarrier` is handled by closure-scope descent;
     /// `None` means no completion.
     pub expecting: ArgKind,
-    /// For dotted relation paths like `with('posts.author.|')`, the prefix the
-    /// user has already typed after the last dot. Completion items filter
-    /// against this and `insert_text` is just the current segment.
+    /// Everything the user has typed before the last dot of the literal under
+    /// the cursor. Two meanings depending on `expecting`:
+    /// - **Relation** (`with('posts.author.|')`) — the relation segments to
+    ///   walk; the final model's relations are then offered.
+    /// - **Column** (`where('orders.|')`) — the table qualifier (alias or
+    ///   table name) the column belongs to; completion narrows to that one
+    ///   table's columns.
     pub dotted_prefix: Option<String>,
+    /// Tables made accessible by `join()`-family calls, in source order.
+    /// Global to the chain — Laravel compiles the whole chain into one SQL
+    /// query regardless of textual order, so a join anywhere in the chain
+    /// makes its table referenceable everywhere. Columns from these are
+    /// offered as `qualifier.column`.
+    pub joined_tables: Vec<AccessibleTable>,
+    /// Whether a `from*()` call replaced or obscured the chain's root table.
+    /// `Inherit` for the common case (no `from()` override).
+    pub from_clause: FromClause,
     /// Set when the chain is inside a recognized relation closure
     /// (`whereHas('posts', fn ($q) => $q->where('|'))` or
     /// `with(['posts' => fn ($q) => $q->where('|')])`). When `Some(rel)`,
@@ -215,3 +310,6 @@ pub enum BuilderMode {
     /// via `load()`.
     EloquentCollection,
 }
+
+#[cfg(test)]
+mod tests;

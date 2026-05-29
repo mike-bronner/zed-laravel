@@ -237,3 +237,59 @@ fn raw_methods_are_unique() {
         sorted
     );
 }
+
+// ---- join / from classification (issue #24) ---------------------------
+
+#[test]
+fn table_join_methods_are_recognized() {
+    for name in [
+        "join",
+        "leftJoin",
+        "rightJoin",
+        "crossJoin",
+        "joinWhere",
+        "leftJoinWhere",
+        "rightJoinWhere",
+    ] {
+        assert!(is_table_join(name), "{name} should be a table join");
+    }
+}
+
+#[test]
+fn non_join_methods_are_not_table_joins() {
+    // Subquery joins take a query, not a table name — they're Phase 4, not
+    // table joins. And ordinary methods obviously aren't joins.
+    for name in ["joinSub", "joinLateral", "where", "select", "with", "from"] {
+        assert!(!is_table_join(name), "{name} should not be a table join");
+    }
+}
+
+#[test]
+fn from_replace_is_only_plain_from() {
+    assert!(is_from_replace("from"));
+    // The opaque from*() variants don't name a concrete table.
+    assert!(!is_from_replace("fromRaw"));
+    assert!(!is_from_replace("fromSub"));
+    assert!(!is_from_replace("join"));
+}
+
+#[test]
+fn from_opaque_covers_raw_and_sub() {
+    assert!(is_from_opaque("fromRaw"));
+    assert!(is_from_opaque("fromSub"));
+    assert!(!is_from_opaque("from"));
+}
+
+#[test]
+fn join_and_from_methods_dont_classify_as_columns() {
+    // Joins/from must not fire column completion inside their own table-name
+    // arg via the column path — they're handled by the accessible-tables scan
+    // instead, so arg_kind stays None for them.
+    for name in TABLE_JOIN_METHODS.iter().chain(FROM_REPLACE_METHODS.iter()) {
+        assert_eq!(
+            arg_kind(name),
+            ArgKind::None,
+            "{name} should not be an ArgKind::Column method"
+        );
+    }
+}

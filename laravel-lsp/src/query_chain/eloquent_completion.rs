@@ -75,9 +75,16 @@ pub async fn tables(
 /// Build column completions for a `BaseBuilder` chain. Reads the schema
 /// directly — no model lookup, no casts, no accessors.
 ///
+/// Handles joined tables (issue #24): when the chain has joins, columns are
+/// offered both bare (root table) and `qualifier.column`-qualified (every
+/// accessible table, including the root). A `from()` override replaces the
+/// root; `fromRaw`/`fromSub` make it opaque (no bare root columns, but joined
+/// tables still resolve). When the user has already typed a `qualifier.`
+/// prefix (`where('orders.|')`), completion narrows to that one table.
+///
 /// Returns an empty `Vec` when:
-/// - The context has no `effective_table` (shouldn't happen for Base chains
-///   coming out of the cursor resolver, but guarded for safety)
+/// - No table is accessible (no root and no joins, or an opaque root with no
+///   joins)
 /// - The database schema isn't introspected yet (cold start, no DB connection,
 ///   or the table doesn't exist in the introspected schema)
 pub async fn columns_raw(
@@ -85,56 +92,162 @@ pub async fn columns_raw(
     db: &DatabaseSchemaProvider,
     wrap_with_quote: Option<char>,
 ) -> Vec<CompletionItem> {
-    let Some(table) = &ctx.effective_table else {
-        info!("🔗 columns_raw: ctx.effective_table is None — returning 0 items");
+    let root = base_root_table(ctx);
+
+    // The user already typed a `qualifier.` — narrow to that one table.
+    if let Some(qualifier) = ctx.dotted_prefix.as_deref() {
+        return narrowed_columns(ctx, db, wrap_with_quote, root.as_ref(), qualifier).await;
+    }
+
+    let has_joins = !ctx.joined_tables.is_empty();
+    let mut items = Vec::new();
+
+    // Root table: bare columns always; qualified forms too once joins make
+    // qualification meaningful (so a plain single-table query keeps offering
+    // only bare names — no `users.name` noise).
+    if let Some(r) = &root {
+        let columns = db.get_columns_with_types(&r.table).await;
+        if columns.is_empty() {
+            info!(
+                "🔗 columns_raw: get_columns_with_types({:?}) returned 0 columns \
+                 (schema cache may not have this table, or DB not yet warmed)",
+                r.table
+            );
+        }
+        for (name, php_type) in &columns {
+            items.push(raw_column_item(
+                name,
+                php_type,
+                &r.table,
+                None,
+                wrap_with_quote,
+                1,
+            ));
+            if has_joins {
+                items.push(raw_column_item(
+                    name,
+                    php_type,
+                    &r.table,
+                    Some(r.qualifier()),
+                    wrap_with_quote,
+                    2,
+                ));
+            }
+        }
+    }
+
+    // Joined tables: always offered as `qualifier.column`.
+    for jt in &ctx.joined_tables {
+        let columns = db.get_columns_with_types(&jt.table).await;
+        for (name, php_type) in &columns {
+            items.push(raw_column_item(
+                name,
+                php_type,
+                &jt.table,
+                Some(jt.qualifier()),
+                wrap_with_quote,
+                2,
+            ));
+        }
+    }
+
+    if items.is_empty() {
+        info!("🔗 columns_raw: no accessible tables/columns resolved — returning 0 items");
+    }
+    items
+}
+
+/// Resolve the root (FROM) table for a base-builder chain, honoring any
+/// `from*()` override. `None` means no bare root columns should be offered
+/// (an opaque `fromRaw`/`fromSub`, or no resolvable table at all).
+fn base_root_table(ctx: &ChainContext) -> Option<AccessibleTable> {
+    match &ctx.from_clause {
+        FromClause::Replace(table) => Some(table.clone()),
+        FromClause::Opaque => None,
+        FromClause::Inherit => ctx.effective_table.clone().map(AccessibleTable::bare),
+    }
+}
+
+/// Narrow completion to a single table when the user has typed its
+/// `qualifier.` prefix (`where('orders.|')`). The qualifier matches an
+/// accessible table's alias or name; columns are inserted **bare** because
+/// the `qualifier.` is already in the source.
+async fn narrowed_columns(
+    ctx: &ChainContext,
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+    root: Option<&AccessibleTable>,
+    qualifier: &str,
+) -> Vec<CompletionItem> {
+    let target = root
+        .into_iter()
+        .chain(ctx.joined_tables.iter())
+        .find(|t| t.qualifier() == qualifier);
+    let Some(at) = target else {
+        info!(
+            "🔗 columns_raw: qualifier {:?} matches no accessible table — returning 0 items",
+            qualifier
+        );
         return Vec::new();
     };
-
-    let columns = db.get_columns_with_types(table).await;
-    if columns.is_empty() {
-        info!(
-            "🔗 columns_raw: get_columns_with_types({:?}) returned 0 columns \
-             (schema cache may not have this table, or DB not yet warmed)",
-            table
-        );
-    }
-    columns
+    db.get_columns_with_types(&at.table)
+        .await
         .into_iter()
         .map(|(name, php_type)| {
-            let insert_text = match wrap_with_quote {
-                Some(q) => format!("{q}{name}{q}"),
-                None => name.clone(),
-            };
-            CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                // Use `label_details` (LSP 3.17) so the type renders right
-                // next to the column name (e.g., "email   string") and the
-                // source table renders as a dimmer suffix on the right
-                // ("from users"). Editors that support it (Zed, VS Code)
-                // render each piece distinctly; older clients fall back to
-                // `detail` below, which we still set as a single-string
-                // approximation.
-                label_details: Some(CompletionItemLabelDetails {
-                    detail: Some(format!("  {php_type}")),
-                    description: Some(table.clone()),
-                }),
-                detail: Some(format!("{php_type} ({table})")),
-                documentation: Some(
-                    CompletionDoc::new()
-                        .header(format!("{}.{}", table, name))
-                        .summary(format!("Database column of type `{}`.", php_type))
-                        .into_documentation(),
-                ),
-                // DB columns rank first; later modes will add accessors at
-                // sort_text = "2_…" so columns still rank above them.
-                sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name.clone()),
-                insert_text: Some(insert_text),
-                ..Default::default()
-            }
+            raw_column_item(&name, &php_type, &at.table, None, wrap_with_quote, 1)
         })
         .collect()
+}
+
+/// Build a schema-only column completion item (no casts/accessors).
+///
+/// - `qualifier = None` → bare item (`label`/`insert` = `name`).
+/// - `qualifier = Some(q)` → qualified item (`label`/`insert` = `q.name`).
+///
+/// `source_table` is the real table name shown in the popup's right-hand
+/// description. `sort_rank` groups items (1 = bare root, 2 = qualified) so
+/// bare columns surface first. Shared by base-builder completion here and (in
+/// later phases) the joined-table portion of Eloquent completion.
+fn raw_column_item(
+    name: &str,
+    php_type: &str,
+    source_table: &str,
+    qualifier: Option<&str>,
+    wrap_with_quote: Option<char>,
+    sort_rank: u8,
+) -> CompletionItem {
+    let text = match qualifier {
+        Some(q) => format!("{q}.{name}"),
+        None => name.to_string(),
+    };
+    let insert_text = match wrap_with_quote {
+        Some(quote) => format!("{quote}{text}{quote}"),
+        None => text.clone(),
+    };
+    CompletionItem {
+        label: text.clone(),
+        kind: Some(CompletionItemKind::FIELD),
+        // Use `label_details` (LSP 3.17) so the type renders right next to the
+        // column name (e.g., "email   string") and the source table renders
+        // as a dimmer suffix on the right. Editors that support it (Zed, VS
+        // Code) render each piece distinctly; older clients fall back to
+        // `detail` below.
+        label_details: Some(CompletionItemLabelDetails {
+            detail: Some(format!("  {php_type}")),
+            description: Some(source_table.to_string()),
+        }),
+        detail: Some(format!("{php_type} ({source_table})")),
+        documentation: Some(
+            CompletionDoc::new()
+                .header(format!("{source_table}.{name}"))
+                .summary(format!("Database column of type `{php_type}`."))
+                .into_documentation(),
+        ),
+        sort_text: Some(format!("{sort_rank}_{text}")),
+        filter_text: Some(text.clone()),
+        insert_text: Some(insert_text),
+        ..Default::default()
+    }
 }
 
 /// Build column completions for an `EloquentBuilder` chain — a chain rooted

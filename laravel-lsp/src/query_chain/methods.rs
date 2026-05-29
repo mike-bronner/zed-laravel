@@ -150,6 +150,54 @@ pub const SAME_MODEL_CLOSURE_CARRIERS: &[&str] = &[
     "tap",
 ];
 
+/// Join methods whose FIRST string argument names a table. After any of
+/// these, that table's columns become referenceable for the rest of the
+/// chain (`->join('orders', …)->where('orders.status', …)`). The optional
+/// later arguments are either the join condition (4-arg form) or a closure
+/// (closure form — Phase 3); neither changes the fact that the FIRST arg is
+/// the table being joined.
+///
+/// Subquery joins (`joinSub`, `joinLateral`, …) take a *query*, not a table
+/// name, so they live in a separate Phase-4 list — their accessible table is
+/// named by the alias argument instead.
+pub const TABLE_JOIN_METHODS: &[&str] = &[
+    "join",
+    "leftJoin",
+    "rightJoin",
+    "crossJoin",
+    "joinWhere",
+    "leftJoinWhere",
+    "rightJoinWhere",
+];
+
+/// Receiver-replacing `from*()` methods whose first string argument names the
+/// new root table — `from('admins')` swaps the FROM clause. Like the joins,
+/// the table reference may carry an alias (`from('admins as a')`) or a
+/// schema qualifier (`from('mydb.admins')`).
+pub const FROM_REPLACE_METHODS: &[&str] = &["from"];
+
+/// `from*()` methods whose argument is opaque SQL or a subquery we don't
+/// resolve to a concrete schema table (until Phase 4 adds `fromSub` virtual
+/// tables). After one of these, the root table is unknown, so no bare root
+/// columns can be offered — but any joined tables remain valid.
+pub const FROM_OPAQUE_METHODS: &[&str] = &["fromRaw", "fromSub"];
+
+/// Whether `name` is a join method whose first string arg names a table.
+pub fn is_table_join(name: &str) -> bool {
+    TABLE_JOIN_METHODS.contains(&name)
+}
+
+/// Whether `name` replaces the chain's root table with a concrete table named
+/// by its first string arg (`from('admins')`).
+pub fn is_from_replace(name: &str) -> bool {
+    FROM_REPLACE_METHODS.contains(&name)
+}
+
+/// Whether `name` makes the chain's root table opaque (`fromRaw`, `fromSub`).
+pub fn is_from_opaque(name: &str) -> bool {
+    FROM_OPAQUE_METHODS.contains(&name)
+}
+
 /// Methods that flip the chain from Eloquent → base query builder. After
 /// these, the chain is operating on `Illuminate\Database\Query\Builder`, so
 /// relation methods would error at runtime — completion returns empty for

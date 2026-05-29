@@ -894,3 +894,52 @@ async fn where_array_values_are_not_flagged() {
         "where-array values must not be flagged: {diags:?}"
     );
 }
+
+// ---- joined-table columns (issue #24) ---------------------------------
+
+#[tokio::test]
+async fn bare_column_from_joined_table_is_not_flagged() {
+    // `status` lives only on `orders`, but the join makes it a legal bare
+    // column — diagnostics must not flag it as missing on `users`.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('status', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "bare joined-table column must not be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn typo_still_flagged_with_joins_present() {
+    // A genuine typo absent from EVERY accessible table is still caught.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'a', '=', 'b')->where('stattus', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "real typo should still be flagged: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+}

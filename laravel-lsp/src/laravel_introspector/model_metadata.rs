@@ -338,6 +338,133 @@ pub fn parse_cast_array(expr: &str) -> HashMap<String, String> {
     parse_cast_array_public(expr)
 }
 
+/// Free-function alias for the string-array parser, exposed at the module
+/// root as `parse_string_array`. Implementation in
+/// [`parse_string_array_public`].
+pub fn parse_string_array(expr: &str) -> Vec<String> {
+    parse_string_array_public(expr)
+}
+
+/// Extract the string-literal KEYS from a PHP array literal, ignoring
+/// values entirely. Used for `$attributes` (defaults map) where the
+/// value side may be a boolean / number / null / expression that we
+/// don't try to interpret — we only need the column names.
+///
+/// `['status' => 'draft', 'is_featured' => false]` → `["status", "is_featured"]`.
+pub fn parse_array_keys_public(expr: &str) -> Vec<String> {
+    let inner = array_literal_inner(expr).unwrap_or(expr);
+    let wrapped = format!("<?php $x = [{}];", inner);
+    let Ok(tree) = crate::parser::parse_php(&wrapped) else {
+        return Vec::new();
+    };
+    let bytes = wrapped.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    walk_for_first_keyed_array(tree.root_node(), bytes, &mut out);
+    out
+}
+
+fn walk_for_first_keyed_array(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    out: &mut Vec<String>,
+) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "array_creation_expression" {
+            collect_keys_only(child, bytes, out);
+            return true;
+        }
+        if walk_for_first_keyed_array(child, bytes, out) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_keys_only(arr: tree_sitter::Node, bytes: &[u8], out: &mut Vec<String>) {
+    let mut cursor = arr.walk();
+    for child in arr.children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        let mut ec = child.walk();
+        let exprs: Vec<tree_sitter::Node> = child
+            .children(&mut ec)
+            .filter(|c| !matches!(c.kind(), "=>" | "comment"))
+            .collect();
+        // Keyed entry: [key, value]. Bare list entry: [value] — no key.
+        if exprs.len() != 2 {
+            continue;
+        }
+        if let Some(key) = string_literal_text(exprs[0], bytes) {
+            out.push(key);
+        }
+    }
+}
+
+/// Parse a PHP array literal containing string values only — e.g.
+/// `['name', 'email', 'created_at']` — into the contained string
+/// values in source order. Used to extract `$fillable`, `$dates`,
+/// and similar list-shaped Eloquent properties.
+///
+/// Accepts both forms:
+/// - Inner text (`"'name', 'email'"`)
+/// - Full expression (`"['name', 'email']"`)
+///
+/// Non-string entries (constants, expressions) are silently skipped
+/// — Laravel's `$fillable` / `$dates` are well-shaped in practice
+/// and any unexpected entry just won't contribute a column.
+pub fn parse_string_array_public(expr: &str) -> Vec<String> {
+    let inner = array_literal_inner(expr).unwrap_or(expr);
+    let wrapped = format!("<?php $x = [{}];", inner);
+    let Ok(tree) = crate::parser::parse_php(&wrapped) else {
+        return Vec::new();
+    };
+    let bytes = wrapped.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    walk_for_first_string_array(tree.root_node(), bytes, &mut out);
+    out
+}
+
+fn walk_for_first_string_array(node: tree_sitter::Node, bytes: &[u8], out: &mut Vec<String>) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "array_creation_expression" {
+            collect_string_entries(child, bytes, out);
+            return true;
+        }
+        if walk_for_first_string_array(child, bytes, out) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_string_entries(arr: tree_sitter::Node, bytes: &[u8], out: &mut Vec<String>) {
+    let mut cursor = arr.walk();
+    for child in arr.children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        // For un-keyed list entries, `array_element_initializer` has
+        // exactly one expression child — the value.
+        let mut ec = child.walk();
+        let exprs: Vec<tree_sitter::Node> = child
+            .children(&mut ec)
+            .filter(|c| !matches!(c.kind(), "=>" | "comment"))
+            .collect();
+        // Either bare `'foo'` (1 child) — take it; or keyed entries
+        // (2 children, `key => value`) — skip, this isn't the
+        // shape we're parsing.
+        if exprs.len() != 1 {
+            continue;
+        }
+        if let Some(text) = string_literal_text(exprs[0], bytes) {
+            out.push(text);
+        }
+    }
+}
+
 pub fn parse_cast_array_public(expr: &str) -> std::collections::HashMap<String, String> {
     let inner = array_literal_inner(expr).unwrap_or(expr);
     let wrapped = format!("<?php $x = [{}];", inner);

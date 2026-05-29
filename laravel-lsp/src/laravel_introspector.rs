@@ -42,8 +42,9 @@ pub mod walker;
 // Core analysis API.
 pub use chain::{
     analyze, analyze_content, extends_eloquent_model, AccessorInfo, BuilderMethod, ClassView,
-    LaravelClassKind, RelationshipInfo, ResolvedMember, ScopeInfo, ScopeStyle,
-    ELOQUENT_BUILDER_FQCN, ELOQUENT_MODEL_FQCN, QUERY_BUILDER_FQCN, SCOPE_ATTRIBUTE_FQCN,
+    ColumnInfo, ColumnSource, LaravelClassKind, RelationshipInfo, ResolvedMember, ScopeInfo,
+    ScopeStyle, AUTHENTICATABLE_TRAIT_FQCN, ELOQUENT_BUILDER_FQCN, ELOQUENT_MODEL_FQCN,
+    FOUNDATION_AUTH_USER_FQCN, QUERY_BUILDER_FQCN, SCOPE_ATTRIBUTE_FQCN, SOFT_DELETES_FQCN,
 };
 
 // Model metadata API + utilities. The `*Info` types come from `chain`;
@@ -53,7 +54,7 @@ pub use chain::{
 // canonical ones in `chain`.
 pub use model_metadata::{
     extract_namespace, extract_use_aliases, map_cast_to_php_type, parse_cast_array,
-    pascal_to_snake, relationship_to_php_type, resolve_to_fqcn, ModelMetadata,
+    parse_string_array, pascal_to_snake, relationship_to_php_type, resolve_to_fqcn, ModelMetadata,
 };
 // Compatibility re-exports of the historical `AccessorInfo` /
 // `RelationshipInfo` shapes that some call sites import from this

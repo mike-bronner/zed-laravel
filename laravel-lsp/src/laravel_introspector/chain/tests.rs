@@ -331,3 +331,315 @@ class Builder {
         .expect("where should be in callstatic surface");
     assert_eq!(where_method.return_type.as_deref(), Some("Builder<static>"));
 }
+
+// ---- Column-surface computation (Phase 3, source-derived path) ---------
+
+/// Helper: turn a column_surface into a `name → (php_type, source)`
+/// map so individual assertions stay readable.
+fn cols(view: &ClassView) -> std::collections::HashMap<String, (String, ColumnSource)> {
+    view.column_surface
+        .iter()
+        .map(|c| (c.name.clone(), (c.php_type.clone(), c.source)))
+        .collect()
+}
+
+#[test]
+fn conventional_columns_present_on_bare_model() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("id"),
+        Some(&("int".to_string(), ColumnSource::Convention))
+    );
+    assert_eq!(
+        map.get("created_at"),
+        Some(&("Carbon".to_string(), ColumnSource::Convention))
+    );
+    assert_eq!(
+        map.get("updated_at"),
+        Some(&("Carbon".to_string(), ColumnSource::Convention))
+    );
+}
+
+#[test]
+fn timestamps_false_suppresses_created_and_updated_at() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    public $timestamps = false;
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let names: Vec<&str> = view.column_surface.iter().map(|c| c.name.as_str()).collect();
+    assert!(!names.contains(&"created_at"), "got: {names:?}");
+    assert!(!names.contains(&"updated_at"), "got: {names:?}");
+    // `id` convention still fires.
+    assert!(names.contains(&"id"));
+}
+
+#[test]
+fn fillable_columns_pick_up_conventional_types() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $fillable = ['name', 'user_id', 'published_at', 'description'];
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("name"),
+        Some(&("mixed".to_string(), ColumnSource::Fillable))
+    );
+    assert_eq!(
+        map.get("user_id"),
+        Some(&("int".to_string(), ColumnSource::Fillable))
+    );
+    assert_eq!(
+        map.get("published_at"),
+        Some(&("Carbon".to_string(), ColumnSource::Fillable))
+    );
+    assert_eq!(
+        map.get("description"),
+        Some(&("mixed".to_string(), ColumnSource::Fillable))
+    );
+}
+
+#[test]
+fn casts_beat_fillable_on_name_collision() {
+    // `options` appears in both — the cast's explicit `array` type should
+    // win over the fillable's conventional `mixed`. This is the
+    // motivating case for cast-first iteration in compute_column_surface.
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $fillable = ['options', 'name'];
+    protected $casts = ['options' => 'array'];
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("options"),
+        Some(&("array".to_string(), ColumnSource::Cast)),
+        "cast should win over fillable for `options`"
+    );
+    // `name` only in fillable.
+    assert_eq!(
+        map.get("name"),
+        Some(&("mixed".to_string(), ColumnSource::Fillable))
+    );
+}
+
+#[test]
+fn legacy_dates_array_adds_carbon_columns() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $dates = ['scheduled_at', 'published_on'];
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("scheduled_at"),
+        Some(&("Carbon".to_string(), ColumnSource::Dates))
+    );
+    assert_eq!(
+        map.get("published_on"),
+        Some(&("Carbon".to_string(), ColumnSource::Dates))
+    );
+}
+
+#[test]
+fn attributes_array_keys_become_columns() {
+    let (dir, path) = fixture(
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Portfolio extends Model {
+    protected $attributes = [
+        'status' => 'draft',
+        'is_featured' => false,
+    ];
+}
+"#,
+    );
+    let view = analyze(&path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("status"),
+        Some(&("mixed".to_string(), ColumnSource::Attributes))
+    );
+    assert_eq!(
+        map.get("is_featured"),
+        Some(&("mixed".to_string(), ColumnSource::Attributes))
+    );
+}
+
+#[test]
+fn soft_deletes_trait_adds_deleted_at() {
+    // Stand up a minimal SoftDeletes trait file in the vendor PSR-4 path
+    // so the walker can compose it in. The trait body doesn't have to be
+    // real — just needs the right FQCN so chain_contains fires.
+    let dir = TempDir::new().unwrap();
+    let model_path = dir.path().join("app/Models/Portfolio.php");
+    fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    fs::write(
+        &model_path,
+        r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
+class Portfolio extends Model {
+    use SoftDeletes;
+}
+"#,
+    )
+    .unwrap();
+
+    // class_locator's vendor heuristic looks at
+    // `vendor/<vendor>/<package>/src/<rest>/<Class>.php` where vendor +
+    // package come from the first two FQCN segments lowercased. For
+    // `Illuminate\Database\Eloquent\SoftDeletes` that resolves to
+    // `vendor/illuminate/database/src/Eloquent/SoftDeletes.php`. The
+    // real Laravel monorepo lives at `vendor/laravel/framework/...`
+    // which only resolves via Composer's installed.json — out of
+    // scope for these unit tests, so we use the heuristic-friendly
+    // layout instead.
+    let trait_path = dir
+        .path()
+        .join("vendor/illuminate/database/src/Eloquent/SoftDeletes.php");
+    fs::create_dir_all(trait_path.parent().unwrap()).unwrap();
+    fs::write(
+        &trait_path,
+        r#"<?php
+namespace Illuminate\Database\Eloquent;
+trait SoftDeletes {
+    public function trashed() { return false; }
+}
+"#,
+    )
+    .unwrap();
+
+    let composer = r#"{
+        "autoload": { "psr-4": { "App\\": "app/" } }
+    }"#;
+    fs::write(dir.path().join("composer.json"), composer).unwrap();
+
+    let view = analyze(&model_path, dir.path()).unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("deleted_at"),
+        Some(&("Carbon".to_string(), ColumnSource::Trait)),
+        "SoftDeletes should add deleted_at; got cols: {:?}",
+        view.column_surface
+    );
+}
+
+#[test]
+fn authenticatable_parent_adds_canonical_auth_columns() {
+    // Stand up Foundation\Auth\User so the walker can compose it in via
+    // `extends Authenticatable`. The body of Authenticatable doesn't
+    // matter; only the FQCN provenance on inherited members does.
+    let dir = TempDir::new().unwrap();
+    let model_path = dir.path().join("app/Models/User.php");
+    fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    fs::write(
+        &model_path,
+        r#"<?php
+namespace App\Models;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+class User extends Authenticatable {}
+"#,
+    )
+    .unwrap();
+
+    // Heuristic-friendly layout — see SoftDeletes test comment for why
+    // we don't use the real laravel/framework monorepo path.
+    let auth_path = dir
+        .path()
+        .join("vendor/illuminate/foundation/src/Auth/User.php");
+    fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+    fs::write(
+        &auth_path,
+        r#"<?php
+namespace Illuminate\Foundation\Auth;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function whoami() { return static::class; }
+}
+"#,
+    )
+    .unwrap();
+
+    let composer = r#"{
+        "autoload": { "psr-4": { "App\\": "app/" } }
+    }"#;
+    fs::write(dir.path().join("composer.json"), composer).unwrap();
+
+    let view = analyze(&model_path, dir.path()).unwrap();
+    let map = cols(&view);
+    for (col, ty) in [
+        ("email", "string"),
+        ("email_verified_at", "Carbon"),
+        ("password", "string"),
+        ("remember_token", "string"),
+        ("name", "string"),
+    ] {
+        assert_eq!(
+            map.get(col),
+            Some(&(ty.to_string(), ColumnSource::ParentClass)),
+            "{col} should come from Authenticatable parent; got cols: {:?}",
+            view.column_surface
+        );
+    }
+}
+
+#[test]
+fn analyze_content_also_populates_column_surface() {
+    // Single-file path (no inheritance walk) should still pull in
+    // $fillable + casts + conventions. SoftDeletes / Authenticatable
+    // can't be detected here (no parent walk), which matches the
+    // documented "limited" behaviour of analyze_content.
+    let view = analyze_content(
+        r#"
+namespace App\Models;
+class Portfolio {
+    protected $fillable = ['name'];
+    protected $casts = ['meta' => 'json'];
+}
+"#,
+    )
+    .unwrap();
+    let map = cols(&view);
+    assert_eq!(
+        map.get("name"),
+        Some(&("mixed".to_string(), ColumnSource::Fillable))
+    );
+    assert_eq!(
+        map.get("meta"),
+        Some(&("array".to_string(), ColumnSource::Cast))
+    );
+    assert!(map.contains_key("id"));
+    assert!(map.contains_key("created_at"));
+}

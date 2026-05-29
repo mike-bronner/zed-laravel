@@ -58,6 +58,9 @@ pub const ELOQUENT_MODEL_FQCN: &str = "Illuminate\\Database\\Eloquent\\Model";
 pub const ELOQUENT_BUILDER_FQCN: &str = "Illuminate\\Database\\Eloquent\\Builder";
 pub const QUERY_BUILDER_FQCN: &str = "Illuminate\\Database\\Query\\Builder";
 pub const SCOPE_ATTRIBUTE_FQCN: &str = "Illuminate\\Database\\Eloquent\\Attributes\\Scope";
+pub const SOFT_DELETES_FQCN: &str = "Illuminate\\Database\\Eloquent\\SoftDeletes";
+pub const AUTHENTICATABLE_TRAIT_FQCN: &str = "Illuminate\\Auth\\Authenticatable";
+pub const FOUNDATION_AUTH_USER_FQCN: &str = "Illuminate\\Foundation\\Auth\\User";
 
 /// What kind of Laravel class this is. Drives which fields on
 /// [`ClassView`] are populated — there's no `scopes` on a
@@ -121,6 +124,53 @@ pub enum ScopeStyle {
     Prefix,
     /// `#[Scope] public function active(...)`.
     Attribute,
+}
+
+/// A database column known about this model at the source level —
+/// i.e. derivable from the model's own PHP source (`$fillable`,
+/// `$casts`, `$dates`, `$attributes`), its trait composition
+/// (`SoftDeletes` implies `deleted_at`), or Laravel's hard
+/// conventions (`id`, `created_at`, `updated_at`).
+///
+/// Drives Phase 3 dynamic `where{Column}` completion-item synthesis.
+/// The DB schema can supplement this when the source surface is
+/// sparse (`$guarded = []` models that declare nothing) — that
+/// fallback happens at the emission site, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ColumnInfo {
+    /// snake_case column name as it appears in the DB / migration.
+    pub name: String,
+    /// PHP type a user typing `where{Column}($value)` should pass.
+    /// `string`, `int`, `bool`, `float`, `array`, `Carbon`, or
+    /// `mixed` when we have no signal.
+    pub php_type: String,
+    /// Where this column knowledge came from. Surfaces in the
+    /// completion doc panel as a brief provenance line.
+    pub source: ColumnSource,
+}
+
+/// Provenance signal for a [`ColumnInfo`]. Each variant maps to a
+/// distinct extraction path so the doc panel can show *why* we
+/// believe this column exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColumnSource {
+    /// Listed in the model's `$fillable` array.
+    Fillable,
+    /// Listed as a key in the model's `$casts` array (or
+    /// `casts()` method on Laravel 11+).
+    Cast,
+    /// Listed in the legacy `$dates` array.
+    Dates,
+    /// Listed as a key in the model's `$attributes` (defaults) array.
+    Attributes,
+    /// Laravel hard convention: `id`, `created_at`, `updated_at`.
+    Convention,
+    /// Implied by a composed trait — e.g. `SoftDeletes` adds
+    /// `deleted_at`.
+    Trait,
+    /// Implied by a parent class — e.g. `Authenticatable` adds
+    /// `email_verified_at`, `remember_token`, `password`.
+    ParentClass,
 }
 
 /// Eloquent accessor — `getXxxAttribute(): Type` (old-style) or a
@@ -211,6 +261,12 @@ pub struct ClassView {
     /// Explicit `$table = '...'`. `None` for non-models or when
     /// implicit naming applies.
     pub table_name: Option<String>,
+    /// Source-derived column surface — every column this model
+    /// can be reasoned about without touching the DB. Drives
+    /// Phase 3 dynamic `where{Column}` item synthesis. Empty for
+    /// non-models or `$guarded = []` models that declare nothing
+    /// (the emission site falls back to the DB schema for those).
+    pub column_surface: Vec<ColumnInfo>,
 
     // ---- Builder-specific surface ----
 
@@ -286,6 +342,8 @@ fn analyze_from_prefixed(content: &str) -> Option<ClassView> {
         })
         .collect();
 
+    let casts = compute_casts(&all_methods, &all_properties);
+    let column_surface = compute_column_surface(&all_methods, &all_properties, &casts);
     Some(ClassView {
         file_path: PathBuf::new(),
         fqcn,
@@ -296,8 +354,9 @@ fn analyze_from_prefixed(content: &str) -> Option<ClassView> {
         scopes: compute_scopes(&all_methods, &aliases, &namespace),
         accessors: compute_accessors(&all_methods),
         relationships: compute_relationships(&all_methods, &aliases, namespace.as_deref()),
-        casts: compute_casts(&all_methods, &all_properties),
+        casts,
         table_name: compute_table_name(&all_properties),
+        column_surface,
         callstatic_surface: Vec::new(),
         all_methods,
         all_properties,
@@ -366,6 +425,7 @@ pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
     let relationships = compute_relationships(&all_methods, &aliases, namespace.as_deref());
     let casts = compute_casts(&all_methods, &all_properties);
     let table_name = compute_table_name(&all_properties);
+    let column_surface = compute_column_surface(&all_methods, &all_properties, &casts);
     let callstatic_surface = match kind {
         LaravelClassKind::EloquentBuilder | LaravelClassKind::QueryBuilder => {
             compute_callstatic_surface(&all_methods, &fqcn)
@@ -387,6 +447,7 @@ pub fn analyze(file_path: &Path, project_root: &Path) -> Option<ClassView> {
         relationships,
         casts,
         table_name,
+        column_surface,
         callstatic_surface,
     })
 }
@@ -794,6 +855,233 @@ fn compute_casts(
         }
     }
     casts
+}
+
+// ---- Column-surface computation ----------------------------------------
+
+/// Build the source-derived column surface for a model. Combines every
+/// signal the walker has about which columns this model knows:
+/// `$fillable` / `$casts` / `$dates` / `$attributes` arrays, the
+/// SoftDeletes / Authenticatable trait + parent implications, and
+/// Laravel's hard conventions (`id`, `created_at`, `updated_at` unless
+/// `$timestamps = false`).
+///
+/// First-seen-wins on column-name collision so cast-typed entries
+/// beat untyped `$fillable` mentions (you'd want
+/// `whereOptions(array $v)` from `'options' => 'array'`, not
+/// `whereOptions(mixed $v)` from the bare `'options'` in `$fillable`).
+///
+/// Returns an empty vector for non-models (the caller's emission path
+/// already gates on `extends_eloquent_model`, so non-empty surfaces
+/// here mean a real Model).
+fn compute_column_surface(
+    methods: &[ResolvedMember<PhpMethodInfo>],
+    properties: &[ResolvedMember<PhpPropertyInfo>],
+    casts: &HashMap<String, String>,
+) -> Vec<ColumnInfo> {
+    let mut columns: Vec<ColumnInfo> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let add = |name: String, php_type: String, source: ColumnSource,
+               columns: &mut Vec<ColumnInfo>,
+               seen: &mut HashSet<String>| {
+        if seen.insert(name.clone()) {
+            columns.push(ColumnInfo {
+                name,
+                php_type,
+                source,
+            });
+        }
+    };
+
+    // Casts come first — their types are explicit and beat any
+    // weaker signal (e.g. an untyped `$fillable` mention of the
+    // same column).
+    let mut cast_keys: Vec<&String> = casts.keys().collect();
+    cast_keys.sort();
+    for key in cast_keys {
+        let php_type =
+            crate::laravel_introspector::model_metadata::map_cast_to_php_type(&casts[key]);
+        add(
+            key.clone(),
+            php_type,
+            ColumnSource::Cast,
+            &mut columns,
+            &mut seen,
+        );
+    }
+
+    // `$fillable` — list of strings, no types. Default each to a
+    // conventional type based on column name.
+    for prop in properties.iter().filter(|p| p.value.name == "fillable") {
+        if let Some(default) = prop.value.default_value.as_deref() {
+            for name in
+                crate::laravel_introspector::model_metadata::parse_string_array_public(default)
+            {
+                let php_type = conventional_php_type(&name);
+                add(
+                    name,
+                    php_type,
+                    ColumnSource::Fillable,
+                    &mut columns,
+                    &mut seen,
+                );
+            }
+        }
+    }
+
+    // `$dates` (legacy) — list of strings, all dates.
+    for prop in properties.iter().filter(|p| p.value.name == "dates") {
+        if let Some(default) = prop.value.default_value.as_deref() {
+            for name in
+                crate::laravel_introspector::model_metadata::parse_string_array_public(default)
+            {
+                add(
+                    name,
+                    "Carbon".to_string(),
+                    ColumnSource::Dates,
+                    &mut columns,
+                    &mut seen,
+                );
+            }
+        }
+    }
+
+    // `$attributes` — keyed array of defaults. Keys are column names;
+    // values may be bool/int/null/expression so we use a key-only
+    // parser that doesn't care about value shape.
+    for prop in properties.iter().filter(|p| p.value.name == "attributes") {
+        if let Some(default) = prop.value.default_value.as_deref() {
+            for key in
+                crate::laravel_introspector::model_metadata::parse_array_keys_public(default)
+            {
+                let php_type = conventional_php_type(&key);
+                add(
+                    key,
+                    php_type,
+                    ColumnSource::Attributes,
+                    &mut columns,
+                    &mut seen,
+                );
+            }
+        }
+    }
+
+    // SoftDeletes trait → `deleted_at` (datetime). Detected by
+    // looking for any inherited member whose source_class is the
+    // SoftDeletes trait — `walk_class_chain` stamps trait FQCN onto
+    // members it composes in.
+    if chain_contains(methods, properties, SOFT_DELETES_FQCN) {
+        add(
+            "deleted_at".to_string(),
+            "Carbon".to_string(),
+            ColumnSource::Trait,
+            &mut columns,
+            &mut seen,
+        );
+    }
+
+    // Authenticatable trait / Foundation\Auth\User parent →
+    // adds the canonical auth columns. Both signals point at the
+    // same column set; we only need one to fire.
+    if chain_contains(methods, properties, AUTHENTICATABLE_TRAIT_FQCN)
+        || chain_contains(methods, properties, FOUNDATION_AUTH_USER_FQCN)
+    {
+        for (name, ty) in [
+            ("name", "string"),
+            ("email", "string"),
+            ("email_verified_at", "Carbon"),
+            ("password", "string"),
+            ("remember_token", "string"),
+        ] {
+            add(
+                name.to_string(),
+                ty.to_string(),
+                ColumnSource::ParentClass,
+                &mut columns,
+                &mut seen,
+            );
+        }
+    }
+
+    // Laravel conventions. `id` is always present unless explicitly
+    // suppressed (which we don't try to detect — opt-out is rare and
+    // the worst case is one spurious `whereId` item that PHP would
+    // still resolve via Builder's `whereId`-routed dynamicWhere).
+    add(
+        "id".to_string(),
+        "int".to_string(),
+        ColumnSource::Convention,
+        &mut columns,
+        &mut seen,
+    );
+
+    // Timestamps default-on; only suppress when `$timestamps = false`
+    // appears as a property default. We don't bother with the rare
+    // `public $timestamps = false;` static-equivalent forms — those
+    // are exotic enough that a false positive is acceptable.
+    if !timestamps_disabled(properties) {
+        add(
+            "created_at".to_string(),
+            "Carbon".to_string(),
+            ColumnSource::Convention,
+            &mut columns,
+            &mut seen,
+        );
+        add(
+            "updated_at".to_string(),
+            "Carbon".to_string(),
+            ColumnSource::Convention,
+            &mut columns,
+            &mut seen,
+        );
+    }
+
+    columns
+}
+
+/// Heuristic PHP type for a column name absent stronger signal.
+/// Laravel's conventions: `id` and `*_id` are integers (foreign keys),
+/// `*_at` columns are datetimes (Laravel auto-casts timestamps), and
+/// everything else is `mixed` — we don't try to infer from prefixes
+/// like `is_` / `has_` because those aren't auto-cast by Laravel and
+/// guessing wrong is worse than `mixed`.
+fn conventional_php_type(column: &str) -> String {
+    if column == "id" || column.ends_with("_id") {
+        return "int".to_string();
+    }
+    if column.ends_with("_at") {
+        return "Carbon".to_string();
+    }
+    "mixed".to_string()
+}
+
+/// Returns true when any inherited member's `source_class` matches
+/// `target_fqcn`. Cheaper than re-walking the chain — the methods
+/// and properties lists already carry the FQCN provenance we need.
+fn chain_contains(
+    methods: &[ResolvedMember<PhpMethodInfo>],
+    properties: &[ResolvedMember<PhpPropertyInfo>],
+    target_fqcn: &str,
+) -> bool {
+    methods.iter().any(|m| m.source_class == target_fqcn)
+        || properties.iter().any(|p| p.source_class == target_fqcn)
+}
+
+/// Returns true when the model declares `public $timestamps = false`
+/// (or any visibility). Conservative — only the literal `false` value
+/// counts; `$timestamps = SomeConst::FALSE` and other indirections are
+/// treated as "timestamps on" (the dominant case).
+fn timestamps_disabled(properties: &[ResolvedMember<PhpPropertyInfo>]) -> bool {
+    properties
+        .iter()
+        .filter(|p| p.value.name == "timestamps")
+        .any(|p| {
+            p.value
+                .default_value
+                .as_deref()
+                .is_some_and(|v| v.trim() == "false")
+        })
 }
 
 // ---- Table-name computation --------------------------------------------

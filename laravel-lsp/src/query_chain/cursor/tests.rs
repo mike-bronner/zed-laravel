@@ -69,6 +69,18 @@ fn target_returns_dotted_relation_value() {
     ));
 }
 
+#[test]
+fn target_resolves_array_element_under_cursor() {
+    // Goto on an element inside an array arg resolves that element (the cursor
+    // resolver recurses into arrays).
+    let t = detect_target("User::with(['posts', 'comm|ents']);").expect("target");
+    assert_eq!(t.value, "comments");
+    assert!(matches!(
+        t.ctx.expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier
+    ));
+}
+
 // ---- fixup_for_completion ---------------------------------------------
 
 #[test]

@@ -220,6 +220,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 class User extends Model {
     public function posts() { return $this->hasMany(Post::class); }
+    public function comments() { return $this->hasMany(Comment::class); }
     public function scopeWhereActive($query) { return $query->where('status', 'active'); }
 }
 "#;
@@ -806,4 +807,90 @@ async fn dynamic_where_data_carries_studly_replacement_and_method_label() {
     assert_eq!(data["replacement"], "Email"); // studly, inserted into the method
     assert_eq!(data["replacementLabel"], "whereEmail"); // shown in the action title
     assert_eq!(data["table"], "users");
+}
+
+// ---- array-form args ------------------------------------------------------
+
+#[tokio::test]
+async fn array_relation_flags_unknown_element() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    // posts + comments exist; postss is a typo.
+    let source =
+        "<?php\nuse App\\Models\\User;\nUser::with(['posts', 'postss', 'comments'])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(diags.len(), 1, "only the typo should flag: {diags:?}");
+    assert!(diags[0].message.contains("postss"));
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_RELATION);
+}
+
+#[tokio::test]
+async fn keyed_relation_array_validates_the_key() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    // `with(['rel' => closure])` — the key is the relation name.
+    let source = "<?php\nuse App\\Models\\User;\nUser::with(['postss' => function ($q) { return $q; }])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(diags.len(), 1, "keyed relation key should flag: {diags:?}");
+    assert!(diags[0].message.contains("postss"));
+}
+
+#[tokio::test]
+async fn array_select_flags_unknown_column() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::select(['id', 'emial', 'email'])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "only the typo column should flag: {diags:?}"
+    );
+    assert!(diags[0].message.contains("emial"));
+}
+
+#[tokio::test]
+async fn array_select_skips_aliased_and_qualified_elements() {
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source =
+        "<?php\nuse App\\Models\\User;\nUser::select(['id', 'name as n', 'users.id'])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "aliased/qualified elements must be skipped: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn where_array_values_are_not_flagged() {
+    // `where(['email' => 'somevalue'])` — the array holds a `col => value`
+    // pair. We don't descend `where`-family arrays, so neither the key nor the
+    // value is validated (the value side would otherwise false-positive).
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::where(['email' => 'somevalue'])->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "where-array values must not be flagged: {diags:?}"
+    );
 }

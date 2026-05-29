@@ -20,13 +20,13 @@
 //! - **Non-identifier literals** — qualified columns (`users.id`), expressions
 //!   (`count(*)`), aliases (`name as n`), wildcards (`*`) — are skipped via the
 //!   [`is_simple_identifier`] guard. A bare typo like `emial` is what we catch.
-//! - **Alias-defining methods** (`select`, `addSelect`, `having`) are not
-//!   diagnosed: their string args are routinely aliases or raw fragments.
-//! - **Array-form args** (`with(['a', 'b'])`, `select(['x'])`) are not yet
-//!   diagnosed — only the first *top-level* string literal of a call is
-//!   checked. Catching the canonical `with('postss')` / `where('emial')` forms
-//!   without risking the keyed-array `where(['col' => 'val'])` false-positive.
-//!   Array coverage is a deliberate follow-up.
+//! - **`having`** is not diagnosed: it filters on aggregate aliases where a
+//!   bare identifier is routinely not a real column. (`select`/`addSelect` ARE
+//!   diagnosed — the identifier guard skips their alias/qualified forms.)
+//! - **Array-form args** are diagnosed for list methods: `with(['a', 'b'])`,
+//!   `select(['x', 'y'])`, and keyed relations `with(['rel' => $closure])`. But
+//!   `where`-family arrays are NOT descended — they hold values / `col => value`
+//!   pairs, and validating the value side would false-positive.
 //!
 //! Raw-SQL methods (`whereRaw`, `selectRaw`, …) never reach here: the method
 //! classifier assigns them [`ArgKind::None`], so their links carry no
@@ -136,22 +136,13 @@ pub async fn chain_diagnostics(
                 ArgKind::None => continue,
             };
 
-            // The literal under inspection: the FIRST top-level string arg.
-            // (Operators / values in `where('col', '=', 'x')` are 2nd+ args and
-            // never validated; array args are skipped entirely.)
-            let Some((value, lit_span)) = first_string_arg(link) else {
-                continue;
-            };
-
-            // The segment we actually validate. Relations may be dotted
-            // (`posts.author`): the prefix is walked as hops, the LAST segment
-            // is the name to check.
-            let needle = match kind {
-                DiagKind::Relation => value.rsplit('.').next().unwrap_or(&value),
-                DiagKind::Column | DiagKind::Table => value.as_str(),
-            };
-            if !is_simple_identifier(needle) {
-                // Qualified / expression / aliased / wildcard — stay quiet.
+            // The literal(s) to validate. Most methods validate a single
+            // leading string; list methods (`select`, `with(['a','b'])`, …)
+            // validate every array element too. `where`-family arrays are
+            // values/`col => value` pairs, so they're never descended (the
+            // value side would false-positive).
+            let targets = collect_targets(link, kind);
+            if targets.is_empty() {
                 continue;
             }
 
@@ -159,39 +150,67 @@ pub async fn chain_diagnostics(
             // the effects of preceding links. This lints each method call on
             // its own; it does NOT depend on the chain being "finished" (a
             // terminator like `->get()`), nor on cursor/completion semantics.
-            let Some(ctx) = chain_context_for_link(chains, chain, idx) else {
+            let Some(base_ctx) = chain_context_for_link(chains, chain, idx) else {
                 continue;
             };
-            let Some(mut ctx) = finalize_context(ctx, project_root).await else {
+            let Some(base_ctx) = finalize_context(base_ctx, project_root).await else {
                 continue;
             };
-            // For dotted relations, the prefix is the hops to walk before
-            // listing the final model's relations (`chain_context_for_link`
-            // doesn't compute this — it's derived from the literal here).
-            if kind == DiagKind::Relation {
-                ctx.dotted_prefix = value.rfind('.').map(|i| value[..i].to_string());
-            }
 
-            // The legal set to check against, plus the message subject
-            // ("table \"users\"" or the model FQCN).
-            let Some((legal, subject)) = legal_names(kind, &ctx, db, project_root).await else {
-                continue; // resolution gap / schema not loaded — stay quiet
-            };
-            if legal.iter().any(|name| name == needle) {
-                continue; // valid — no diagnostic
+            match kind {
+                // Columns/tables share one legal set across all targets (no
+                // per-element hop), so resolve it once.
+                DiagKind::Column | DiagKind::Table => {
+                    let Some((legal, subject)) =
+                        legal_names(kind, &base_ctx, db, project_root).await
+                    else {
+                        continue; // resolution gap / schema not loaded — stay quiet
+                    };
+                    for (value, span) in targets {
+                        if !is_simple_identifier(&value) {
+                            continue; // qualified / expression / aliased / wildcard
+                        }
+                        if legal.iter().any(|name| name == &value) {
+                            continue; // valid
+                        }
+                        let suggestion = best_suggestion(&value, &legal);
+                        out.push(make_diagnostic(
+                            kind, &value, &subject, suggestion, span, &value, content, severity,
+                        ));
+                    }
+                }
+                // Relations can be dotted per element (`with(['posts.author',
+                // 'comments'])`), so the legal set is resolved per target.
+                DiagKind::Relation => {
+                    for (value, span) in targets {
+                        let needle = value.rsplit('.').next().unwrap_or(&value);
+                        if !is_simple_identifier(needle) {
+                            continue;
+                        }
+                        let mut ctx = base_ctx.clone();
+                        ctx.dotted_prefix = value.rfind('.').map(|i| value[..i].to_string());
+                        let Some((legal, subject)) =
+                            legal_names(DiagKind::Relation, &ctx, db, project_root).await
+                        else {
+                            continue;
+                        };
+                        if legal.iter().any(|name| name == needle) {
+                            continue;
+                        }
+                        let suggestion = best_suggestion(needle, &legal);
+                        out.push(make_diagnostic(
+                            DiagKind::Relation,
+                            needle,
+                            &subject,
+                            suggestion,
+                            span,
+                            &value,
+                            content,
+                            severity,
+                        ));
+                    }
+                }
             }
-
-            let suggestion = best_suggestion(needle, &legal);
-            out.push(make_diagnostic(
-                kind,
-                needle,
-                &subject,
-                suggestion,
-                lit_span,
-                value.as_str(),
-                content,
-                severity,
-            ));
         }
     }
 
@@ -626,6 +645,86 @@ fn make_dynamic_where_diagnostic(
         message,
         data: Some(data),
         ..Default::default()
+    }
+}
+
+/// Column methods that take a *list* of columns rather than a single column
+/// followed by operator/value args. Their positional string args AND array
+/// elements are all columns. `where`-family methods are excluded: their arrays
+/// are values or `col => value` pairs, and their 2nd+ args are operators/values.
+const COLUMN_LIST_METHODS: &[&str] = &["select", "addSelect", "groupBy"];
+
+/// The literal(s) to validate for a link, as `(value, span)` (span includes
+/// quotes). Method-aware so we never validate a `where(...)` value or a
+/// `whereHas(...)` operator:
+///
+/// - **Table** / **where-family column**: the first top-level string only.
+/// - **Column list methods** (`select`/`addSelect`/`groupBy`): every top-level
+///   string AND every string element of array args.
+/// - **Relation**: the first argument only (a string, or the string elements of
+///   an array like `with(['a', 'b'])` / `with(['rel' => $closure])`) — never the
+///   2nd+ args, which are closures/operators.
+fn collect_targets(link: &ChainLink, kind: DiagKind) -> Vec<(String, (usize, usize))> {
+    match kind {
+        DiagKind::Table => first_string_arg(link).into_iter().collect(),
+        DiagKind::Relation => relation_targets(link),
+        DiagKind::Column => {
+            if COLUMN_LIST_METHODS.contains(&link.method.as_str()) {
+                column_list_targets(link)
+            } else {
+                first_string_arg(link).into_iter().collect()
+            }
+        }
+    }
+}
+
+/// Relation targets: the first arg only. A `StringLit` → that one; an `Array`
+/// → its string elements (plain `'rel'` entries and keyed `'rel' => …` keys).
+fn relation_targets(link: &ChainLink) -> Vec<(String, (usize, usize))> {
+    match link.args.first() {
+        Some(ChainArg::StringLit {
+            value,
+            span_byte_range,
+            ..
+        }) => vec![(value.clone(), *span_byte_range)],
+        Some(arr @ ChainArg::Array { .. }) => array_string_elements(arr),
+        _ => Vec::new(),
+    }
+}
+
+/// Column-list targets: every top-level string arg plus every string element of
+/// any array arg (`select('a', 'b')`, `select(['a', 'b'])`).
+fn column_list_targets(link: &ChainLink) -> Vec<(String, (usize, usize))> {
+    let mut out = Vec::new();
+    for arg in &link.args {
+        match arg {
+            ChainArg::StringLit {
+                value,
+                span_byte_range,
+                ..
+            } => out.push((value.clone(), *span_byte_range)),
+            ChainArg::Array { .. } => out.extend(array_string_elements(arg)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The top-level string elements of an `Array` arg, as `(value, span)`.
+fn array_string_elements(arg: &ChainArg) -> Vec<(String, (usize, usize))> {
+    match arg {
+        ChainArg::Array { elements, .. } => elements
+            .iter()
+            .filter_map(|e| match e {
+                ChainArg::StringLit {
+                    value,
+                    span_byte_range,
+                    ..
+                } => Some((value.clone(), *span_byte_range)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

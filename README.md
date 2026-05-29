@@ -50,6 +50,9 @@ The extension works out of the box with zero configuration. It automatically dis
         "autoCompleteDebounce": 200,
         "blade": {
           "directiveSpacing": false
+        },
+        "diagnostics": {
+          "severity": "warning"
         }
       }
     }
@@ -61,6 +64,7 @@ The extension works out of the box with zero configuration. It automatically dis
 |---------|---------|-------------|
 | `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates after typing. Lower values (50-100ms) give faster feedback. Higher values (300-500ms) reduce CPU usage. |
 | `blade.directiveSpacing` | `false` | Add space between directive name and parentheses. `false`: `@if($condition)` / `true`: `@if ($condition)` |
+| `diagnostics.severity` | `"warning"` | Severity for query-chain diagnostics (unknown column/relation/table in Eloquent & `DB::table()` chains). One of `"warning"`, `"error"`, `"info"`, or `"off"` to disable. Requires a working database connection — diagnostics stay silent when the schema can't be introspected. |
 
 **🗄️ Database autocomplete** (`exists:`, `unique:` rules, Eloquent properties) requires a working database connection. Configure in your `.env`:
 

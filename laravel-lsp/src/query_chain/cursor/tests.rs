@@ -768,3 +768,68 @@ fn find_chain_containing_picks_innermost() {
         other => panic!("expected $q's chain, got {other:?}"),
     }
 }
+
+// ---- byte_offset_to_position ----------------------------------------------
+
+#[test]
+fn byte_offset_to_position_first_line() {
+    let content = "abc\ndef";
+    assert_eq!(
+        byte_offset_to_position(content, 0),
+        tower_lsp::lsp_types::Position {
+            line: 0,
+            character: 0
+        }
+    );
+    assert_eq!(
+        byte_offset_to_position(content, 2),
+        tower_lsp::lsp_types::Position {
+            line: 0,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn byte_offset_to_position_after_newline() {
+    let content = "abc\ndef";
+    // Byte 4 is 'd' on line 1, column 0.
+    assert_eq!(
+        byte_offset_to_position(content, 4),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 0
+        }
+    );
+    // Byte 6 is 'f' → line 1, column 2.
+    assert_eq!(
+        byte_offset_to_position(content, 6),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn byte_offset_to_position_clamps_past_end() {
+    let content = "ab\ncd";
+    assert_eq!(
+        byte_offset_to_position(content, 999),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn position_byte_round_trip_is_stable() {
+    let content = "<?php\nUser::where('email');\n$x = 1;\n";
+    for byte in [0usize, 6, 12, 20, 27] {
+        let pos = byte_offset_to_position(content, byte);
+        let back =
+            position_to_byte_offset(content, pos.line, pos.character).expect("round-trip offset");
+        assert_eq!(back, byte, "round-trip failed for byte {byte}");
+    }
+}

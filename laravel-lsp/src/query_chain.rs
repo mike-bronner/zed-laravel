@@ -19,6 +19,7 @@
 
 pub mod chain;
 pub mod cursor;
+pub mod diagnostics;
 pub mod eloquent_completion;
 pub mod extractor;
 pub mod flow;
@@ -28,8 +29,10 @@ pub mod var_type;
 
 pub use chain::*;
 pub use cursor::{
-    detect_chain_context_at, detect_chain_context_at_diagnostic, fixup_for_completion,
-    position_to_byte_offset, ChainResolveFailure, CompletionPrep,
+    byte_offset_to_position, chain_context_for_link, detect_chain_context_at,
+    detect_chain_context_at_diagnostic, fixup_for_completion, position_to_byte_offset,
+    ChainResolveFailure, CompletionPrep,
 };
+pub use diagnostics::chain_diagnostics;
 pub use extractor::extract_chains;
 pub use use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};

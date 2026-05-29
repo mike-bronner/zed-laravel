@@ -1869,6 +1869,10 @@ struct LaravelLanguageServer {
     /// Add space between directive name and parentheses in completions
     /// false: @if($condition)  |  true: @if ($condition)
     directive_spacing: Arc<RwLock<bool>>,
+    /// Severity for query-chain diagnostics (unknown column/relation/table).
+    /// `None` disables them; defaults to `WARNING`. Set via the
+    /// `diagnostics.severity` LSP setting.
+    chain_diagnostic_severity: Arc<RwLock<Option<DiagnosticSeverity>>>,
     /// Whether we've shown the vendor missing diagnostic this session
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
@@ -1941,6 +1945,42 @@ struct BladeSettings {
     directive_spacing: bool,
 }
 
+/// Query-chain diagnostics settings (unknown column / relation / table).
+/// Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "diagnostics": { "severity": "warning" } } } } }`
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsSettings {
+    /// Severity for unknown column/relation/table diagnostics in query chains.
+    /// One of `"warning"` (default), `"error"`, `"info"`, or `"off"`.
+    #[serde(default = "default_diagnostics_severity")]
+    severity: String,
+}
+
+impl Default for DiagnosticsSettings {
+    fn default() -> Self {
+        Self {
+            severity: default_diagnostics_severity(),
+        }
+    }
+}
+
+fn default_diagnostics_severity() -> String {
+    "warning".to_string()
+}
+
+/// Parse the configured `diagnostics.severity` string into an LSP severity.
+/// `None` means the feature is turned off; an unrecognised value falls back to
+/// `WARNING` (the safe, visible-but-non-blocking default).
+fn parse_chain_diagnostic_severity(value: &str) -> Option<DiagnosticSeverity> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "false" => None,
+        "error" => Some(DiagnosticSeverity::ERROR),
+        "info" | "information" | "hint" => Some(DiagnosticSeverity::INFORMATION),
+        _ => Some(DiagnosticSeverity::WARNING),
+    }
+}
+
 fn default_auto_complete_debounce() -> u64 {
     DEFAULT_SALSA_DEBOUNCE_MS
 }
@@ -1957,6 +1997,8 @@ struct LspSettings {
     auto_complete_debounce: u64,
     #[serde(default)]
     blade: BladeSettings,
+    #[serde(default)]
+    diagnostics: DiagnosticsSettings,
 }
 
 // ============================================================================
@@ -3454,6 +3496,7 @@ impl LaravelLanguageServer {
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
+            chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             database_schema: Arc::new(RwLock::new(None)),
@@ -3489,6 +3532,17 @@ impl LaravelLanguageServer {
                 old_spacing, new_spacing
             );
             *self.directive_spacing.write().await = new_spacing;
+        }
+
+        // Query-chain diagnostics severity
+        let new_severity = parse_chain_diagnostic_severity(&settings.diagnostics.severity);
+        let old_severity = *self.chain_diagnostic_severity.read().await;
+        if new_severity != old_severity {
+            info!(
+                "⚙️  Updating chain diagnostics severity: {:?} → {:?} (from {:?})",
+                old_severity, new_severity, settings.diagnostics.severity
+            );
+            *self.chain_diagnostic_severity.write().await = new_severity;
         }
     }
 
@@ -13101,6 +13155,7 @@ return [
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
+            chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             database_schema: self.database_schema.clone(),
@@ -13185,6 +13240,81 @@ return [
             }
         };
         info!("   ⏱️  salsa.get_patterns: {:?}", t_patterns.elapsed());
+
+        // Query-chain diagnostics: unknown column / relation / table inside
+        // Eloquent & DB builder chains. Runs for both PHP and Blade (chains
+        // appear in `@php` blocks and `{{ }}`). Gated on the configured
+        // severity (None = feature off) and on the schema + project root being
+        // available — every guard inside `chain_diagnostics` errs toward
+        // staying quiet, so a cold DB or unresolved model yields no squiggles.
+        if is_php || is_blade {
+            if let Some(severity) = *self.chain_diagnostic_severity.read().await {
+                // CRITICAL: derive chains from the EXACT `source` we convert to
+                // ranges, not from `patterns.chains`. Salsa's cached chains can
+                // lag the live document (e.g. did_save without a prior debounce
+                // flush), and stale byte offsets produce squiggles in the wrong
+                // place AND that never clear. Completion re-extracts for the same
+                // reason. For PHP we re-parse here; Blade keeps the Salsa path,
+                // which already shifts embedded-PHP offsets back to Blade
+                // coordinates (re-parsing raw Blade as PHP wouldn't work).
+                let fresh_chains: Vec<Arc<laravel_lsp::query_chain::BuilderChain>> = if is_php {
+                    match laravel_lsp::parser::parse_php(source) {
+                        Ok(tree) => laravel_lsp::query_chain::extract_chains(&tree, source)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    patterns.chains.clone()
+                };
+                // Log the chain count unconditionally so the LSP log explains a
+                // "no diagnostics" outcome: 0 chains → nothing to lint (or
+                // unparsed); N chains but 0 found → schema/model didn't resolve
+                // (most often: DB not connected).
+                let n_chains = fresh_chains.len();
+                let root = self.initialized_root.read().await.clone();
+                match (n_chains, root) {
+                    (0, _) => {
+                        info!("🔗 chain_diagnostics: 0 chains in patterns for {}", uri);
+                    }
+                    (_, None) => {
+                        info!(
+                            "🔗 chain_diagnostics: {} chains but project root not initialised",
+                            n_chains
+                        );
+                    }
+                    (_, Some(root)) => {
+                        let db_guard = self.database_schema.read().await;
+                        match db_guard.as_ref() {
+                            None => info!(
+                                "🔗 chain_diagnostics: {} chains but DB schema provider not \
+                                 initialised — column/relation diagnostics need a DB connection",
+                                n_chains
+                            ),
+                            Some(db) => {
+                                let t_chain = std::time::Instant::now();
+                                let chain_diags = laravel_lsp::query_chain::chain_diagnostics(
+                                    &fresh_chains,
+                                    db,
+                                    &root,
+                                    source,
+                                    severity,
+                                )
+                                .await;
+                                info!(
+                                    "🔗 chain_diagnostics: {:?} — {} found over {} chains",
+                                    t_chain.elapsed(),
+                                    chain_diags.len(),
+                                    n_chains
+                                );
+                                diagnostics.extend(chain_diags);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Validate PHP files with view() calls and env() calls
         if is_php {

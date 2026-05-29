@@ -1006,6 +1006,77 @@ async fn eloquent_from_replace_validates_against_new_table() {
 }
 
 #[tokio::test]
+async fn ambiguous_bare_column_is_flagged() {
+    // `id` exists on BOTH users and the joined orders — bare `id` is
+    // ambiguous and must be qualified.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('id', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "ambiguous column should be flagged: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_AMBIGUOUS_COLUMN);
+    assert!(
+        diags[0].message.contains("ambiguous"),
+        "{}",
+        diags[0].message
+    );
+    assert!(diags[0].message.contains("users"));
+    assert!(diags[0].message.contains("orders"));
+}
+
+#[tokio::test]
+async fn column_on_a_single_accessible_table_is_valid() {
+    // `name` lives only on users — unambiguous, so no diagnostic (and not
+    // flagged unknown either).
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source =
+        "<?php\nDB::table('users')->join('orders', 'a', '=', 'b')->where('name', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "column on exactly one table is valid: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_check_does_not_fire_without_joins() {
+    // A single-table query can't be ambiguous — `id` is just valid.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source = "<?php\nDB::table('users')->where('id', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "single-table column is unambiguous: {diags:?}"
+    );
+}
+
+#[tokio::test]
 async fn virtual_table_in_scope_suppresses_column_diagnostics() {
     // A `fromSub` virtual table exposes best-effort columns; diagnostics stay
     // quiet rather than risk a false positive on a column the subquery might

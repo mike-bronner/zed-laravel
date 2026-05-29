@@ -13074,13 +13074,15 @@ return [
         }
     }
 
-    /// Column literal → the migration line that defines it, resolved across
+    /// Column literal → the migration line(s) that define it, resolved across
     /// every table the chain can reference (root + joined tables, issue #24).
     ///
     /// - A **qualified** literal (`orders.status`, `o.status`) resolves its
-    ///   qualifier (alias or name) to a real table.
-    /// - A **bare** literal (`status`) is probed against each accessible table
-    ///   in order (root first); the first table that defines it wins.
+    ///   qualifier (alias or name) to a real table — a single target.
+    /// - A **bare** literal (`status`) is probed against every accessible
+    ///   table. If exactly one defines it, jump there; if several do (an
+    ///   ambiguous column), return them ALL so the editor lets the user pick
+    ///   (the ambiguity diagnostic flags it separately).
     async fn goto_column_definition(
         &self,
         ctx: &laravel_lsp::query_chain::ChainContext,
@@ -13094,12 +13096,17 @@ return [
 
         let guard = self.migration_index.read().await;
         let index = guard.as_ref()?;
-        let site = candidates
+        let links: Vec<LocationLink> = candidates
             .iter()
-            .find_map(|(table, column)| index.column(table, column))?
-            .clone();
+            .filter_map(|(table, column)| index.column(table, column))
+            .filter_map(Self::location_link_from_migration_site)
+            .collect();
         drop(guard);
-        Self::location_from_migration_site(&site)
+        if links.is_empty() {
+            None
+        } else {
+            Some(GotoDefinitionResponse::Link(links))
+        }
     }
 
     /// Build the tables a chain can reference columns from, for goto
@@ -13217,6 +13224,16 @@ return [
     fn location_from_migration_site(
         site: &laravel_lsp::migration_index::MigrationSite,
     ) -> Option<GotoDefinitionResponse> {
+        Self::location_link_from_migration_site(site)
+            .map(|link| GotoDefinitionResponse::Link(vec![link]))
+    }
+
+    /// Build a single `LocationLink` for a migration site. Shared by
+    /// single-target goto and the multi-target ambiguous-column case (issue
+    /// #24), which returns several links so the editor lets the user pick.
+    fn location_link_from_migration_site(
+        site: &laravel_lsp::migration_index::MigrationSite,
+    ) -> Option<LocationLink> {
         let uri = Url::from_file_path(&site.file).ok()?;
         let range = Range {
             start: Position {
@@ -13236,12 +13253,12 @@ return [
             start: range.start,
             end: range.start,
         };
-        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+        Some(LocationLink {
             origin_selection_range: None,
             target_uri: uri,
             target_range: range,
             target_selection_range: caret,
-        }]))
+        })
     }
 
     /// prepare_rename fallback: if the cursor is on a PHP class name that
@@ -18033,6 +18050,11 @@ impl LanguageServer for LaravelLanguageServer {
                 {
                     actions.push(action);
                 }
+                // Ambiguous-column diagnostics offer one "Qualify as `t.col`"
+                // fix per candidate table (issue #24).
+                actions.extend(
+                    laravel_lsp::query_chain::code_actions::qualify_actions(diagnostic, uri),
+                );
                 if let Some(root) = root {
                     let timestamp =
                         laravel_lsp::query_chain::code_actions::format_migration_timestamp(

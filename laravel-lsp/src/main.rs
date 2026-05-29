@@ -18052,9 +18052,9 @@ impl LanguageServer for LaravelLanguageServer {
                 }
                 // Ambiguous-column diagnostics offer one "Qualify as `t.col`"
                 // fix per candidate table (issue #24).
-                actions.extend(
-                    laravel_lsp::query_chain::code_actions::qualify_actions(diagnostic, uri),
-                );
+                actions.extend(laravel_lsp::query_chain::code_actions::qualify_actions(
+                    diagnostic, uri,
+                ));
                 if let Some(root) = root {
                     let timestamp =
                         laravel_lsp::query_chain::code_actions::format_migration_timestamp(

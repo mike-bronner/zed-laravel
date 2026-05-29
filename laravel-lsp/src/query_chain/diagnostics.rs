@@ -939,11 +939,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Build the LSP `Diagnostic` for one unknown identifier. The squiggle is
-/// narrowed to the offending segment (e.g. just `authorr` in `posts.authorr`).
-/// A structured `data` payload carries everything the code-action handler needs
-/// without re-parsing the message string.
-#[allow(clippy::too_many_arguments)]
 /// LSP `Range` covering just the `needle` at the end of a string literal's
 /// content. The literal span includes its quotes (single-byte ASCII), so the
 /// closing quote is one byte before the span end; the needle is the trailing
@@ -991,6 +986,11 @@ fn ambiguous_column_diagnostic(
     }
 }
 
+/// Build the LSP `Diagnostic` for one unknown identifier. The squiggle is
+/// narrowed to the offending segment (e.g. just `authorr` in `posts.authorr`).
+/// A structured `data` payload carries everything the code-action handler needs
+/// without re-parsing the message string.
+#[allow(clippy::too_many_arguments)]
 fn make_diagnostic(
     kind: DiagKind,
     needle: &str,

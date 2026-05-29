@@ -259,6 +259,19 @@ async fn legal_names(
             Some((tables, String::new()))
         }
         DiagKind::Column => {
+            // Virtual (subquery) tables carry best-effort SELECT columns — a
+            // bare column might be legitimately exposed by the subquery even
+            // if our extraction missed it. Stay quiet (under-warn) whenever a
+            // virtual table is in scope, rather than risk a false positive.
+            let has_virtual = matches!(&ctx.from_clause, FromClause::Replace(t) if t.virtual_columns.is_some())
+                || ctx
+                    .joined_tables
+                    .iter()
+                    .any(|t| t.virtual_columns.is_some());
+            if has_virtual {
+                return None;
+            }
+
             // Resolve the root (FROM) table plus, for Eloquent chains, the
             // model's casts/accessors. A `from()` override redirects the root
             // to a plain schema-only table (no model casts apply once the table

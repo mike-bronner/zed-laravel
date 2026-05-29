@@ -1091,6 +1091,7 @@ fn join_closure_aliased_table_narrows_on_alias() {
         FromClause::Replace(AccessibleTable {
             table: "orders".to_string(),
             alias: Some("o".to_string()),
+            virtual_columns: None,
         })
     );
     assert_eq!(ctx.dotted_prefix.as_deref(), Some("o"));
@@ -1158,6 +1159,62 @@ fn join_closure_eloquent_parent_sets_pending_model() {
     let ctx = detect("User::query()->join('orders', function ($join) { $join->where('|'); });")
         .expect("ctx");
     assert_eq!(ctx.join_parent_model.as_deref(), Some("User"));
+}
+
+// ---- subquery virtual tables (issue #24, Phase 4) ---------------------
+
+#[test]
+fn from_sub_creates_virtual_root_table() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->select('id', 'name'); }, 'u')->where('|');",
+    )
+    .expect("ctx");
+    match &ctx.from_clause {
+        FromClause::Replace(t) => {
+            assert_eq!(t.qualifier(), "u");
+            assert_eq!(
+                t.virtual_columns.as_deref(),
+                Some(["id".to_string(), "name".to_string()].as_slice())
+            );
+        }
+        other => panic!("expected Replace(virtual table), got {other:?}"),
+    }
+}
+
+#[test]
+fn from_sub_without_select_is_opaque() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->where('x', 1); }, 'u')->where('|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.from_clause, FromClause::Opaque);
+}
+
+#[test]
+fn join_sub_creates_virtual_joined_table() {
+    let ctx = detect(
+        "DB::table('users')->joinSub(function ($q) { $q->select('total'); }, 'agg', 'agg.user_id', '=', 'users.id')->where('|');",
+    )
+    .expect("ctx");
+    let virt = ctx
+        .joined_tables
+        .iter()
+        .find(|t| t.qualifier() == "agg")
+        .expect("virtual joined table 'agg'");
+    assert_eq!(
+        virt.virtual_columns.as_deref(),
+        Some(["total".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_narrows_on_alias() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->select('id', 'name'); }, 'u')->where('u.|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("u"));
 }
 
 #[test]

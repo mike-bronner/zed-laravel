@@ -124,6 +124,7 @@ fn link(method: &str, arg: ArgKind, args: Vec<ChainArg>) -> ChainLink {
         effect: ChainEffect::None,
         span_byte_range: (0, 0),
         args,
+        subquery_columns: None,
     }
 }
 
@@ -1001,5 +1002,22 @@ async fn eloquent_from_replace_validates_against_new_table() {
         diags.len(),
         1,
         "column from the replaced table should be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn virtual_table_in_scope_suppresses_column_diagnostics() {
+    // A `fromSub` virtual table exposes best-effort columns; diagnostics stay
+    // quiet rather than risk a false positive on a column the subquery might
+    // legitimately expose.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source = "<?php\nDB::table('users')->fromSub(function ($q) { $q->select('id', 'total'); }, 'u')->where('whatever', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "virtual table in scope should suppress column diagnostics: {diags:?}"
     );
 }

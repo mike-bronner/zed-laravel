@@ -98,6 +98,14 @@ pub struct ChainLink {
     pub effect: ChainEffect,
     pub span_byte_range: (usize, usize),
     pub args: Vec<ChainArg>,
+    /// For subquery methods (`fromSub`/`joinSub`/lateral, issue #24): the
+    /// column names the subquery's SELECT list exposes, extracted from the
+    /// first argument's AST at parse time (the cursor resolver only sees
+    /// [`ChainArg`]s, which don't carry the nested selects). `None` for every
+    /// other method; `Some(empty)` when the subquery has no resolvable SELECT
+    /// (e.g. `select('*')`), meaning the virtual table is opaque.
+    #[serde(default)]
+    pub subquery_columns: Option<Vec<String>>,
 }
 
 /// What kind of argument the cursor's link expects. Used at the cursor only —
@@ -186,26 +194,45 @@ pub struct ClosureParam {
 pub struct AccessibleTable {
     /// Real table name as it appears in the database. May be schema-qualified
     /// (`mydb.orders`) for cross-database joins; column lookup passes it
-    /// through to the schema provider, which resolves it best-effort.
+    /// through to the schema provider, which resolves it best-effort. For a
+    /// virtual (subquery) table this holds the alias — there's no real table,
+    /// so [`virtual_columns`](Self::virtual_columns) supplies the columns.
     pub table: String,
     /// Alias the user references columns by — `u` from `users as u`, or a
     /// subquery alias. `None` for a plain `join('orders', …)`, where the
     /// qualifier IS the table name.
     pub alias: Option<String>,
+    /// For virtual tables synthesized from a subquery (`fromSub`/`joinSub`,
+    /// issue #24): the columns the subquery's SELECT list exposes. `Some` →
+    /// completion/validation use these instead of a DB schema lookup. `None`
+    /// for ordinary tables backed by the database.
+    pub virtual_columns: Option<Vec<String>>,
 }
 
 impl AccessibleTable {
-    /// Construct an unaliased accessible table from a bare name.
+    /// Construct an unaliased, database-backed accessible table from a bare
+    /// name.
     pub fn bare(table: impl Into<String>) -> Self {
         Self {
             table: table.into(),
             alias: None,
+            virtual_columns: None,
+        }
+    }
+
+    /// Construct a virtual (subquery) table: the `alias` is both the qualifier
+    /// and the stored name, and `columns` are the subquery's SELECT list.
+    pub fn virtual_table(alias: impl Into<String>, columns: Vec<String>) -> Self {
+        Self {
+            table: alias.into(),
+            alias: None,
+            virtual_columns: Some(columns),
         }
     }
 
     /// The qualifier the user types before a column: the alias if present,
     /// else the table name. For a schema-qualified table with no alias this
-    /// is the full `mydb.orders`.
+    /// is the full `mydb.orders`; for a virtual table it's the subquery alias.
     pub fn qualifier(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.table)
     }
@@ -229,11 +256,13 @@ pub fn parse_table_ref(raw: &str) -> AccessibleTable {
         [table, kw, alias] if kw.eq_ignore_ascii_case("as") => AccessibleTable {
             table: (*table).to_string(),
             alias: Some((*alias).to_string()),
+            virtual_columns: None,
         },
         // `table alias` (implicit alias)
         [table, alias] => AccessibleTable {
             table: (*table).to_string(),
             alias: Some((*alias).to_string()),
+            virtual_columns: None,
         },
         // `table` (no alias) — also the fallback for any unexpected shape,
         // where keeping the whole trimmed string as the table name is the

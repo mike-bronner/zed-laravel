@@ -479,6 +479,7 @@ fn shift_chain_byte_ranges_shifts_every_span() {
                     body_byte_range: (44, 48),
                 },
             ],
+            subquery_columns: None,
         }],
     };
     // Region starts at outer byte 100. Wrapper prefix is 6 bytes (<?php ).
@@ -1255,4 +1256,94 @@ fn join_closure_records_aliased_table_ref_verbatim() {
         &binding.kind,
         ClosureScopeKind::JoinTable { table_ref } if table_ref == "orders as o"
     ));
+}
+
+// ---- subquery SELECT-column extraction (issue #24, Phase 4) -----------
+
+/// Pull the `subquery_columns` off the first link matching `method`.
+fn subquery_cols(chains: &[BuilderChain], method: &str) -> Option<Vec<String>> {
+    chains
+        .iter()
+        .flat_map(|c| &c.links)
+        .find(|l| l.method == method)
+        .and_then(|l| l.subquery_columns.clone())
+}
+
+#[test]
+fn from_sub_extracts_columns_from_closure_select() {
+    let chains = extract(
+        "DB::table('o')->fromSub(function ($q) { $q->from('users')->select('id', 'name'); }, 'u');",
+    );
+    assert_eq!(
+        subquery_cols(&chains, "fromSub").as_deref(),
+        Some(["id".to_string(), "name".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_extracts_columns_from_query_expression() {
+    // The subquery is a query-builder expression, not a closure.
+    let chains = extract("DB::query()->fromSub(User::select('id', 'email'), 'u');");
+    assert_eq!(
+        subquery_cols(&chains, "fromSub").as_deref(),
+        Some(["id".to_string(), "email".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_includes_add_select_and_arrays() {
+    let chains = extract(
+        "DB::query()->fromSub(function ($q) { $q->select(['id', 'name'])->addSelect('email'); }, 'u');",
+    );
+    assert_eq!(
+        subquery_cols(&chains, "fromSub").as_deref(),
+        Some(["id".to_string(), "name".to_string(), "email".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_exposed_names_strip_qualifiers_and_use_aliases() {
+    // `users.id` → `id`; `votes as score` → `score`; `count(*)` and `*` skipped.
+    let chains = extract(
+        "DB::query()->fromSub(function ($q) { $q->select('users.id', 'votes as score', 'count(*)', '*'); }, 'u');",
+    );
+    assert_eq!(
+        subquery_cols(&chains, "fromSub").as_deref(),
+        Some(["id".to_string(), "score".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_without_select_yields_empty_columns() {
+    // No SELECT → unknown columns → empty (the caller treats it as opaque).
+    let chains = extract("DB::query()->fromSub(function ($q) { $q->where('x', 1); }, 'u');");
+    assert_eq!(
+        subquery_cols(&chains, "fromSub").as_deref(),
+        Some([].as_slice())
+    );
+}
+
+#[test]
+fn join_sub_extracts_columns() {
+    let chains = extract(
+        "DB::table('users')->joinSub(function ($q) { $q->select('total'); }, 'agg', 'agg.user_id', '=', 'users.id');",
+    );
+    assert_eq!(
+        subquery_cols(&chains, "joinSub").as_deref(),
+        Some(["total".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn non_subquery_methods_have_no_subquery_columns() {
+    let chains = extract("DB::table('users')->where('id', 1)->join('orders', 'a', '=', 'b');");
+    for chain in &chains {
+        for link in &chain.links {
+            assert!(
+                link.subquery_columns.is_none(),
+                "{} should have no subquery_columns",
+                link.method
+            );
+        }
+    }
 }

@@ -22,7 +22,7 @@
 
 use super::chain::*;
 use super::methods::{
-    arg_kind, chain_effect, is_table_join, CLOSURE_CARRIERS, RELATION_METHODS,
+    arg_kind, chain_effect, is_subquery_method, is_table_join, CLOSURE_CARRIERS, RELATION_METHODS,
     SAME_MODEL_CLOSURE_CARRIERS,
 };
 use super::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
@@ -239,13 +239,151 @@ fn extract_link(call_node: Node, bytes: &[u8]) -> Option<ChainLink> {
         .map(|n| extract_args(n, bytes))
         .unwrap_or_default();
 
+    // Subquery methods (`fromSub`/`joinSub`/lateral) expose a virtual table
+    // whose columns are the subquery's SELECT list. The cursor resolver only
+    // sees ChainArgs (closures as byte ranges, query exprs as `Other`), so we
+    // walk the first argument's AST here while the tree is still available.
+    let subquery_columns = if is_subquery_method(&method) {
+        Some(
+            args_node
+                .map(|n| extract_subquery_columns(n, bytes))
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+
     Some(ChainLink {
         arg: arg_kind(&method),
         effect: chain_effect(&method),
         method,
         span_byte_range: (call_node.start_byte(), call_node.end_byte()),
         args,
+        subquery_columns,
     })
+}
+
+/// Extract the column names a subquery exposes, by walking the FIRST argument
+/// of a `fromSub`/`joinSub`/lateral call (a closure or a query-builder
+/// expression) for `select`/`addSelect` calls and collecting their string
+/// literals. Best-effort, per the issue:
+/// - `select('id', 'name')` / `addSelect('email')` / `select(['a', 'b'])` →
+///   `id, name, email, a, b`
+/// - `'users.id'` → `id` (table qualifier stripped — that's the outer name)
+/// - `'votes as score'` → `score` (the exposed alias)
+/// - `'*'` and expressions (`count(*)`, raw) → skipped
+///
+/// An empty result means the subquery's columns are unknown (no usable
+/// SELECT) — the caller treats the virtual table as opaque.
+fn extract_subquery_columns(args_node: Node, bytes: &[u8]) -> Vec<String> {
+    let mut cursor = args_node.walk();
+    let Some(first_arg) = args_node
+        .named_children(&mut cursor)
+        .find(|n| n.kind() == "argument")
+    else {
+        return Vec::new();
+    };
+    let Some(subquery) = first_arg.named_child(0) else {
+        return Vec::new();
+    };
+
+    // Walk the subquery subtree iteratively, collecting columns from every
+    // `select` / `addSelect` call. We tag each with its source byte offset and
+    // sort at the end, so the result follows the SELECT list as written
+    // (`select('id','name')->addSelect('email')` → id, name, email) regardless
+    // of tree-traversal order.
+    let mut columns: Vec<(usize, String)> = Vec::new();
+    let mut stack: Vec<Node> = vec![subquery];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "member_call_expression" | "scoped_call_expression"
+        ) {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Some(name) = node_text(name_node, bytes) {
+                    if name == "select" || name == "addSelect" {
+                        if let Some(call_args) = node.child_by_field_name("arguments") {
+                            collect_select_columns(call_args, bytes, &mut columns);
+                        }
+                    }
+                }
+            }
+        }
+        let mut child_cursor = node.walk();
+        for child in node.children(&mut child_cursor) {
+            stack.push(child);
+        }
+    }
+    columns.sort_by_key(|(byte, _)| *byte);
+    columns.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Append `(source_byte, exposed_column)` pairs from a `select(...)` /
+/// `addSelect(...)` argument list to `out`. Handles top-level string args and
+/// string elements inside an array arg (`select(['a', 'b'])`).
+fn collect_select_columns(args_node: Node, bytes: &[u8], out: &mut Vec<(usize, String)>) {
+    let mut cursor = args_node.walk();
+    for child in args_node.named_children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        let Some(inner) = child.named_child(0) else {
+            continue;
+        };
+        match inner.kind() {
+            "string" => {
+                if let Some((value, _)) = single_quoted_string(inner, bytes) {
+                    push_exposed_column(&value, inner.start_byte(), out);
+                }
+            }
+            "encapsed_string" => {
+                if let Some(value) = encapsed_string_content(inner, bytes) {
+                    push_exposed_column(&value, inner.start_byte(), out);
+                }
+            }
+            "array_creation_expression" => {
+                for elem in extract_array_elements(inner, bytes) {
+                    if let ChainArg::StringLit {
+                        value,
+                        span_byte_range,
+                        ..
+                    } = elem
+                    {
+                        push_exposed_column(&value, span_byte_range.0, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolve the outer-facing column name a SELECT entry exposes and push
+/// `(byte, name)` to `out` (skips wildcards and expressions). See
+/// [`extract_subquery_columns`].
+fn push_exposed_column(raw: &str, byte: usize, out: &mut Vec<(usize, String)>) {
+    let trimmed = raw.trim();
+    if trimmed == "*" || trimmed.is_empty() || trimmed.contains('(') {
+        return; // wildcard or expression — no single exposed name
+    }
+    // `col as alias` (case-insensitive `as`) → the alias is what's exposed.
+    let exposed = if let Some(idx) = find_as_keyword(trimmed) {
+        trimmed[idx..].trim()
+    } else {
+        // Strip a table qualifier: the subquery result exposes the bare column.
+        trimmed.rsplit('.').next().unwrap_or(trimmed)
+    };
+    if exposed.contains('*') || exposed.is_empty() {
+        return;
+    }
+    out.push((byte, exposed.to_string()));
+}
+
+/// Byte index of the character AFTER a whitespace-delimited `as` keyword
+/// (case-insensitive) in `s`, i.e. the start of the alias. `None` if absent.
+/// ASCII-lowercasing preserves byte offsets, so the index maps back to `s`.
+fn find_as_keyword(s: &str) -> Option<usize> {
+    s.to_ascii_lowercase().find(" as ").map(|idx| idx + 4)
 }
 
 /// Decode an `arguments` node into a `Vec<ChainArg>` in source order. We only

@@ -10,7 +10,9 @@
 //! later phases.
 
 use super::chain::*;
-use super::methods::{is_from_opaque, is_from_replace, is_table_join};
+use super::methods::{
+    is_from_opaque, is_from_replace, is_from_sub, is_subquery_join, is_table_join,
+};
 use std::sync::Arc;
 use tower_lsp::lsp_types::Position;
 
@@ -696,6 +698,25 @@ fn scan_accessible_tables(chain: &BuilderChain) -> (Vec<AccessibleTable>, FromCl
             }
         } else if is_from_opaque(method) {
             from_clause = FromClause::Opaque;
+        } else if is_from_sub(method) {
+            // `fromSub($query, 'alias')` — virtual root from the subquery's
+            // SELECT list. Unknown columns (no usable SELECT) → opaque root.
+            from_clause = match (first_string_arg_value(link), &link.subquery_columns) {
+                (Some(alias), Some(cols)) if !cols.is_empty() => {
+                    FromClause::Replace(AccessibleTable::virtual_table(alias, cols.clone()))
+                }
+                _ => FromClause::Opaque,
+            };
+        } else if is_subquery_join(method) {
+            // `joinSub($query, 'alias', …)` — virtual joined table. Skip when
+            // the subquery's columns are unknown (offer nothing for it).
+            if let (Some(alias), Some(cols)) =
+                (first_string_arg_value(link), &link.subquery_columns)
+            {
+                if !cols.is_empty() {
+                    joined.push(AccessibleTable::virtual_table(alias, cols.clone()));
+                }
+            }
         }
     }
     (joined, from_clause)

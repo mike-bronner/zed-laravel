@@ -333,7 +333,15 @@ async fn build_table_items(
     meta: &RootMeta,
     emit: ColEmit,
 ) -> Vec<CompletionItem> {
-    let columns = db.get_columns_with_types(&table.table).await;
+    // Virtual (subquery) tables carry their columns directly — the SELECT
+    // list, with no DB types known (so `mixed`). Real tables hit the schema.
+    let columns: Vec<(String, String)> = match &table.virtual_columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| (c.clone(), "mixed".to_string()))
+            .collect(),
+        None => db.get_columns_with_types(&table.table).await,
+    };
     if columns.is_empty() {
         info!(
             "🔗 build_table_items: get_columns_with_types({:?}) returned 0 columns \

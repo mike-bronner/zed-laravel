@@ -908,6 +908,7 @@ async fn columns_raw_narrows_via_alias() {
         vec![AccessibleTable {
             table: "orders".to_string(),
             alias: Some("o".to_string()),
+            virtual_columns: None,
         }],
         FromClause::Inherit,
         Some("o"),
@@ -932,6 +933,7 @@ async fn columns_raw_alias_qualifies_with_alias_not_table() {
         vec![AccessibleTable {
             table: "orders".to_string(),
             alias: Some("o".to_string()),
+            virtual_columns: None,
         }],
         FromClause::Inherit,
         None,
@@ -1238,6 +1240,83 @@ class User extends Model {
     assert!(!got.contains(&"users.full_name".to_string()));
 }
 
+// ---- subquery virtual tables (issue #24, Phase 4) --------------------
+
+#[tokio::test]
+async fn virtual_root_table_offers_subquery_columns() {
+    let dir = TempDir::new().unwrap();
+    // The DB has no table named "u" — columns come from the virtual table.
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![("users", vec![("id", "int")])],
+    )
+    .await;
+    let ctx = base_ctx(
+        None,
+        Vec::new(),
+        FromClause::Replace(AccessibleTable::virtual_table(
+            "u",
+            vec!["id".to_string(), "total".to_string()],
+        )),
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert!(got.contains(&"id".to_string()), "got {got:?}");
+    assert!(got.contains(&"total".to_string()), "got {got:?}");
+}
+
+#[tokio::test]
+async fn virtual_joined_table_offers_qualified_columns() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![("users", vec![("id", "int"), ("name", "string")])],
+    )
+    .await;
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::virtual_table(
+            "agg",
+            vec!["total".to_string()],
+        )],
+        FromClause::Inherit,
+        None,
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert!(got.contains(&"name".to_string()), "bare root; got {got:?}");
+    assert!(
+        got.contains(&"agg.total".to_string()),
+        "virtual joined column qualified; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn virtual_table_narrows_on_alias() {
+    let dir = TempDir::new().unwrap();
+    let db = provider_with_tables(
+        dir.path().to_path_buf(),
+        vec![("users", vec![("id", "int")])],
+    )
+    .await;
+    let ctx = base_ctx(
+        Some("users"),
+        vec![AccessibleTable::virtual_table(
+            "agg",
+            vec!["total".to_string(), "avg".to_string()],
+        )],
+        FromClause::Inherit,
+        Some("agg"),
+    );
+    let got = labels(&columns_raw(&ctx, &db, None).await);
+    assert_eq!(
+        got.len(),
+        2,
+        "only the virtual table's columns; got {got:?}"
+    );
+    assert!(got.contains(&"total".to_string()));
+    assert!(got.contains(&"avg".to_string()));
+}
+
 // ---- goto_column_candidates (issue #24) -------------------------------
 
 #[test]
@@ -1271,6 +1350,7 @@ fn goto_candidates_qualified_resolves_alias_to_real_table() {
         AccessibleTable {
             table: "orders".to_string(),
             alias: Some("o".to_string()),
+            virtual_columns: None,
         },
     ];
     assert_eq!(

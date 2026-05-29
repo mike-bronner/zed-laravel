@@ -274,10 +274,33 @@ fn from_replace_is_only_plain_from() {
 }
 
 #[test]
-fn from_opaque_covers_raw_and_sub() {
+fn from_opaque_is_only_from_raw() {
     assert!(is_from_opaque("fromRaw"));
-    assert!(is_from_opaque("fromSub"));
     assert!(!is_from_opaque("from"));
+    // fromSub resolves to a virtual table (Phase 4), not opaque.
+    assert!(!is_from_opaque("fromSub"));
+}
+
+#[test]
+fn subquery_methods_are_classified() {
+    assert!(is_from_sub("fromSub"));
+    assert!(!is_from_sub("from"));
+    assert!(!is_from_sub("fromRaw"));
+
+    for name in [
+        "joinSub",
+        "leftJoinSub",
+        "rightJoinSub",
+        "joinLateral",
+        "leftJoinLateral",
+    ] {
+        assert!(is_subquery_join(name), "{name} should be a subquery join");
+        assert!(is_subquery_method(name));
+    }
+    assert!(is_subquery_method("fromSub"));
+    // Plain table joins are not subquery joins.
+    assert!(!is_subquery_join("join"));
+    assert!(!is_subquery_method("join"));
 }
 
 #[test]

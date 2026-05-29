@@ -56,11 +56,16 @@ use std::path::Path;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 
-/// Column methods whose first string arg we deliberately DON'T validate,
-/// because it's frequently an alias or raw fragment rather than a bare column:
-/// `select`/`addSelect` define aliases (`'votes as score'`), `having` filters
-/// on them. These would surface false positives on valid queries.
-const COLUMN_DIAG_DENY: &[&str] = &["select", "addSelect", "having"];
+/// Column methods whose first string arg we deliberately DON'T validate.
+/// `having` filters on aggregate *aliases* (`having('total', '>', 5)` after a
+/// `selectRaw('count(*) as total')`), where a bare simple identifier is
+/// routinely not a real column — validating it would false-positive.
+///
+/// `select`/`addSelect` are NOT denied: their alias/qualified/expression forms
+/// (`'votes as score'`, `'users.id'`, `'count(*)'`) are already skipped by the
+/// [`is_simple_identifier`] guard, so only a bare typo like `select('emial')`
+/// is flagged — which is exactly what we want.
+const COLUMN_DIAG_DENY: &[&str] = &["having"];
 
 /// Diagnostic codes — stable strings the code-action handler keys off to offer
 /// the matching quick-fix. Kept here so the producer and the consumer share a

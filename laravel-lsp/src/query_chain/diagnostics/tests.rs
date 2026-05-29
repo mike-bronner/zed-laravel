@@ -311,18 +311,53 @@ async fn qualified_column_is_skipped() {
 }
 
 #[tokio::test]
-async fn select_alias_method_is_not_diagnosed() {
-    // `select` defines aliases; its args are deny-listed for diagnostics.
+async fn select_flags_bare_typo() {
+    // A bare typo in `select` IS diagnosed (AC names `select`). Alias/qualified
+    // forms are handled separately by the identifier guard (below).
     let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
-    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let db = provider_with(
+        root.clone(),
+        &[("users", &[("id", "int"), ("email", "string")])],
+    )
+    .await;
     let source = "<?php\nuse App\\Models\\User;\nUser::select('emial')->get();\n";
     let chains = chains_of(source);
 
     let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
-    assert!(
-        diags.is_empty(),
-        "select args must not be diagnosed: {diags:?}"
-    );
+    assert_eq!(diags.len(), 1, "bare select typo should flag: {diags:?}");
+    assert!(diags[0].message.contains("emial"));
+}
+
+#[tokio::test]
+async fn select_alias_and_qualified_forms_are_skipped() {
+    // `'votes as score'` (alias) and `'users.id'` (qualified) are not simple
+    // identifiers → skipped, so un-denying `select` doesn't add false positives.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let alias = "<?php\nuse App\\Models\\User;\nUser::select('votes as score')->get();\n";
+    let qualified = "<?php\nuse App\\Models\\User;\nUser::select('users.id')->get();\n";
+    for source in [alias, qualified] {
+        let chains = chains_of(source);
+        let diags =
+            chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+        assert!(
+            diags.is_empty(),
+            "alias/qualified select must not flag: {source:?} → {diags:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn having_is_not_diagnosed() {
+    // `having` filters on aggregate aliases — a bare identifier there is often
+    // not a real column, so it stays deny-listed.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::having('total', '>', 5)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(diags.is_empty(), "having must not be diagnosed: {diags:?}");
 }
 
 #[tokio::test]

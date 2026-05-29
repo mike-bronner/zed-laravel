@@ -25,6 +25,7 @@ use laravel_lsp::cache_manager::{
 use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
+use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::route_discovery::{build_route_index, discover_route_files, RouteIndex};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
@@ -1869,6 +1870,10 @@ struct LaravelLanguageServer {
     /// Add space between directive name and parentheses in completions
     /// false: @if($condition)  |  true: @if ($condition)
     directive_spacing: Arc<RwLock<bool>>,
+    /// Severity for query-chain diagnostics (unknown column/relation/table).
+    /// `None` disables them; defaults to `WARNING`. Set via the
+    /// `diagnostics.severity` LSP setting.
+    chain_diagnostic_severity: Arc<RwLock<Option<DiagnosticSeverity>>>,
     /// Whether we've shown the vendor missing diagnostic this session
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
@@ -1881,6 +1886,12 @@ struct LaravelLanguageServer {
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
+
+    /// Project-wide index of column/table definitions parsed from
+    /// `database/migrations/*.php`. Powers goto-definition on chain literals
+    /// (column → migration line, table → create-table migration). Built at init
+    /// and refreshed when migration files change.
+    migration_index: Arc<RwLock<Option<MigrationIndex>>>,
 
     /// Cached map of translation `namespace → absolute lang directory` for
     /// unpublished vendor packages. Lazily populated on the first translation
@@ -1941,6 +1952,42 @@ struct BladeSettings {
     directive_spacing: bool,
 }
 
+/// Query-chain diagnostics settings (unknown column / relation / table).
+/// Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "diagnostics": { "severity": "warning" } } } } }`
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsSettings {
+    /// Severity for unknown column/relation/table diagnostics in query chains.
+    /// One of `"warning"` (default), `"error"`, `"info"`, or `"off"`.
+    #[serde(default = "default_diagnostics_severity")]
+    severity: String,
+}
+
+impl Default for DiagnosticsSettings {
+    fn default() -> Self {
+        Self {
+            severity: default_diagnostics_severity(),
+        }
+    }
+}
+
+fn default_diagnostics_severity() -> String {
+    "warning".to_string()
+}
+
+/// Parse the configured `diagnostics.severity` string into an LSP severity.
+/// `None` means the feature is turned off; an unrecognised value falls back to
+/// `WARNING` (the safe, visible-but-non-blocking default).
+fn parse_chain_diagnostic_severity(value: &str) -> Option<DiagnosticSeverity> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "false" => None,
+        "error" => Some(DiagnosticSeverity::ERROR),
+        "info" | "information" | "hint" => Some(DiagnosticSeverity::INFORMATION),
+        _ => Some(DiagnosticSeverity::WARNING),
+    }
+}
+
 fn default_auto_complete_debounce() -> u64 {
     DEFAULT_SALSA_DEBOUNCE_MS
 }
@@ -1957,6 +2004,8 @@ struct LspSettings {
     auto_complete_debounce: u64,
     #[serde(default)]
     blade: BladeSettings,
+    #[serde(default)]
+    diagnostics: DiagnosticsSettings,
 }
 
 // ============================================================================
@@ -3454,11 +3503,13 @@ impl LaravelLanguageServer {
             pending_salsa_updates: Arc::new(RwLock::new(HashMap::new())),
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
+            chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
+            migration_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3489,6 +3540,17 @@ impl LaravelLanguageServer {
                 old_spacing, new_spacing
             );
             *self.directive_spacing.write().await = new_spacing;
+        }
+
+        // Query-chain diagnostics severity
+        let new_severity = parse_chain_diagnostic_severity(&settings.diagnostics.severity);
+        let old_severity = *self.chain_diagnostic_severity.read().await;
+        if new_severity != old_severity {
+            info!(
+                "⚙️  Updating chain diagnostics severity: {:?} → {:?} (from {:?})",
+                old_severity, new_severity, settings.diagnostics.severity
+            );
+            *self.chain_diagnostic_severity.write().await = new_severity;
         }
     }
 
@@ -4424,6 +4486,7 @@ impl LaravelLanguageServer {
             let server = self.clone_for_spawn();
             tokio::spawn(async move {
                 server.rebuild_route_index(&route_root).await;
+                server.rebuild_migration_index(&route_root).await;
             });
         }
 
@@ -4787,6 +4850,7 @@ impl LaravelLanguageServer {
         // Rebuild the route name index so any route definition changes (added,
         // renamed, removed) are reflected on the next goto-definition request.
         self.rebuild_route_index(&root).await;
+        self.rebuild_migration_index(&root).await;
 
         // Populate cache with ALL parsed middleware/bindings AFTER all rescans complete
         // This ensures we capture middleware from both vendor and app sources
@@ -5029,6 +5093,7 @@ impl LaravelLanguageServer {
         info!("🛣️  Building route index from root: {:?}", discovered_root);
         info!("========================================");
         self.rebuild_route_index(&discovered_root).await;
+        self.rebuild_migration_index(&discovered_root).await;
 
         // Initialize environment variables with Salsa
         info!("========================================");
@@ -12908,6 +12973,441 @@ return [
         }
     }
 
+    /// Rebuild the migration index by parsing `database/migrations/*.php`.
+    /// Mirrors `rebuild_route_index` — runs the (blocking) walk + parse off the
+    /// async runtime, then swaps the index in.
+    async fn rebuild_migration_index(&self, root: &Path) {
+        let root = root.to_path_buf();
+        let index = tokio::task::spawn_blocking(move || build_migration_index(&root)).await;
+        match index {
+            Ok(index) => {
+                info!(
+                    "🗄️  Migration index built: {} columns, {} tables",
+                    index.column_count(),
+                    index.table_count()
+                );
+                *self.migration_index.write().await = Some(index);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build migration index: {}", e);
+            }
+        }
+    }
+
+    /// Goto-definition for a query-chain literal under the cursor. Re-extracts
+    /// chains from the LIVE document (Salsa's cached chains can lag, and we need
+    /// byte offsets that match `content`), resolves the literal, and routes it:
+    /// column → migration line, relation → model method, table → create
+    /// migration. Returns `None` when nothing resolves (no chain at cursor,
+    /// unresolved receiver, missing source) — goto then no-ops.
+    async fn chain_goto_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{
+            detect_chain_target_at, eloquent_completion, extract_chains, position_to_byte_offset,
+            ArgKind, BuilderChain, BuilderMode,
+        };
+
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let root = self.initialized_root.read().await.clone()?;
+
+        let tree = laravel_lsp::parser::parse_php(&content).ok()?;
+        let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, &content)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        if chains.is_empty() {
+            return None;
+        }
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let target = detect_chain_target_at(&chains, byte)?;
+        let mut ctx = target.ctx;
+
+        // Finalize the context the same way completion/diagnostics do: resolve a
+        // relation closure hop, then a post-`toBase()` table.
+        if let Some(rel) = ctx.closure_relation_hop.clone() {
+            let parent = ctx.effective_model.clone()?;
+            ctx.effective_model =
+                Some(eloquent_completion::resolve_related_model(&parent, &rel, &root).await?);
+            ctx.closure_relation_hop = None;
+        }
+        if ctx.mode == BuilderMode::BaseBuilder && ctx.effective_table.is_none() {
+            if let Some(model) = ctx.effective_model.clone() {
+                ctx.effective_table =
+                    eloquent_completion::resolve_table_for_model(&model, &root).await;
+            }
+        }
+
+        match ctx.expecting {
+            ArgKind::Column => {
+                self.goto_column_definition(&ctx, &target.value, &root)
+                    .await
+            }
+            ArgKind::Relation | ArgKind::ClosureCarrier => {
+                self.goto_relation_definition(&ctx, &target.value, &root)
+                    .await
+            }
+            ArgKind::Table => self.goto_table_definition(&target.value).await,
+            ArgKind::None => None,
+        }
+    }
+
+    /// Column literal → the migration line that defines it. A qualified literal
+    /// (`users.id`) carries its own table; otherwise the chain's effective table
+    /// is used (resolved from the model for Eloquent chains).
+    async fn goto_column_definition(
+        &self,
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        value: &str,
+        root: &Path,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+
+        let (table, column) = match value.rsplit_once('.') {
+            Some((t, c)) => (t.to_string(), c.to_string()),
+            None => {
+                let table = match ctx.mode {
+                    BuilderMode::BaseBuilder => ctx.effective_table.clone()?,
+                    _ => {
+                        let model = ctx.effective_model.as_deref()?;
+                        eloquent_completion::resolve_table_for_model(model, root).await?
+                    }
+                };
+                (table, value.to_string())
+            }
+        };
+
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.column(&table, &column)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Table literal (`DB::table('users')`) → the `Schema::create('users'` line.
+    async fn goto_table_definition(&self, table: &str) -> Option<GotoDefinitionResponse> {
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.table(table)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Relation literal → the relation method on the model file. Walks any
+    /// dotted prefix (`posts.author`) to the final model, then locates the
+    /// last-segment method by name.
+    async fn goto_relation_definition(
+        &self,
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        value: &str,
+        root: &Path,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+
+        if ctx.mode == BuilderMode::BaseBuilder {
+            return None; // base query builder has no relations
+        }
+        let starting = ctx.effective_model.as_deref()?;
+        let (model, method) = match value.rsplit_once('.') {
+            Some((prefix, last)) => {
+                let m = eloquent_completion::walk_dotted_hops(starting, prefix, root).await?;
+                (m, last.to_string())
+            }
+            None => (starting.to_string(), value.to_string()),
+        };
+
+        let path = laravel_lsp::class_locator::find_php_class_file(&model, root)?;
+        let path_for_blocking = path.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let content = std::fs::read_to_string(&path_for_blocking).ok()?;
+            let structure = laravel_lsp::laravel_introspector::extract_php_structure(&content);
+            structure
+                .structures
+                .iter()
+                .flat_map(|s| &s.methods)
+                .find(|m| m.name == method)
+                .map(|m| (m.start_line, m.start_column, m.end_line, m.end_column))
+        })
+        .await
+        .ok()
+        .flatten()?;
+
+        let uri = Url::from_file_path(&path).ok()?;
+        let (start_line, start_col, end_line, end_col) = found;
+        let target_range = Range {
+            start: Position {
+                line: start_line,
+                character: start_col,
+            },
+            end: Position {
+                line: end_line,
+                character: end_col,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range,
+            target_selection_range: Range {
+                start: Position {
+                    line: start_line,
+                    character: start_col,
+                },
+                end: Position {
+                    line: start_line,
+                    character: start_col,
+                },
+            },
+        }]))
+    }
+
+    /// Build a goto response pointing at a migration definition site.
+    fn location_from_migration_site(
+        site: &laravel_lsp::migration_index::MigrationSite,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = Url::from_file_path(&site.file).ok()?;
+        let range = Range {
+            start: Position {
+                line: site.line,
+                character: site.start_char,
+            },
+            end: Position {
+                line: site.line,
+                character: site.end_char,
+            },
+        };
+        // Land the caret at the column/table name WITHOUT selecting it. A
+        // selected `email` makes Zed highlight every `email` substring (incl.
+        // `email_verified_at`), which reads as "jumped to the wrong field". A
+        // zero-width selection reveals the line and places the caret cleanly.
+        let caret = Range {
+            start: range.start,
+            end: range.start,
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: range,
+            target_selection_range: caret,
+        }]))
+    }
+
+    /// prepare_rename fallback: if the cursor is on a PHP class name that
+    /// resolves to a *project* (non-dependency) class, return the basename range
+    /// so the editor offers a rename. Returns `None` for vendor classes, aliases,
+    /// and non-class positions.
+    async fn prepare_class_rename(&self, uri: &Url, position: Position) -> Option<Range> {
+        use laravel_lsp::query_chain::{byte_offset_to_position, position_to_byte_offset};
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let (fqcn, span) = laravel_lsp::class_rename::class_at_cursor(&content, byte)?;
+        let root = self.initialized_root.read().await.clone()?;
+        let decl = laravel_lsp::class_locator::find_php_class_file(&fqcn, &root)?;
+        if laravel_lsp::class_rename::is_dependency_path(&decl) {
+            return None; // don't rename vendor classes
+        }
+        Some(Range {
+            start: byte_offset_to_position(&content, span.0),
+            end: byte_offset_to_position(&content, span.1),
+        })
+    }
+
+    /// rename fallback for PHP class names: rewrite every project-wide reference
+    /// to the class (declaration, `use`, `::`, `new`, type hints, `::class`,
+    /// `instanceof`, docblocks) and rename the declaring file. Same-namespace
+    /// rename only — `new_name` must be a simple class identifier.
+    async fn class_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        use laravel_lsp::query_chain::{byte_offset_to_position, position_to_byte_offset};
+
+        let content = match self.documents.read().await.get(uri) {
+            Some((c, _)) => c.clone(),
+            None => return Ok(None),
+        };
+        let Some(byte) = position_to_byte_offset(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
+        let Some((fqcn, _span)) = laravel_lsp::class_rename::class_at_cursor(&content, byte) else {
+            return Ok(None);
+        };
+        let Some(root) = self.initialized_root.read().await.clone() else {
+            return Ok(None);
+        };
+        let Some(decl_path) = laravel_lsp::class_locator::find_php_class_file(&fqcn, &root) else {
+            return Ok(None);
+        };
+        if laravel_lsp::class_rename::is_dependency_path(&decl_path) {
+            return Ok(None);
+        }
+
+        // `new_name` must be a bare class identifier — renaming into a different
+        // namespace (a move) isn't supported.
+        let new_basename = new_name.trim();
+        let is_identifier = !new_basename.is_empty()
+            && new_basename
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && new_basename
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !is_identifier {
+            return Err(laravel_lsp::rename::rename_error(
+                "Rename a class to a simple name (moving it to another namespace isn't supported).",
+            ));
+        }
+        let old_basename = fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string();
+        if new_basename == old_basename {
+            return Ok(None);
+        }
+
+        // Find every reference across project PHP files. The expensive step is
+        // the per-file tree-sitter parse, so we read first (cheap) and only
+        // parse files whose text actually contains the old basename — on a large
+        // project that's a handful out of thousands. A size cap skips
+        // pathological generated files (e.g. giant `_ide_helper`).
+        const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+        // Show a status-bar spinner — scanning a large project takes a few
+        // seconds and the rename would otherwise look frozen. Indeterminate
+        // (no percentage): the scan is one blocking pass we can't report inside.
+        // Best-effort; `None` if the client doesn't support progress.
+        let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+            self.client.clone(),
+            laravel_lsp::indexing_progress::RENAME_TOKEN,
+            "Laravel",
+            format!("Renaming {old_basename} → {new_basename}…"),
+            None,
+        )
+        .await;
+
+        let root2 = root.clone();
+        let fqcn2 = fqcn.clone();
+        let old2 = old_basename.clone();
+        let t_scan = std::time::Instant::now();
+        let (per_file, scanned, parsed) = tokio::task::spawn_blocking(move || {
+            let files = laravel_lsp::class_rename::project_php_files(&root2);
+            let scanned = files.len();
+            let mut parsed = 0usize;
+            let per_file: Vec<_> = files
+                .into_iter()
+                .filter_map(|p| {
+                    let c = std::fs::read_to_string(&p).ok()?;
+                    // Cheap pre-filter: skip files that can't reference the class.
+                    if c.len() > MAX_FILE_BYTES || !c.contains(&old2) {
+                        return None;
+                    }
+                    parsed += 1;
+                    let spans = laravel_lsp::class_rename::reference_spans(&c, &fqcn2, &old2);
+                    if spans.is_empty() {
+                        None
+                    } else {
+                        Some((p, c, spans))
+                    }
+                })
+                .collect();
+            (per_file, scanned, parsed)
+        })
+        .await
+        .unwrap_or_default();
+
+        let edit_count: usize = per_file.iter().map(|(_, _, s)| s.len()).sum();
+        info!(
+            "✏️  class rename {} → {}: {} edits in {} files (scanned {}, parsed {}) in {:?}",
+            old_basename,
+            new_basename,
+            edit_count,
+            per_file.len(),
+            scanned,
+            parsed,
+            t_scan.elapsed()
+        );
+
+        // Scan done (the edit-building below is instant) — clear the spinner.
+        if let Some(p) = progress {
+            p.end(format!(
+                "Renamed {old_basename} → {new_basename} ({edit_count} edits, {} files)",
+                per_file.len()
+            ))
+            .await;
+        }
+
+        if per_file.is_empty() {
+            return Ok(None);
+        }
+
+        let new_basename = new_basename.to_string();
+        let mut ops: Vec<DocumentChangeOperation> = Vec::new();
+        for (path, file_content, spans) in &per_file {
+            let Ok(file_uri) = Url::from_file_path(path) else {
+                continue;
+            };
+            let edits: Vec<OneOf<TextEdit, AnnotatedTextEdit>> = spans
+                .iter()
+                .map(|(s, e)| {
+                    OneOf::Left(TextEdit {
+                        range: Range {
+                            start: byte_offset_to_position(file_content, *s),
+                            end: byte_offset_to_position(file_content, *e),
+                        },
+                        new_text: new_basename.clone(),
+                    })
+                })
+                .collect();
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: file_uri,
+                    version: None,
+                },
+                edits,
+            }));
+        }
+
+        // Rename the declaring file (same dir, new basename). Emitted AFTER the
+        // text edits so the `class User → class NewName` edit lands first.
+        let new_path = decl_path.with_file_name(format!("{new_basename}.php"));
+        if new_path != decl_path {
+            if let (Ok(old_uri), Ok(new_uri)) = (
+                Url::from_file_path(&decl_path),
+                Url::from_file_path(&new_path),
+            ) {
+                ops.push(DocumentChangeOperation::Op(ResourceOp::Rename(
+                    RenameFile {
+                        old_uri,
+                        new_uri,
+                        options: Some(RenameFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(false),
+                        }),
+                        annotation_id: None,
+                    },
+                )));
+            }
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            change_annotations: None,
+        }))
+    }
+
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
     async fn create_url_location_from_salsa(
@@ -13101,11 +13601,13 @@ return [
             pending_salsa_updates: self.pending_salsa_updates.clone(),
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
+            chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
+            migration_index: self.migration_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
@@ -13185,6 +13687,81 @@ return [
             }
         };
         info!("   ⏱️  salsa.get_patterns: {:?}", t_patterns.elapsed());
+
+        // Query-chain diagnostics: unknown column / relation / table inside
+        // Eloquent & DB builder chains. Runs for both PHP and Blade (chains
+        // appear in `@php` blocks and `{{ }}`). Gated on the configured
+        // severity (None = feature off) and on the schema + project root being
+        // available — every guard inside `chain_diagnostics` errs toward
+        // staying quiet, so a cold DB or unresolved model yields no squiggles.
+        if is_php || is_blade {
+            if let Some(severity) = *self.chain_diagnostic_severity.read().await {
+                // CRITICAL: derive chains from the EXACT `source` we convert to
+                // ranges, not from `patterns.chains`. Salsa's cached chains can
+                // lag the live document (e.g. did_save without a prior debounce
+                // flush), and stale byte offsets produce squiggles in the wrong
+                // place AND that never clear. Completion re-extracts for the same
+                // reason. For PHP we re-parse here; Blade keeps the Salsa path,
+                // which already shifts embedded-PHP offsets back to Blade
+                // coordinates (re-parsing raw Blade as PHP wouldn't work).
+                let fresh_chains: Vec<Arc<laravel_lsp::query_chain::BuilderChain>> = if is_php {
+                    match laravel_lsp::parser::parse_php(source) {
+                        Ok(tree) => laravel_lsp::query_chain::extract_chains(&tree, source)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    patterns.chains.clone()
+                };
+                // Log the chain count unconditionally so the LSP log explains a
+                // "no diagnostics" outcome: 0 chains → nothing to lint (or
+                // unparsed); N chains but 0 found → schema/model didn't resolve
+                // (most often: DB not connected).
+                let n_chains = fresh_chains.len();
+                let root = self.initialized_root.read().await.clone();
+                match (n_chains, root) {
+                    (0, _) => {
+                        info!("🔗 chain_diagnostics: 0 chains in patterns for {}", uri);
+                    }
+                    (_, None) => {
+                        info!(
+                            "🔗 chain_diagnostics: {} chains but project root not initialised",
+                            n_chains
+                        );
+                    }
+                    (_, Some(root)) => {
+                        let db_guard = self.database_schema.read().await;
+                        match db_guard.as_ref() {
+                            None => info!(
+                                "🔗 chain_diagnostics: {} chains but DB schema provider not \
+                                 initialised — column/relation diagnostics need a DB connection",
+                                n_chains
+                            ),
+                            Some(db) => {
+                                let t_chain = std::time::Instant::now();
+                                let chain_diags = laravel_lsp::query_chain::chain_diagnostics(
+                                    &fresh_chains,
+                                    db,
+                                    &root,
+                                    source,
+                                    severity,
+                                )
+                                .await;
+                                info!(
+                                    "🔗 chain_diagnostics: {:?} — {} found over {} chains",
+                                    t_chain.elapsed(),
+                                    chain_diags.len(),
+                                    n_chains
+                                );
+                                diagnostics.extend(chain_diags);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Validate PHP files with view() calls and env() calls
         if is_php {
@@ -15627,8 +16204,10 @@ impl LanguageServer for LaravelLanguageServer {
             // editor chrome with.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
+                laravel_lsp::indexing_progress::INDEXING_TOKEN,
                 "Laravel",
                 "Starting indexer…",
+                Some(0),
             )
             .await;
 
@@ -15971,6 +16550,7 @@ impl LanguageServer for LaravelLanguageServer {
         let mut created_or_changed = 0usize;
         let mut deleted = 0usize;
         let mut skipped_open = 0usize;
+        let mut migrations_changed = false;
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -15980,6 +16560,9 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
+                migrations_changed = true;
+            }
             match change.typ {
                 FileChangeType::CREATED => {
                     // Best-effort read. The file may already be gone
@@ -16058,6 +16641,14 @@ impl LanguageServer for LaravelLanguageServer {
                 "🛡️  watched files: {} updated, {} deleted, {} skipped (open in editor)",
                 created_or_changed, deleted, skipped_open
             );
+        }
+
+        // A migration changed on disk — rebuild the column/table index so
+        // goto-definition reflects the new schema. One rebuild per batch.
+        if migrations_changed {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                self.rebuild_migration_index(&root).await;
+            }
         }
     }
 
@@ -16161,6 +16752,15 @@ impl LanguageServer for LaravelLanguageServer {
                     if let Some(loc) = self.blade_variable_goto_definition(&uri, position).await {
                         return Ok(Some(loc));
                     }
+                }
+
+                // Query-chain literal fallback: cmd-click on a column / relation
+                // / table literal inside an Eloquent or DB::table() chain jumps
+                // to its definition (migration line / model method / create
+                // migration). Chains aren't position-indexed, so this lives in
+                // the no-pattern branch.
+                if let Some(loc) = self.chain_goto_definition(&uri, position).await {
+                    return Ok(Some(loc));
                 }
 
                 // Debug: show what middleware patterns exist on this line
@@ -16509,7 +17109,11 @@ impl LanguageServer for LaravelLanguageServer {
                     "prepare_rename: no classifier match at {}:{}",
                     position.line, position.character
                 );
-                return Ok(None);
+                // Fallback: a PHP class name (model, etc.) under the cursor.
+                return Ok(self
+                    .prepare_class_rename(uri, position)
+                    .await
+                    .map(PrepareRenameResponse::Range));
             }
         };
 
@@ -16580,7 +17184,8 @@ impl LanguageServer for LaravelLanguageServer {
                     "rename: classify returned None at {}:{}",
                     position.line, position.character
                 );
-                return Ok(None);
+                // Fallback: PHP class rename (model, etc.) across the project.
+                return self.class_rename_edit(uri, position, &new_name).await;
             }
         };
 
@@ -17373,6 +17978,31 @@ impl LanguageServer for LaravelLanguageServer {
 
         // Process each diagnostic to see if we can offer a fix
         for diagnostic in &context.diagnostics {
+            // Query-chain diagnostics (source: laravel-lsp) carry a structured
+            // `data` payload — offer rename + create-migration quick-fixes.
+            if diagnostic.source.as_deref() == Some("laravel-lsp") {
+                if let Some(action) =
+                    laravel_lsp::query_chain::code_actions::rename_action(diagnostic, uri)
+                {
+                    actions.push(action);
+                }
+                if let Some(root) = root {
+                    let timestamp =
+                        laravel_lsp::query_chain::code_actions::format_migration_timestamp(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        );
+                    if let Some(action) = laravel_lsp::query_chain::code_actions::migration_action(
+                        diagnostic, root, &timestamp,
+                    ) {
+                        actions.push(action);
+                    }
+                }
+                continue;
+            }
+
             // Check if this is our diagnostic (source: laravel)
             if diagnostic.source.as_deref() != Some("laravel") {
                 continue;

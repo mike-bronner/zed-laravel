@@ -11,6 +11,7 @@
 
 use super::chain::*;
 use std::sync::Arc;
+use tower_lsp::lsp_types::Position;
 
 /// Result of preparing source content for chain-completion at the cursor.
 /// Carries the (possibly fixed) content to parse PLUS metadata the items
@@ -216,6 +217,36 @@ pub fn position_to_byte_offset(content: &str, line: u32, character: u32) -> Opti
     Some(line_start + byte_in_line)
 }
 
+/// Inverse of [`position_to_byte_offset`]: translate a byte offset inside
+/// `content` into an LSP `Position` (0-based line + character). Characters are
+/// counted as Unicode code points, matching `position_to_byte_offset` — so a
+/// round-trip through both functions is stable for ASCII Laravel source. A
+/// `byte_offset` past the end of `content` clamps to the final position; an
+/// offset that lands mid-codepoint (only possible from a buggy caller) falls
+/// back to column 0 on its line rather than panicking.
+///
+/// Used by the diagnostics path, which carries byte spans out of the chain
+/// extractor and needs LSP `Range`s to attach squiggles.
+pub fn byte_offset_to_position(content: &str, byte_offset: usize) -> Position {
+    let clamped = byte_offset.min(content.len());
+    let mut line: u32 = 0;
+    let mut line_start = 0usize;
+    for (idx, b) in content.bytes().enumerate() {
+        if idx >= clamped {
+            break;
+        }
+        if b == b'\n' {
+            line += 1;
+            line_start = idx + 1;
+        }
+    }
+    let character = content
+        .get(line_start..clamped)
+        .map(|slice| slice.chars().count() as u32)
+        .unwrap_or(0);
+    Position { line, character }
+}
+
 /// Resolve a cursor inside a parsed file to a `ChainContext`. Returns `None`
 /// when no chain contains the cursor, when the chain's receiver can't be
 /// resolved without async I/O (Eloquent — handled by later phases), or when
@@ -279,23 +310,24 @@ fn find_chain_containing(
     best
 }
 
-fn detect_in_chain(
+/// Resolve the initial chain context from the receiver alone, before any links
+/// are walked. Returns `(mode, effective_table, effective_model,
+/// closure_relation_hop)`, or `None` when the receiver can't be resolved
+/// synchronously (unknown receiver, or an instance var with no declared type
+/// and no enclosing closure binding).
+///
+/// - DbTable carries the table directly; no model lookup needed.
+/// - Eloquent static receivers (`User::where(...)`) carry the class FQCN; the
+///   handler resolves it to a model/table async (file I/O). `effective_table`
+///   stays `None` here.
+/// - Eloquent instance receivers (`$user->newQuery()`) resolve via an
+///   enclosing relation/same-model closure binding, or a declared `@var` /
+///   typed-param type captured at extraction time.
+fn initial_receiver_context(
     chains: &[Arc<BuilderChain>],
     chain: &BuilderChain,
-    byte_offset: usize,
-) -> Option<ChainContext> {
-    // Initial mode + table + model from the receiver.
-    //
-    // - DbTable carries the table directly; no model lookup needed.
-    // - Eloquent static receivers (`User::where(...)`) carry the class FQCN;
-    //   the handler will resolve it to a `ModelMetadata` async (file I/O).
-    //   `effective_table` stays `None` here — the handler fills it in.
-    // - Eloquent instance receivers (`$user->newQuery()`) need `@var`
-    //   docblock + typed-param scanning to resolve the class; that lands in
-    //   Phase 9. Phase 8 handles the special case of `$q` bound by an
-    //   enclosing relation closure: the parent chain's model + the closure's
-    //   relation name resolve via one async hop in the handler.
-    let (mut mode, effective_table, effective_model, closure_relation_hop) = match &chain.receiver {
+) -> Option<(BuilderMode, Option<String>, Option<String>, Option<String>)> {
+    let resolved = match &chain.receiver {
         ChainReceiver::DbTable { table, .. } => {
             (BuilderMode::BaseBuilder, Some(table.clone()), None, None)
         }
@@ -306,23 +338,11 @@ fn detect_in_chain(
             None,
         ),
         ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, php_type }) => {
-            // Phase 8: if the chain's receiver var is bound by an enclosing
-            // closure carrier, inherit the parent chain's effective model.
-            // Two flavors:
-            //
-            // - RelationHop (`whereHas('rel', closure)` / `with(['rel' =>
-            //   closure])`): closure binds to a *related* model's builder.
-            //   The handler walks one hop on the parent's model.
-            // - SameModel (`where(closure)`, `when($cond, closure)`,
-            //   `having(closure)`, etc.): closure binds to the *same* model
-            //   as the parent. Inherit `effective_model` directly; no hop.
-            //
-            // Phase 9 (fallback): no closure scope match? Try the resolved
-            // `php_type` captured at extraction time from a typed function
-            // parameter (`function show(User $user)`) or a `@var` docblock
-            // (`/** @var User $u */`). This is what makes the idiomatic
-            // controller-style `public function show(User $user) {
-            // $user->newQuery()->where('|'); }` work end-to-end.
+            // Phase 8: a `$q` receiver bound by an enclosing closure carrier
+            // inherits the parent chain's model — RelationHop (`whereHas('rel',
+            // closure)`) walks one relation hop; SameModel (`where(closure)`,
+            // `when(...)`, …) inherits directly. Phase 9 fallback: the resolved
+            // `php_type` from a typed param / `@var` docblock.
             match chain.closure_scope.as_ref() {
                 Some(binding) if &binding.param_var == var => {
                     let parent_model = parent_chain_eloquent_model(chains, chain)?;
@@ -351,6 +371,76 @@ fn detect_in_chain(
         }
         ChainReceiver::Unknown => return None,
     };
+    Some(resolved)
+}
+
+/// Resolve the chain context at a specific link index, applying the effects of
+/// all links *before* `link_idx` to the running mode. Unlike
+/// [`detect_chain_context_at`], this does NOT require the link to expose a
+/// recognised string argument — it's for diagnostics on dynamic
+/// `where{Column}` finders, whose column lives in the method name rather than
+/// an argument. `expecting` is set to the target link's `ArgKind` (often
+/// `None` for dynamic finders). Returns `None` if a prior link terminated the
+/// chain or the receiver can't be resolved synchronously.
+pub fn chain_context_for_link(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    link_idx: usize,
+) -> Option<ChainContext> {
+    let (mut mode, effective_table, effective_model, closure_relation_hop) =
+        initial_receiver_context(chains, chain)?;
+    for link in chain.links.iter().take(link_idx) {
+        match link.effect {
+            ChainEffect::FlipToBase => mode = BuilderMode::BaseBuilder,
+            ChainEffect::FlipToCollection => {
+                if mode == BuilderMode::EloquentBuilder {
+                    mode = BuilderMode::EloquentCollection;
+                }
+            }
+            ChainEffect::Terminate => return None,
+            ChainEffect::None => {}
+        }
+    }
+    let arg = chain.links.get(link_idx)?.arg;
+    Some(ChainContext {
+        mode,
+        effective_table,
+        effective_model,
+        expecting: arg,
+        dotted_prefix: None,
+        closure_relation_hop,
+        quote: '\'',
+    })
+}
+
+/// The string literal the cursor sits in, plus the resolved [`ChainContext`].
+/// Goto-definition needs the literal's value (which column/relation/table) and
+/// its span — neither of which `ChainContext` carries — so the cursor resolver
+/// surfaces them here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainTarget {
+    pub ctx: ChainContext,
+    /// The unquoted literal under the cursor (`"posts.author"`, `"email"`, …).
+    pub value: String,
+    /// Byte span of the string literal *including* its quotes.
+    pub value_span: (usize, usize),
+}
+
+fn detect_in_chain(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    byte_offset: usize,
+) -> Option<ChainContext> {
+    detect_target_in_chain(chains, chain, byte_offset).map(|t| t.ctx)
+}
+
+fn detect_target_in_chain(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    byte_offset: usize,
+) -> Option<ChainTarget> {
+    let (mut mode, effective_table, effective_model, closure_relation_hop) =
+        initial_receiver_context(chains, chain)?;
 
     // Walk links in source order. For each link, decide: (a) does the cursor
     // sit inside this link? (b) if not, apply this link's effect and move on.
@@ -382,7 +472,7 @@ fn detect_in_chain(
     // The cursor must be inside a string-literal arg of the cursor link.
     // `pluck` is `ArgKind::Column` even though it terminates the chain —
     // we still complete inside its first arg.
-    let (quote, string_value) = string_arg_at(cursor_link, byte_offset)?;
+    let (quote, string_value, value_span) = string_arg_at(cursor_link, byte_offset)?;
 
     if !matches!(
         cursor_link.arg,
@@ -410,15 +500,30 @@ fn detect_in_chain(
         None
     };
 
-    Some(ChainContext {
-        mode,
-        effective_table,
-        effective_model,
-        expecting: cursor_link.arg,
-        dotted_prefix,
-        closure_relation_hop,
-        quote,
+    Some(ChainTarget {
+        ctx: ChainContext {
+            mode,
+            effective_table,
+            effective_model,
+            expecting: cursor_link.arg,
+            dotted_prefix,
+            closure_relation_hop,
+            quote,
+        },
+        value: string_value,
+        value_span,
     })
+}
+
+/// Resolve a cursor to the chain literal under it plus its [`ChainContext`].
+/// Like [`detect_chain_context_at`], but also returns the literal's value and
+/// span — used by goto-definition to route the literal to its source.
+pub fn detect_chain_target_at(
+    chains: &[Arc<BuilderChain>],
+    byte_offset: usize,
+) -> Option<ChainTarget> {
+    let chain = find_chain_containing(chains, byte_offset)?;
+    detect_target_in_chain(chains, chain, byte_offset)
 }
 
 /// Phase 8 helper: find the smallest chain in `chains` whose span strictly
@@ -464,14 +569,14 @@ fn parent_chain_eloquent_model(
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning
-/// its quote character and value. Walks both top-level `StringLit` args and
-/// string literals nested inside an `Array` arg, so `with(['posts'|, 'comments'])`
-/// resolves the same as `with('posts'|)`. Returns `None` if no string arg
-/// covers the cursor.
-fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String)> {
+/// its quote character, value, and byte span (incl. quotes). Walks both
+/// top-level `StringLit` args and string literals nested inside an `Array` arg,
+/// so `with(['posts'|, 'comments'])` resolves the same as `with('posts'|)`.
+/// Returns `None` if no string arg covers the cursor.
+fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String, (usize, usize))> {
     for arg in &link.args {
-        if let Some((quote, value)) = string_arg_in(arg, byte_offset) {
-            return Some((quote, value));
+        if let Some(found) = string_arg_in(arg, byte_offset) {
+            return Some(found);
         }
     }
     None
@@ -479,9 +584,10 @@ fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String)>
 
 /// Check whether a single arg (or any of its nested string elements, for
 /// `Array` args) contains the cursor and is a string literal. Returns the
-/// quote character + literal value on hit. Pulled out as a separate helper
-/// so `Array` can recurse into its elements without duplicating the span check.
-fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String)> {
+/// quote character, literal value, and byte span on hit. Pulled out as a
+/// separate helper so `Array` can recurse into its elements without
+/// duplicating the span check.
+fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String, (usize, usize))> {
     match arg {
         ChainArg::StringLit {
             quote,
@@ -490,7 +596,7 @@ fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String)> {
         } => {
             let (start, end) = *span_byte_range;
             if byte_offset >= start && byte_offset <= end {
-                Some((*quote, value.clone()))
+                Some((*quote, value.clone(), *span_byte_range))
             } else {
                 None
             }

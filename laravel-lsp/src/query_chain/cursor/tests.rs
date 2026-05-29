@@ -34,6 +34,53 @@ fn detect(src_with_cursor: &str) -> Option<ChainContext> {
     detect_chain_context_at(&chains, byte_offset)
 }
 
+fn detect_target(src_with_cursor: &str) -> Option<ChainTarget> {
+    let (wrapped, byte_offset) = cursor_at(src_with_cursor);
+    let tree = parse_php(&wrapped).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, &wrapped)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    detect_chain_target_at(&chains, byte_offset).inspect(|t| {
+        // Verify the span maps back to the literal in the source.
+        let span_text = &wrapped[t.value_span.0..t.value_span.1];
+        assert_eq!(
+            span_text,
+            format!("'{}'", t.value),
+            "span should cover the quoted literal"
+        );
+    })
+}
+
+#[test]
+fn target_returns_column_value_and_kind() {
+    let t = detect_target("DB::table('users')->where('emai|l', 1);").expect("target");
+    assert_eq!(t.value, "email");
+    assert_eq!(t.ctx.expecting, ArgKind::Column);
+}
+
+#[test]
+fn target_returns_dotted_relation_value() {
+    let t = detect_target("User::with('posts.auth|or');").expect("target");
+    assert_eq!(t.value, "posts.author");
+    assert!(matches!(
+        t.ctx.expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier
+    ));
+}
+
+#[test]
+fn target_resolves_array_element_under_cursor() {
+    // Goto on an element inside an array arg resolves that element (the cursor
+    // resolver recurses into arrays).
+    let t = detect_target("User::with(['posts', 'comm|ents']);").expect("target");
+    assert_eq!(t.value, "comments");
+    assert!(matches!(
+        t.ctx.expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier
+    ));
+}
+
 // ---- fixup_for_completion ---------------------------------------------
 
 #[test]
@@ -766,5 +813,70 @@ fn find_chain_containing_picks_innermost() {
             assert_eq!(var, "q", "innermost chain should be $q's");
         }
         other => panic!("expected $q's chain, got {other:?}"),
+    }
+}
+
+// ---- byte_offset_to_position ----------------------------------------------
+
+#[test]
+fn byte_offset_to_position_first_line() {
+    let content = "abc\ndef";
+    assert_eq!(
+        byte_offset_to_position(content, 0),
+        tower_lsp::lsp_types::Position {
+            line: 0,
+            character: 0
+        }
+    );
+    assert_eq!(
+        byte_offset_to_position(content, 2),
+        tower_lsp::lsp_types::Position {
+            line: 0,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn byte_offset_to_position_after_newline() {
+    let content = "abc\ndef";
+    // Byte 4 is 'd' on line 1, column 0.
+    assert_eq!(
+        byte_offset_to_position(content, 4),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 0
+        }
+    );
+    // Byte 6 is 'f' → line 1, column 2.
+    assert_eq!(
+        byte_offset_to_position(content, 6),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn byte_offset_to_position_clamps_past_end() {
+    let content = "ab\ncd";
+    assert_eq!(
+        byte_offset_to_position(content, 999),
+        tower_lsp::lsp_types::Position {
+            line: 1,
+            character: 2
+        }
+    );
+}
+
+#[test]
+fn position_byte_round_trip_is_stable() {
+    let content = "<?php\nUser::where('email');\n$x = 1;\n";
+    for byte in [0usize, 6, 12, 20, 27] {
+        let pos = byte_offset_to_position(content, byte);
+        let back =
+            position_to_byte_offset(content, pos.line, pos.character).expect("round-trip offset");
+        assert_eq!(back, byte, "round-trip failed for byte {byte}");
     }
 }

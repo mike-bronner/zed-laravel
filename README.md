@@ -50,6 +50,9 @@ The extension works out of the box with zero configuration. It automatically dis
         "autoCompleteDebounce": 200,
         "blade": {
           "directiveSpacing": false
+        },
+        "diagnostics": {
+          "severity": "warning"
         }
       }
     }
@@ -61,6 +64,7 @@ The extension works out of the box with zero configuration. It automatically dis
 |---------|---------|-------------|
 | `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates after typing. Lower values (50-100ms) give faster feedback. Higher values (300-500ms) reduce CPU usage. |
 | `blade.directiveSpacing` | `false` | Add space between directive name and parentheses. `false`: `@if($condition)` / `true`: `@if ($condition)` |
+| `diagnostics.severity` | `"warning"` | Severity for query-chain diagnostics (unknown column/relation/table in Eloquent & `DB::table()` chains). One of `"warning"`, `"error"`, `"info"`, or `"off"` to disable. Requires a working database connection — diagnostics stay silent when the schema can't be introspected. |
 
 **🗄️ Database autocomplete** (`exists:`, `unique:` rules, Eloquent properties) requires a working database connection. Configure in your `.env`:
 
@@ -234,8 +238,19 @@ $message = __('auth.failed');
 //            ^^^^^^^^^^^^ → lang/en/auth.php
 ```
 
+Cmd+Click also works on **query-chain literals** — columns jump to the migration line that defines them, relations to the relation method on the model, and `DB::table()` names to the create-table migration:
+
+```php
+User::where('email', $value)->with('posts');
+//          ^^^^^ → database/migrations/..._create_users_table.php  ($table->string('email'))
+//                                ^^^^^ → app/Models/User.php  (public function posts())
+
+DB::table('users')->get();
+//        ^^^^^ → database/migrations/..._create_users_table.php  (Schema::create('users'))
+```
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature`
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
 
 ### 🔍 Find References
 

@@ -62,12 +62,14 @@ pub use model_metadata::{
 // module specifically. These are structurally identical to the ones
 // in `chain` — the model_metadata module keeps its own copy because
 // it's the public API surface that existed before the consolidation.
-pub use model_metadata::{AccessorInfo as ModelAccessorInfo, RelationshipInfo as ModelRelationshipInfo};
+pub use model_metadata::{
+    AccessorInfo as ModelAccessorInfo, RelationshipInfo as ModelRelationshipInfo,
+};
 
 // Builder method index API.
 pub use builder_index::{
-    parse_builder_methods, BuilderMethodIndex, ELOQUENT_BUILDER_REL_PATH,
-    ELOQUENT_MODEL_REL_PATH, ParsedMethod, QUERY_BUILDER_REL_PATH,
+    parse_builder_methods, BuilderMethodIndex, ParsedMethod, ELOQUENT_BUILDER_REL_PATH,
+    ELOQUENT_MODEL_REL_PATH, QUERY_BUILDER_REL_PATH,
 };
 
 // Low-level PHP structure types — surfaced for the few call sites

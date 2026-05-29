@@ -129,7 +129,11 @@ class Portfolio extends Model {
 "#,
     );
     let view = analyze(&path, dir.path()).unwrap();
-    assert!(view.scopes.is_empty(), "unexpected scopes: {:?}", view.scopes);
+    assert!(
+        view.scopes.is_empty(),
+        "unexpected scopes: {:?}",
+        view.scopes
+    );
 }
 
 // ---- Inheritance + traits ----------------------------------------------
@@ -380,7 +384,11 @@ class Portfolio extends Model {
 "#,
     );
     let view = analyze(&path, dir.path()).unwrap();
-    let names: Vec<&str> = view.column_surface.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = view
+        .column_surface
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert!(!names.contains(&"created_at"), "got: {names:?}");
     assert!(!names.contains(&"updated_at"), "got: {names:?}");
     // `id` convention still fires.

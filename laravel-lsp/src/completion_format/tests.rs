@@ -55,10 +55,7 @@ fn php_code_block_is_seeded_with_open_tag() {
 fn php_code_block_does_not_double_seed_open_tag() {
     // If the caller already supplied `<?php`, leave it alone — don't
     // produce `<?php\n\n<?php\n…`.
-    let doc = CompletionDoc::new().code(CodeBlock::new(
-        "php",
-        "<?php\npublic function get()",
-    ));
+    let doc = CompletionDoc::new().code(CodeBlock::new("php", "<?php\npublic function get()"));
     assert_eq!(doc.render(), "```php\n<?php\npublic function get()\n```");
 }
 
@@ -71,10 +68,7 @@ fn non_php_code_block_carries_language_tag_only() {
 
 #[test]
 fn empty_strings_are_ignored() {
-    let doc = CompletionDoc::new()
-        .header("")
-        .summary("")
-        .section("");
+    let doc = CompletionDoc::new().header("").summary("").section("");
     assert!(doc.is_empty());
     assert_eq!(doc.render(), "");
 }
@@ -101,9 +95,7 @@ fn code_opt_handles_none() {
 
 #[test]
 fn sections_plural_appends_all_nonempty() {
-    let doc = CompletionDoc::new()
-        .header("X")
-        .sections(["a", "", "b"]);
+    let doc = CompletionDoc::new().header("X").sections(["a", "", "b"]);
     assert_eq!(doc.render(), "**X**\n\na\n\nb");
 }
 
@@ -272,22 +264,13 @@ fn format_phpdoc_tag_unknown_tag_passes_through() {
     // Tags without a type slot (@deprecated, @internal, @see, etc.)
     // shouldn't have anything wrapped.
     assert_eq!(format_phpdoc_tag("@deprecated"), "@deprecated");
-    assert_eq!(
-        format_phpdoc_tag("@see Foo::bar()"),
-        "@see Foo::bar()"
-    );
-    assert_eq!(
-        format_phpdoc_tag("@since 9.0.0"),
-        "@since 9.0.0"
-    );
+    assert_eq!(format_phpdoc_tag("@see Foo::bar()"), "@see Foo::bar()");
+    assert_eq!(format_phpdoc_tag("@since 9.0.0"), "@since 9.0.0");
 }
 
 #[test]
 fn format_phpdoc_tag_already_backticked_type_not_double_wrapped() {
-    assert_eq!(
-        format_phpdoc_tag("@return `Builder`"),
-        "@return `Builder`"
-    );
+    assert_eq!(format_phpdoc_tag("@return `Builder`"), "@return `Builder`");
 }
 
 #[test]
@@ -331,9 +314,7 @@ fn render_resolves_self_types_in_tags_when_class_provided() {
 #[test]
 fn render_leaves_self_keyword_alone_without_resolution_class() {
     // No `.resolve_self_for(...)` call → tags preserve `$this` verbatim.
-    let doc = CompletionDoc::new()
-        .header("x")
-        .section("@return $this");
+    let doc = CompletionDoc::new().header("x").section("@return $this");
     let rendered = doc.render();
     assert!(rendered.contains("@return `$this`"));
 }

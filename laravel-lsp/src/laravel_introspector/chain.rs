@@ -254,7 +254,6 @@ pub struct ClassView {
     pub all_properties: Vec<ResolvedMember<PhpPropertyInfo>>,
 
     // ---- Model-specific surfaces ----
-
     /// Eloquent local scopes. Empty for non-models.
     pub scopes: Vec<ScopeInfo>,
     /// Old-style + new-style accessors. Empty for non-models.
@@ -274,7 +273,6 @@ pub struct ClassView {
     pub column_surface: Vec<ColumnInfo>,
 
     // ---- Builder-specific surface ----
-
     /// Methods exposed at `Model::|` via `__callStatic`. Populated
     /// for Eloquent Builder and Query Builder; empty for everything
     /// else.
@@ -634,9 +632,7 @@ fn compute_scopes(
 ) -> Vec<ScopeInfo> {
     let mut scopes: Vec<ScopeInfo> = Vec::new();
     for member in methods {
-        if member.value.visibility != PhpVisibility::Public
-            || member.value.name.starts_with("__")
-        {
+        if member.value.visibility != PhpVisibility::Public || member.value.name.starts_with("__") {
             continue;
         }
 
@@ -686,10 +682,7 @@ fn compute_scopes(
     scopes
 }
 
-fn has_scope_attribute(
-    method: &PhpMethodInfo,
-    aliases: &HashMap<String, String>,
-) -> bool {
+fn has_scope_attribute(method: &PhpMethodInfo, aliases: &HashMap<String, String>) -> bool {
     method.attributes.iter().any(|attr| {
         let fqcn = resolve_to_fqcn(attr, None, aliases);
         fqcn == SCOPE_ATTRIBUTE_FQCN
@@ -704,7 +697,9 @@ fn compute_accessors(methods: &[ResolvedMember<PhpMethodInfo>]) -> Vec<AccessorI
         let name = &member.value.name;
 
         // Old-style: getXxxAttribute
-        if let Some(middle) = name.strip_prefix("get").and_then(|s| s.strip_suffix("Attribute"))
+        if let Some(middle) = name
+            .strip_prefix("get")
+            .and_then(|s| s.strip_suffix("Attribute"))
         {
             if !middle.is_empty() {
                 accessors.push(AccessorInfo {
@@ -722,13 +717,7 @@ fn compute_accessors(methods: &[ResolvedMember<PhpMethodInfo>]) -> Vec<AccessorI
             .value
             .return_type_raw
             .as_deref()
-            .map(|t| {
-                t.trim_start_matches('?')
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or("")
-                    == "Attribute"
-            })
+            .map(|t| t.trim_start_matches('?').rsplit('\\').next().unwrap_or("") == "Attribute")
             .unwrap_or(false);
         if returns_attribute {
             accessors.push(AccessorInfo {
@@ -887,7 +876,9 @@ fn compute_column_surface(
     let mut columns: Vec<ColumnInfo> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let add = |name: String, php_type: String, source: ColumnSource,
+    let add = |name: String,
+               php_type: String,
+               source: ColumnSource,
                columns: &mut Vec<ColumnInfo>,
                seen: &mut HashSet<String>| {
         if seen.insert(name.clone()) {
@@ -957,8 +948,7 @@ fn compute_column_surface(
     // parser that doesn't care about value shape.
     for prop in properties.iter().filter(|p| p.value.name == "attributes") {
         if let Some(default) = prop.value.default_value.as_deref() {
-            for key in
-                crate::laravel_introspector::model_metadata::parse_array_keys_public(default)
+            for key in crate::laravel_introspector::model_metadata::parse_array_keys_public(default)
             {
                 let php_type = conventional_php_type(&key);
                 add(
@@ -1118,7 +1108,10 @@ fn compute_callstatic_surface(
             continue;
         }
         // @internal-marked methods are framework-internal — skip.
-        if m.docblock.as_deref().is_some_and(|d| d.contains("@internal")) {
+        if m.docblock
+            .as_deref()
+            .is_some_and(|d| d.contains("@internal"))
+        {
             continue;
         }
 
@@ -1265,7 +1258,10 @@ fn extract_return_type_with_self_resolution(
     let raw = doc_body
         .and_then(return_type_from_phpdoc)
         .or_else(|| php_return_type.map(str::to_string))?;
-    Some(crate::completion_format::resolve_self_type(&raw, entry_class))
+    Some(crate::completion_format::resolve_self_type(
+        &raw,
+        entry_class,
+    ))
 }
 
 fn return_type_from_phpdoc(doc_body: &str) -> Option<String> {

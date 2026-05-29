@@ -91,8 +91,7 @@ pub fn detect_method_name_position(line: &str, cursor_col: usize) -> Option<Meth
     let before = &line[..cursor_col];
     let stripped = before.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
 
-    if stripped.ends_with("::") {
-        let before_op = &stripped[..stripped.len() - 2];
+    if let Some(before_op) = stripped.strip_suffix("::") {
         // Walk back through identifier / namespace chars to find the
         // receiver's start. Stop at the first char that can't be part of
         // a class name.
@@ -316,10 +315,7 @@ fn dynamic_where_item(
 ) -> CompletionItem {
     let detail = col.php_type.clone();
     let summary = if is_or {
-        format!(
-            "Eloquent dynamic where (or {} = ?)",
-            col.name
-        )
+        format!("Eloquent dynamic where (or {} = ?)", col.name)
     } else {
         format!("Eloquent dynamic where ({} = ?)", col.name)
     };

@@ -18,11 +18,11 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 // Use the library crate for all modules
-use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::cache_manager::{
     BindingEntry, CacheManager, CachedEnvVars, CachedLaravelConfig, MiddlewareEntry, RescanType,
     ScanResult,
 };
+use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::route_discovery::{build_route_index, discover_route_files, RouteIndex};
@@ -306,9 +306,7 @@ struct CastTypeInfo {
 /// `ParentClass`-sourced columns (Authenticatable's name/email/etc.)
 /// count as conventions for this purpose — they're framework defaults,
 /// not user intent. We don't treat their presence as "rich enough."
-fn is_column_surface_sparse(
-    columns: &[laravel_lsp::laravel_introspector::ColumnInfo],
-) -> bool {
+fn is_column_surface_sparse(columns: &[laravel_lsp::laravel_introspector::ColumnInfo]) -> bool {
     use laravel_lsp::laravel_introspector::ColumnSource;
     !columns.iter().any(|c| {
         matches!(
@@ -1904,14 +1902,8 @@ struct LaravelLanguageServer {
     /// requires an extension reload to pick up new methods. Acceptable
     /// for now; can switch to file-watcher invalidation if it becomes
     /// painful in practice.
-    builder_method_index_cache: Arc<
-        RwLock<
-            HashMap<
-                PathBuf,
-                Arc<laravel_lsp::method_name_completion::BuilderMethodIndex>,
-            >,
-        >,
-    >,
+    builder_method_index_cache:
+        Arc<RwLock<HashMap<PathBuf, Arc<laravel_lsp::method_name_completion::BuilderMethodIndex>>>>,
 
     /// Per-route-file cache of [`route_name_locator`] output, keyed by
     /// mtime. Find-references on a route runs route_name_locator on every
@@ -3261,10 +3253,10 @@ impl LaravelLanguageServer {
         cursor_col: usize,
         _uri: &Url,
     ) -> Option<Vec<CompletionItem>> {
+        use laravel_lsp::laravel_introspector::ModelMetadata;
         use laravel_lsp::method_name_completion::{
             build_items_from_index, detect_method_name_position, MethodNameContext,
         };
-        use laravel_lsp::laravel_introspector::ModelMetadata;
         use laravel_lsp::query_chain::{extract_use_aliases, resolve_class_name};
 
         // 1. Cursor at a static-receiver position?
@@ -3370,11 +3362,8 @@ impl LaravelLanguageServer {
                 let db_guard = self.database_schema.read().await;
                 if let Some(db) = db_guard.as_ref() {
                     let table = view.table_name.clone().unwrap_or_else(|| {
-                        let basename =
-                            view.fqcn.rsplit('\\').next().unwrap_or(&view.fqcn);
-                        laravel_lsp::query_chain::eloquent_completion::snake_pluralize(
-                            basename,
-                        )
+                        let basename = view.fqcn.rsplit('\\').next().unwrap_or(&view.fqcn);
+                        laravel_lsp::query_chain::eloquent_completion::snake_pluralize(basename)
                     });
                     let db_cols = db.get_columns_with_types(&table).await;
                     use std::collections::HashSet;
@@ -9881,7 +9870,10 @@ impl LaravelLanguageServer {
                         documentation: Some(
                             CompletionDoc::new()
                                 .header(&mt)
-                                .summary(format!("Allow uploaded files with the `{}` MIME type.", mt))
+                                .summary(format!(
+                                    "Allow uploaded files with the `{}` MIME type.",
+                                    mt
+                                ))
                                 .into_documentation(),
                         ),
                         ..Default::default()
@@ -17529,7 +17521,10 @@ impl LanguageServer for LaravelLanguageServer {
                                 documentation: Some(
                                     CompletionDoc::new()
                                         .header(format!("${}", v.name))
-                                        .summary(format!("Blade variable of type `{}`.", v.php_type))
+                                        .summary(format!(
+                                            "Blade variable of type `{}`.",
+                                            v.php_type
+                                        ))
                                         .section(format!("Source: {}", v.source))
                                         .into_documentation(),
                                 ),
@@ -18259,7 +18254,10 @@ impl LanguageServer for LaravelLanguageServer {
                             documentation: Some(
                                 CompletionDoc::new()
                                     .header(&b.abstract_name)
-                                    .summary(format!("Container binding to `{}`.", b.concrete_class))
+                                    .summary(format!(
+                                        "Container binding to `{}`.",
+                                        b.concrete_class
+                                    ))
                                     .section(format!("Source: {}", source))
                                     .into_documentation(),
                             ),

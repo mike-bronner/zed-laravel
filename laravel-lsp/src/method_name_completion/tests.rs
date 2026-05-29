@@ -313,9 +313,7 @@ fn documentation_panel_carries_intelephense_structure() {
     );
     // Fenced PHP signature block, seeded with `<?php` so Zed highlights it
     assert!(
-        value.contains(
-            "```php\n<?php\npublic function where($column, $operator = null)\n```"
-        ),
+        value.contains("```php\n<?php\npublic function where($column, $operator = null)\n```"),
         "panel should include the fenced signature with PHP open tag:\n{value}"
     );
     // @param tag with its type wrapped in backticks
@@ -342,9 +340,7 @@ fn documentation_panel_for_method_without_docblock_still_has_signature() {
         other => panic!("expected MarkupContent, got {other:?}"),
     };
     assert!(value.contains("**Illuminate\\Database\\Eloquent\\Builder::find**"));
-    assert!(value.contains(
-        "```php\n<?php\npublic function find($id, $columns = ['*'])\n```"
-    ));
+    assert!(value.contains("```php\n<?php\npublic function find($id, $columns = ['*'])\n```"));
 }
 
 #[test]
@@ -456,14 +452,16 @@ fn dynamic_where_skips_when_real_builder_method_exists() {
     // Builder's real method; emitting our synthetic would be misleading.
     let view = empty_view();
     let mut index = empty_index();
-    index.eloquent_builder.push(crate::laravel_introspector::ParsedMethod {
-        name: "whereDate".to_string(),
-        source_class: "Illuminate\\Database\\Eloquent\\Builder".to_string(),
-        signature: "public function whereDate($column, $op, $value)".to_string(),
-        return_type: None,
-        summary: None,
-        doc_body: None,
-    });
+    index
+        .eloquent_builder
+        .push(crate::laravel_introspector::ParsedMethod {
+            name: "whereDate".to_string(),
+            source_class: "Illuminate\\Database\\Eloquent\\Builder".to_string(),
+            signature: "public function whereDate($column, $op, $value)".to_string(),
+            return_type: None,
+            summary: None,
+            doc_body: None,
+        });
     let cols = vec![col("date", "Carbon", ColumnSource::Fillable)];
     let items = dynamic_where_to_items(&view, &index, &cols);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
@@ -534,7 +532,10 @@ fn dynamic_where_doc_panel_includes_provenance_line() {
     // Header shows the synthetic method name.
     assert!(value.contains("**whereEmail**"), "panel: {value}");
     // Summary shows the underlying column.
-    assert!(value.contains("Eloquent dynamic where (email = ?)"), "panel: {value}");
+    assert!(
+        value.contains("Eloquent dynamic where (email = ?)"),
+        "panel: {value}"
+    );
     // Signature carries the column's PHP type.
     assert!(value.contains("string $value"), "panel: {value}");
     // Provenance section credits $fillable.
@@ -570,9 +571,13 @@ fn dynamic_where_provenance_distinguishes_all_sources() {
     assert!(panels.iter().any(|p| p.contains("declared in `$fillable`")));
     assert!(panels.iter().any(|p| p.contains("declared in `$casts`")));
     assert!(panels.iter().any(|p| p.contains("declared in `$dates`")));
-    assert!(panels.iter().any(|p| p.contains("declared in `$attributes`")));
+    assert!(panels
+        .iter()
+        .any(|p| p.contains("declared in `$attributes`")));
     assert!(panels.iter().any(|p| p.contains("Laravel convention")));
-    assert!(panels.iter().any(|p| p.contains("implied by composed trait")));
+    assert!(panels
+        .iter()
+        .any(|p| p.contains("implied by composed trait")));
     assert!(panels.iter().any(|p| p.contains("implied by parent class")));
     assert!(panels.iter().any(|p| p.contains("from live DB schema")));
 }

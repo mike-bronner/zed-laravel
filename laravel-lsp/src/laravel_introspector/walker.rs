@@ -210,10 +210,7 @@ fn walk_top_level(node: Node, source: &[u8], result: &mut PhpFileStructure) {
             //   - `if_statement` for the `function_exists` guard pattern
             //     common in Laravel helpers files
             //   - `else_clause` / `else_if_clause` for the same
-            "compound_statement"
-            | "if_statement"
-            | "else_clause"
-            | "else_if_clause" => {
+            "compound_statement" | "if_statement" | "else_clause" | "else_if_clause" => {
                 walk_top_level(child, source, result);
             }
             _ => {}
@@ -462,11 +459,7 @@ fn extract_raw_signature(node: Node, source: &[u8]) -> String {
     normalised.trim_end_matches(';').trim_end().to_string()
 }
 
-fn parse_properties(
-    node: Node,
-    source: &[u8],
-    docblock: Option<String>,
-) -> Vec<PhpPropertyInfo> {
+fn parse_properties(node: Node, source: &[u8], docblock: Option<String>) -> Vec<PhpPropertyInfo> {
     let visibility = parse_visibility(node, source);
     let is_static = has_static_modifier(node, source);
     let property_type = node
@@ -518,13 +511,22 @@ fn parse_properties(
 /// occasionally varies between versions on whether subexpressions are
 /// addressable by field name.
 fn find_child_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if kinds.contains(&child.kind()) {
-            return Some(child);
+    // Hand-rolled scan instead of `Iterator::find` because the iterator
+    // returned by `node.children(&mut cursor)` borrows `cursor` for the
+    // duration of the closure — and `cursor` is a local. With `for` we
+    // bind each iteration to its own scope and return out before the
+    // cursor drops; `find` keeps the borrow live until after the
+    // closure returns, which the borrow checker flags as use-after-drop.
+    #[allow(clippy::manual_find)]
+    {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if kinds.contains(&child.kind()) {
+                return Some(child);
+            }
         }
+        None
     }
-    None
 }
 
 /// Look for a `default_value:` field on a `property_element`; if missing,

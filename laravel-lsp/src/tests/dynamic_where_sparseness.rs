@@ -24,10 +24,7 @@ fn empty_surface_is_sparse() {
 
 #[test]
 fn convention_only_is_sparse() {
-    let cols = vec![
-        col(ColumnSource::Convention),
-        col(ColumnSource::Convention),
-    ];
+    let cols = vec![col(ColumnSource::Convention), col(ColumnSource::Convention)];
     assert!(crate::is_column_surface_sparse(&cols));
 }
 
@@ -55,10 +52,7 @@ fn convention_plus_parent_class_is_sparse() {
 
 #[test]
 fn fillable_makes_surface_rich() {
-    let cols = vec![
-        col(ColumnSource::Convention),
-        col(ColumnSource::Fillable),
-    ];
+    let cols = vec![col(ColumnSource::Convention), col(ColumnSource::Fillable)];
     assert!(!crate::is_column_surface_sparse(&cols));
 }
 
@@ -84,9 +78,6 @@ fn attributes_make_surface_rich() {
 fn trait_signal_makes_surface_rich() {
     // SoftDeletes alone is enough — the developer explicitly opted in
     // to a behaviour that pulls a column in. That's intent.
-    let cols = vec![
-        col(ColumnSource::Convention),
-        col(ColumnSource::Trait),
-    ];
+    let cols = vec![col(ColumnSource::Convention), col(ColumnSource::Trait)];
     assert!(!crate::is_column_surface_sparse(&cols));
 }

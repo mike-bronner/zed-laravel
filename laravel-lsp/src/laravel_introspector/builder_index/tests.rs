@@ -5,11 +5,7 @@ use tempfile::TempDir;
 
 /// Build a fake vendor layout at `root` with the given file contents.
 /// Returns the temp dir so the caller keeps the files alive for the test.
-fn fake_vendor(
-    root: &TempDir,
-    eloquent_builder: Option<&str>,
-    query_builder: Option<&str>,
-) {
+fn fake_vendor(root: &TempDir, eloquent_builder: Option<&str>, query_builder: Option<&str>) {
     if let Some(content) = eloquent_builder {
         let path = root.path().join(ELOQUENT_BUILDER_REL_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -368,7 +364,11 @@ fn parses_query_builder_separately() {
     fake_vendor(&dir, None, Some(MINIMAL_QUERY_BUILDER));
 
     let index = parse_builder_methods(dir.path()).expect("should parse");
-    let q_names: Vec<&str> = index.query_builder.iter().map(|m| m.name.as_str()).collect();
+    let q_names: Vec<&str> = index
+        .query_builder
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
     assert!(q_names.contains(&"where"));
     assert!(q_names.contains(&"select"));
     assert!(
@@ -402,7 +402,8 @@ fn merged_surface_eloquent_wins_collisions() {
     // `where` exists in both files — make sure we get exactly one entry.
     let where_count = merged.iter().filter(|m| m.name == "where").count();
     assert_eq!(
-        where_count, 1,
+        where_count,
+        1,
         "duplicate where in merged surface: {:?}",
         merged.iter().map(|m| &m.name).collect::<Vec<_>>()
     );
@@ -550,14 +551,23 @@ fn real_laravel_where_method_panel_resolves_self() {
         .find(|m| m.name == "where")
         .expect("where method");
 
-    eprintln!("[real-where] source_class = {:?}", where_method.source_class);
+    eprintln!(
+        "[real-where] source_class = {:?}",
+        where_method.source_class
+    );
     eprintln!("[real-where] return_type = {:?}", where_method.return_type);
     eprintln!(
         "[real-where] doc_body (first 200 chars) = {:?}",
-        where_method.doc_body.as_deref().map(|s| &s[..s.len().min(200)])
+        where_method
+            .doc_body
+            .as_deref()
+            .map(|s| &s[..s.len().min(200)])
     );
 
-    let doc_body = where_method.doc_body.as_deref().expect("where should have docblock");
+    let doc_body = where_method
+        .doc_body
+        .as_deref()
+        .expect("where should have docblock");
     let (_summary, tags) = split_phpdoc(doc_body);
     eprintln!("[real-where] tags = {:#?}", tags);
 
@@ -566,8 +576,7 @@ fn real_laravel_where_method_panel_resolves_self() {
         .iter()
         .find(|t| t.starts_with("@return"))
         .expect("@return tag should exist");
-    let formatted =
-        format_phpdoc_tag_with(return_tag, Some(&where_method.source_class));
+    let formatted = format_phpdoc_tag_with(return_tag, Some(&where_method.source_class));
     eprintln!("[real-where] formatted @return = {:?}", formatted);
     assert!(
         formatted.contains("Builder<static>"),
@@ -584,9 +593,7 @@ fn parses_real_laravel_install_when_available() {
     // Best-effort: walk up from CWD looking for a sibling Laravel project's
     // vendor dir. The dev branch's known path; skips silently if missing
     // so this passes on CI / fresh checkouts.
-    let candidate_roots = [
-        PathBuf::from("/Users/mike/Developer/Sites/decisioncloud"),
-    ];
+    let candidate_roots = [PathBuf::from("/Users/mike/Developer/Sites/decisioncloud")];
     let Some(root) = candidate_roots
         .iter()
         .find(|p| p.join(ELOQUENT_BUILDER_REL_PATH).exists())
@@ -619,8 +626,16 @@ fn parses_real_laravel_install_when_available() {
     // documented collision with Model's real static, so it's suppressed
     // from the merged surface. See the explicit assertion further down.
     for expected in [
-        "where", "whereIn", "whereNotIn", "whereNull", "find", "first", "get",
-        "orderBy", "select", "count",
+        "where",
+        "whereIn",
+        "whereNotIn",
+        "whereNull",
+        "find",
+        "first",
+        "get",
+        "orderBy",
+        "select",
+        "count",
     ] {
         assert!(
             names.contains(&expected),

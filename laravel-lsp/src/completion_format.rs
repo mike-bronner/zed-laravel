@@ -316,7 +316,13 @@ pub fn format_phpdoc_tag_with(tag: &str, entry_class: Option<&str>) -> String {
 
     let typed_tag = matches!(
         keyword,
-        "@param" | "@return" | "@throws" | "@var" | "@property" | "@property-read" | "@property-write"
+        "@param"
+            | "@return"
+            | "@throws"
+            | "@var"
+            | "@property"
+            | "@property-read"
+            | "@property-write"
     );
     if !typed_tag {
         return tag.to_string();

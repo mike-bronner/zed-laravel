@@ -291,17 +291,6 @@ impl ModelMetadata {
     // used internally by the now-deleted accessor extractor).
 }
 
-/// Parse a PHP `[ 'key' => 'value', 'k2' => Class::class ]` array
-/// expression into a `String → String` map. Used by the unified
-/// [`crate::laravel_introspector`] walker for `$casts` extraction.
-///
-/// Accepts either form:
-/// - Inner text (`"'col' => 'json', 'meta' => 'array'"`)
-/// - Full expression (`"['col' => 'json', ...]"`)
-///
-/// Wraps the content in `<?php $x = [content];` and walks the
-/// resulting `array_creation_expression` via tree-sitter — robust
-/// against escaped quotes, nested arrays, comments mid-entry.
 // Free-function aliases for the module's text utilities — exposed at
 // `laravel_introspector::*` for callers who don't want to type
 // `ModelMetadata::pascal_to_snake(...)` etc. Each delegates to the
@@ -451,7 +440,11 @@ pub fn parse_string_array_public(expr: &str) -> Vec<String> {
     out
 }
 
-fn walk_for_first_string_array(node: tree_sitter::Node, bytes: &[u8], out: &mut Vec<String>) -> bool {
+fn walk_for_first_string_array(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    out: &mut Vec<String>,
+) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "array_creation_expression" {
@@ -490,6 +483,17 @@ fn collect_string_entries(arr: tree_sitter::Node, bytes: &[u8], out: &mut Vec<St
     }
 }
 
+/// Parse a PHP `[ 'key' => 'value', 'k2' => Class::class ]` array
+/// expression into a `String → String` map. Used by the unified
+/// [`crate::laravel_introspector`] walker for `$casts` extraction.
+///
+/// Accepts either form:
+/// - Inner text (`"'col' => 'json', 'meta' => 'array'"`)
+/// - Full expression (`"['col' => 'json', ...]"`)
+///
+/// Wraps the content in `<?php $x = [content];` and walks the
+/// resulting `array_creation_expression` via tree-sitter — robust
+/// against escaped quotes, nested arrays, comments mid-entry.
 pub fn parse_cast_array_public(expr: &str) -> std::collections::HashMap<String, String> {
     let inner = array_literal_inner(expr).unwrap_or(expr);
     let wrapped = format!("<?php $x = [{}];", inner);
@@ -637,12 +641,12 @@ fn class_constant_basename(node: tree_sitter::Node, bytes: &[u8]) -> Option<Stri
     Some(raw.rsplit('\\').next().unwrap_or(raw).to_string())
 }
 
-/// Scan a method body's source for `return $this->KIND(...)` where KIND
-/// is one of the recognised relationship builder names. Returns the
-/// matching kind (the literal name from the list, preserving its
-/// original casing) on first hit. Longest-first ordering in the list
-/// prevents `belongsTo` from matching a `belongsToMany` call.
-///
+// Scan a method body's source for `return $this->KIND(...)` where KIND
+// is one of the recognised relationship builder names. Returns the
+// matching kind (the literal name from the list, preserving its
+// original casing) on first hit. Longest-first ordering in the list
+// prevents `belongsTo` from matching a `belongsToMany` call.
+//
 // detect_relationship_kind_in_body / first_class_constant_arg:
 // removed. Both were used by the now-deleted `extract_relationships`;
 // the equivalents live inside `laravel_class` as private helpers for

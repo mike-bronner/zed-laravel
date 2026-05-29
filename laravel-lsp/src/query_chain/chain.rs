@@ -52,6 +52,13 @@ pub enum ClosureScopeKind {
     /// `where(closure)` / `when($cond, closure)` / `having(closure)` /
     /// `tap(closure)` etc. — bind to the same model as the outer chain.
     SameModel,
+    /// `join('orders', fn ($join) => …)` — `$join` is a `JoinClause` builder
+    /// rooted at the joined table (issue #24). `table_ref` is the raw
+    /// first-arg string (`"orders"`, `"orders as o"`, `"mydb.orders"`); the
+    /// cursor resolver parses it to an [`AccessibleTable`] and models it as a
+    /// `from()` override so column completion inside the closure resolves
+    /// against that table (alias included).
+    JoinTable { table_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -281,10 +288,22 @@ pub struct ChainContext {
     /// query regardless of textual order, so a join anywhere in the chain
     /// makes its table referenceable everywhere. Columns from these are
     /// offered as `qualifier.column`.
+    ///
+    /// Inside a join closure (`join('orders', fn ($join) => …)`) this also
+    /// carries the *parent* query's accessible tables that resolve
+    /// synchronously (a `DB::table()` / `from()` root and the parent's other
+    /// joins), so both sides of an ON clause complete.
     pub joined_tables: Vec<AccessibleTable>,
     /// Whether a `from*()` call replaced or obscured the chain's root table.
     /// `Inherit` for the common case (no `from()` override).
     pub from_clause: FromClause,
+    /// Inside a join closure whose *parent* query is rooted at an Eloquent
+    /// model (`User::query()->join('orders', fn ($join) => …)`), the parent
+    /// model's FQCN. Its table needs async model→table resolution, so the
+    /// cursor resolver can't add it to `joined_tables` synchronously —
+    /// consumers resolve it and fold it into the accessible set (mirrors how
+    /// `closure_relation_hop` defers a relation hop). `None` otherwise.
+    pub join_parent_model: Option<String>,
     /// Set when the chain is inside a recognized relation closure
     /// (`whereHas('posts', fn ($q) => $q->where('|'))` or
     /// `with(['posts' => fn ($q) => $q->where('|')])`). When `Some(rel)`,

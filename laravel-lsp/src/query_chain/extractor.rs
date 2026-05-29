@@ -22,7 +22,8 @@
 
 use super::chain::*;
 use super::methods::{
-    arg_kind, chain_effect, CLOSURE_CARRIERS, RELATION_METHODS, SAME_MODEL_CLOSURE_CARRIERS,
+    arg_kind, chain_effect, is_table_join, CLOSURE_CARRIERS, RELATION_METHODS,
+    SAME_MODEL_CLOSURE_CARRIERS,
 };
 use super::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
 use tree_sitter::{Node, Tree};
@@ -696,19 +697,21 @@ fn detect_closure_scope_positional(
     // Relation-hop carrier? Extract the relation name from the first
     // string arg.
     if CLOSURE_CARRIERS.contains(&method_name) {
-        let mut args_cursor = args_node.walk();
-        let first_arg = args_node
-            .named_children(&mut args_cursor)
-            .find(|n| n.kind() == "argument")?;
-        let first_inner = first_arg.named_child(0)?;
-        let relation_name = match first_inner.kind() {
-            "string" => single_quoted_string(first_inner, bytes).map(|(s, _)| s)?,
-            "encapsed_string" => encapsed_string_content(first_inner, bytes)?,
-            _ => return None,
-        };
+        let relation_name = first_string_arg_value(args_node, bytes)?;
         return Some(ClosureScopeBinding {
             param_var,
             kind: ClosureScopeKind::RelationHop { relation_name },
+        });
+    }
+
+    // Join carrier? `join('orders', fn ($join) => …)` — `$join` is a
+    // JoinClause rooted at the joined table named by the first string arg
+    // (issue #24).
+    if is_table_join(method_name) {
+        let table_ref = first_string_arg_value(args_node, bytes)?;
+        return Some(ClosureScopeBinding {
+            param_var,
+            kind: ClosureScopeKind::JoinTable { table_ref },
         });
     }
 
@@ -721,6 +724,22 @@ fn detect_closure_scope_positional(
     }
 
     None
+}
+
+/// The value of the first string-literal argument in an `arguments` node —
+/// the relation name for `whereHas('rel', …)` or the table name for
+/// `join('orders', …)`. Returns `None` if the first argument isn't a string.
+fn first_string_arg_value(args_node: Node, bytes: &[u8]) -> Option<String> {
+    let mut args_cursor = args_node.walk();
+    let first_arg = args_node
+        .named_children(&mut args_cursor)
+        .find(|n| n.kind() == "argument")?;
+    let first_inner = first_arg.named_child(0)?;
+    match first_inner.kind() {
+        "string" => single_quoted_string(first_inner, bytes).map(|(s, _)| s),
+        "encapsed_string" => encapsed_string_content(first_inner, bytes),
+        _ => None,
+    }
 }
 
 /// Resolve `with(['rel' => fn ($q) => …])` shape. The closure is the

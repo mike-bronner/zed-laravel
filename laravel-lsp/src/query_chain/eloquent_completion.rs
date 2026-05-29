@@ -758,6 +758,27 @@ pub async fn resolve_table_for_model(class: &str, project_root: &Path) -> Option
     )
 }
 
+/// Fold a join closure's Eloquent *parent* table into the accessible set
+/// (issue #24). When the cursor is inside `User::query()->join('orders',
+/// fn ($join) => …)`, the parent model's table can't be resolved
+/// synchronously, so the cursor resolver leaves it in `ctx.join_parent_model`.
+/// Consumers (completion, diagnostics, goto) call this to resolve it (async)
+/// and append it to `joined_tables`, so the parent side of an ON clause
+/// (`$join->on('orders.id', '=', 'users.|')`) completes. No-op when the field
+/// is unset.
+pub async fn enrich_join_parent_tables(ctx: &mut ChainContext, project_root: &Path) {
+    let Some(model) = ctx.join_parent_model.take() else {
+        return;
+    };
+    let Some(table) = resolve_table_for_model(&model, project_root).await else {
+        return;
+    };
+    // Dedup by qualifier — don't double-list a table already accessible.
+    if ctx.joined_tables.iter().all(|t| t.qualifier() != table) {
+        ctx.joined_tables.push(AccessibleTable::bare(table));
+    }
+}
+
 /// Phase 6: column completion for an `EloquentCollection` chain — a
 /// chain that's been executed via `->get()` / `->all()` / `->pluck()` /
 /// `->cursor()` etc. After execution, the result is a hydrated

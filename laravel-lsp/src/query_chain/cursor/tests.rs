@@ -1052,3 +1052,126 @@ fn db_table_still_expects_table() {
     let ctx = detect("DB::table('|');").expect("ctx");
     assert_eq!(ctx.expecting, ArgKind::Table);
 }
+
+// ---- closure-form joins (issue #24, Phase 3) --------------------------
+
+#[test]
+fn join_closure_binds_receiver_to_joined_table() {
+    // Inside `join('orders', fn ($join) => $join->where('|'))`, `$join` is a
+    // builder rooted at orders — modeled as a from() override.
+    let ctx =
+        detect("DB::table('users')->join('orders', function ($join) { $join->where('|'); });")
+            .expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_closure_arrow_fn_form() {
+    let ctx = detect("DB::table('users')->join('orders', fn ($join) => $join->where('|'));")
+        .expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_closure_aliased_table_narrows_on_alias() {
+    let ctx = detect(
+        "DB::table('users')->join('orders as o', function ($join) { $join->where('o.sta|'); });",
+    )
+    .expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable {
+            table: "orders".to_string(),
+            alias: Some("o".to_string()),
+        })
+    );
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("o"));
+}
+
+#[test]
+fn join_closure_on_eloquent_parent_resolves_joined_table() {
+    // The parent is an Eloquent chain; the join closure still resolves to the
+    // joined table without needing the parent model.
+    let ctx = detect("User::query()->join('orders', function ($join) { $join->where('|'); });")
+        .expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_clause_on_method_completes_columns() {
+    // `$join->on('orders.id', '=', 'users.id')` — `on` on the query builder
+    // takes columns. The first ON arg narrows on its qualifier.
+    let ctx = detect(
+        "DB::table('users')->join('orders', function ($join) { $join->on('orders.us|', '=', 'users.id'); });",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("orders"));
+}
+
+#[test]
+fn model_static_on_is_connection_not_column() {
+    // `User::on('mysql')` is the connection setter, called directly on the
+    // model (static) — it must NOT offer column completion.
+    let ctx = detect("User::on('mys|ql');");
+    assert!(
+        ctx.is_none(),
+        "Model::on(connection) must not be column completion: {ctx:?}"
+    );
+}
+
+#[test]
+fn join_closure_includes_parent_dbtable_root() {
+    // Inside the join closure, the parent's `users` table is accessible (the
+    // other side of the ON clause).
+    let ctx =
+        detect("DB::table('users')->join('orders', function ($join) { $join->where('|'); });")
+            .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert!(
+        tables.contains(&"users"),
+        "parent root should be accessible inside the join closure; got {tables:?}"
+    );
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+    assert!(ctx.join_parent_model.is_none());
+}
+
+#[test]
+fn join_closure_eloquent_parent_sets_pending_model() {
+    // The parent root is an Eloquent model — its table needs async
+    // resolution, so it's deferred via join_parent_model.
+    let ctx = detect("User::query()->join('orders', function ($join) { $join->where('|'); });")
+        .expect("ctx");
+    assert_eq!(ctx.join_parent_model.as_deref(), Some("User"));
+}
+
+#[test]
+fn join_closure_includes_sibling_joins_excludes_own() {
+    let ctx = detect(
+        "DB::table('users')->join('orders', function ($join) { $join->where('|'); })\
+         ->join('roles', 'roles.id', '=', 'users.role_id');",
+    )
+    .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert!(tables.contains(&"users"), "parent root; got {tables:?}");
+    assert!(tables.contains(&"roles"), "sibling join; got {tables:?}");
+    assert!(
+        !tables.contains(&"orders"),
+        "the join's own table is the root, not a sibling; got {tables:?}"
+    );
+}

@@ -3135,6 +3135,17 @@ impl LaravelLanguageServer {
             _ => ctx,
         };
 
+        // Join-closure parent table (issue #24): inside `User::query()->join(
+        // 'orders', fn ($join) => …)`, fold the parent model's table into the
+        // accessible set so the parent side of the ON clause completes. No-op
+        // unless `join_parent_model` is set.
+        let mut ctx = ctx;
+        if ctx.join_parent_model.is_some() {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                eloquent_completion::enrich_join_parent_tables(&mut ctx, &root).await;
+            }
+        }
+
         let items = match (ctx.mode, ctx.expecting) {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
                 eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
@@ -13044,6 +13055,10 @@ return [
                     eloquent_completion::resolve_table_for_model(&model, &root).await;
             }
         }
+        // Join-closure parent table (issue #24): fold an Eloquent parent's
+        // table into the accessible set so goto on the parent side of an ON
+        // clause resolves.
+        eloquent_completion::enrich_join_parent_tables(&mut ctx, &root).await;
 
         match ctx.expecting {
             ArgKind::Column => {

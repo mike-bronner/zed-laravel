@@ -1207,3 +1207,52 @@ function search() {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn join_closure_records_join_table_binding() {
+    // `DB::table('users')->join('orders', function ($join) { $join->where(...) })`
+    // — the inner `$join->where(...)` chain should carry a JoinTable binding
+    // naming the joined table (issue #24).
+    let chains = extract(
+        "DB::table('users')->join('orders', function ($join) { $join->where('status', 1); });",
+    );
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "join"
+            )
+        })
+        .expect("inner $join chain not found");
+    let binding = inner
+        .closure_scope
+        .as_ref()
+        .expect("inner chain should have closure_scope set");
+    assert_eq!(binding.param_var, "join");
+    assert!(matches!(
+        &binding.kind,
+        ClosureScopeKind::JoinTable { table_ref } if table_ref == "orders"
+    ));
+}
+
+#[test]
+fn join_closure_records_aliased_table_ref_verbatim() {
+    // The alias is kept in the raw table_ref; the cursor resolver parses it.
+    let chains =
+        extract("DB::table('users')->join('orders as o', fn ($join) => $join->where('o.id', 1));");
+    let inner = chains
+        .iter()
+        .find(|c| {
+            matches!(
+                &c.receiver,
+                ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) if var == "join"
+            )
+        })
+        .expect("inner $join chain");
+    let binding = inner.closure_scope.as_ref().expect("scope set");
+    assert!(matches!(
+        &binding.kind,
+        ClosureScopeKind::JoinTable { table_ref } if table_ref == "orders as o"
+    ));
+}

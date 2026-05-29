@@ -115,6 +115,7 @@ fn make_ctx(class: &str) -> ChainContext {
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
+        join_parent_model: None,
     }
 }
 
@@ -701,6 +702,7 @@ class Post extends Model {
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
+        join_parent_model: None,
     };
     let items = relations(&ctx, None, &root).await;
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
@@ -737,6 +739,7 @@ class User extends Model {
         quote: '\'',
         joined_tables: Vec::new(),
         from_clause: FromClause::Inherit,
+        join_parent_model: None,
     };
     let items = relations(&ctx, None, &root).await;
     assert!(items.is_empty(), "unresolvable hop should yield no items");
@@ -798,6 +801,7 @@ fn base_ctx(
         quote: '\'',
         joined_tables,
         from_clause,
+        join_parent_model: None,
     }
 }
 
@@ -1038,6 +1042,7 @@ fn eloquent_ctx(
         quote: '\'',
         joined_tables,
         from_clause,
+        join_parent_model: None,
     }
 }
 
@@ -1305,4 +1310,44 @@ fn goto_candidates_schema_qualified() {
         goto_column_candidates(&accessible, "mydb.orders.status"),
         vec![("mydb.orders".to_string(), "status".to_string())]
     );
+}
+
+// ---- enrich_join_parent_tables (issue #24, Phase 3) -------------------
+
+#[tokio::test]
+async fn enrich_join_parent_tables_resolves_model_table() {
+    let (_dir, root) = project_with_model("User", PLAIN_USER); // → users
+    let mut ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::BaseBuilder,
+        Vec::new(),
+        FromClause::Replace(AccessibleTable::bare("orders")),
+        None,
+    );
+    ctx.join_parent_model = Some("App\\Models\\User".to_string());
+
+    enrich_join_parent_tables(&mut ctx, &root).await;
+
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert!(
+        tables.contains(&"users"),
+        "parent model table folded into accessible set; got {tables:?}"
+    );
+    assert!(ctx.join_parent_model.is_none(), "pending model consumed");
+}
+
+#[tokio::test]
+async fn enrich_join_parent_tables_noop_when_unset() {
+    let (_dir, root) = project_with_model("User", PLAIN_USER);
+    let mut ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::BaseBuilder,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Replace(AccessibleTable::bare("orders")),
+        None,
+    );
+    // join_parent_model defaults to None.
+    enrich_join_parent_tables(&mut ctx, &root).await;
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(tables, vec!["orders"], "no change when no pending model");
 }

@@ -45,7 +45,8 @@
 use super::chain::*;
 use super::cursor::{byte_offset_to_position, chain_context_for_link};
 use super::eloquent_completion::{
-    resolve_related_model, resolve_table_for_model, snake_pluralize, walk_dotted_hops,
+    enrich_join_parent_tables, resolve_related_model, resolve_table_for_model, snake_pluralize,
+    walk_dotted_hops,
 };
 use crate::class_locator::find_php_class_file;
 use crate::database::DatabaseSchemaProvider;
@@ -232,6 +233,10 @@ async fn finalize_context(mut ctx: ChainContext, root: &Path) -> Option<ChainCon
             ctx.effective_table = resolve_table_for_model(&model, root).await;
         }
     }
+    // Join-closure parent table (issue #24): fold an Eloquent parent's table
+    // into the accessible set so a bare parent column inside the closure isn't
+    // false-flagged.
+    enrich_join_parent_tables(&mut ctx, root).await;
     Some(ctx)
 }
 

@@ -98,6 +98,16 @@ pub fn build_watchers(
         kind,
     });
 
+    // Migrations — feed the migration index (goto-definition for columns and
+    // tables). New/renamed/edited migrations change column definitions.
+    watchers.push(FileSystemWatcher {
+        glob_pattern: GlobPattern::String(format!(
+            "{}/database/migrations/**/*.php",
+            root.display()
+        )),
+        kind,
+    });
+
     // View paths. We watch `.blade.php` first as the primary case, then
     // bare `.php` for the rare anonymous-component-in-PHP-only style.
     // Some projects configure multiple view paths (e.g., themed apps);

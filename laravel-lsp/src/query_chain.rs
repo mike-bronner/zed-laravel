@@ -31,8 +31,8 @@ pub mod var_type;
 pub use chain::*;
 pub use cursor::{
     byte_offset_to_position, chain_context_for_link, detect_chain_context_at,
-    detect_chain_context_at_diagnostic, fixup_for_completion, position_to_byte_offset,
-    ChainResolveFailure, CompletionPrep,
+    detect_chain_context_at_diagnostic, detect_chain_target_at, fixup_for_completion,
+    position_to_byte_offset, ChainResolveFailure, ChainTarget, CompletionPrep,
 };
 pub use diagnostics::chain_diagnostics;
 pub use extractor::extract_chains;

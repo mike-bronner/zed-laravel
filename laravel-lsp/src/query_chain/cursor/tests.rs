@@ -34,6 +34,41 @@ fn detect(src_with_cursor: &str) -> Option<ChainContext> {
     detect_chain_context_at(&chains, byte_offset)
 }
 
+fn detect_target(src_with_cursor: &str) -> Option<ChainTarget> {
+    let (wrapped, byte_offset) = cursor_at(src_with_cursor);
+    let tree = parse_php(&wrapped).expect("parse");
+    let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, &wrapped)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    detect_chain_target_at(&chains, byte_offset).inspect(|t| {
+        // Verify the span maps back to the literal in the source.
+        let span_text = &wrapped[t.value_span.0..t.value_span.1];
+        assert_eq!(
+            span_text,
+            format!("'{}'", t.value),
+            "span should cover the quoted literal"
+        );
+    })
+}
+
+#[test]
+fn target_returns_column_value_and_kind() {
+    let t = detect_target("DB::table('users')->where('emai|l', 1);").expect("target");
+    assert_eq!(t.value, "email");
+    assert_eq!(t.ctx.expecting, ArgKind::Column);
+}
+
+#[test]
+fn target_returns_dotted_relation_value() {
+    let t = detect_target("User::with('posts.auth|or');").expect("target");
+    assert_eq!(t.value, "posts.author");
+    assert!(matches!(
+        t.ctx.expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier
+    ));
+}
+
 // ---- fixup_for_completion ---------------------------------------------
 
 #[test]

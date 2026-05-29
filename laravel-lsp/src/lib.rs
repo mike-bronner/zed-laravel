@@ -36,6 +36,7 @@ pub mod livewire_version;
 pub mod method_name_completion;
 pub mod middleware_binding_locator;
 pub mod middleware_parser;
+pub mod migration_index;
 // model_analyzer was consolidated into `laravel_introspector::model_metadata`.
 // Public API is re-exported as `laravel_introspector::ModelMetadata`.
 pub mod naming;

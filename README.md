@@ -238,8 +238,19 @@ $message = __('auth.failed');
 //            ^^^^^^^^^^^^ → lang/en/auth.php
 ```
 
+Cmd+Click also works on **query-chain literals** — columns jump to the migration line that defines them, relations to the relation method on the model, and `DB::table()` names to the create-table migration:
+
+```php
+User::where('email', $value)->with('posts');
+//          ^^^^^ → database/migrations/..._create_users_table.php  ($table->string('email'))
+//                                ^^^^^ → app/Models/User.php  (public function posts())
+
+DB::table('users')->get();
+//        ^^^^^ → database/migrations/..._create_users_table.php  (Schema::create('users'))
+```
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature`
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
 
 ### 🔍 Find References
 

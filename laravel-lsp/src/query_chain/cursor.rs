@@ -413,11 +413,32 @@ pub fn chain_context_for_link(
     })
 }
 
+/// The string literal the cursor sits in, plus the resolved [`ChainContext`].
+/// Goto-definition needs the literal's value (which column/relation/table) and
+/// its span — neither of which `ChainContext` carries — so the cursor resolver
+/// surfaces them here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainTarget {
+    pub ctx: ChainContext,
+    /// The unquoted literal under the cursor (`"posts.author"`, `"email"`, …).
+    pub value: String,
+    /// Byte span of the string literal *including* its quotes.
+    pub value_span: (usize, usize),
+}
+
 fn detect_in_chain(
     chains: &[Arc<BuilderChain>],
     chain: &BuilderChain,
     byte_offset: usize,
 ) -> Option<ChainContext> {
+    detect_target_in_chain(chains, chain, byte_offset).map(|t| t.ctx)
+}
+
+fn detect_target_in_chain(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    byte_offset: usize,
+) -> Option<ChainTarget> {
     let (mut mode, effective_table, effective_model, closure_relation_hop) =
         initial_receiver_context(chains, chain)?;
 
@@ -451,7 +472,7 @@ fn detect_in_chain(
     // The cursor must be inside a string-literal arg of the cursor link.
     // `pluck` is `ArgKind::Column` even though it terminates the chain —
     // we still complete inside its first arg.
-    let (quote, string_value) = string_arg_at(cursor_link, byte_offset)?;
+    let (quote, string_value, value_span) = string_arg_at(cursor_link, byte_offset)?;
 
     if !matches!(
         cursor_link.arg,
@@ -479,15 +500,30 @@ fn detect_in_chain(
         None
     };
 
-    Some(ChainContext {
-        mode,
-        effective_table,
-        effective_model,
-        expecting: cursor_link.arg,
-        dotted_prefix,
-        closure_relation_hop,
-        quote,
+    Some(ChainTarget {
+        ctx: ChainContext {
+            mode,
+            effective_table,
+            effective_model,
+            expecting: cursor_link.arg,
+            dotted_prefix,
+            closure_relation_hop,
+            quote,
+        },
+        value: string_value,
+        value_span,
     })
+}
+
+/// Resolve a cursor to the chain literal under it plus its [`ChainContext`].
+/// Like [`detect_chain_context_at`], but also returns the literal's value and
+/// span — used by goto-definition to route the literal to its source.
+pub fn detect_chain_target_at(
+    chains: &[Arc<BuilderChain>],
+    byte_offset: usize,
+) -> Option<ChainTarget> {
+    let chain = find_chain_containing(chains, byte_offset)?;
+    detect_target_in_chain(chains, chain, byte_offset)
 }
 
 /// Phase 8 helper: find the smallest chain in `chains` whose span strictly
@@ -533,14 +569,14 @@ fn parent_chain_eloquent_model(
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning
-/// its quote character and value. Walks both top-level `StringLit` args and
-/// string literals nested inside an `Array` arg, so `with(['posts'|, 'comments'])`
-/// resolves the same as `with('posts'|)`. Returns `None` if no string arg
-/// covers the cursor.
-fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String)> {
+/// its quote character, value, and byte span (incl. quotes). Walks both
+/// top-level `StringLit` args and string literals nested inside an `Array` arg,
+/// so `with(['posts'|, 'comments'])` resolves the same as `with('posts'|)`.
+/// Returns `None` if no string arg covers the cursor.
+fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String, (usize, usize))> {
     for arg in &link.args {
-        if let Some((quote, value)) = string_arg_in(arg, byte_offset) {
-            return Some((quote, value));
+        if let Some(found) = string_arg_in(arg, byte_offset) {
+            return Some(found);
         }
     }
     None
@@ -548,9 +584,10 @@ fn string_arg_at(link: &ChainLink, byte_offset: usize) -> Option<(char, String)>
 
 /// Check whether a single arg (or any of its nested string elements, for
 /// `Array` args) contains the cursor and is a string literal. Returns the
-/// quote character + literal value on hit. Pulled out as a separate helper
-/// so `Array` can recurse into its elements without duplicating the span check.
-fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String)> {
+/// quote character, literal value, and byte span on hit. Pulled out as a
+/// separate helper so `Array` can recurse into its elements without
+/// duplicating the span check.
+fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String, (usize, usize))> {
     match arg {
         ChainArg::StringLit {
             quote,
@@ -559,7 +596,7 @@ fn string_arg_in(arg: &ChainArg, byte_offset: usize) -> Option<(char, String)> {
         } => {
             let (start, end) = *span_byte_range;
             if byte_offset >= start && byte_offset <= end {
-                Some((*quote, value.clone()))
+                Some((*quote, value.clone(), *span_byte_range))
             } else {
                 None
             }

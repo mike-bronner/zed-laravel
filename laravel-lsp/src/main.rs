@@ -25,6 +25,7 @@ use laravel_lsp::cache_manager::{
 use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
+use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
 use laravel_lsp::route_discovery::{build_route_index, discover_route_files, RouteIndex};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
@@ -1886,6 +1887,12 @@ struct LaravelLanguageServer {
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
 
+    /// Project-wide index of column/table definitions parsed from
+    /// `database/migrations/*.php`. Powers goto-definition on chain literals
+    /// (column → migration line, table → create-table migration). Built at init
+    /// and refreshed when migration files change.
+    migration_index: Arc<RwLock<Option<MigrationIndex>>>,
+
     /// Cached map of translation `namespace → absolute lang directory` for
     /// unpublished vendor packages. Lazily populated on the first translation
     /// hover that needs it; subsequent hovers reuse the cached map. See
@@ -3502,6 +3509,7 @@ impl LaravelLanguageServer {
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
+            migration_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -4478,6 +4486,7 @@ impl LaravelLanguageServer {
             let server = self.clone_for_spawn();
             tokio::spawn(async move {
                 server.rebuild_route_index(&route_root).await;
+                server.rebuild_migration_index(&route_root).await;
             });
         }
 
@@ -4841,6 +4850,7 @@ impl LaravelLanguageServer {
         // Rebuild the route name index so any route definition changes (added,
         // renamed, removed) are reflected on the next goto-definition request.
         self.rebuild_route_index(&root).await;
+        self.rebuild_migration_index(&root).await;
 
         // Populate cache with ALL parsed middleware/bindings AFTER all rescans complete
         // This ensures we capture middleware from both vendor and app sources
@@ -5083,6 +5093,7 @@ impl LaravelLanguageServer {
         info!("🛣️  Building route index from root: {:?}", discovered_root);
         info!("========================================");
         self.rebuild_route_index(&discovered_root).await;
+        self.rebuild_migration_index(&discovered_root).await;
 
         // Initialize environment variables with Salsa
         info!("========================================");
@@ -12962,6 +12973,230 @@ return [
         }
     }
 
+    /// Rebuild the migration index by parsing `database/migrations/*.php`.
+    /// Mirrors `rebuild_route_index` — runs the (blocking) walk + parse off the
+    /// async runtime, then swaps the index in.
+    async fn rebuild_migration_index(&self, root: &Path) {
+        let root = root.to_path_buf();
+        let index = tokio::task::spawn_blocking(move || build_migration_index(&root)).await;
+        match index {
+            Ok(index) => {
+                info!(
+                    "🗄️  Migration index built: {} columns, {} tables",
+                    index.column_count(),
+                    index.table_count()
+                );
+                *self.migration_index.write().await = Some(index);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build migration index: {}", e);
+            }
+        }
+    }
+
+    /// Goto-definition for a query-chain literal under the cursor. Re-extracts
+    /// chains from the LIVE document (Salsa's cached chains can lag, and we need
+    /// byte offsets that match `content`), resolves the literal, and routes it:
+    /// column → migration line, relation → model method, table → create
+    /// migration. Returns `None` when nothing resolves (no chain at cursor,
+    /// unresolved receiver, missing source) — goto then no-ops.
+    async fn chain_goto_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{
+            detect_chain_target_at, eloquent_completion, extract_chains, position_to_byte_offset,
+            ArgKind, BuilderChain, BuilderMode,
+        };
+
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let root = self.initialized_root.read().await.clone()?;
+
+        let tree = laravel_lsp::parser::parse_php(&content).ok()?;
+        let chains: Vec<Arc<BuilderChain>> = extract_chains(&tree, &content)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        if chains.is_empty() {
+            return None;
+        }
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let target = detect_chain_target_at(&chains, byte)?;
+        let mut ctx = target.ctx;
+
+        // Finalize the context the same way completion/diagnostics do: resolve a
+        // relation closure hop, then a post-`toBase()` table.
+        if let Some(rel) = ctx.closure_relation_hop.clone() {
+            let parent = ctx.effective_model.clone()?;
+            ctx.effective_model =
+                Some(eloquent_completion::resolve_related_model(&parent, &rel, &root).await?);
+            ctx.closure_relation_hop = None;
+        }
+        if ctx.mode == BuilderMode::BaseBuilder && ctx.effective_table.is_none() {
+            if let Some(model) = ctx.effective_model.clone() {
+                ctx.effective_table =
+                    eloquent_completion::resolve_table_for_model(&model, &root).await;
+            }
+        }
+
+        match ctx.expecting {
+            ArgKind::Column => {
+                self.goto_column_definition(&ctx, &target.value, &root)
+                    .await
+            }
+            ArgKind::Relation | ArgKind::ClosureCarrier => {
+                self.goto_relation_definition(&ctx, &target.value, &root)
+                    .await
+            }
+            ArgKind::Table => self.goto_table_definition(&target.value).await,
+            ArgKind::None => None,
+        }
+    }
+
+    /// Column literal → the migration line that defines it. A qualified literal
+    /// (`users.id`) carries its own table; otherwise the chain's effective table
+    /// is used (resolved from the model for Eloquent chains).
+    async fn goto_column_definition(
+        &self,
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        value: &str,
+        root: &Path,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+
+        let (table, column) = match value.rsplit_once('.') {
+            Some((t, c)) => (t.to_string(), c.to_string()),
+            None => {
+                let table = match ctx.mode {
+                    BuilderMode::BaseBuilder => ctx.effective_table.clone()?,
+                    _ => {
+                        let model = ctx.effective_model.as_deref()?;
+                        eloquent_completion::resolve_table_for_model(model, root).await?
+                    }
+                };
+                (table, value.to_string())
+            }
+        };
+
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.column(&table, &column)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Table literal (`DB::table('users')`) → the `Schema::create('users'` line.
+    async fn goto_table_definition(&self, table: &str) -> Option<GotoDefinitionResponse> {
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.table(table)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Relation literal → the relation method on the model file. Walks any
+    /// dotted prefix (`posts.author`) to the final model, then locates the
+    /// last-segment method by name.
+    async fn goto_relation_definition(
+        &self,
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        value: &str,
+        root: &Path,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+
+        if ctx.mode == BuilderMode::BaseBuilder {
+            return None; // base query builder has no relations
+        }
+        let starting = ctx.effective_model.as_deref()?;
+        let (model, method) = match value.rsplit_once('.') {
+            Some((prefix, last)) => {
+                let m = eloquent_completion::walk_dotted_hops(starting, prefix, root).await?;
+                (m, last.to_string())
+            }
+            None => (starting.to_string(), value.to_string()),
+        };
+
+        let path = laravel_lsp::class_locator::find_php_class_file(&model, root)?;
+        let path_for_blocking = path.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let content = std::fs::read_to_string(&path_for_blocking).ok()?;
+            let structure = laravel_lsp::laravel_introspector::extract_php_structure(&content);
+            structure
+                .structures
+                .iter()
+                .flat_map(|s| &s.methods)
+                .find(|m| m.name == method)
+                .map(|m| (m.start_line, m.start_column, m.end_line, m.end_column))
+        })
+        .await
+        .ok()
+        .flatten()?;
+
+        let uri = Url::from_file_path(&path).ok()?;
+        let (start_line, start_col, end_line, end_col) = found;
+        let target_range = Range {
+            start: Position {
+                line: start_line,
+                character: start_col,
+            },
+            end: Position {
+                line: end_line,
+                character: end_col,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range,
+            target_selection_range: Range {
+                start: Position {
+                    line: start_line,
+                    character: start_col,
+                },
+                end: Position {
+                    line: start_line,
+                    character: start_col,
+                },
+            },
+        }]))
+    }
+
+    /// Build a goto response pointing at a migration definition site.
+    fn location_from_migration_site(
+        site: &laravel_lsp::migration_index::MigrationSite,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = Url::from_file_path(&site.file).ok()?;
+        let range = Range {
+            start: Position {
+                line: site.line,
+                character: site.start_char,
+            },
+            end: Position {
+                line: site.line,
+                character: site.end_char,
+            },
+        };
+        // Land the caret at the column/table name WITHOUT selecting it. A
+        // selected `email` makes Zed highlight every `email` substring (incl.
+        // `email_verified_at`), which reads as "jumped to the wrong field". A
+        // zero-width selection reveals the line and places the caret cleanly.
+        let caret = Range {
+            start: range.start,
+            end: range.start,
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: range,
+            target_selection_range: caret,
+        }]))
+    }
+
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
     async fn create_url_location_from_salsa(
@@ -13161,6 +13396,7 @@ return [
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
+            migration_index: self.migration_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
@@ -16101,6 +16337,7 @@ impl LanguageServer for LaravelLanguageServer {
         let mut created_or_changed = 0usize;
         let mut deleted = 0usize;
         let mut skipped_open = 0usize;
+        let mut migrations_changed = false;
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -16110,6 +16347,9 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
+                migrations_changed = true;
+            }
             match change.typ {
                 FileChangeType::CREATED => {
                     // Best-effort read. The file may already be gone
@@ -16188,6 +16428,14 @@ impl LanguageServer for LaravelLanguageServer {
                 "🛡️  watched files: {} updated, {} deleted, {} skipped (open in editor)",
                 created_or_changed, deleted, skipped_open
             );
+        }
+
+        // A migration changed on disk — rebuild the column/table index so
+        // goto-definition reflects the new schema. One rebuild per batch.
+        if migrations_changed {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                self.rebuild_migration_index(&root).await;
+            }
         }
     }
 
@@ -16291,6 +16539,15 @@ impl LanguageServer for LaravelLanguageServer {
                     if let Some(loc) = self.blade_variable_goto_definition(&uri, position).await {
                         return Ok(Some(loc));
                     }
+                }
+
+                // Query-chain literal fallback: cmd-click on a column / relation
+                // / table literal inside an Eloquent or DB::table() chain jumps
+                // to its definition (migration line / model method / create
+                // migration). Chains aren't position-indexed, so this lives in
+                // the no-pattern branch.
+                if let Some(loc) = self.chain_goto_definition(&uri, position).await {
+                    return Ok(Some(loc));
                 }
 
                 // Debug: show what middleware patterns exist on this line

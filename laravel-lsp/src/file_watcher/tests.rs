@@ -133,10 +133,10 @@ fn registration_options_round_trip_through_serde() {
     );
 
     // We constructed exactly 1 (controllers) + 1 (routes) + 2 (view
-    // blade + php) + 1 (livewire) + 2 (vendor php + blade) = 7
-    // watchers. If the construction changes, this assertion will
+    // blade + php) + 1 (livewire) + 2 (vendor php + blade) + 1 (migrations)
+    // = 8 watchers. If the construction changes, this assertion will
     // flag it for review.
-    assert_eq!(parsed.watchers.len(), 7);
+    assert_eq!(parsed.watchers.len(), 8);
 }
 
 #[test]

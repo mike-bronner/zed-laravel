@@ -13059,35 +13059,67 @@ return [
         }
     }
 
-    /// Column literal → the migration line that defines it. A qualified literal
-    /// (`users.id`) carries its own table; otherwise the chain's effective table
-    /// is used (resolved from the model for Eloquent chains).
+    /// Column literal → the migration line that defines it, resolved across
+    /// every table the chain can reference (root + joined tables, issue #24).
+    ///
+    /// - A **qualified** literal (`orders.status`, `o.status`) resolves its
+    ///   qualifier (alias or name) to a real table.
+    /// - A **bare** literal (`status`) is probed against each accessible table
+    ///   in order (root first); the first table that defines it wins.
     async fn goto_column_definition(
         &self,
         ctx: &laravel_lsp::query_chain::ChainContext,
         value: &str,
         root: &Path,
     ) -> Option<GotoDefinitionResponse> {
-        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+        use laravel_lsp::query_chain::eloquent_completion;
 
-        let (table, column) = match value.rsplit_once('.') {
-            Some((t, c)) => (t.to_string(), c.to_string()),
-            None => {
-                let table = match ctx.mode {
-                    BuilderMode::BaseBuilder => ctx.effective_table.clone()?,
-                    _ => {
-                        let model = ctx.effective_model.as_deref()?;
-                        eloquent_completion::resolve_table_for_model(model, root).await?
-                    }
-                };
-                (table, value.to_string())
-            }
-        };
+        let accessible = Self::accessible_tables_for_goto(ctx, root).await;
+        let candidates = eloquent_completion::goto_column_candidates(&accessible, value);
 
         let guard = self.migration_index.read().await;
-        let site = guard.as_ref()?.column(&table, &column)?.clone();
+        let index = guard.as_ref()?;
+        let site = candidates
+            .iter()
+            .find_map(|(table, column)| index.column(table, column))?
+            .clone();
         drop(guard);
         Self::location_from_migration_site(&site)
+    }
+
+    /// Build the tables a chain can reference columns from, for goto
+    /// resolution: the root (honoring a `from()` override, or the model's
+    /// table for Eloquent chains) plus any joined tables. Mirrors the
+    /// accessible-table model `eloquent_completion` uses for completion.
+    async fn accessible_tables_for_goto(
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        root: &Path,
+    ) -> Vec<laravel_lsp::query_chain::AccessibleTable> {
+        use laravel_lsp::query_chain::{
+            eloquent_completion, AccessibleTable, BuilderMode, FromClause,
+        };
+
+        let mut tables = Vec::new();
+        match &ctx.from_clause {
+            FromClause::Replace(table) => tables.push(table.clone()),
+            FromClause::Opaque => {}
+            FromClause::Inherit => {
+                let root_table = match ctx.mode {
+                    BuilderMode::BaseBuilder => ctx.effective_table.clone(),
+                    _ => match ctx.effective_model.as_deref() {
+                        Some(model) => {
+                            eloquent_completion::resolve_table_for_model(model, root).await
+                        }
+                        None => None,
+                    },
+                };
+                if let Some(table) = root_table {
+                    tables.push(AccessibleTable::bare(table));
+                }
+            }
+        }
+        tables.extend(ctx.joined_tables.iter().cloned());
+        tables
     }
 
     /// Table literal (`DB::table('users')`) → the `Schema::create('users'` line.

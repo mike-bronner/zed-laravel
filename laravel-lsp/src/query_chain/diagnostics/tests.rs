@@ -943,3 +943,63 @@ async fn typo_still_flagged_with_joins_present() {
     );
     assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
 }
+
+#[tokio::test]
+async fn eloquent_bare_joined_column_not_flagged() {
+    // `status` is on `orders`, joined onto a `User::query()` chain — must not
+    // be flagged as missing on the model's `users` table.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::query()->join('orders', 'orders.user_id', '=', 'users.id')->where('status', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "Eloquent joined-table column must not be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn eloquent_from_replace_validates_against_new_table() {
+    // `User::query()->from('admins')` redirects the root — a column on
+    // `admins` is valid; one only on the replaced `users` table is flagged.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("admins", &[("admin_id", "int"), ("level", "int")]),
+        ],
+    )
+    .await;
+
+    let ok =
+        "<?php\nuse App\\Models\\User;\nUser::query()->from('admins')->where('level', 1)->get();\n";
+    let diags =
+        chain_diagnostics(&chains_of(ok), &db, &root, ok, DiagnosticSeverity::WARNING).await;
+    assert!(diags.is_empty(), "admins column must be valid: {diags:?}");
+
+    let bad =
+        "<?php\nuse App\\Models\\User;\nUser::query()->from('admins')->where('name', 1)->get();\n";
+    let diags = chain_diagnostics(
+        &chains_of(bad),
+        &db,
+        &root,
+        bad,
+        DiagnosticSeverity::WARNING,
+    )
+    .await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "column from the replaced table should be flagged: {diags:?}"
+    );
+}

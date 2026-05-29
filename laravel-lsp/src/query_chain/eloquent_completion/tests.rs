@@ -1017,3 +1017,292 @@ async fn columns_raw_wraps_qualified_insert_text() {
         .expect("qualified item");
     assert_eq!(qualified.insert_text.as_deref(), Some("'orders.status'"));
 }
+
+// ---- Eloquent joins + from() (issue #24, Phase 2) ---------------------
+
+/// Build an Eloquent `ChainContext` for column-completion tests.
+fn eloquent_ctx(
+    class: &str,
+    mode: BuilderMode,
+    joined_tables: Vec<AccessibleTable>,
+    from_clause: FromClause,
+    dotted_prefix: Option<&str>,
+) -> ChainContext {
+    ChainContext {
+        mode,
+        effective_table: None,
+        effective_model: Some(class.to_string()),
+        expecting: ArgKind::Column,
+        dotted_prefix: dotted_prefix.map(|s| s.to_string()),
+        closure_relation_hop: None,
+        quote: '\'',
+        joined_tables,
+        from_clause,
+    }
+}
+
+const PLAIN_USER: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {}
+"#;
+
+#[tokio::test]
+async fn eloquent_builder_offers_joined_columns() {
+    let (_dir, root) = project_with_model("User", PLAIN_USER);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int"), ("name", "string")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentBuilder,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        None,
+    );
+    let got = labels(&columns_for_builder(&ctx, &db, None, &root).await);
+    assert!(got.contains(&"name".to_string()), "bare root; got {got:?}");
+    assert!(got.contains(&"users.name".to_string()), "qualified root");
+    assert!(
+        got.contains(&"orders.status".to_string()),
+        "qualified joined"
+    );
+}
+
+#[tokio::test]
+async fn eloquent_builder_narrows_to_joined_table() {
+    let (_dir, root) = project_with_model("User", PLAIN_USER);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string"), ("total", "int")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentBuilder,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        Some("orders"),
+    );
+    let got = labels(&columns_for_builder(&ctx, &db, None, &root).await);
+    assert_eq!(got.len(), 2, "only orders columns; got {got:?}");
+    assert!(got.contains(&"status".to_string()));
+    assert!(got.contains(&"total".to_string()));
+}
+
+#[tokio::test]
+async fn eloquent_narrow_to_root_model_table_keeps_casts() {
+    // `User::query()->join(...)->where('users.|')` narrows to the model's
+    // table (qualifier = "users") and still applies the model cast.
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $casts = ['options' => 'array'];
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int"), ("options", "string")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentBuilder,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        Some("users"),
+    );
+    let items = columns_for_builder(&ctx, &db, None, &root).await;
+    let options = items
+        .iter()
+        .find(|i| i.label == "options")
+        .expect("options column narrowed to users");
+    assert!(
+        options.detail.as_deref().unwrap_or("").contains("array"),
+        "cast should still apply when narrowing to the model table; got {:?}",
+        options.detail
+    );
+}
+
+#[tokio::test]
+async fn eloquent_from_replace_uses_schema_table() {
+    // `User::query()->from('admins')` redirects the root to admins
+    // (schema-only — the User model's casts no longer apply).
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $casts = ['options' => 'array'];
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int"), ("options", "string")]),
+            ("admins", vec![("admin_id", "int"), ("level", "int")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentBuilder,
+        Vec::new(),
+        FromClause::Replace(AccessibleTable::bare("admins")),
+        None,
+    );
+    let got = labels(&columns_for_builder(&ctx, &db, None, &root).await);
+    assert!(got.contains(&"admin_id".to_string()), "got {got:?}");
+    assert!(got.contains(&"level".to_string()));
+    assert!(!got.contains(&"id".to_string()), "users table is replaced");
+    assert!(!got.contains(&"options".to_string()));
+}
+
+#[tokio::test]
+async fn eloquent_opaque_from_suppresses_root_keeps_joins() {
+    let (_dir, root) = project_with_model("User", PLAIN_USER);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentBuilder,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Opaque,
+        None,
+    );
+    let got = labels(&columns_for_builder(&ctx, &db, None, &root).await);
+    assert!(got.contains(&"orders.status".to_string()));
+    assert!(
+        !got.contains(&"id".to_string()),
+        "opaque root suppressed; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn eloquent_collection_offers_joined_columns_and_accessors() {
+    let body = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function getFullNameAttribute(): string { return ''; }
+}
+"#;
+    let (_dir, root) = project_with_model("User", body);
+    let db = provider_with_tables(
+        root.clone(),
+        vec![
+            ("users", vec![("id", "int"), ("name", "string")]),
+            ("orders", vec![("status", "string")]),
+        ],
+    )
+    .await;
+    let ctx = eloquent_ctx(
+        "App\\Models\\User",
+        BuilderMode::EloquentCollection,
+        vec![AccessibleTable::bare("orders")],
+        FromClause::Inherit,
+        None,
+    );
+    let got = labels(&columns_for_collection(&ctx, &db, None, &root).await);
+    assert!(got.contains(&"name".to_string()), "bare root col");
+    assert!(got.contains(&"orders.status".to_string()), "joined col");
+    assert!(
+        got.contains(&"full_name".to_string()),
+        "accessor; got {got:?}"
+    );
+    // Accessors are in-memory props — never offered table-qualified.
+    assert!(!got.contains(&"users.full_name".to_string()));
+}
+
+// ---- goto_column_candidates (issue #24) -------------------------------
+
+#[test]
+fn goto_candidates_bare_single_table() {
+    let accessible = vec![AccessibleTable::bare("users")];
+    assert_eq!(
+        goto_column_candidates(&accessible, "email"),
+        vec![("users".to_string(), "email".to_string())]
+    );
+}
+
+#[test]
+fn goto_candidates_bare_searches_all_tables_root_first() {
+    let accessible = vec![
+        AccessibleTable::bare("users"),
+        AccessibleTable::bare("orders"),
+    ];
+    assert_eq!(
+        goto_column_candidates(&accessible, "status"),
+        vec![
+            ("users".to_string(), "status".to_string()),
+            ("orders".to_string(), "status".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn goto_candidates_qualified_resolves_alias_to_real_table() {
+    let accessible = vec![
+        AccessibleTable::bare("users"),
+        AccessibleTable {
+            table: "orders".to_string(),
+            alias: Some("o".to_string()),
+        },
+    ];
+    assert_eq!(
+        goto_column_candidates(&accessible, "o.status"),
+        vec![("orders".to_string(), "status".to_string())]
+    );
+}
+
+#[test]
+fn goto_candidates_qualified_by_table_name() {
+    let accessible = vec![
+        AccessibleTable::bare("users"),
+        AccessibleTable::bare("orders"),
+    ];
+    assert_eq!(
+        goto_column_candidates(&accessible, "orders.status"),
+        vec![("orders".to_string(), "status".to_string())]
+    );
+}
+
+#[test]
+fn goto_candidates_unknown_qualifier_falls_back_to_literal() {
+    // A qualifier that matches no accessible table is treated as a literal
+    // table name (covers schema-qualified / untracked tables).
+    let accessible = vec![AccessibleTable::bare("users")];
+    assert_eq!(
+        goto_column_candidates(&accessible, "posts.id"),
+        vec![("posts".to_string(), "id".to_string())]
+    );
+}
+
+#[test]
+fn goto_candidates_schema_qualified() {
+    // `mydb.orders.status` — qualifier is everything before the last dot.
+    let accessible = vec![AccessibleTable::bare("mydb.orders")];
+    assert_eq!(
+        goto_column_candidates(&accessible, "mydb.orders.status"),
+        vec![("mydb.orders".to_string(), "status".to_string())]
+    );
+}

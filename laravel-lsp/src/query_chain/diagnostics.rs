@@ -256,40 +256,41 @@ async fn legal_names(
         DiagKind::Column => {
             // Resolve the root (FROM) table plus, for Eloquent chains, the
             // model's casts/accessors. A `from()` override redirects the root
-            // to a plain table; `fromRaw`/`fromSub` (Opaque) leaves no root.
+            // to a plain schema-only table (no model casts apply once the table
+            // is redirected); `fromRaw`/`fromSub` (Opaque) leaves no root.
+            // This mirrors `eloquent_completion::resolve_eloquent_root`.
             let (root_table, casts, accessors): (Option<String>, Vec<String>, Vec<String>) =
-                match ctx.mode {
-                    BuilderMode::BaseBuilder => {
-                        let table = match &ctx.from_clause {
-                            FromClause::Replace(at) => Some(at.table.clone()),
-                            FromClause::Opaque => None,
-                            FromClause::Inherit => ctx.effective_table.clone(),
-                        };
-                        (table, Vec::new(), Vec::new())
-                    }
-                    BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
-                        let model = ctx.effective_model.as_deref()?;
-                        let meta = load_metadata(model, root).await?;
-                        let simple = model.rsplit('\\').next().unwrap_or(model);
-                        let table = meta
-                            .table_name
-                            .clone()
-                            .unwrap_or_else(|| snake_pluralize(simple));
-                        let casts: Vec<String> = meta.casts.keys().cloned().collect();
-                        // Accessors are valid `where` args only post-execution,
-                        // when filtering happens in memory on a hydrated
-                        // collection.
-                        let accessors: Vec<String> = if ctx.mode == BuilderMode::EloquentCollection
-                        {
-                            meta.accessors
-                                .iter()
-                                .map(|a| a.property_name.clone())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        (Some(table), casts, accessors)
-                    }
+                match &ctx.from_clause {
+                    FromClause::Replace(at) => (Some(at.table.clone()), Vec::new(), Vec::new()),
+                    FromClause::Opaque => (None, Vec::new(), Vec::new()),
+                    FromClause::Inherit => match ctx.mode {
+                        BuilderMode::BaseBuilder => {
+                            (ctx.effective_table.clone(), Vec::new(), Vec::new())
+                        }
+                        BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
+                            let model = ctx.effective_model.as_deref()?;
+                            let meta = load_metadata(model, root).await?;
+                            let simple = model.rsplit('\\').next().unwrap_or(model);
+                            let table = meta
+                                .table_name
+                                .clone()
+                                .unwrap_or_else(|| snake_pluralize(simple));
+                            let casts: Vec<String> = meta.casts.keys().cloned().collect();
+                            // Accessors are valid `where` args only
+                            // post-execution, when filtering happens in memory
+                            // on a hydrated collection.
+                            let accessors: Vec<String> =
+                                if ctx.mode == BuilderMode::EloquentCollection {
+                                    meta.accessors
+                                        .iter()
+                                        .map(|a| a.property_name.clone())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            (Some(table), casts, accessors)
+                        }
+                    },
                 };
 
             // Union columns across every accessible table — the root plus any

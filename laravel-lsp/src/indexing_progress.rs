@@ -24,9 +24,10 @@ use lsp_types::{
 };
 use tower_lsp::Client;
 
-/// Token identifier for our indexing progress. A constant string is fine —
-/// only one indexing progress is in flight at a time per LSP instance.
-const PROGRESS_TOKEN: &str = "laravel-lsp/indexing";
+/// Token identifier for the project-warming progress.
+pub const INDEXING_TOKEN: &str = "laravel-lsp/indexing";
+/// Token identifier for the class-rename progress.
+pub const RENAME_TOKEN: &str = "laravel-lsp/rename";
 
 /// Minimum interval between `$/progress` report notifications. Faster
 /// than this and we'd just be spamming the editor for sub-frame updates
@@ -36,9 +37,14 @@ const REPORT_THROTTLE: Duration = Duration::from_millis(150);
 /// Active progress handle. `report` is throttled so call sites don't
 /// need to be careful about update frequency. `end` consumes self; drop
 /// without ending also ends (with a fallback message) so a panic in the
-/// middle of warming doesn't leave a stale progress bar.
+/// middle of an operation doesn't leave a stale progress bar.
+///
+/// General-purpose despite the name — used for both project warming
+/// (determinate, with a filled bar) and class rename (indeterminate
+/// spinner). Each owner passes its own `token`.
 pub struct IndexingProgress {
     client: Client,
+    token: NumberOrString,
     /// Set to false after `end` runs so `Drop` doesn't double-end.
     active: bool,
     last_report: Instant,
@@ -46,29 +52,30 @@ pub struct IndexingProgress {
 
 impl IndexingProgress {
     /// Create the progress token on the client and emit the `Begin`
-    /// notification with both the persistent `title` and an initial
-    /// `message`. Returns `None` if the client doesn't honour the create
-    /// request — in that case the caller proceeds without UI.
+    /// notification with the persistent `title` and an initial `message`.
+    /// `percentage` is `Some(0)` for a determinate bar, or `None` for an
+    /// indeterminate spinner (use this when you can't report incremental
+    /// progress, e.g. a single blocking scan). Returns `None` if the client
+    /// doesn't honour the create request — the caller proceeds without UI.
     ///
-    /// Passing the initial message into `Begin` (rather than firing a
-    /// separate `Report` immediately after) matters: there's a real
-    /// observable gap between `Begin` and the first follow-up report
-    /// because intervening work (actor calls, config lookups) runs
-    /// between them. Without an initial message, the status-bar entry
-    /// shows just the title (e.g. "Laravel") for that gap, which looks
-    /// like the LSP is stuck.
+    /// Passing the initial message into `Begin` (rather than a separate
+    /// `Report`) matters: there's an observable gap between `Begin` and the
+    /// first follow-up report, and without an initial message the status-bar
+    /// entry shows just the title for that gap, looking stuck.
     pub async fn begin(
         client: Client,
+        token: impl Into<String>,
         title: impl Into<String>,
         initial_message: impl Into<String>,
+        percentage: Option<u32>,
     ) -> Option<Self> {
-        let token = NumberOrString::String(PROGRESS_TOKEN.to_string());
+        let token = NumberOrString::String(token.into());
         let title = title.into();
         let initial_message = initial_message.into();
 
         // Ask the client to allocate the progress token. Some clients
         // (older ones) don't support this; we'd rather skip the UI than
-        // fail warming.
+        // fail the operation.
         if client
             .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
                 token: token.clone(),
@@ -81,20 +88,16 @@ impl IndexingProgress {
 
         client
             .send_notification::<ProgressNotification>(ProgressParams {
-                token,
+                token: token.clone(),
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
                     WorkDoneProgressBegin {
                         title,
                         cancellable: Some(false),
                         message: Some(initial_message),
-                        // Percentage is sent on the wire but the message
-                        // text is deliberately free of any "(X%)" suffix.
-                        // The LSP `percentage` field is a separate numeric
-                        // channel — clients that render a progress bar
-                        // use it for fill, clients that don't are free
-                        // to ignore it. Either way, the message stays
-                        // clean for the narrow status bar.
-                        percentage: Some(0),
+                        // The `percentage` field is a separate numeric channel
+                        // from the message: clients that render a bar use it for
+                        // fill, `None` yields an indeterminate spinner.
+                        percentage,
                     },
                 )),
             })
@@ -102,6 +105,7 @@ impl IndexingProgress {
 
         Some(Self {
             client,
+            token,
             active: true,
             last_report: Instant::now(),
         })
@@ -127,7 +131,7 @@ impl IndexingProgress {
 
         self.client
             .send_notification::<ProgressNotification>(ProgressParams {
-                token: NumberOrString::String(PROGRESS_TOKEN.to_string()),
+                token: self.token.clone(),
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
                     WorkDoneProgressReport {
                         cancellable: Some(false),
@@ -148,7 +152,7 @@ impl IndexingProgress {
         self.active = false;
         self.client
             .send_notification::<ProgressNotification>(ProgressParams {
-                token: NumberOrString::String(PROGRESS_TOKEN.to_string()),
+                token: self.token.clone(),
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
                     message: Some(message.into()),
                 })),
@@ -166,13 +170,14 @@ impl Drop for IndexingProgress {
             return;
         }
         let client = self.client.clone();
+        let token = self.token.clone();
         tokio::spawn(async move {
             client
                 .send_notification::<ProgressNotification>(ProgressParams {
-                    token: NumberOrString::String(PROGRESS_TOKEN.to_string()),
+                    token,
                     value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
                         WorkDoneProgressEnd {
-                            message: Some("Indexing interrupted.".into()),
+                            message: Some("Interrupted.".into()),
                         },
                     )),
                 })

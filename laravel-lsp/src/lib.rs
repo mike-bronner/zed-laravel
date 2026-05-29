@@ -16,6 +16,7 @@ pub mod blade_php_block;
 pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
+pub mod class_rename;
 pub mod completion_format;
 pub mod component_declaration_locator;
 pub mod composer_autoload;

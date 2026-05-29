@@ -13197,6 +13197,217 @@ return [
         }]))
     }
 
+    /// prepare_rename fallback: if the cursor is on a PHP class name that
+    /// resolves to a *project* (non-dependency) class, return the basename range
+    /// so the editor offers a rename. Returns `None` for vendor classes, aliases,
+    /// and non-class positions.
+    async fn prepare_class_rename(&self, uri: &Url, position: Position) -> Option<Range> {
+        use laravel_lsp::query_chain::{byte_offset_to_position, position_to_byte_offset};
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let (fqcn, span) = laravel_lsp::class_rename::class_at_cursor(&content, byte)?;
+        let root = self.initialized_root.read().await.clone()?;
+        let decl = laravel_lsp::class_locator::find_php_class_file(&fqcn, &root)?;
+        if laravel_lsp::class_rename::is_dependency_path(&decl) {
+            return None; // don't rename vendor classes
+        }
+        Some(Range {
+            start: byte_offset_to_position(&content, span.0),
+            end: byte_offset_to_position(&content, span.1),
+        })
+    }
+
+    /// rename fallback for PHP class names: rewrite every project-wide reference
+    /// to the class (declaration, `use`, `::`, `new`, type hints, `::class`,
+    /// `instanceof`, docblocks) and rename the declaring file. Same-namespace
+    /// rename only — `new_name` must be a simple class identifier.
+    async fn class_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        use laravel_lsp::query_chain::{byte_offset_to_position, position_to_byte_offset};
+
+        let content = match self.documents.read().await.get(uri) {
+            Some((c, _)) => c.clone(),
+            None => return Ok(None),
+        };
+        let Some(byte) = position_to_byte_offset(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
+        let Some((fqcn, _span)) = laravel_lsp::class_rename::class_at_cursor(&content, byte) else {
+            return Ok(None);
+        };
+        let Some(root) = self.initialized_root.read().await.clone() else {
+            return Ok(None);
+        };
+        let Some(decl_path) = laravel_lsp::class_locator::find_php_class_file(&fqcn, &root) else {
+            return Ok(None);
+        };
+        if laravel_lsp::class_rename::is_dependency_path(&decl_path) {
+            return Ok(None);
+        }
+
+        // `new_name` must be a bare class identifier — renaming into a different
+        // namespace (a move) isn't supported.
+        let new_basename = new_name.trim();
+        let is_identifier = !new_basename.is_empty()
+            && new_basename
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && new_basename
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !is_identifier {
+            return Err(laravel_lsp::rename::rename_error(
+                "Rename a class to a simple name (moving it to another namespace isn't supported).",
+            ));
+        }
+        let old_basename = fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string();
+        if new_basename == old_basename {
+            return Ok(None);
+        }
+
+        // Find every reference across project PHP files. The expensive step is
+        // the per-file tree-sitter parse, so we read first (cheap) and only
+        // parse files whose text actually contains the old basename — on a large
+        // project that's a handful out of thousands. A size cap skips
+        // pathological generated files (e.g. giant `_ide_helper`).
+        const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+        // Show a status-bar spinner — scanning a large project takes a few
+        // seconds and the rename would otherwise look frozen. Indeterminate
+        // (no percentage): the scan is one blocking pass we can't report inside.
+        // Best-effort; `None` if the client doesn't support progress.
+        let progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
+            self.client.clone(),
+            laravel_lsp::indexing_progress::RENAME_TOKEN,
+            "Laravel",
+            format!("Renaming {old_basename} → {new_basename}…"),
+            None,
+        )
+        .await;
+
+        let root2 = root.clone();
+        let fqcn2 = fqcn.clone();
+        let old2 = old_basename.clone();
+        let t_scan = std::time::Instant::now();
+        let (per_file, scanned, parsed) = tokio::task::spawn_blocking(move || {
+            let files = laravel_lsp::class_rename::project_php_files(&root2);
+            let scanned = files.len();
+            let mut parsed = 0usize;
+            let per_file: Vec<_> = files
+                .into_iter()
+                .filter_map(|p| {
+                    let c = std::fs::read_to_string(&p).ok()?;
+                    // Cheap pre-filter: skip files that can't reference the class.
+                    if c.len() > MAX_FILE_BYTES || !c.contains(&old2) {
+                        return None;
+                    }
+                    parsed += 1;
+                    let spans = laravel_lsp::class_rename::reference_spans(&c, &fqcn2, &old2);
+                    if spans.is_empty() {
+                        None
+                    } else {
+                        Some((p, c, spans))
+                    }
+                })
+                .collect();
+            (per_file, scanned, parsed)
+        })
+        .await
+        .unwrap_or_default();
+
+        let edit_count: usize = per_file.iter().map(|(_, _, s)| s.len()).sum();
+        info!(
+            "✏️  class rename {} → {}: {} edits in {} files (scanned {}, parsed {}) in {:?}",
+            old_basename,
+            new_basename,
+            edit_count,
+            per_file.len(),
+            scanned,
+            parsed,
+            t_scan.elapsed()
+        );
+
+        // Scan done (the edit-building below is instant) — clear the spinner.
+        if let Some(p) = progress {
+            p.end(format!(
+                "Renamed {old_basename} → {new_basename} ({edit_count} edits, {} files)",
+                per_file.len()
+            ))
+            .await;
+        }
+
+        if per_file.is_empty() {
+            return Ok(None);
+        }
+
+        let new_basename = new_basename.to_string();
+        let mut ops: Vec<DocumentChangeOperation> = Vec::new();
+        for (path, file_content, spans) in &per_file {
+            let Ok(file_uri) = Url::from_file_path(path) else {
+                continue;
+            };
+            let edits: Vec<OneOf<TextEdit, AnnotatedTextEdit>> = spans
+                .iter()
+                .map(|(s, e)| {
+                    OneOf::Left(TextEdit {
+                        range: Range {
+                            start: byte_offset_to_position(file_content, *s),
+                            end: byte_offset_to_position(file_content, *e),
+                        },
+                        new_text: new_basename.clone(),
+                    })
+                })
+                .collect();
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: file_uri,
+                    version: None,
+                },
+                edits,
+            }));
+        }
+
+        // Rename the declaring file (same dir, new basename). Emitted AFTER the
+        // text edits so the `class User → class NewName` edit lands first.
+        let new_path = decl_path.with_file_name(format!("{new_basename}.php"));
+        if new_path != decl_path {
+            if let (Ok(old_uri), Ok(new_uri)) = (
+                Url::from_file_path(&decl_path),
+                Url::from_file_path(&new_path),
+            ) {
+                ops.push(DocumentChangeOperation::Op(ResourceOp::Rename(
+                    RenameFile {
+                        old_uri,
+                        new_uri,
+                        options: Some(RenameFileOptions {
+                            overwrite: Some(false),
+                            ignore_if_exists: Some(false),
+                        }),
+                        annotation_id: None,
+                    },
+                )));
+            }
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            change_annotations: None,
+        }))
+    }
+
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
     async fn create_url_location_from_salsa(
@@ -15993,8 +16204,10 @@ impl LanguageServer for LaravelLanguageServer {
             // editor chrome with.
             let mut progress = laravel_lsp::indexing_progress::IndexingProgress::begin(
                 client,
+                laravel_lsp::indexing_progress::INDEXING_TOKEN,
                 "Laravel",
                 "Starting indexer…",
+                Some(0),
             )
             .await;
 
@@ -16896,7 +17109,11 @@ impl LanguageServer for LaravelLanguageServer {
                     "prepare_rename: no classifier match at {}:{}",
                     position.line, position.character
                 );
-                return Ok(None);
+                // Fallback: a PHP class name (model, etc.) under the cursor.
+                return Ok(self
+                    .prepare_class_rename(uri, position)
+                    .await
+                    .map(PrepareRenameResponse::Range));
             }
         };
 
@@ -16967,7 +17184,8 @@ impl LanguageServer for LaravelLanguageServer {
                     "rename: classify returned None at {}:{}",
                     position.line, position.character
                 );
-                return Ok(None);
+                // Fallback: PHP class rename (model, etc.) across the project.
+                return self.class_rename_edit(uri, position, &new_name).await;
             }
         };
 

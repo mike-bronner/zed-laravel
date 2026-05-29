@@ -356,3 +356,245 @@ fn merged_surface_includes_query_only_methods() {
         "select (Query-only) should appear in items: {labels:?}"
     );
 }
+
+// ---- Phase 3: dynamic_where_to_items ----------------------------------
+
+use crate::laravel_introspector::{
+    AccessorInfo, ClassView, ColumnInfo, ColumnSource, LaravelClassKind, PhpStructure,
+    PhpStructureKind,
+};
+
+fn col(name: &str, php_type: &str, source: ColumnSource) -> ColumnInfo {
+    ColumnInfo {
+        name: name.to_string(),
+        php_type: php_type.to_string(),
+        source,
+    }
+}
+
+/// Minimal ClassView with no real-method surface — every synthetic
+/// passes through. Specific tests populate `callstatic_surface` /
+/// `scopes` when exercising the "PHP magic methods don't fire when a
+/// real method exists" rule.
+fn empty_view() -> ClassView {
+    ClassView {
+        file_path: std::path::PathBuf::new(),
+        fqcn: "App\\Models\\Portfolio".to_string(),
+        namespace: Some("App\\Models".to_string()),
+        class_name: "Portfolio".to_string(),
+        kind: LaravelClassKind::Model,
+        direct: PhpStructure {
+            kind: PhpStructureKind::Class,
+            name: "Portfolio".to_string(),
+            extends: None,
+            extends_raw: None,
+            trait_uses: Vec::new(),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+            methods: Vec::new(),
+            properties: Vec::new(),
+        },
+        all_methods: Vec::new(),
+        all_properties: Vec::new(),
+        scopes: Vec::new(),
+        accessors: Vec::<AccessorInfo>::new(),
+        relationships: Vec::new(),
+        casts: std::collections::HashMap::new(),
+        table_name: None,
+        column_surface: Vec::new(),
+        callstatic_surface: Vec::new(),
+    }
+}
+
+fn empty_index() -> BuilderMethodIndex {
+    BuilderMethodIndex {
+        eloquent_builder: Vec::new(),
+        query_builder: Vec::new(),
+        model_static_method_names: std::collections::HashSet::new(),
+    }
+}
+
+#[test]
+fn dynamic_where_emits_where_and_or_where_pair_per_column() {
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![col("email", "string", ColumnSource::Fillable)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"whereEmail"),
+        "should emit whereEmail; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"orWhereEmail"),
+        "should emit orWhereEmail; got {labels:?}"
+    );
+}
+
+#[test]
+fn dynamic_where_snake_to_studly_handles_multi_segment_columns() {
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![
+        col("email_verified_at", "Carbon", ColumnSource::ParentClass),
+        col("user_id", "int", ColumnSource::Convention),
+    ];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"whereEmailVerifiedAt"));
+    assert!(labels.contains(&"orWhereEmailVerifiedAt"));
+    assert!(labels.contains(&"whereUserId"));
+}
+
+#[test]
+fn dynamic_where_skips_when_real_builder_method_exists() {
+    // PHP magic methods only fire when no real method exists. Builder
+    // defines `whereDate(column, op, value)` — a column called `date`
+    // would synthesize `whereDate(...)` which collides. PHP routes to
+    // Builder's real method; emitting our synthetic would be misleading.
+    let view = empty_view();
+    let mut index = empty_index();
+    index.eloquent_builder.push(crate::laravel_introspector::ParsedMethod {
+        name: "whereDate".to_string(),
+        source_class: "Illuminate\\Database\\Eloquent\\Builder".to_string(),
+        signature: "public function whereDate($column, $op, $value)".to_string(),
+        return_type: None,
+        summary: None,
+        doc_body: None,
+    });
+    let cols = vec![col("date", "Carbon", ColumnSource::Fillable)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"whereDate"),
+        "whereDate must be suppressed when Builder defines a real method; got {labels:?}"
+    );
+    // orWhereDate is NOT a real Builder method, so the synthetic survives.
+    assert!(
+        labels.contains(&"orWhereDate"),
+        "orWhereDate should still be emitted (no real method collision); got {labels:?}"
+    );
+}
+
+#[test]
+fn dynamic_where_skips_when_local_scope_exists() {
+    // A model's `scopeWhereEmail` would surface as `whereEmail()` —
+    // synthetic emission would collide. Same skip rule applies.
+    let mut view = empty_view();
+    view.scopes.push(crate::laravel_introspector::ScopeInfo {
+        name: "whereEmail".to_string(),
+        source_class: "App\\Models\\Portfolio".to_string(),
+        signature: "public function whereEmail($q): Builder".to_string(),
+        doc_body: None,
+        summary: None,
+        style: crate::laravel_introspector::ScopeStyle::Prefix,
+    });
+    let index = empty_index();
+    let cols = vec![col("email", "string", ColumnSource::Fillable)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        !labels.contains(&"whereEmail"),
+        "whereEmail must be suppressed when a local scope owns the name; got {labels:?}"
+    );
+}
+
+#[test]
+fn dynamic_where_detail_carries_column_php_type() {
+    // The row's `detail` field shows the column's PHP type so users
+    // can see at a glance what `where{Column}` expects.
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![col("user_id", "int", ColumnSource::Convention)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let item = items
+        .iter()
+        .find(|i| i.label == "whereUserId")
+        .expect("whereUserId");
+    assert_eq!(item.detail.as_deref(), Some("int"));
+}
+
+#[test]
+fn dynamic_where_doc_panel_includes_provenance_line() {
+    use tower_lsp::lsp_types::{Documentation, MarkupContent};
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![col("email", "string", ColumnSource::Fillable)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    let item = items
+        .iter()
+        .find(|i| i.label == "whereEmail")
+        .expect("whereEmail");
+    let value = match item.documentation.as_ref() {
+        Some(Documentation::MarkupContent(MarkupContent { value, .. })) => value.clone(),
+        other => panic!("expected MarkupContent, got {other:?}"),
+    };
+    // Header shows the synthetic method name.
+    assert!(value.contains("**whereEmail**"), "panel: {value}");
+    // Summary shows the underlying column.
+    assert!(value.contains("Eloquent dynamic where (email = ?)"), "panel: {value}");
+    // Signature carries the column's PHP type.
+    assert!(value.contains("string $value"), "panel: {value}");
+    // Provenance section credits $fillable.
+    assert!(value.contains("declared in `$fillable`"), "panel: {value}");
+}
+
+#[test]
+fn dynamic_where_provenance_distinguishes_all_sources() {
+    // Every ColumnSource variant should produce a distinct, human-readable
+    // provenance line. Spot-check each.
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![
+        col("a", "mixed", ColumnSource::Fillable),
+        col("b", "array", ColumnSource::Cast),
+        col("c", "Carbon", ColumnSource::Dates),
+        col("d", "mixed", ColumnSource::Attributes),
+        col("e", "int", ColumnSource::Convention),
+        col("f", "Carbon", ColumnSource::Trait),
+        col("g", "string", ColumnSource::ParentClass),
+        col("h", "mixed", ColumnSource::DatabaseSchema),
+    ];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    use tower_lsp::lsp_types::{Documentation, MarkupContent};
+    let panels: Vec<String> = items
+        .iter()
+        .filter(|i| i.label.starts_with("where") && !i.label.starts_with("orWhere"))
+        .map(|i| match i.documentation.as_ref() {
+            Some(Documentation::MarkupContent(MarkupContent { value, .. })) => value.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert!(panels.iter().any(|p| p.contains("declared in `$fillable`")));
+    assert!(panels.iter().any(|p| p.contains("declared in `$casts`")));
+    assert!(panels.iter().any(|p| p.contains("declared in `$dates`")));
+    assert!(panels.iter().any(|p| p.contains("declared in `$attributes`")));
+    assert!(panels.iter().any(|p| p.contains("Laravel convention")));
+    assert!(panels.iter().any(|p| p.contains("implied by composed trait")));
+    assert!(panels.iter().any(|p| p.contains("implied by parent class")));
+    assert!(panels.iter().any(|p| p.contains("from live DB schema")));
+}
+
+#[test]
+fn dynamic_where_emits_nothing_for_empty_columns() {
+    let view = empty_view();
+    let index = empty_index();
+    let items = dynamic_where_to_items(&view, &index, &[]);
+    assert!(items.is_empty());
+}
+
+#[test]
+fn dynamic_where_items_carry_method_kind() {
+    let view = empty_view();
+    let index = empty_index();
+    let cols = vec![col("email", "string", ColumnSource::Fillable)];
+    let items = dynamic_where_to_items(&view, &index, &cols);
+    for item in &items {
+        assert_eq!(
+            item.kind,
+            Some(tower_lsp::lsp_types::CompletionItemKind::METHOD)
+        );
+    }
+}

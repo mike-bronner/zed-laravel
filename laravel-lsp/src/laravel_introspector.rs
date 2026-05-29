@@ -53,8 +53,9 @@ pub use chain::{
 // `ModelMetadata`-flavoured shapes, but they're identical to the
 // canonical ones in `chain`.
 pub use model_metadata::{
-    extract_namespace, extract_use_aliases, map_cast_to_php_type, parse_cast_array,
-    parse_string_array, pascal_to_snake, relationship_to_php_type, resolve_to_fqcn, ModelMetadata,
+    extract_namespace, extract_use_aliases, map_cast_to_php_type, parse_array_keys_public,
+    parse_cast_array, parse_string_array, pascal_to_snake, relationship_to_php_type,
+    resolve_to_fqcn, snake_to_studly, ModelMetadata,
 };
 // Compatibility re-exports of the historical `AccessorInfo` /
 // `RelationshipInfo` shapes that some call sites import from this

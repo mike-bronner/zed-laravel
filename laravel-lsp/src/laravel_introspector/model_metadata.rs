@@ -345,6 +345,31 @@ pub fn parse_string_array(expr: &str) -> Vec<String> {
     parse_string_array_public(expr)
 }
 
+/// Snake_case → StudlyCase (PascalCase). Inverse of
+/// [`pascal_to_snake`]. Used to synthesize Eloquent's dynamic
+/// `where{Column}` method names from snake_case column names —
+/// e.g. `created_at` → `CreatedAt`, yielding `whereCreatedAt`.
+///
+/// Underscores act as word boundaries. Leading underscores and
+/// runs of consecutive underscores are squashed.
+pub fn snake_to_studly(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+            continue;
+        }
+        if capitalize_next {
+            out.extend(c.to_uppercase());
+            capitalize_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extract the string-literal KEYS from a PHP array literal, ignoring
 /// values entirely. Used for `$attributes` (defaults map) where the
 /// value side may be a boolean / number / null / expression that we

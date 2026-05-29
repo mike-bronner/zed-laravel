@@ -171,6 +171,11 @@ pub enum ColumnSource {
     /// Implied by a parent class — e.g. `Authenticatable` adds
     /// `email_verified_at`, `remember_token`, `password`.
     ParentClass,
+    /// Pulled from the live DB schema. Reserved for the emission-site
+    /// fallback when source-derived columns are sparse (the
+    /// `$guarded = []` case). Never produced by the walker itself —
+    /// the walker has no DB access.
+    DatabaseSchema,
 }
 
 /// Eloquent accessor — `getXxxAttribute(): Type` (old-style) or a

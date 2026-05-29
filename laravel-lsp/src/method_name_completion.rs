@@ -242,5 +242,125 @@ fn build_method_documentation(m: &ParsedMethod) -> CompletionDoc {
         .sections(tags)
 }
 
+// ---- Phase 3: Eloquent dynamic where{Column} item synthesis ------------
+
+/// Synthesize completion items for Eloquent's dynamic `where{Column}` /
+/// `orWhere{Column}` magic against `columns`. PHP magic methods only
+/// fire when no real method matches — so for each column we skip the
+/// synthetic when the resulting `where{Studly(column)}` collides with
+/// a real Builder method (Eloquent or Query), an inherited model
+/// method, or a local scope. This is modeling PHP semantics directly,
+/// not deduplication: the synthetic never exists at runtime when a
+/// real method does.
+///
+/// `view` supplies the real-method surface (`callstatic_surface` for
+/// Builder methods, `scopes` for model-local scopes). `index` is the
+/// pre-built Builder method index — same data, different shape; both
+/// are consulted because not every Builder method appears in the
+/// model's resolved view (the walker stops at Eloquent's base Model
+/// and the Builder methods come from the index instead).
+///
+/// Returns items in source order (whatever order `columns` was passed
+/// in). The caller orders columns from highest- to lowest-confidence
+/// provenance (cast > fillable > convention > DB schema) — that order
+/// carries into the popup, which is the right default before any
+/// `sortText` override.
+pub fn dynamic_where_to_items(
+    view: &crate::laravel_introspector::ClassView,
+    index: &BuilderMethodIndex,
+    columns: &[crate::laravel_introspector::ColumnInfo],
+) -> Vec<CompletionItem> {
+    use std::collections::HashSet;
+
+    // Real-method surface: every name that PHP would resolve BEFORE
+    // routing to __call/__callStatic. Built once, reused per column.
+    let mut real_methods: HashSet<&str> = HashSet::new();
+    for m in &view.callstatic_surface {
+        real_methods.insert(m.name.as_str());
+    }
+    for m in &index.eloquent_builder {
+        real_methods.insert(m.name.as_str());
+    }
+    for m in &index.query_builder {
+        real_methods.insert(m.name.as_str());
+    }
+    for s in &view.scopes {
+        real_methods.insert(s.name.as_str());
+    }
+
+    let mut items: Vec<CompletionItem> = Vec::new();
+    for col in columns {
+        let studly = crate::laravel_introspector::snake_to_studly(&col.name);
+        for prefix in ["where", "orWhere"] {
+            let synthetic = format!("{prefix}{studly}");
+            // PHP's `__call` only fires for unknown methods. If the
+            // synthetic matches a real method, PHP routes there
+            // instead — emitting our item would be misleading.
+            if real_methods.contains(synthetic.as_str()) {
+                continue;
+            }
+            items.push(dynamic_where_item(&synthetic, col, prefix == "orWhere"));
+        }
+    }
+    items
+}
+
+/// Build one `where{Column}` / `orWhere{Column}` completion item with
+/// the Intelephense-style doc panel. The panel header includes the
+/// column source so the user can tell at a glance whether the column
+/// came from `$fillable`, a cast, a convention, etc.
+fn dynamic_where_item(
+    synthetic_name: &str,
+    col: &crate::laravel_introspector::ColumnInfo,
+    is_or: bool,
+) -> CompletionItem {
+    let detail = col.php_type.clone();
+    let summary = if is_or {
+        format!(
+            "Eloquent dynamic where (or {} = ?)",
+            col.name
+        )
+    } else {
+        format!("Eloquent dynamic where ({} = ?)", col.name)
+    };
+    let signature = format!(
+        "public function {synthetic_name}({} $value): Builder<static>",
+        col.php_type
+    );
+    let provenance = column_provenance_line(col);
+
+    let doc = CompletionDoc::new()
+        .header(synthetic_name.to_string())
+        .summary(summary)
+        .code(CodeBlock::new("php", signature))
+        .section(provenance);
+
+    CompletionItem {
+        label: synthetic_name.to_string(),
+        kind: Some(CompletionItemKind::METHOD),
+        detail: Some(detail),
+        documentation: Some(doc.into_documentation()),
+        ..Default::default()
+    }
+}
+
+/// One-line provenance string for the column's source. Renders below
+/// the signature block as a `> Note:`-style aside so users can tell
+/// `$fillable`-derived columns apart from convention guesses.
+fn column_provenance_line(col: &crate::laravel_introspector::ColumnInfo) -> String {
+    use crate::laravel_introspector::ColumnSource;
+    let detail = match col.source {
+        ColumnSource::Fillable => "declared in `$fillable`",
+        ColumnSource::Cast => "declared in `$casts`",
+        ColumnSource::Dates => "declared in `$dates`",
+        ColumnSource::Attributes => "declared in `$attributes`",
+        ColumnSource::Convention => "Laravel convention",
+        ColumnSource::Trait => "implied by composed trait",
+        ColumnSource::ParentClass => "implied by parent class",
+        ColumnSource::DatabaseSchema => "from live DB schema",
+    };
+    format!("> Column `{}` — {}.", col.name, detail)
+}
+
 #[cfg(test)]
 mod tests;

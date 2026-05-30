@@ -5,8 +5,8 @@
 //!
 //! Cache location follows XDG Base Directory Specification:
 //! - Linux: ~/.cache/laravel-lsp/{project-hash}/cache.json
-//! - macOS: ~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/cache.json
-//! - Windows: %LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\cache.json
+//! - macOS: ~/Library/Caches/org.mike-bronner.laravel-lsp/{project-hash}/cache.json
+//! - Windows: %LOCALAPPDATA%\mike-bronner\laravel-lsp\cache\{project-hash}\cache.json
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -34,11 +34,11 @@ const CACHE_VERSION: u32 = 4;
 ///
 /// Returns platform-specific cache directory:
 /// - Linux: ~/.cache/laravel-lsp/{project-hash}/
-/// - macOS: ~/Library/Caches/com.genealabs.laravel-lsp/{project-hash}/
-/// - Windows: %LOCALAPPDATA%\genealabs\laravel-lsp\cache\{project-hash}\
+/// - macOS: ~/Library/Caches/org.mike-bronner.laravel-lsp/{project-hash}/
+/// - Windows: %LOCALAPPDATA%\mike-bronner\laravel-lsp\cache\{project-hash}\
 fn get_cache_dir(project_root: &Path) -> Option<PathBuf> {
     // Get platform-specific cache directory
-    let proj_dirs = ProjectDirs::from("com", "genealabs", "laravel-lsp")?;
+    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
     let cache_base = proj_dirs.cache_dir();
 
     // Create unique hash for this project based on its absolute path

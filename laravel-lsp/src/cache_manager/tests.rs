@@ -75,8 +75,8 @@ fn test_xdg_cache_path() {
     {
         let path_str = cache_path.to_string_lossy();
         assert!(
-            path_str.contains("Library/Caches/com.genealabs.laravel-lsp"),
-            "macOS cache should be in ~/Library/Caches/com.genealabs.laravel-lsp, got: {}",
+            path_str.contains("Library/Caches/org.mike-bronner.laravel-lsp"),
+            "macOS cache should be in ~/Library/Caches/org.mike-bronner.laravel-lsp, got: {}",
             path_str
         );
         assert!(

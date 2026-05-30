@@ -3,8 +3,8 @@ name = "Laravel"
 description = "Laravel development support for Zed with go-to-definition for Blade, Livewire, and Flux components. Install the separate Blade extension for syntax highlighting."
 version = "0.1.19"
 schema_version = 1
-authors = ["Mike Bronner <mike@genealabs.com>"]
-repository = "https://github.com/GeneaLabs/zed-laravel"
+authors = ["Mike Bronner <mike.bronner@icloud.com>"]
+repository = "https://github.com/mike-bronner/zed-laravel"
 
 [lib]
 kind = "Rust"

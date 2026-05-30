@@ -2,7 +2,7 @@
 name = "laravel-lsp"
 version = "0.1.19"
 edition = "2021"
-authors = ["Mike"]
+authors = ["Mike Bronner <mike.bronner@icloud.com>"]
 description = "Language Server Protocol implementation for Laravel development"
 license = "MIT"
 

@@ -9,7 +9,7 @@ inputs:
     description: 'Version number to publish, without "v" prefix (e.g., "0.1.15"). Must already exist as tag "v<version>" on the source repo.'
     required: true
   push-to:
-    description: 'Fork of the upstream extensions repo to push to, in "owner/repo" form (e.g., "GeneaLabs/extensions"). Must already exist.'
+    description: 'Fork of the upstream extensions repo to push to, in "owner/repo" form (e.g., "mike-bronner/extensions"). Must already exist.'
     required: true
   upstream-repo:
     description: 'Upstream extensions repo'

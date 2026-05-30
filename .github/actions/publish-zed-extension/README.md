@@ -22,7 +22,7 @@ ever** — re-runs update the existing PR.
 | ----------------- | -------- | --------------------------------------------------------------------------- |
 | `extension-name`  | yes      | Name as registered upstream (e.g., `laravel`).                              |
 | `version`         | yes      | Version without `v` prefix. A tag `v<version>` must exist on the source repo. |
-| `push-to`         | yes      | Fork of `zed-industries/extensions` to push to (e.g., `GeneaLabs/extensions`). Must already exist. |
+| `push-to`         | yes      | Fork of `zed-industries/extensions` to push to (e.g., `mike-bronner/extensions`). Must already exist. |
 | `upstream-repo`   | no       | Defaults to `zed-industries/extensions`.                                    |
 | `committer-token` | yes      | PAT with `repo` + `workflow` scopes on the fork.                            |
 | `signing-key`     | no       | SSH private key for signing commits. Public key must be on the PAT owner's GitHub account as a *Signing Key*. |
@@ -69,6 +69,6 @@ ever** — re-runs update the existing PR.
   with:
     extension-name: laravel
     version: ${{ needs.update-version.outputs.new_version }}
-    push-to: GeneaLabs/extensions
+    push-to: mike-bronner/extensions
     committer-token: ${{ secrets.ZED_PUBLISHING_TOKEN }}
 ```

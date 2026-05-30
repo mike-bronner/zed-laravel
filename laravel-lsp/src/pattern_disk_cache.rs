@@ -82,7 +82,7 @@ struct CachedEntry {
 /// only if the user's home directory can't be resolved — every modern
 /// OS we support has one, so this is effectively infallible in practice.
 fn cache_file_path(project_root: &Path) -> Option<PathBuf> {
-    let proj_dirs = ProjectDirs::from("com", "genealabs", "laravel-lsp")?;
+    let proj_dirs = ProjectDirs::from("org", "mike-bronner", "laravel-lsp")?;
     let canonical = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());

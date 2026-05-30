@@ -22,7 +22,7 @@ zed-laravel/
 1. **Clone and build the LSP:**
 
    ```bash
-   git clone https://github.com/GeneaLabs/zed-laravel.git
+   git clone https://github.com/mike-bronner/zed-laravel.git
    cd zed-laravel/laravel-lsp
    cargo build --release
    ```

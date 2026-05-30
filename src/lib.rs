@@ -101,7 +101,7 @@ impl LaravelExtension {
         let archive_name = format!("{}.{}", binary_name, archive_ext);
 
         let release_url = format!(
-            "https://github.com/GeneaLabs/zed-laravel/releases/download/{}/{}",
+            "https://github.com/mike-bronner/zed-laravel/releases/download/{}/{}",
             VERSION, archive_name
         );
 

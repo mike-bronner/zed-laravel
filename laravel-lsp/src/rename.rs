@@ -136,7 +136,7 @@ pub fn unsupported_rename_error(_symbol: &SymbolRef) -> jsonrpc::Error {
 /// GitHub issues URL the unsupported-rename toast points users to. Lives
 /// here so adding similar "not implemented" toasts elsewhere only needs to
 /// import the constant — no hand-copied URL drift.
-pub const FEATURE_REQUEST_URL: &str = "https://github.com/GeneaLabs/zed-laravel/issues";
+pub const FEATURE_REQUEST_URL: &str = "https://github.com/mike-bronner/zed-laravel/issues";
 
 /// A file move emitted alongside text edits.
 ///

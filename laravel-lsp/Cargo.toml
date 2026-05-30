@@ -1,6 +1,6 @@
 [package]
 name = "laravel-lsp"
-version = "0.1.19"
+version = "0.2.1"
 edition = "2021"
 authors = ["Mike Bronner <mike.bronner@icloud.com>"]
 description = "Language Server Protocol implementation for Laravel development"

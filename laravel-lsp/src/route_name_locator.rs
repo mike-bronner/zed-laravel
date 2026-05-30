@@ -39,6 +39,39 @@ pub struct RouteNameDeclaration {
     pub end_column: u32,
 }
 
+impl RouteNameDeclaration {
+    /// Given the new fully-qualified route name the user typed (e.g.
+    /// `admin.dashboard`), return the text to write at THIS declaration's
+    /// source position — which spans only `local_segment`, not the whole
+    /// dotted name.
+    ///
+    /// Because `full_name` is built as `inherited_prefix + local_segment`
+    /// (see [`process_chain`]), the prefix is recovered by stripping the
+    /// segment back off. We then drop that same prefix from the new name so
+    /// only this declaration's own segment is rewritten — the inherited
+    /// `Route::name('admin.')` group prefix lives at a separate declaration
+    /// the user renames independently.
+    ///
+    /// This deliberately differs from the config/translation rename, which
+    /// take `new_key.rsplit('.').next()` (last dot segment). Route leaf
+    /// segments can themselves be dotted (`->name('users.index')`), so a
+    /// last-dot split would corrupt them; suffix-based prefix stripping
+    /// preserves the full local segment.
+    ///
+    /// Fallback: if the new name doesn't carry the inherited prefix (the user
+    /// rewrote the group portion — something a leaf rename can't express
+    /// coherently), the new name is returned verbatim as a best effort.
+    pub fn rewritten_segment<'a>(&self, new_full_name: &'a str) -> &'a str {
+        let inherited_prefix = self
+            .full_name
+            .strip_suffix(&self.local_segment)
+            .unwrap_or("");
+        new_full_name
+            .strip_prefix(inherited_prefix)
+            .unwrap_or(new_full_name)
+    }
+}
+
 /// Walk a route file and return every `->name(...)` / `->as(...)` declaration
 /// in source order, regardless of whether they sit on leaf routes or on
 /// `Route::group(...)` containers.

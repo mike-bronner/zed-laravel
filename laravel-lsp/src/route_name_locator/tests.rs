@@ -131,3 +131,88 @@ Route::name('api.')->group(function () {
         .unwrap();
     assert_eq!(leaf.local_segment, "users");
 }
+
+#[test]
+fn rewritten_segment_strips_group_prefix_from_new_name() {
+    // Regression: renaming `admin.users` → `admin.dashboard` on a route
+    // nested in `Route::name('admin.')->group(...)`. The leaf declaration
+    // physically spans only `users`, so it must receive `dashboard`, not
+    // the full `admin.dashboard` (which would yield `admin.admin.dashboard`).
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::get('/users', [UserController::class, 'index'])->name('users');
+});
+"#;
+    let decls = extract_route_name_declarations(src);
+    let leaf = decls.iter().find(|d| d.full_name == "admin.users").unwrap();
+    assert_eq!(leaf.rewritten_segment("admin.dashboard"), "dashboard");
+}
+
+#[test]
+fn rewritten_segment_preserves_dotted_leaf_under_group() {
+    // The leaf segment itself is dotted (`users.index`). A naive
+    // `rsplit('.').next()` would corrupt it to `index`; prefix stripping
+    // keeps the whole local segment intact.
+    let src = r#"<?php
+Route::name('admin.')->group(function () {
+    Route::get('/users', [UserController::class, 'index'])->name('users.index');
+});
+"#;
+    let decls = extract_route_name_declarations(src);
+    let leaf = decls
+        .iter()
+        .find(|d| d.full_name == "admin.users.index")
+        .unwrap();
+    assert_eq!(leaf.local_segment, "users.index");
+    assert_eq!(
+        leaf.rewritten_segment("admin.users.list"),
+        "users.list",
+        "the multi-segment leaf must survive — only the group prefix is dropped"
+    );
+}
+
+#[test]
+fn rewritten_segment_composes_nested_group_prefixes() {
+    // Two nested groups (`api.` + `v1.`). The leaf prefix is `api.v1.`.
+    let src = r#"<?php
+Route::name('api.')->group(function () {
+    Route::name('v1.')->group(function () {
+        Route::get('/users', [U::class, 'i'])->name('users');
+    });
+});
+"#;
+    let decls = extract_route_name_declarations(src);
+    let leaf = decls
+        .iter()
+        .find(|d| d.full_name == "api.v1.users")
+        .unwrap();
+    assert_eq!(leaf.rewritten_segment("api.v1.accounts"), "accounts");
+}
+
+#[test]
+fn rewritten_segment_is_verbatim_for_ungrouped_route() {
+    // No group prefix → inherited prefix is empty → the new name is written
+    // as-is, including a dotted form like `users.index`.
+    let src = r#"<?php
+Route::get('/home', [HomeController::class, 'index'])->name('home');
+"#;
+    let decls = extract_route_name_declarations(src);
+    let d = &decls[0];
+    assert_eq!(d.rewritten_segment("dashboard"), "dashboard");
+    assert_eq!(d.rewritten_segment("users.index"), "users.index");
+}
+
+#[test]
+fn rewritten_segment_falls_back_when_prefix_mismatches() {
+    // The user rewrote the group portion (`admin.` → `web.`) — something a
+    // leaf rename can't express coherently. Best effort: write the new name
+    // verbatim rather than silently dropping a non-matching prefix.
+    let decl = RouteNameDeclaration {
+        full_name: "admin.users".to_string(),
+        local_segment: "users".to_string(),
+        line: 0,
+        start_column: 0,
+        end_column: 5,
+    };
+    assert_eq!(decl.rewritten_segment("web.dashboard"), "web.dashboard");
+}

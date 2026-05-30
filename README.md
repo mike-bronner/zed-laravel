@@ -28,6 +28,28 @@
 
 ---
 
+## 💛 Why we built this
+
+We love Laravel, and we love Zed. When we moved our Laravel work into Zed, the deep, framework-aware tooling we'd relied on elsewhere wasn't there yet — so we built it. This extension exists to give Laravel first-class support in Zed, because a framework this good deserves great tooling everywhere its developers work.
+
+The intelligence lives in a standalone language server (LSP) — the same protocol your editor already speaks for other languages. Today it targets Zed; because it's LSP-based, the same engine could reach other LSP-capable editors (Neovim, Helix, Sublime Text, and more) down the road. That's a direction we'd love to grow toward, not something we ship yet.
+
+### How it works — static analysis
+
+Everything is parsed statically with tree-sitter: the extension reads your files, it never runs them. It only touches your database when *you* opt into schema-backed completion, and it keeps working even when your app won't boot — a half-applied migration, a missing `.env`, or a dirty branch won't stop it. The honest trade-off: some deeply dynamic runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone.
+
+### Laravel across editors
+
+Laravel developers are spoiled for choice — every major editor has a strong way to work with the framework. Here's roughly where things stand and what each needs, so you can pick whatever fits how you work:
+
+| Editor | Laravel-aware tooling | Cost |
+|---|---|---|
+| **PHPStorm** | Laravel support built in, powered by the [Laravel Idea](https://laravel-idea.com/) plugin | Paid IDE (free for non-commercial use) |
+| **VS Code** | [Official Laravel extension](https://github.com/laravel/vs-code-extension), maintained by the Laravel team | Free |
+| **Zed** | This extension, plus [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) for syntax highlighting | Free |
+
+<sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
+
 ## 📦 Install
 
 Search **"Laravel"** in Zed Extensions and click Install.
@@ -78,7 +100,7 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
-**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since the last save get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
+**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
 
 **🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. This is also the only way to get correct highlighting for **custom directives** (e.g., `@myCustomDirective`, Livewire's `@teleport`, Pennant's `@feature`) that tree-sitter doesn't know about. Enable it in your Zed `settings.json`:
 
@@ -124,17 +146,17 @@ Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP 
 }
 ```
 
-`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. Editors that call `textDocument/documentSymbol` unconditionally (Helix, Neovim, Sublime/LSP, Kate) need no opt-in.
+`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. (This opt-in is a Zed quirk — LSP clients that request `textDocument/documentSymbol` unconditionally, like Helix or Neovim, wouldn't need it.)
 
 > **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
 
-## 🔧 Tuning Intelephense
+### 🔧 Tuning Intelephense
 
 If you use Intelephense as your PHP language server, goto-definition on a class name (e.g. `User`) can land you in a Zed multi-buffer with several unrelated files — the actual class, plus generated stubs from [barryvdh/laravel-ide-helper](https://github.com/barryvdh/laravel-ide-helper), `.phpstorm.meta.php`, and `class User` stub templates that packages like Jetstream ship under `vendor/*/stubs/`. Intelephense indexes all of them by default.
 
 Zed merges goto responses across every running LSP and only dedupes identical locations — distinct paths from the same logical click stay separate. So even though `laravel-lsp` returns nothing for bare class references (we don't claim that pattern), Intelephense's noisy results show through unfiltered.
 
-### Safe baseline
+#### Safe baseline
 
 Tell Intelephense to skip `vendor/*/stubs/` — those are scaffold templates (Jetstream, Filament, etc.), never loaded at runtime. Excluding them costs nothing.
 
@@ -164,7 +186,7 @@ After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). The stub-te
 
 > ⚠️ **Cache caveat.** Intelephense keeps a persistent symbol index on disk, so already-indexed symbols can still surface after you add excludes. To force a rebuild, add `"clearCache": true` to `initialization_options` for one startup (then remove it — leaving it `true` re-indexes from scratch every launch). As a fallback, wipe `~/Library/Application Support/intelephense/` (macOS) while Zed isn't running.
 
-### More aggressive (with trade-offs)
+#### More aggressive (with trade-offs)
 
 If `_ide_helper_models.php` and `.phpstorm.meta.php` still cluttering goto bothers you more than the Intelephense fidelity they enable, add them to the exclude array:
 
@@ -185,7 +207,7 @@ What you trade:
 
 If you use packages that extend Laravel facades with their own methods (Scout adds `Searchable` methods, Telescope extends `Gate`, etc.), keep `_ide_helper*.php` in to retain completion for those package-added methods. Core Laravel facades resolve fine without it.
 
-### Per-project
+#### Per-project
 
 Drop the same exclude patterns into an `.intelephense.json` at your project root. Unlike the Zed `settings` block, this file is read directly by Intelephense, so it uses the standard namespaced shape:
 
@@ -250,7 +272,33 @@ DB::table('users')->get();
 ```
 
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
+
+### ℹ️ Hover
+
+Hover any recognised pattern to get an Intelephense-style summary card — a header, the relevant source snippet, and a clickable link to the file it resolves to. No need to jump away from your current line to remember what a view, route, or config key points at.
+
+```php
+return view('users.profile');
+//          ^^^^^^^^^^^^^^^ hover →  resources/views/users/profile.blade.php
+//                                   @props([...]) declaration + click-to-open link
+
+$url = route('users.show', $user);
+//           ^^^^^^^^^^^^ hover →  Route::get('/users/{user}', ...)->name('users.show')
+//                                 verb · URI · controller@action · click-to-open link
+
+$tz = config('app.timezone');
+//           ^^^^^^^^^^^^^^ hover →  'UTC'   (the resolved value, from config/app.php)
+```
+
+```blade
+{{ $user->email }}
+{{-- ^^^^^ hover →  App\Models\User::$email, its PHPDoc summary, and the declaration --}}
+```
+
+**Hovered patterns:** views, Blade components (anonymous *and* class-backed), Livewire components, routes, config keys, env vars, translations (including `vendor::namespace.key`), middleware aliases, container bindings, assets (`asset()`, `Vite::asset()`, `mix()`, `public_path()`, …), `url()`, and Blade variables. The bottom-line source path renders as a `file://` link, so the whole card is click-to-open in any LSP client that supports markdown links.
+
+Class-backed components and Livewire components show the `class Foo extends Component` signature and link to the PHP class; anonymous components fall back to the `@props([...])` declaration from the `.blade.php` template. Patterns without a meaningful target (directives, controller actions, Pennant features) stay silent rather than showing an empty card.
 
 ### 🔍 Find References
 
@@ -304,7 +352,7 @@ return redirect()->route('dashboard');
 <a href="{{ route('dashboard') }}">
 ```
 
-Route group prefixes compose correctly — renaming a route from inside `Route::group(['as' => 'admin.'], …)` rewrites only the leaf segment in the declaration while every call site still gets the full new dotted name.
+Route group prefixes compose correctly — renaming a route nested in `Route::name('admin.')->group(…)` rewrites only the leaf segment at the `->name(...)` declaration (`users` → `dashboard`), while every call site still gets the full new dotted name (`admin.users` → `admin.dashboard`). The inherited `admin.` group prefix is left untouched, so the effective name stays `admin.dashboard` instead of doubling to `admin.admin.dashboard`.
 
 **Config keys** rewrite call sites and the array-key in the source config file:
 
@@ -361,6 +409,8 @@ return view('users.account');
 **Middleware aliases** rewrite the registration string at its source (in `Kernel.php`, `bootstrap/app.php`, or any service-provider `register()`) AND every `->middleware('x')` call site. Works for both the per-entry `'auth' => …` form and Laravel 11's bulk `$middleware->alias([…])` form. Parameterized references like `'auth:sanctum'` are refused with a clear message — rename the bare alias instead.
 
 **Container bindings** follow the same shape as middleware aliases: the quoted name at the registration site PLUS every `app('x')`, `resolve('x')`, `app()->make('x')` call site.
+
+**Eloquent model classes** rename project-wide. Press `F2` on a model class name and every reference rewrites in one pass — `use` imports, `User::` static calls, `new User`, type hints, `::class` references, `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside. Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
 
 **Same parser-classified guarantee as Find References** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
 
@@ -444,6 +494,62 @@ $user->
 
 Works with type-hinted variables, PHPDoc annotations, and static chains like `User::find(1)->`.
 
+#### 🔗 Eloquent Query Chains
+
+Type a string literal inside a query-builder method and the extension completes it from your schema and model definitions — **columns** inside `where`, `orderBy`, `whereIn`, `pluck`, `select`, … and **relations** inside `with`, `whereHas`, `withCount`, `load`, `has`, …:
+
+```php
+User::where('')->orderBy('');
+//          ^ 🗄️ columns of the users table        ^ 🗄️ same
+
+User::with('');
+//         ^ 🔗 relation methods on User (posts, profile, roles…)
+
+DB::table('')->where('');
+//        ^ 🗄️ table names    ^ 🗄️ columns of the chosen table
+
+User::whereHas('posts', fn ($q) => $q->where(''));
+//                                           ^ 🗄️ columns of the *Post* model (relation hop)
+
+User::with('posts.author.');
+//                       ^ 🔗 relations of the final model in the dotted path
+```
+
+Chains rooted at a variable resolve through intervening statements and conditional rebuilds:
+
+```php
+$query = User::query();
+if ($active) { $query = $query->where('active', true); }
+$query->orderBy('');
+//              ^ 🗄️ still completes User's columns
+```
+
+**Joined tables** are fully resolved. After a `join`, `leftJoin`, or closure-form join, bare columns complete against *every* accessible table and `qualifier.` narrows to one; `from`/`fromSub`/`joinSub`/`lateral` are handled too (subquery `SELECT` lists become virtual columns):
+
+```php
+DB::table('orders')->join('users', 'users.id', '=', 'orders.user_id')->where('');
+//                                                                            ^ 🗄️ orders + users columns
+DB::table('orders')->join('users', ...)->where('users.');
+//                                                     ^ 🗄️ narrowed to users
+```
+
+Columns are read live from your database (cast-aware), so completions reflect the *actual* schema. Relations come from the model's relation methods, walking parent classes and traits. Works in PHP **and** in Blade-embedded expressions (`@php`, `{{ }}`). Raw-SQL methods (`whereRaw`, `havingRaw`, `selectRaw`, `DB::raw`, …) are deliberately left to your PHP language server — their arguments are opaque SQL, not column names.
+
+> 🗄️ Column and relation completion needs a working database connection (see [Configuration](#️-configuration)). Without one, the chain still parses — you just won't get column suggestions.
+
+#### 🧰 Query Builder Methods
+
+Type `Model::wher` and the extension surfaces the query-builder methods that PHP routes through `Model::__callStatic` — `where`, `whereIn`, `find`, `first`, `firstOrFail`, and dozens more. Laravel's `Model.php` carries no `@method` or `@mixin` tags for these, so most PHP language servers miss them at the static-call position; we fill the gap by parsing the `Builder` / `Query\Builder` classes (and their composed traits) from *your* installed `vendor/laravel/framework`:
+
+```php
+Portfolio::wher
+//        ^ 🧰 where, whereIn, whereNot, whereBetween…   (Builder<static>)
+//        🎯 active, popular…                            (your scopeActive / scopePopular methods)
+//        🪄 whereName, whereEmail, orWhereCreatedAt…    (dynamic where{Column}, synthesized per column)
+```
+
+Model **scopes** (`scopeActive` → `active`) and **dynamic `where{Column}` finders** are included. The dynamic finders are synthesized from the model's columns — `$fillable`, `$casts`, conventions, and the live schema — and only when no real method of that name already exists, mirroring exactly what PHP's magic methods would route at runtime. Scoped to the `Model::` static position; instance chains (`->`) yield to your PHP LSP, which already sees them via `Builder`'s `@mixin`. Every item we add is attributable in its docs panel header, so you can tell ours apart from your PHP LSP's.
+
 #### 📝 Blade Variables
 
 Type `$` in Blade files to see all available variables passed to the view:
@@ -522,20 +628,20 @@ Feature::allAreActive(['']);
 {{--     ^ 🚩 feature names appear here --}}
 ```
 
-Features are discovered from `app/Features/*.php` class files. Both string keys (`'new-api'`) and class references (`NewApi::class`) are supported.
+Features are discovered from `app/Features/*.php` class files. String keys (`'new-api'`) get autocomplete; class references (`NewApi::class`) are resolved for go-to-definition and diagnostics.
 
 ### ❌ Diagnostics
 
 See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
 
-**Missing files are reported as errors** to catch issues early:
+**Missing files — views, components, Livewire components, features, and invalid validation rules — are reported as errors** to catch issues early. (These existence checks are always errors; the `diagnostics.severity` setting only controls the query-chain diagnostics below.)
 
 ```php
 return view('users.dashboard');
 //          ^^^^^^^^^^^^^^^^^ ❌ View not found: resources/views/users/dashboard.blade.php
 
 Route::middleware('admin-only')->group(...);
-//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                ^^^^^^^^^^^^ ❌ Middleware not found
 
 $request->validate([
     'email' => 'required|emal|unique:users',
@@ -560,30 +666,69 @@ Feature::active('undefined-feature');
 {{--      ^^^^^^^^^^^^^^^^^^ ❌ Feature not found --}}
 ```
 
+**Query-chain typos** are caught against your real schema — unknown columns, relations, and tables each get a Levenshtein "did you mean" suggestion:
+
+```php
+User::where('emial', $value);
+//          ^^^^^ ⚠️ Unknown column 'emial' on users — did you mean 'email'?
+
+User::with('postz');
+//         ^^^^^ ⚠️ Unknown relation 'postz' on User — did you mean 'posts'?
+
+DB::table('userz')->get();
+//        ^^^^^ ⚠️ Unknown table 'userz' — did you mean 'users'?
+
+User::whereEmial($value);
+//   ^^^^^^^^^^^ ⚠️ Unknown column 'emial' (dynamic where) — did you mean 'whereEmail'?
+```
+
+When joins put a bare column on more than one accessible table, it's flagged as **ambiguous** so you can qualify it:
+
+```php
+DB::table('orders')->join('users', ...)->where('id', 1);
+//                                              ^^ ⚠️ Ambiguous column 'id' — exists on orders and users
+```
+
+These diagnostics **under-warn on purpose**: they stay silent on a cold or absent schema, unresolved receivers, qualified/aliased/expression literals, and raw SQL — a missing squiggle never means "this is definitely fine," only "we couldn't prove it's wrong." Severity is configurable via `diagnostics.severity` (`warning` / `error` / `info` / `off`); see [Configuration](#️-configuration). A working database connection is required — column and relation linting silently disables when the schema can't be introspected.
+
 ### ⚡ Quick Actions
 
 Fix problems with a single click. When you see a warning, press `Cmd+.` to open quick actions. The extension offers to create missing files with the correct Laravel structure—views, components, middleware, translations, and more.
 
 ```php
 return view('users.dashboard');
-//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found
+//          ^^^^^^^^^^^^^^^^^ ❌ View not found
 //                            ⚡ Create view: users.dashboard
 
 Route::middleware('admin-only')->group(...);
-//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                ^^^^^^^^^^^^ ❌ Middleware not found
 //                             ⚡ Create middleware: admin-only
 ```
 
 ```blade
 <x-dashboard-widget />
-{{-- ⚠️ Component not found
+{{-- ❌ Component not found
      ⚡ Create component (anonymous)
      ⚡ Create component with class --}}
 
 <livewire:admin-panel />
-{{-- ⚠️ Livewire component not found
+{{-- ❌ Livewire component not found
      ⚡ Create Livewire component --}}
 ```
+
+Query-chain diagnostics carry their own fixes:
+
+```php
+User::where('emial');
+//          ^^^^^ ⚡ Rename to 'email'
+//                ⚡ Create migration: add column 'emial' to users
+
+DB::table('orders')->join('users', ...)->where('id', 1);
+//                                              ^^ ⚡ Qualify as 'orders.id'
+//                                                 ⚡ Qualify as 'users.id'
+```
+
+The "Create migration" action scaffolds a timestamped `database/migrations/*.php` using your project's `migration.update.stub` (custom → vendor → built-in fallback, the same resolution `php artisan make:migration` uses), so your own stub format is honoured.
 
 **Available quick actions:**
 - 📄 Create missing views
@@ -593,12 +738,15 @@ Route::middleware('admin-only')->group(...);
 - 🚩 Create Laravel Pennant feature classes
 - 🌐 Add translations to existing files
 - 🔐 Add environment variables to `.env`
+- 🗄️ Rename a mistyped column / relation / table to the suggested name
+- 🆕 Create a migration to add a missing column
+- 🏷️ Qualify an ambiguous column as `table.column`
 
 ### 🎨 Blade Editing Support
 
 #### Directive Autocomplete
 
-Type `@` to see all 100+ Blade directives with descriptions:
+Type `@` to see the Blade directives available in *your* project. The list is discovered live — Laravel's built-in directives are read from your installed framework, and **custom directives registered via `Blade::directive()`** (in your app or in packages) are picked up too, so a directive like `@feature` or your own `@money` shows up without us hardcoding it. A full Laravel app typically surfaces 100+; a built-in fallback set keeps completion working if the project can't be scanned.
 
 ```blade
 @fo
@@ -690,9 +838,9 @@ If your PHP class outline isn't appearing, make sure:
 
 ## 🚧 Planned Features
 
-**Rename — remaining work** (the class-backed kinds shipped; variables didn't):
+**Rename — remaining work** (the class-backed kinds and the Eloquent model-class engine shipped; variables didn't):
 
-- ✏️ **PHP class rename engine** — FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Foundation for renaming controllers, models, jobs, etc. as first-class symbols.
+- ✏️ **More PHP class kinds** — the FQCN rename engine (use-statement updates, type-hint / static-call / `new` / `::class` rewrites, docblocks, file move) now powers Eloquent model rename; extending it to controllers, jobs, services, and form requests as first-class symbols is the follow-up.
 - 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
 - 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
 

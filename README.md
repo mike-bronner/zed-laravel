@@ -58,14 +58,14 @@ The official VS Code extension is the Laravel tooling most developers already kn
 | Go-to-definition (views, routes, config, env, translations, components) | ✅ | ✅ |
 | Hover summaries | ✅ | ✅ |
 | Eloquent autocomplete (models, attributes, relations, columns) | ✅ | ✅ |
-| Blade directive autocomplete (`@if`, `@foreach`, …) | ✅ 100+ directives | ❌ |
-| Diagnostics | ✅ with quick-fixes & "did you mean" | ✅ existence checks (route/config/view…) |
+| Blade directive autocomplete (`@if`, `@foreach`, …) | ✅ 100+ directives | ✅ |
+| Diagnostics | ✅ with quick-fixes & "did you mean" suggestions | ✅ existence checks; quick-fixes for env/view/Inertia |
 | Find references / rename across Laravel patterns | ✅ | ❌ |
-| Livewire | ✅ v3 + v4 + Volt | 🚧 Roadmap |
+| Livewire | ✅ v3 + v4 + Volt · diagnostics · rename | ✅ completion, goto, hover (tag form) |
 | Laravel Pennant feature flags | ✅ | ❌ |
 | Inertia.js | 🚧 [#10](https://github.com/GeneaLabs/zed-laravel/issues/10) | ✅ |
 
-<sub>Official-extension column verified against its <a href="https://github.com/laravel/vs-code-extension">README</a> on 2026-05-30. Both extensions also cover assets, middleware, config, translations, validation rules, and container bindings. Corrections welcome via PR.</sub>
+<sub>Official-extension column verified against its <a href="https://github.com/laravel/vs-code-extension">source code</a> on 2026-05-30 (its README is more conservative than its code — e.g. Livewire and Blade-component support ship but aren't documented there). Both extensions also cover assets, middleware, config, translations, validation rules, and container bindings. Corrections welcome via PR.</sub>
 
 ## 📦 Install
 

@@ -47,7 +47,11 @@ ever** — re-runs update the existing PR.
 - Ensure the fork's `.gitmodules` for `extensions/<ext>` points at the source
   repo (true by default if the fork was made cleanly).
 - Add a `ZED_PUBLISHING_TOKEN` repo secret with a PAT that has `repo` +
-  `workflow` scopes on the fork's owner account.
+  `workflow` scopes. This repo's `release.yml` also uses it as the push token
+  for the version-bump commit (in place of a separate `OWNER_PAT`), so the PAT
+  must have write access to **both** the source repo and the `push-to` fork. A
+  classic PAT owned by the account that owns both covers this automatically; a
+  fine-grained PAT must list both repos with Contents + Workflows = Read/Write.
 - Push tag `<version>` (or `v<version>`) to the source repo *before* this
   action runs. The script auto-detects which form exists. In this repo's
   `release.yml`, the `update-version` job handles that and `publish` depends

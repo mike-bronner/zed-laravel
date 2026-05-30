@@ -10,7 +10,7 @@ on:
         required: true
 
 env:
-  GITHUB_TOKEN: ${{ secrets.OWNER_PAT || secrets.GITHUB_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.ZED_PUBLISHING_TOKEN || secrets.GITHUB_TOKEN }}
 
 jobs:
   update-version:

@@ -30,27 +30,29 @@
 
 ## 🤔 Why this extension?
 
-Two design choices set this extension apart from the official Laravel VS Code extension — and they're the reason it exists.
+This extension brings Laravel-aware intelligence — go-to-definition, autocomplete, hover, diagnostics — to **Zed**. It isn't trying to replace the official Laravel VS Code extension; it's a different approach for a different editor, shaped by two design choices worth understanding before you install.
 
-### A real language server — works in any editor
+### Built on a real language server
 
-This is a Language Server Protocol (LSP) server, not a VS Code plugin. It speaks the same protocol your editor already uses for every other language, so it runs anywhere an LSP client does: **Zed, Neovim** (`nvim-lspconfig`), **Helix, Sublime Text** (LSP package), **Kate, BBEdit**, and more. The official Laravel VS Code extension is VS Code–only by design. If you've moved off VS Code — or never used it — this is the cross-editor option.
+The intelligence lives in a standalone Language Server Protocol (LSP) server, not in editor-specific plugin code. Today it targets Zed. But because everything runs through the LSP — the same protocol your editor already speaks for other languages — the door is open to supporting other LSP-capable editors (Neovim, Helix, Sublime Text, Kate, and more) in the future. That portability is a deliberate architectural bet, not something we ship yet.
 
 ### No app boot — pure static analysis
 
-The official extension boots your Laravel application in the background to gather its data. That means it executes your service providers (with whatever side effects they carry), can touch your database, and breaks when local state is broken — a half-applied migration, a missing `.env`, a dirty branch. It also runs your code, which is a real consideration when you open an unfamiliar project.
+The official VS Code extension boots your Laravel application in the background to gather its data. That means it executes your service providers (with whatever side effects they carry), can touch your database, and can struggle when local state is broken — a half-applied migration, a missing `.env`, a dirty branch. It runs your code, which is worth knowing when you open an unfamiliar project.
 
 The official extension is candid about this in its own README:
 
 > This extension will occasionally boot your app in the background to collect information about your app for use in autocompletion, linking, hovering, and diagnostics.
 
-This extension does **none of that**. Everything is parsed statically with tree-sitter — it reads your files, it never runs them. The trade-off is honest: some deep runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone. But it never executes your code, it only reads your database when *you* opt into schema-backed column completion, and it keeps working when your app won't even boot.
+This extension takes the opposite approach: everything is parsed statically with tree-sitter — it reads your files, it never runs them. The trade-off is honest: some deep runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone. But it never executes your code, it only reads your database when *you* opt into schema-backed column completion, and it keeps working even when your app won't boot.
 
-### Feature comparison
+### How it compares
 
-| Capability | This extension | Official Laravel VS Code |
+The official VS Code extension is the Laravel tooling most developers already know, so it's a useful reference point. This isn't a head-to-head — they're different tools for different editors, with different trade-offs:
+
+| Capability | This extension (Zed) | Official Laravel VS Code |
 |---|---|---|
-| Editor support | ✅ Any LSP client (Zed, Neovim, Helix, Sublime, Kate…) | ❌ VS Code only |
+| Editor | Zed today — LSP-based, designed to be portable to other editors later | VS Code |
 | Runtime model | ✅ Static parse (tree-sitter) — never runs your code | ⚠️ Runs your application code to gather data |
 | Works when the app won't boot | ✅ | ❌ |
 | Go-to-definition (views, routes, config, env, translations, components) | ✅ | ✅ |
@@ -161,7 +163,7 @@ Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP 
 }
 ```
 
-`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. Editors that call `textDocument/documentSymbol` unconditionally (Helix, Neovim, Sublime/LSP, Kate) need no opt-in.
+`document_symbols: on` for `PHP` unlocks both our route outline (for files under `routes/`) and your PHP LSP's class outline (for everything else). `document_symbols: on` for `Blade` unlocks our Blade outline. (This opt-in is a Zed quirk — LSP clients that request `textDocument/documentSymbol` unconditionally, like Helix or Neovim, wouldn't need it.)
 
 > **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
 

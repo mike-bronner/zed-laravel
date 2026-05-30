@@ -55,6 +55,13 @@ git push origin "${DEFAULT_BRANCH}"
 # trying to rebase whatever was on the existing PR branch.
 git checkout -B "${BRANCH}" "upstream/${DEFAULT_BRANCH}"
 
+# Upstream's .gitmodules can record a stale submodule URL (e.g. after the
+# source repo moved to a new org). Force it to the current source repo so the
+# tag is fetched from the right place AND the bump PR carries the correction
+# upstream. Self-healing for any future transfer/rename.
+git config -f .gitmodules "submodule.${SUBMODULE_PATH}.url" "https://github.com/${SOURCE_REPO}.git"
+git submodule sync "${SUBMODULE_PATH}"
+
 git submodule update --init "${SUBMODULE_PATH}"
 SOURCE_TAG=""
 (
@@ -77,6 +84,7 @@ SOURCE_TAG=""
 SOURCE_TAG="$(cat /tmp/source-tag)"
 rm -f /tmp/source-tag
 git add "${SUBMODULE_PATH}"
+git add .gitmodules
 
 # Update the version line within the [<ext_name>] section only.
 awk -v ext="${EXT_NAME}" -v ver="${VERSION}" '

@@ -712,7 +712,7 @@ Route::middleware('admin-only')->group(...);
      ⚡ Create component with class --}}
 
 <livewire:admin-panel />
-{{-- ⚠️ Livewire component not found
+{{-- ❌ Livewire component not found
      ⚡ Create Livewire component --}}
 ```
 

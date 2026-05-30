@@ -100,7 +100,7 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
-**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since the last save get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
+**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
 
 **🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. This is also the only way to get correct highlighting for **custom directives** (e.g., `@myCustomDirective`, Livewire's `@teleport`, Pennant's `@feature`) that tree-sitter doesn't know about. Enable it in your Zed `settings.json`:
 
@@ -628,20 +628,20 @@ Feature::allAreActive(['']);
 {{--     ^ 🚩 feature names appear here --}}
 ```
 
-Features are discovered from `app/Features/*.php` class files. Both string keys (`'new-api'`) and class references (`NewApi::class`) are supported.
+Features are discovered from `app/Features/*.php` class files. String keys (`'new-api'`) get autocomplete; class references (`NewApi::class`) are resolved for go-to-definition and diagnostics.
 
 ### ❌ Diagnostics
 
 See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
 
-**Missing files are reported as errors** to catch issues early:
+**Missing files — views, components, Livewire components, features, and invalid validation rules — are reported as errors** to catch issues early. (These existence checks are always errors; the `diagnostics.severity` setting only controls the query-chain diagnostics below.)
 
 ```php
 return view('users.dashboard');
 //          ^^^^^^^^^^^^^^^^^ ❌ View not found: resources/views/users/dashboard.blade.php
 
 Route::middleware('admin-only')->group(...);
-//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                ^^^^^^^^^^^^ ❌ Middleware not found
 
 $request->validate([
     'email' => 'required|emal|unique:users',
@@ -746,7 +746,7 @@ The "Create migration" action scaffolds a timestamped `database/migrations/*.php
 
 #### Directive Autocomplete
 
-Type `@` to see all 100+ Blade directives with descriptions:
+Type `@` to see the Blade directives available in *your* project. The list is discovered live — Laravel's built-in directives are read from your installed framework, and **custom directives registered via `Blade::directive()`** (in your app or in packages) are picked up too, so a directive like `@feature` or your own `@money` shows up without us hardcoding it. A full Laravel app typically surfaces 100+; a built-in fallback set keeps completion working if the project can't be scanned.
 
 ```blade
 @fo

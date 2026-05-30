@@ -352,7 +352,7 @@ return redirect()->route('dashboard');
 <a href="{{ route('dashboard') }}">
 ```
 
-Route group prefixes compose correctly — renaming a route from inside `Route::group(['as' => 'admin.'], …)` rewrites only the leaf segment in the declaration while every call site still gets the full new dotted name.
+Route group prefixes compose correctly — renaming a route nested in `Route::name('admin.')->group(…)` rewrites only the leaf segment at the `->name(...)` declaration (`users` → `dashboard`), while every call site still gets the full new dotted name (`admin.users` → `admin.dashboard`). The inherited `admin.` group prefix is left untouched, so the effective name stays `admin.dashboard` instead of doubling to `admin.admin.dashboard`.
 
 **Config keys** rewrite call sites and the array-key in the source config file:
 

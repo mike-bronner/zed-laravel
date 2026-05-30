@@ -15938,10 +15938,12 @@ fn collect_env_declaration_targets(
 }
 
 /// Walk every `routes/*.php` under the project root and surface
-/// `->name(...)` declaration sites whose full name matches `target`. Each
-/// emitted target writes `new_name` verbatim at the captured position. (For
-/// group-prefixed routes, the locator already emits one target per segment
-/// so the prefix composition stays intact.)
+/// `->name(...)` declaration sites whose full name matches `target`. The
+/// captured position spans only the declaration's own `local_segment`, so
+/// each target writes the LEAF of `new_name` (its inherited group prefix
+/// stripped) rather than the whole dotted form — otherwise a route inside
+/// `Route::name('admin.')->group(...)` would have its prefix doubled.
+/// See [`RouteNameDeclaration::rewritten_segment`].
 async fn collect_route_declaration_targets(
     server: &LaravelLanguageServer,
     root: &Path,
@@ -15974,7 +15976,9 @@ async fn collect_route_declaration_targets(
                 line: d.line,
                 start_column: d.start_column,
                 end_column: d.end_column,
-                new_text: new_name.to_string(),
+                // Decl spans only this segment; the group prefix (if any)
+                // lives elsewhere and must not be re-written here.
+                new_text: d.rewritten_segment(new_name).to_string(),
             });
         }
     }
@@ -17331,9 +17335,9 @@ impl LanguageServer for LaravelLanguageServer {
         let mut file_renames: Vec<laravel_lsp::rename::FileRename> = Vec::new();
         match &symbol {
             laravel_lsp::references::SymbolRef::Route(name) => {
-                // Route names are written verbatim at every declaration site
-                // (the locator emits one target per `->name(...)` segment;
-                // group prefixes get their own segments).
+                // Call sites get the full dotted `new_name` (above); each
+                // declaration site gets only its own leaf segment, since the
+                // group `->name('admin.')` prefix lives at a separate decl.
                 if let Some(root) = root_path.as_ref() {
                     targets.extend(
                         collect_route_declaration_targets(self, root, name, &new_name).await,

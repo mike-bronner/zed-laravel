@@ -1,0 +1,62 @@
+# ❌ Diagnostics
+
+[← Back to README](../README.md)
+
+See problems in real-time as you type. The extension validates your Laravel code against your actual project structure, highlighting missing views, undefined components, invalid validation rules, and other issues before you run your application.
+
+**Missing files — views, components, Livewire components, features, and invalid validation rules — are reported as errors** to catch issues early. (These existence checks are always errors; the `diagnostics.severity` setting only controls the query-chain diagnostics below.)
+
+```php
+return view('users.dashboard');
+//          ^^^^^^^^^^^^^^^^^ ❌ View not found: resources/views/users/dashboard.blade.php
+
+Route::middleware('admin-only')->group(...);
+//                ^^^^^^^^^^^^ ❌ Middleware not found
+
+$request->validate([
+    'email' => 'required|emal|unique:users',
+    //                   ^^^^ ❌ Unknown validation rule: 'emal'
+]);
+
+Feature::active('undefined-feature');
+//               ^^^^^^^^^^^^^^^^^^ ❌ Feature not found: app/Features/UndefinedFeature.php
+```
+
+```blade
+<x-dashboard-widget />
+{{-- ^^^^^^^^^^^^^^^^ ❌ Component not found --}}
+
+<livewire:admin-panel />
+{{--       ^^^^^^^^^^^ ❌ Livewire component not found --}}
+
+@extends('layouts.missing')
+{{--      ^^^^^^^^^^^^^^^^ ❌ View not found --}}
+
+@feature('undefined-feature')
+{{--      ^^^^^^^^^^^^^^^^^^ ❌ Feature not found --}}
+```
+
+**Query-chain typos** are caught against your real schema — unknown columns, relations, and tables each get a Levenshtein "did you mean" suggestion:
+
+```php
+User::where('emial', $value);
+//          ^^^^^ ⚠️ Unknown column 'emial' on users — did you mean 'email'?
+
+User::with('postz');
+//         ^^^^^ ⚠️ Unknown relation 'postz' on User — did you mean 'posts'?
+
+DB::table('userz')->get();
+//        ^^^^^ ⚠️ Unknown table 'userz' — did you mean 'users'?
+
+User::whereEmial($value);
+//   ^^^^^^^^^^^ ⚠️ Unknown column 'emial' (dynamic where) — did you mean 'whereEmail'?
+```
+
+When joins put a bare column on more than one accessible table, it's flagged as **ambiguous** so you can qualify it:
+
+```php
+DB::table('orders')->join('users', ...)->where('id', 1);
+//                                              ^^ ⚠️ Ambiguous column 'id' — exists on orders and users
+```
+
+These diagnostics **under-warn on purpose**: they stay silent on a cold or absent schema, unresolved receivers, qualified/aliased/expression literals, and raw SQL — a missing squiggle never means "this is definitely fine," only "we couldn't prove it's wrong." Severity is configurable via `diagnostics.severity` (`warning` / `error` / `info` / `off`); see [Configuration](../README.md#️-configuration). A working database connection is required — column and relation linting silently disables when the schema can't be introspected.

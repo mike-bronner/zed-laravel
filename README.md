@@ -28,6 +28,43 @@
 
 ---
 
+## 🤔 Why this extension?
+
+Two design choices set this extension apart from the official Laravel VS Code extension — and they're the reason it exists.
+
+### A real language server — works in any editor
+
+This is a Language Server Protocol (LSP) server, not a VS Code plugin. It speaks the same protocol your editor already uses for every other language, so it runs anywhere an LSP client does: **Zed, Neovim** (`nvim-lspconfig`), **Helix, Sublime Text** (LSP package), **Kate, BBEdit**, and more. The official Laravel VS Code extension is VS Code–only by design. If you've moved off VS Code — or never used it — this is the cross-editor option.
+
+### No app boot — pure static analysis
+
+The official extension boots your Laravel application in the background to gather its data. That means it executes your service providers (with whatever side effects they carry), can touch your database, and breaks when local state is broken — a half-applied migration, a missing `.env`, a dirty branch. It also runs your code, which is a real consideration when you open an unfamiliar project.
+
+The official extension is candid about this in its own README:
+
+> This extension will occasionally boot your app in the background to collect information about your app for use in autocompletion, linking, hovering, and diagnostics.
+
+This extension does **none of that**. Everything is parsed statically with tree-sitter — it reads your files, it never runs them. The trade-off is honest: some deep runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone. But it never executes your code, it only reads your database when *you* opt into schema-backed column completion, and it keeps working when your app won't even boot.
+
+### Feature comparison
+
+| Capability | This extension | Official Laravel VS Code |
+|---|---|---|
+| Editor support | ✅ Any LSP client (Zed, Neovim, Helix, Sublime, Kate…) | ❌ VS Code only |
+| Runtime model | ✅ Static parse (tree-sitter) — never runs your code | ⚠️ Runs your application code to gather data |
+| Works when the app won't boot | ✅ | ❌ |
+| Go-to-definition (views, routes, config, env, translations, components) | ✅ | ✅ |
+| Hover summaries | ✅ | ✅ |
+| Eloquent autocomplete (models, attributes, relations, columns) | ✅ | ✅ |
+| Blade directive autocomplete (`@if`, `@foreach`, …) | ✅ 100+ directives | ❌ |
+| Diagnostics | ✅ with quick-fixes & "did you mean" | ✅ existence checks (route/config/view…) |
+| Find references / rename across Laravel patterns | ✅ | ❌ |
+| Livewire | ✅ v3 + v4 + Volt | 🚧 Roadmap |
+| Laravel Pennant feature flags | ✅ | ❌ |
+| Inertia.js | 🚧 [#10](https://github.com/GeneaLabs/zed-laravel/issues/10) | ✅ |
+
+<sub>Official-extension column verified against its <a href="https://github.com/laravel/vs-code-extension">README</a> on 2026-05-30. Both extensions also cover assets, middleware, config, translations, validation rules, and container bindings. Corrections welcome via PR.</sub>
+
 ## 📦 Install
 
 Search **"Laravel"** in Zed Extensions and click Install.
@@ -128,13 +165,13 @@ Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP 
 
 > **Quirks worth knowing** — Zed colors outline labels by word-matching them against the source buffer's tree-sitter highlights, which produces slightly inconsistent colors on multi-segment URLs (e.g., `/cra-details` may color `cra` and `details` differently if they match different tokens elsewhere in the file). Route names appear in the LSP `detail` field, which Zed's outline panel doesn't currently render (VSCode and Sublime/LSP do). Both are tracked upstream: [zed#57576](https://github.com/zed-industries/zed/issues/57576).
 
-## 🔧 Tuning Intelephense
+### 🔧 Tuning Intelephense
 
 If you use Intelephense as your PHP language server, goto-definition on a class name (e.g. `User`) can land you in a Zed multi-buffer with several unrelated files — the actual class, plus generated stubs from [barryvdh/laravel-ide-helper](https://github.com/barryvdh/laravel-ide-helper), `.phpstorm.meta.php`, and `class User` stub templates that packages like Jetstream ship under `vendor/*/stubs/`. Intelephense indexes all of them by default.
 
 Zed merges goto responses across every running LSP and only dedupes identical locations — distinct paths from the same logical click stay separate. So even though `laravel-lsp` returns nothing for bare class references (we don't claim that pattern), Intelephense's noisy results show through unfiltered.
 
-### Safe baseline
+#### Safe baseline
 
 Tell Intelephense to skip `vendor/*/stubs/` — those are scaffold templates (Jetstream, Filament, etc.), never loaded at runtime. Excluding them costs nothing.
 
@@ -164,7 +201,7 @@ After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). The stub-te
 
 > ⚠️ **Cache caveat.** Intelephense keeps a persistent symbol index on disk, so already-indexed symbols can still surface after you add excludes. To force a rebuild, add `"clearCache": true` to `initialization_options` for one startup (then remove it — leaving it `true` re-indexes from scratch every launch). As a fallback, wipe `~/Library/Application Support/intelephense/` (macOS) while Zed isn't running.
 
-### More aggressive (with trade-offs)
+#### More aggressive (with trade-offs)
 
 If `_ide_helper_models.php` and `.phpstorm.meta.php` still cluttering goto bothers you more than the Intelephense fidelity they enable, add them to the exclude array:
 
@@ -185,7 +222,7 @@ What you trade:
 
 If you use packages that extend Laravel facades with their own methods (Scout adds `Searchable` methods, Telescope extends `Gate`, etc.), keep `_ide_helper*.php` in to retain completion for those package-added methods. Core Laravel facades resolve fine without it.
 
-### Per-project
+#### Per-project
 
 Drop the same exclude patterns into an `.intelephense.json` at your project root. Unlike the Zed `settings` block, this file is read directly by Intelephense, so it uses the standard namespaced shape:
 
@@ -250,7 +287,33 @@ DB::table('users')->get();
 ```
 
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `config()` `Config::get()` `env()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
+
+### ℹ️ Hover
+
+Hover any recognised pattern to get an Intelephense-style summary card — a header, the relevant source snippet, and a clickable link to the file it resolves to. No need to jump away from your current line to remember what a view, route, or config key points at.
+
+```php
+return view('users.profile');
+//          ^^^^^^^^^^^^^^^ hover →  resources/views/users/profile.blade.php
+//                                   @props([...]) declaration + click-to-open link
+
+$url = route('users.show', $user);
+//           ^^^^^^^^^^^^ hover →  Route::get('/users/{user}', ...)->name('users.show')
+//                                 verb · URI · controller@action · click-to-open link
+
+$tz = config('app.timezone');
+//           ^^^^^^^^^^^^^^ hover →  'UTC'   (the resolved value, from config/app.php)
+```
+
+```blade
+{{ $user->email }}
+{{-- ^^^^^ hover →  App\Models\User::$email, its PHPDoc summary, and the declaration --}}
+```
+
+**Hovered patterns:** views, Blade components (anonymous *and* class-backed), Livewire components, routes, config keys, env vars, translations (including `vendor::namespace.key`), middleware aliases, container bindings, assets (`asset()`, `Vite::asset()`, `mix()`, `public_path()`, …), `url()`, and Blade variables. The bottom-line source path renders as a `file://` link, so the whole card is click-to-open in any LSP client that supports markdown links.
+
+Class-backed components and Livewire components show the `class Foo extends Component` signature and link to the PHP class; anonymous components fall back to the `@props([...])` declaration from the `.blade.php` template. Patterns without a meaningful target (directives, controller actions, Pennant features) stay silent rather than showing an empty card.
 
 ### 🔍 Find References
 
@@ -362,6 +425,8 @@ return view('users.account');
 
 **Container bindings** follow the same shape as middleware aliases: the quoted name at the registration site PLUS every `app('x')`, `resolve('x')`, `app()->make('x')` call site.
 
+**Eloquent model classes** rename project-wide. Press `F2` on a model class name and every reference rewrites in one pass — `use` imports, `User::` static calls, `new User`, type hints, `::class` references, `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside. Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
+
 **Same parser-classified guarantee as Find References** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
 
 **Vendor-located files refuse to rename** — never moves a Composer-installed view, component, or Livewire class, and never rewrites a middleware alias or binding registered inside `vendor/`. You'll see a toast explaining why instead of a silent no-op.
@@ -443,6 +508,62 @@ $user->
 ```
 
 Works with type-hinted variables, PHPDoc annotations, and static chains like `User::find(1)->`.
+
+#### 🔗 Eloquent Query Chains
+
+Type a string literal inside a query-builder method and the extension completes it from your schema and model definitions — **columns** inside `where`, `orderBy`, `whereIn`, `pluck`, `select`, … and **relations** inside `with`, `whereHas`, `withCount`, `load`, `has`, …:
+
+```php
+User::where('')->orderBy('');
+//          ^ 🗄️ columns of the users table        ^ 🗄️ same
+
+User::with('');
+//         ^ 🔗 relation methods on User (posts, profile, roles…)
+
+DB::table('')->where('');
+//        ^ 🗄️ table names    ^ 🗄️ columns of the chosen table
+
+User::whereHas('posts', fn ($q) => $q->where(''));
+//                                           ^ 🗄️ columns of the *Post* model (relation hop)
+
+User::with('posts.author.');
+//                       ^ 🔗 relations of the final model in the dotted path
+```
+
+Chains rooted at a variable resolve through intervening statements and conditional rebuilds:
+
+```php
+$query = User::query();
+if ($active) { $query = $query->where('active', true); }
+$query->orderBy('');
+//              ^ 🗄️ still completes User's columns
+```
+
+**Joined tables** are fully resolved. After a `join`, `leftJoin`, or closure-form join, bare columns complete against *every* accessible table and `qualifier.` narrows to one; `from`/`fromSub`/`joinSub`/`lateral` are handled too (subquery `SELECT` lists become virtual columns):
+
+```php
+DB::table('orders')->join('users', 'users.id', '=', 'orders.user_id')->where('');
+//                                                                            ^ 🗄️ orders + users columns
+DB::table('orders')->join('users', ...)->where('users.');
+//                                                     ^ 🗄️ narrowed to users
+```
+
+Columns are read live from your database (cast-aware), so completions reflect the *actual* schema. Relations come from the model's relation methods, walking parent classes and traits. Works in PHP **and** in Blade-embedded expressions (`@php`, `{{ }}`). Raw-SQL methods (`whereRaw`, `havingRaw`, `selectRaw`, `DB::raw`, …) are deliberately left to your PHP language server — their arguments are opaque SQL, not column names.
+
+> 🗄️ Column and relation completion needs a working database connection (see [Configuration](#️-configuration)). Without one, the chain still parses — you just won't get column suggestions.
+
+#### 🧰 Query Builder Methods
+
+Type `Model::wher` and the extension surfaces the query-builder methods that PHP routes through `Model::__callStatic` — `where`, `whereIn`, `find`, `first`, `firstOrFail`, and dozens more. Laravel's `Model.php` carries no `@method` or `@mixin` tags for these, so most PHP language servers miss them at the static-call position; we fill the gap by parsing the `Builder` / `Query\Builder` classes (and their composed traits) from *your* installed `vendor/laravel/framework`:
+
+```php
+Portfolio::wher
+//        ^ 🧰 where, whereIn, whereNot, whereBetween…   (Builder<static>)
+//        🎯 active, popular…                            (your scopeActive / scopePopular methods)
+//        🪄 whereName, whereEmail, orWhereCreatedAt…    (dynamic where{Column}, synthesized per column)
+```
+
+Model **scopes** (`scopeActive` → `active`) and **dynamic `where{Column}` finders** are included. The dynamic finders are synthesized from the model's columns — `$fillable`, `$casts`, conventions, and the live schema — and only when no real method of that name already exists, mirroring exactly what PHP's magic methods would route at runtime. Scoped to the `Model::` static position; instance chains (`->`) yield to your PHP LSP, which already sees them via `Builder`'s `@mixin`. Every item we add is attributable in its docs panel header, so you can tell ours apart from your PHP LSP's.
 
 #### 📝 Blade Variables
 
@@ -560,6 +681,31 @@ Feature::active('undefined-feature');
 {{--      ^^^^^^^^^^^^^^^^^^ ❌ Feature not found --}}
 ```
 
+**Query-chain typos** are caught against your real schema — unknown columns, relations, and tables each get a Levenshtein "did you mean" suggestion:
+
+```php
+User::where('emial', $value);
+//          ^^^^^ ⚠️ Unknown column 'emial' on users — did you mean 'email'?
+
+User::with('postz');
+//         ^^^^^ ⚠️ Unknown relation 'postz' on User — did you mean 'posts'?
+
+DB::table('userz')->get();
+//        ^^^^^ ⚠️ Unknown table 'userz' — did you mean 'users'?
+
+User::whereEmial($value);
+//   ^^^^^^^^^^^ ⚠️ Unknown column 'emial' (dynamic where) — did you mean 'whereEmail'?
+```
+
+When joins put a bare column on more than one accessible table, it's flagged as **ambiguous** so you can qualify it:
+
+```php
+DB::table('orders')->join('users', ...)->where('id', 1);
+//                                              ^^ ⚠️ Ambiguous column 'id' — exists on orders and users
+```
+
+These diagnostics **under-warn on purpose**: they stay silent on a cold or absent schema, unresolved receivers, qualified/aliased/expression literals, and raw SQL — a missing squiggle never means "this is definitely fine," only "we couldn't prove it's wrong." Severity is configurable via `diagnostics.severity` (`warning` / `error` / `info` / `off`); see [Configuration](#️-configuration). A working database connection is required — column and relation linting silently disables when the schema can't be introspected.
+
 ### ⚡ Quick Actions
 
 Fix problems with a single click. When you see a warning, press `Cmd+.` to open quick actions. The extension offers to create missing files with the correct Laravel structure—views, components, middleware, translations, and more.
@@ -585,6 +731,20 @@ Route::middleware('admin-only')->group(...);
      ⚡ Create Livewire component --}}
 ```
 
+Query-chain diagnostics carry their own fixes:
+
+```php
+User::where('emial');
+//          ^^^^^ ⚡ Rename to 'email'
+//                ⚡ Create migration: add column 'emial' to users
+
+DB::table('orders')->join('users', ...)->where('id', 1);
+//                                              ^^ ⚡ Qualify as 'orders.id'
+//                                                 ⚡ Qualify as 'users.id'
+```
+
+The "Create migration" action scaffolds a timestamped `database/migrations/*.php` using your project's `migration.update.stub` (custom → vendor → built-in fallback, the same resolution `php artisan make:migration` uses), so your own stub format is honoured.
+
 **Available quick actions:**
 - 📄 Create missing views
 - 🧩 Create Blade components (anonymous or with class)
@@ -593,6 +753,9 @@ Route::middleware('admin-only')->group(...);
 - 🚩 Create Laravel Pennant feature classes
 - 🌐 Add translations to existing files
 - 🔐 Add environment variables to `.env`
+- 🗄️ Rename a mistyped column / relation / table to the suggested name
+- 🆕 Create a migration to add a missing column
+- 🏷️ Qualify an ambiguous column as `table.column`
 
 ### 🎨 Blade Editing Support
 
@@ -690,9 +853,9 @@ If your PHP class outline isn't appearing, make sure:
 
 ## 🚧 Planned Features
 
-**Rename — remaining work** (the class-backed kinds shipped; variables didn't):
+**Rename — remaining work** (the class-backed kinds and the Eloquent model-class engine shipped; variables didn't):
 
-- ✏️ **PHP class rename engine** — FQCN walker, `use`-statement updates, type-hint rewrites, instantiation / static-call / `::class` rewrites, and the file move. Foundation for renaming controllers, models, jobs, etc. as first-class symbols.
+- ✏️ **More PHP class kinds** — the FQCN rename engine (use-statement updates, type-hint / static-call / `new` / `::class` rewrites, docblocks, file move) now powers Eloquent model rename; extending it to controllers, jobs, services, and form requests as first-class symbols is the follow-up.
 - 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
 - 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
 

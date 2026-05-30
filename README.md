@@ -26,8 +26,6 @@
 <sub>A community extension — not affiliated with Laravel LLC</sub>
 </p>
 
----
-
 ## ❤️ Why we built this
 
 We love Laravel, and we love Zed. When we moved our Laravel work into Zed, the deep, framework-aware tooling we'd relied on elsewhere wasn't there yet — so we built it. This extension exists to give Laravel first-class support in Zed, because a framework this good deserves great tooling everywhere its developers work.
@@ -40,6 +38,7 @@ Everything is parsed statically with tree-sitter: the extension reads your files
 
 **⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
 
+
 ### Laravel across editors
 
 Laravel developers are spoiled for choice — every major editor has a strong way to work with the framework. Here's roughly where things stand and what each needs, so you can pick whatever fits how you work:
@@ -51,6 +50,22 @@ Laravel developers are spoiled for choice — every major editor has a strong wa
 | **Zed** | This extension, in addition to companion extensions:  [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade), [PHP](https://github.com/zed-extensions/php) (Intelephense), [phpcs](https://github.com/GeneaLabs/zed-phpcs-lsp), and [phpmd](https://github.com/GeneaLabs/zed-phpmd-lsp) | Free |
 
 <sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
+
+## ✨ Features
+
+Each feature has a focused reference under [`docs/`](docs/) — click through to dive in.
+
+| Feature | What it does |
+|---|---|
+| [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings — plus query-chain columns / relations / tables |
+| [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern |
+| [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included |
+| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, and model classes |
+| [💡 Autocomplete](docs/autocomplete.md) | Cast types, model properties, query chains, builder methods, Blade / loop / slot variables, Pennant flags |
+| [❌ Diagnostics](docs/diagnostics.md) | Missing views / components / features, invalid rules, query-chain typos against your real schema |
+| [⚡ Quick Actions](docs/quick-actions.md) | One-click create missing views, components, middleware, features, and migrations |
+| [🎨 Blade Editing](docs/blade-editing.md) | Directive autocomplete, smart bracket expansion, closing-tag navigation |
+| [🗺️ Outline Panel](docs/outline.md) | Laravel-aware route + Blade structure in Zed's outline and breadcrumbs |
 
 ## 📦 Install
 
@@ -185,22 +200,6 @@ If you use Intelephense as your PHP language server, goto-definition on a class 
 ```
 
 After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). For the licence-key shape, the `_ide_helper*.php` / `.phpstorm.meta.php` trade-offs, the cache caveat, and per-project `.intelephense.json`, see the **[full Intelephense tuning guide](docs/tuning-intelephense.md)**.
-
-## ✨ Features
-
-Each feature has a focused reference under [`docs/`](docs/) — click through to dive in.
-
-| Feature | What it does |
-|---|---|
-| [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings — plus query-chain columns / relations / tables |
-| [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern |
-| [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included |
-| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, and model classes |
-| [💡 Autocomplete](docs/autocomplete.md) | Cast types, model properties, query chains, builder methods, Blade / loop / slot variables, Pennant flags |
-| [❌ Diagnostics](docs/diagnostics.md) | Missing views / components / features, invalid rules, query-chain typos against your real schema |
-| [⚡ Quick Actions](docs/quick-actions.md) | One-click create missing views, components, middleware, features, and migrations |
-| [🎨 Blade Editing](docs/blade-editing.md) | Directive autocomplete, smart bracket expansion, closing-tag navigation |
-| [🗺️ Outline Panel](docs/outline.md) | Laravel-aware route + Blade structure in Zed's outline and breadcrumbs |
 
 ## 🚧 Planned Features
 

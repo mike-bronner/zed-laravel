@@ -28,44 +28,27 @@
 
 ---
 
-## 🤔 Why this extension?
+## 💛 Why we built this
 
-This extension brings Laravel-aware intelligence — go-to-definition, autocomplete, hover, diagnostics — to **Zed**. It isn't trying to replace the official Laravel VS Code extension; it's a different approach for a different editor, shaped by two design choices worth understanding before you install.
+We love Laravel, and we love Zed. When we moved our Laravel work into Zed, the deep, framework-aware tooling we'd relied on elsewhere wasn't there yet — so we built it. This extension exists to give Laravel first-class support in Zed, because a framework this good deserves great tooling everywhere its developers work.
 
-### Built on a real language server
+The intelligence lives in a standalone language server (LSP) — the same protocol your editor already speaks for other languages. Today it targets Zed; because it's LSP-based, the same engine could reach other LSP-capable editors (Neovim, Helix, Sublime Text, and more) down the road. That's a direction we'd love to grow toward, not something we ship yet.
 
-The intelligence lives in a standalone Language Server Protocol (LSP) server, not in editor-specific plugin code. Today it targets Zed. But because everything runs through the LSP — the same protocol your editor already speaks for other languages — the door is open to supporting other LSP-capable editors (Neovim, Helix, Sublime Text, Kate, and more) in the future. That portability is a deliberate architectural bet, not something we ship yet.
+### How it works — static analysis
 
-### No app boot — pure static analysis
+Everything is parsed statically with tree-sitter: the extension reads your files, it never runs them. It only touches your database when *you* opt into schema-backed completion, and it keeps working even when your app won't boot — a half-applied migration, a missing `.env`, or a dirty branch won't stop it. The honest trade-off: some deeply dynamic runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone.
 
-The official VS Code extension boots your Laravel application in the background to gather its data. That means it executes your service providers (with whatever side effects they carry), can touch your database, and can struggle when local state is broken — a half-applied migration, a missing `.env`, a dirty branch. It runs your code, which is worth knowing when you open an unfamiliar project.
+### Laravel across editors
 
-The official extension is candid about this in its own README:
+Laravel developers are spoiled for choice — every major editor has a strong way to work with the framework. Here's roughly where things stand and what each needs, so you can pick whatever fits how you work:
 
-> This extension will occasionally boot your app in the background to collect information about your app for use in autocompletion, linking, hovering, and diagnostics.
-
-This extension takes the opposite approach: everything is parsed statically with tree-sitter — it reads your files, it never runs them. The trade-off is honest: some deep runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone. But it never executes your code, it only reads your database when *you* opt into schema-backed column completion, and it keeps working even when your app won't boot.
-
-### How it compares
-
-The official VS Code extension is the Laravel tooling most developers already know, so it's a useful reference point. This isn't a head-to-head — they're different tools for different editors, with different trade-offs:
-
-| Capability | This extension (Zed) | Official Laravel VS Code |
+| Editor | Laravel-aware tooling | Cost |
 |---|---|---|
-| Editor | Zed today — LSP-based, designed to be portable to other editors later | VS Code |
-| Runtime model | ✅ Static parse (tree-sitter) — never runs your code | ⚠️ Runs your application code to gather data |
-| Works when the app won't boot | ✅ | ❌ |
-| Go-to-definition (views, routes, config, env, translations, components) | ✅ | ✅ |
-| Hover summaries | ✅ | ✅ |
-| Eloquent autocomplete (models, attributes, relations, columns) | ✅ | ✅ |
-| Blade directive autocomplete (`@if`, `@foreach`, …) | ✅ 100+ directives | ✅ |
-| Diagnostics | ✅ with quick-fixes & "did you mean" suggestions | ✅ existence checks; quick-fixes for env/view/Inertia |
-| Find references / rename across Laravel patterns | ✅ | ❌ |
-| Livewire | ✅ v3 + v4 + Volt · diagnostics · rename | ✅ completion, goto, hover (tag form) |
-| Laravel Pennant feature flags | ✅ | ❌ |
-| Inertia.js | 🚧 [#10](https://github.com/GeneaLabs/zed-laravel/issues/10) | ✅ |
+| **PHPStorm** | Laravel support built in, powered by the [Laravel Idea](https://laravel-idea.com/) plugin | Paid IDE (free for non-commercial use) |
+| **VS Code** | [Official Laravel extension](https://github.com/laravel/vs-code-extension), maintained by the Laravel team | Free |
+| **Zed** | This extension, plus [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) for syntax highlighting | Free |
 
-<sub>Official-extension column verified against its <a href="https://github.com/laravel/vs-code-extension">source code</a> on 2026-05-30 (its README is more conservative than its code — e.g. Livewire and Blade-component support ship but aren't documented there). Both extensions also cover assets, middleware, config, translations, validation rules, and container bindings. Corrections welcome via PR.</sub>
+<sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
 
 ## 📦 Install
 

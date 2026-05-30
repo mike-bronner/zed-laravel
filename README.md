@@ -697,17 +697,17 @@ Fix problems with a single click. When you see a warning, press `Cmd+.` to open 
 
 ```php
 return view('users.dashboard');
-//          ^^^^^^^^^^^^^^^^^ ⚠️ View not found
+//          ^^^^^^^^^^^^^^^^^ ❌ View not found
 //                            ⚡ Create view: users.dashboard
 
 Route::middleware('admin-only')->group(...);
-//                ^^^^^^^^^^^^ ⚠️ Middleware not found
+//                ^^^^^^^^^^^^ ❌ Middleware not found
 //                             ⚡ Create middleware: admin-only
 ```
 
 ```blade
 <x-dashboard-widget />
-{{-- ⚠️ Component not found
+{{-- ❌ Component not found
      ⚡ Create component (anonymous)
      ⚡ Create component with class --}}
 

@@ -301,3 +301,49 @@ fn migration_action_none_without_table() {
     );
     assert!(migration_action(&d, Path::new("/srv/app"), "2026_05_29_120000").is_none());
 }
+
+// ---- qualify_actions (ambiguous columns, issue #24) ------------------------
+
+#[test]
+fn qualify_actions_one_per_candidate_table() {
+    let d = diag(
+        "laravel-lsp.ambiguous-column",
+        json!({"kind": "ambiguous-column", "name": "id", "tables": ["users", "orders"]}),
+    );
+    let actions: Vec<_> = qualify_actions(&d, &uri())
+        .into_iter()
+        .map(into_action)
+        .collect();
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].title, "Qualify as `users.id`");
+    assert_eq!(actions[1].title, "Qualify as `orders.id`");
+    // Each replaces the diagnostic range with the qualified column.
+    let edits = actions[0].edit.as_ref().unwrap().changes.as_ref().unwrap();
+    assert_eq!(edits[&uri()][0].new_text, "users.id");
+    assert_eq!(edits[&uri()][0].range, d.range);
+    assert_eq!(actions[0].kind, Some(CodeActionKind::QUICKFIX));
+}
+
+#[test]
+fn qualify_actions_uses_alias_qualifier() {
+    // For an aliased join the candidate is the alias the user must type.
+    let d = diag(
+        "laravel-lsp.ambiguous-column",
+        json!({"kind": "ambiguous-column", "name": "id", "tables": ["u", "o"]}),
+    );
+    let actions: Vec<_> = qualify_actions(&d, &uri())
+        .into_iter()
+        .map(into_action)
+        .collect();
+    assert_eq!(actions[0].title, "Qualify as `u.id`");
+    assert_eq!(actions[1].title, "Qualify as `o.id`");
+}
+
+#[test]
+fn qualify_actions_empty_for_non_ambiguity_diagnostic() {
+    let d = diag(
+        "laravel-lsp.unknown-column",
+        json!({"kind": "column", "name": "emial", "replacement": "email", "table": "users"}),
+    );
+    assert!(qualify_actions(&d, &uri()).is_empty());
+}

@@ -150,6 +150,86 @@ pub const SAME_MODEL_CLOSURE_CARRIERS: &[&str] = &[
     "tap",
 ];
 
+/// Join methods whose FIRST string argument names a table. After any of
+/// these, that table's columns become referenceable for the rest of the
+/// chain (`->join('orders', …)->where('orders.status', …)`). The optional
+/// later arguments are either the join condition (4-arg form) or a closure
+/// (closure form — Phase 3); neither changes the fact that the FIRST arg is
+/// the table being joined.
+///
+/// Subquery joins (`joinSub`, `joinLateral`, …) take a *query*, not a table
+/// name, so they live in a separate Phase-4 list — their accessible table is
+/// named by the alias argument instead.
+pub const TABLE_JOIN_METHODS: &[&str] = &[
+    "join",
+    "leftJoin",
+    "rightJoin",
+    "crossJoin",
+    "joinWhere",
+    "leftJoinWhere",
+    "rightJoinWhere",
+];
+
+/// Receiver-replacing `from*()` methods whose first string argument names the
+/// new root table — `from('admins')` swaps the FROM clause. Like the joins,
+/// the table reference may carry an alias (`from('admins as a')`) or a
+/// schema qualifier (`from('mydb.admins')`).
+pub const FROM_REPLACE_METHODS: &[&str] = &["from"];
+
+/// `from*()` methods whose argument is opaque SQL — the root table becomes
+/// unknown, so no bare root columns can be offered (joined tables remain
+/// valid). `fromSub` is NOT here: it resolves to a virtual table (see
+/// [`FROM_SUB_METHODS`]).
+pub const FROM_OPAQUE_METHODS: &[&str] = &["fromRaw"];
+
+/// Subquery `from*()` — `fromSub($query, $alias)` synthesizes a virtual root
+/// table named by the `$alias`, whose columns come from the subquery's SELECT
+/// list (issue #24, Phase 4).
+pub const FROM_SUB_METHODS: &[&str] = &["fromSub"];
+
+/// Subquery joins — `joinSub`/`leftJoinSub`/`rightJoinSub`/`joinLateral`/
+/// `leftJoinLateral`($query, $alias, …). Each synthesizes a virtual joined
+/// table named by the `$alias`, columns from the subquery's SELECT list.
+pub const SUBQUERY_JOIN_METHODS: &[&str] = &[
+    "joinSub",
+    "leftJoinSub",
+    "rightJoinSub",
+    "joinLateral",
+    "leftJoinLateral",
+];
+
+/// Whether `name` is a join method whose first string arg names a table.
+pub fn is_table_join(name: &str) -> bool {
+    TABLE_JOIN_METHODS.contains(&name)
+}
+
+/// Whether `name` replaces the chain's root table with a concrete table named
+/// by its first string arg (`from('admins')`).
+pub fn is_from_replace(name: &str) -> bool {
+    FROM_REPLACE_METHODS.contains(&name)
+}
+
+/// Whether `name` makes the chain's root table opaque (`fromRaw`).
+pub fn is_from_opaque(name: &str) -> bool {
+    FROM_OPAQUE_METHODS.contains(&name)
+}
+
+/// Whether `name` is `fromSub` — a virtual-table root from a subquery.
+pub fn is_from_sub(name: &str) -> bool {
+    FROM_SUB_METHODS.contains(&name)
+}
+
+/// Whether `name` is a subquery join (`joinSub`, `joinLateral`, …).
+pub fn is_subquery_join(name: &str) -> bool {
+    SUBQUERY_JOIN_METHODS.contains(&name)
+}
+
+/// Whether `name` takes a subquery + alias and synthesizes a virtual table
+/// (either `fromSub` or a subquery join).
+pub fn is_subquery_method(name: &str) -> bool {
+    is_from_sub(name) || is_subquery_join(name)
+}
+
 /// Methods that flip the chain from Eloquent → base query builder. After
 /// these, the chain is operating on `Illuminate\Database\Query\Builder`, so
 /// relation methods would error at runtime — completion returns empty for

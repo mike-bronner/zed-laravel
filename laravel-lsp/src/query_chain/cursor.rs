@@ -10,6 +10,9 @@
 //! later phases.
 
 use super::chain::*;
+use super::methods::{
+    is_from_opaque, is_from_replace, is_from_sub, is_subquery_join, is_table_join,
+};
 use std::sync::Arc;
 use tower_lsp::lsp_types::Position;
 
@@ -344,20 +347,29 @@ fn initial_receiver_context(
             // `when(...)`, …) inherits directly. Phase 9 fallback: the resolved
             // `php_type` from a typed param / `@var` docblock.
             match chain.closure_scope.as_ref() {
-                Some(binding) if &binding.param_var == var => {
-                    let parent_model = parent_chain_eloquent_model(chains, chain)?;
-                    match &binding.kind {
-                        ClosureScopeKind::RelationHop { relation_name } => (
+                Some(binding) if &binding.param_var == var => match &binding.kind {
+                    ClosureScopeKind::RelationHop { relation_name } => {
+                        let parent_model = parent_chain_eloquent_model(chains, chain)?;
+                        (
                             BuilderMode::EloquentBuilder,
                             None,
                             Some(parent_model),
                             Some(relation_name.clone()),
-                        ),
-                        ClosureScopeKind::SameModel => {
-                            (BuilderMode::EloquentBuilder, None, Some(parent_model), None)
-                        }
+                        )
                     }
-                }
+                    ClosureScopeKind::SameModel => {
+                        let parent_model = parent_chain_eloquent_model(chains, chain)?;
+                        (BuilderMode::EloquentBuilder, None, Some(parent_model), None)
+                    }
+                    // `$join` is a base query builder rooted at the joined
+                    // table. The table itself is supplied via the from_clause
+                    // override ([`closure_join_from_override`]); here we only
+                    // set the mode (and don't need the parent model, so a
+                    // `DB::table()` parent works too).
+                    ClosureScopeKind::JoinTable { .. } => {
+                        (BuilderMode::BaseBuilder, None, None, None)
+                    }
+                },
                 _ => match php_type {
                     Some(class) => (
                         BuilderMode::EloquentBuilder,
@@ -402,6 +414,19 @@ pub fn chain_context_for_link(
         }
     }
     let arg = chain.links.get(link_idx)?.arg;
+    let (mut joined_tables, mut from_clause) = scan_accessible_tables(chain);
+    let mut join_parent_model = None;
+    if let Some(override_clause) = closure_join_from_override(chain) {
+        let own_qualifier = match &override_clause {
+            FromClause::Replace(t) => t.qualifier().to_string(),
+            _ => String::new(),
+        };
+        from_clause = override_clause;
+        let (parent_tables, parent_model) =
+            join_closure_parent_tables(chains, chain, &own_qualifier);
+        joined_tables.extend(parent_tables);
+        join_parent_model = parent_model;
+    }
     Some(ChainContext {
         mode,
         effective_table,
@@ -410,6 +435,9 @@ pub fn chain_context_for_link(
         dotted_prefix: None,
         closure_relation_hop,
         quote: '\'',
+        joined_tables,
+        from_clause,
+        join_parent_model,
     })
 }
 
@@ -474,25 +502,33 @@ fn detect_target_in_chain(
     // we still complete inside its first arg.
     let (quote, string_value, value_span) = string_arg_at(cursor_link, byte_offset)?;
 
+    // Position-aware classification: most methods carry one ArgKind for the
+    // whole link, but join/`from` methods name a TABLE in their first string
+    // arg (`crossJoin('|')`, `from('|')`) — so we offer table completion there,
+    // just like `DB::table('|')`. Inside a join closure, `$join->on(...)` takes
+    // columns (`in_join_clause`).
+    let expecting = expecting_at(cursor_link, byte_offset, is_join_clause_chain(chain));
+
     if !matches!(
-        cursor_link.arg,
+        expecting,
         ArgKind::Column | ArgKind::Relation | ArgKind::ClosureCarrier | ArgKind::Table
     ) {
         return None;
     }
 
-    // Phase 7: dotted-relation paths in relation positions. For
-    // `with('posts.author.|')` the value is "posts.author." — everything
-    // before the LAST dot is the relation chain to walk
-    // ("posts" → Post, then "author" on Post → Author), and the portion
-    // after is the typing prefix that the editor uses for fuzzy
-    // filtering. Only meaningful for Relation / ClosureCarrier args
-    // — Column args don't follow dotted hops (`where('a.b')` isn't a
-    // thing) and Table args are single-segment.
-    let dotted_prefix = if matches!(cursor_link.arg, ArgKind::Relation | ArgKind::ClosureCarrier) {
-        // Find the last `.` in the string value. If present, return the
-        // substring up to (not including) that dot — those are the
-        // segments we walk.
+    // Dotted prefixes — everything before the LAST dot of the literal.
+    // - Relation / ClosureCarrier (`with('posts.author.|')`): the relation
+    //   chain to walk ("posts" → Post, then "author" on Post → Author).
+    // - Column (`where('orders.|')`): the table qualifier (alias or table
+    //   name) the column belongs to, so completion narrows to that one
+    //   table. Joins make qualified columns meaningful (`orders.status`);
+    //   without joins it's still harmless (the qualifier just matches the
+    //   root table or nothing).
+    // Table args stay single-segment.
+    let dotted_prefix = if matches!(
+        expecting,
+        ArgKind::Relation | ArgKind::ClosureCarrier | ArgKind::Column
+    ) {
         string_value
             .rfind('.')
             .map(|idx| string_value[..idx].to_string())
@@ -500,15 +536,34 @@ fn detect_target_in_chain(
         None
     };
 
+    let (mut joined_tables, mut from_clause) = scan_accessible_tables(chain);
+    let mut join_parent_model = None;
+    if let Some(override_clause) = closure_join_from_override(chain) {
+        let own_qualifier = match &override_clause {
+            FromClause::Replace(t) => t.qualifier().to_string(),
+            _ => String::new(),
+        };
+        from_clause = override_clause;
+        // Inside a join closure, the parent query's tables are also
+        // referenceable (both sides of the ON clause).
+        let (parent_tables, parent_model) =
+            join_closure_parent_tables(chains, chain, &own_qualifier);
+        joined_tables.extend(parent_tables);
+        join_parent_model = parent_model;
+    }
+
     Some(ChainTarget {
         ctx: ChainContext {
             mode,
             effective_table,
             effective_model,
-            expecting: cursor_link.arg,
+            expecting,
             dotted_prefix,
             closure_relation_hop,
             quote,
+            joined_tables,
+            from_clause,
+            join_parent_model,
         },
         value: string_value,
         value_span,
@@ -526,46 +581,248 @@ pub fn detect_chain_target_at(
     detect_target_in_chain(chains, chain, byte_offset)
 }
 
-/// Phase 8 helper: find the smallest chain in `chains` whose span strictly
-/// contains `child`'s span and whose receiver is an Eloquent static model.
-/// Returns the model's class name (FQCN if it was resolved through
-/// use-aliases at extraction time).
-///
-/// Used when a child chain's receiver is `$q` bound by an enclosing
-/// `whereHas` / `with` closure — the parent's model is the starting point
-/// for the relation hop the handler will perform.
-fn parent_chain_eloquent_model(
-    chains: &[Arc<BuilderChain>],
+/// Find the smallest chain in `chains` whose span *strictly* contains
+/// `child`'s span — the innermost enclosing chain (the one whose method
+/// invoked the closure `child`'s receiver is bound by).
+fn parent_chain<'a>(
+    chains: &'a [Arc<BuilderChain>],
     child: &BuilderChain,
-) -> Option<String> {
+) -> Option<&'a BuilderChain> {
     let (cs, ce) = child.span_byte_range;
     let mut best: Option<&BuilderChain> = None;
     for chain in chains {
         let (ps, pe) = chain.span_byte_range;
         // Strictly contains (not equal — that'd be the child itself).
         if ps <= cs && pe >= ce && (ps, pe) != (cs, ce) {
-            // Pick the SMALLEST containing chain — that's the innermost
-            // parent, the one whose method invoked the closure.
             let new_size = pe - ps;
             let pick = match best {
                 None => true,
-                Some(b) => {
-                    let cur_size = b.span_byte_range.1 - b.span_byte_range.0;
-                    new_size < cur_size
-                }
+                Some(b) => new_size < (b.span_byte_range.1 - b.span_byte_range.0),
             };
             if pick {
                 best = Some(chain.as_ref());
             }
         }
     }
-    let parent = best?;
-    match &parent.receiver {
+    best
+}
+
+/// Phase 8 helper: the Eloquent model class of the innermost chain enclosing
+/// `child`. Used when a child chain's receiver is `$q` bound by an enclosing
+/// `whereHas` / `with` closure — the parent's model is the starting point for
+/// the relation hop the handler will perform.
+fn parent_chain_eloquent_model(
+    chains: &[Arc<BuilderChain>],
+    child: &BuilderChain,
+) -> Option<String> {
+    match &parent_chain(chains, child)?.receiver {
         ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => Some(class.clone()),
         // Future: also support `(new self)` receivers etc. — already
         // produce StaticModel via Phase 5.1.
         _ => None,
     }
+}
+
+/// The tables the *parent* query contributes inside a join closure (issue
+/// #24), so `$join->on('orders.id', '=', 'users.|')` completes the `users`
+/// side. Returns `(sync_tables, parent_model)`:
+///
+/// - `sync_tables` — the parent's root when it's a `DB::table()` / `from()`
+///   table, plus the parent's other joins. These resolve without I/O.
+/// - `parent_model` — set when the parent is rooted at an Eloquent model whose
+///   table needs async resolution; consumers fold it in (see
+///   `ChainContext::join_parent_model`).
+///
+/// The join's *own* table (`own_qualifier`) is excluded — it's already the
+/// inner chain's root.
+fn join_closure_parent_tables(
+    chains: &[Arc<BuilderChain>],
+    chain: &BuilderChain,
+    own_qualifier: &str,
+) -> (Vec<AccessibleTable>, Option<String>) {
+    let Some(parent) = parent_chain(chains, chain) else {
+        return (Vec::new(), None);
+    };
+    let (parent_joins, parent_from) = scan_accessible_tables(parent);
+
+    let mut tables = Vec::new();
+    let mut parent_model = None;
+    match &parent_from {
+        FromClause::Replace(table) => tables.push(table.clone()),
+        FromClause::Opaque => {}
+        FromClause::Inherit => match &parent.receiver {
+            ChainReceiver::DbTable { table, .. } => {
+                tables.push(AccessibleTable::bare(table.clone()));
+            }
+            ChainReceiver::Eloquent(EloquentReceiver::StaticModel(class)) => {
+                parent_model = Some(class.clone());
+            }
+            ChainReceiver::Eloquent(EloquentReceiver::InstanceVar {
+                php_type: Some(class),
+                ..
+            }) => {
+                parent_model = Some(class.clone());
+            }
+            _ => {}
+        },
+    }
+    tables.extend(parent_joins);
+    // Drop the join's own table — it's the inner root, not a sibling.
+    tables.retain(|t| t.qualifier() != own_qualifier);
+    (tables, parent_model)
+}
+
+/// Scan ALL links in the chain and collect the tables made accessible by
+/// `join()`-family calls, plus any `from*()` root override.
+///
+/// Visibility is **global**: Laravel compiles the entire chain into one SQL
+/// query, so a join appearing anywhere in the chain makes its table
+/// referenceable from every column position — we don't gate on whether the
+/// join textually precedes the cursor. (Mode flips like `toBase()` stay
+/// positional; that's a separate concern handled by the link walk.)
+///
+/// The last `from*()` wins, mirroring Laravel's runtime where a later
+/// `from()` overrides an earlier FROM clause.
+fn scan_accessible_tables(chain: &BuilderChain) -> (Vec<AccessibleTable>, FromClause) {
+    let mut joined = Vec::new();
+    let mut from_clause = FromClause::Inherit;
+    for link in &chain.links {
+        let method = link.method.as_str();
+        if is_table_join(method) {
+            if let Some(table_ref) = first_string_arg_value(link) {
+                joined.push(parse_table_ref(&table_ref));
+            }
+        } else if is_from_replace(method) {
+            if let Some(table_ref) = first_string_arg_value(link) {
+                from_clause = FromClause::Replace(parse_table_ref(&table_ref));
+            }
+        } else if is_from_opaque(method) {
+            from_clause = FromClause::Opaque;
+        } else if is_from_sub(method) {
+            // `fromSub($query, 'alias')` — virtual root from the subquery's
+            // SELECT list. Unknown columns (no usable SELECT) → opaque root.
+            from_clause = match (first_string_arg_value(link), &link.subquery_columns) {
+                (Some(alias), Some(cols)) if !cols.is_empty() => {
+                    FromClause::Replace(AccessibleTable::virtual_table(alias, cols.clone()))
+                }
+                _ => FromClause::Opaque,
+            };
+        } else if is_subquery_join(method) {
+            // `joinSub($query, 'alias', …)` — virtual joined table. Skip when
+            // the subquery's columns are unknown (offer nothing for it).
+            if let (Some(alias), Some(cols)) =
+                (first_string_arg_value(link), &link.subquery_columns)
+            {
+                if !cols.is_empty() {
+                    joined.push(AccessibleTable::virtual_table(alias, cols.clone()));
+                }
+            }
+        }
+    }
+    (joined, from_clause)
+}
+
+/// If this chain's receiver `$var` is bound by an enclosing join closure
+/// (`join('orders', fn ($var) => $var->where(…))`), the `$var` `JoinClause`
+/// builder is rooted at the joined table — model it as a `from(orders)`
+/// override so column completion/narrowing inside the closure resolves
+/// against that table (alias included). Returns `None` for any other chain.
+fn closure_join_from_override(chain: &BuilderChain) -> Option<FromClause> {
+    let var = match &chain.receiver {
+        ChainReceiver::Eloquent(EloquentReceiver::InstanceVar { var, .. }) => var,
+        _ => return None,
+    };
+    let binding = chain.closure_scope.as_ref()?;
+    if &binding.param_var != var {
+        return None;
+    }
+    match &binding.kind {
+        ClosureScopeKind::JoinTable { table_ref } => {
+            Some(FromClause::Replace(parse_table_ref(table_ref)))
+        }
+        _ => None,
+    }
+}
+
+/// The value of a link's first `StringLit` argument, if any. Used to read the
+/// table name out of a `join('orders', …)` / `from('admins')` call. Closures
+/// and other arg shapes are skipped — `join('orders', fn ($j) => …)` still
+/// returns `"orders"` because the closure is a later arg.
+fn first_string_arg_value(link: &ChainLink) -> Option<String> {
+    link.args.iter().find_map(|arg| match arg {
+        ChainArg::StringLit { value, .. } => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// What the cursor's link expects at this byte position. Most links carry a
+/// single `ArgKind` for the whole call, but join/`from` methods are
+/// position-sensitive:
+///
+/// - **Join methods** (`join('orders', 'orders.user_id', '=', 'users.id')`):
+///   the FIRST string arg names a table → [`ArgKind::Table`] (table-name
+///   completion, like `DB::table('|')`). Every later arg is part of the ON
+///   condition, which references the accessible tables → [`ArgKind::Column`]
+///   (`join('orders', 'orders.|')` offers `orders` columns). The operator /
+///   value slots over-offer harmlessly, exactly as `where('x', '=', '|')`
+///   already does — the editor filters them out.
+/// - **`from('admins')`**: the first arg names the new root table →
+///   [`ArgKind::Table`]; any later arg (e.g. a connection name) →
+///   [`ArgKind::None`].
+/// - **`on`/`orOn` on a JoinClause** (`$join->on('orders.id', '=', 'users.id')`
+///   inside a join closure, `in_join_clause = true`): the ON-condition args
+///   are columns → [`ArgKind::Column`]. This is disambiguated by receiver: a
+///   *member* call on the query builder takes columns, whereas the *static*
+///   `Model::on('mysql')` connection-setter (`in_join_clause = false`) is left
+///   as [`ArgKind::None`] — not a column.
+///
+/// Non-join/from links fall through to the link's own `arg` classification.
+fn expecting_at(link: &ChainLink, byte_offset: usize, in_join_clause: bool) -> ArgKind {
+    if is_table_join(&link.method) {
+        return if cursor_in_first_string_arg(link, byte_offset) {
+            ArgKind::Table
+        } else {
+            ArgKind::Column
+        };
+    }
+    if is_from_replace(&link.method) {
+        return if cursor_in_first_string_arg(link, byte_offset) {
+            ArgKind::Table
+        } else {
+            ArgKind::None
+        };
+    }
+    if in_join_clause && matches!(link.method.as_str(), "on" | "orOn") {
+        return ArgKind::Column;
+    }
+    link.arg
+}
+
+/// Whether this chain is the body of a join closure — its receiver `$join` is
+/// bound by an enclosing `join('orders', fn ($join) => …)`. Inside it, the
+/// builder is a `JoinClause`, so `on`/`orOn` take columns (see
+/// [`expecting_at`]).
+fn is_join_clause_chain(chain: &BuilderChain) -> bool {
+    matches!(
+        chain.closure_scope.as_ref().map(|b| &b.kind),
+        Some(ClosureScopeKind::JoinTable { .. })
+    )
+}
+
+/// Whether `byte_offset` falls inside the link's FIRST string-literal arg —
+/// the table-name slot of a join/`from` call. A cursor in a later string arg
+/// (the join condition) returns `false`.
+fn cursor_in_first_string_arg(link: &ChainLink, byte_offset: usize) -> bool {
+    for arg in &link.args {
+        if let ChainArg::StringLit {
+            span_byte_range, ..
+        } = arg
+        {
+            let (start, end) = *span_byte_range;
+            return byte_offset >= start && byte_offset <= end;
+        }
+    }
+    false
 }
 
 /// Find the string-literal arg of `link` that contains the cursor, returning

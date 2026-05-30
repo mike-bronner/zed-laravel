@@ -3135,6 +3135,17 @@ impl LaravelLanguageServer {
             _ => ctx,
         };
 
+        // Join-closure parent table (issue #24): inside `User::query()->join(
+        // 'orders', fn ($join) => …)`, fold the parent model's table into the
+        // accessible set so the parent side of the ON clause completes. No-op
+        // unless `join_parent_model` is set.
+        let mut ctx = ctx;
+        if ctx.join_parent_model.is_some() {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                eloquent_completion::enrich_join_parent_tables(&mut ctx, &root).await;
+            }
+        }
+
         let items = match (ctx.mode, ctx.expecting) {
             (BuilderMode::BaseBuilder, ArgKind::Column) => {
                 eloquent_completion::columns_raw(&ctx, db, wrap_with_quote).await
@@ -13044,6 +13055,10 @@ return [
                     eloquent_completion::resolve_table_for_model(&model, &root).await;
             }
         }
+        // Join-closure parent table (issue #24): fold an Eloquent parent's
+        // table into the accessible set so goto on the parent side of an ON
+        // clause resolves.
+        eloquent_completion::enrich_join_parent_tables(&mut ctx, &root).await;
 
         match ctx.expecting {
             ArgKind::Column => {
@@ -13059,35 +13074,74 @@ return [
         }
     }
 
-    /// Column literal → the migration line that defines it. A qualified literal
-    /// (`users.id`) carries its own table; otherwise the chain's effective table
-    /// is used (resolved from the model for Eloquent chains).
+    /// Column literal → the migration line(s) that define it, resolved across
+    /// every table the chain can reference (root + joined tables, issue #24).
+    ///
+    /// - A **qualified** literal (`orders.status`, `o.status`) resolves its
+    ///   qualifier (alias or name) to a real table — a single target.
+    /// - A **bare** literal (`status`) is probed against every accessible
+    ///   table. If exactly one defines it, jump there; if several do (an
+    ///   ambiguous column), return them ALL so the editor lets the user pick
+    ///   (the ambiguity diagnostic flags it separately).
     async fn goto_column_definition(
         &self,
         ctx: &laravel_lsp::query_chain::ChainContext,
         value: &str,
         root: &Path,
     ) -> Option<GotoDefinitionResponse> {
-        use laravel_lsp::query_chain::{eloquent_completion, BuilderMode};
+        use laravel_lsp::query_chain::eloquent_completion;
 
-        let (table, column) = match value.rsplit_once('.') {
-            Some((t, c)) => (t.to_string(), c.to_string()),
-            None => {
-                let table = match ctx.mode {
-                    BuilderMode::BaseBuilder => ctx.effective_table.clone()?,
-                    _ => {
-                        let model = ctx.effective_model.as_deref()?;
-                        eloquent_completion::resolve_table_for_model(model, root).await?
-                    }
-                };
-                (table, value.to_string())
-            }
-        };
+        let accessible = Self::accessible_tables_for_goto(ctx, root).await;
+        let candidates = eloquent_completion::goto_column_candidates(&accessible, value);
 
         let guard = self.migration_index.read().await;
-        let site = guard.as_ref()?.column(&table, &column)?.clone();
+        let index = guard.as_ref()?;
+        let links: Vec<LocationLink> = candidates
+            .iter()
+            .filter_map(|(table, column)| index.column(table, column))
+            .filter_map(Self::location_link_from_migration_site)
+            .collect();
         drop(guard);
-        Self::location_from_migration_site(&site)
+        if links.is_empty() {
+            None
+        } else {
+            Some(GotoDefinitionResponse::Link(links))
+        }
+    }
+
+    /// Build the tables a chain can reference columns from, for goto
+    /// resolution: the root (honoring a `from()` override, or the model's
+    /// table for Eloquent chains) plus any joined tables. Mirrors the
+    /// accessible-table model `eloquent_completion` uses for completion.
+    async fn accessible_tables_for_goto(
+        ctx: &laravel_lsp::query_chain::ChainContext,
+        root: &Path,
+    ) -> Vec<laravel_lsp::query_chain::AccessibleTable> {
+        use laravel_lsp::query_chain::{
+            eloquent_completion, AccessibleTable, BuilderMode, FromClause,
+        };
+
+        let mut tables = Vec::new();
+        match &ctx.from_clause {
+            FromClause::Replace(table) => tables.push(table.clone()),
+            FromClause::Opaque => {}
+            FromClause::Inherit => {
+                let root_table = match ctx.mode {
+                    BuilderMode::BaseBuilder => ctx.effective_table.clone(),
+                    _ => match ctx.effective_model.as_deref() {
+                        Some(model) => {
+                            eloquent_completion::resolve_table_for_model(model, root).await
+                        }
+                        None => None,
+                    },
+                };
+                if let Some(table) = root_table {
+                    tables.push(AccessibleTable::bare(table));
+                }
+            }
+        }
+        tables.extend(ctx.joined_tables.iter().cloned());
+        tables
     }
 
     /// Table literal (`DB::table('users')`) → the `Schema::create('users'` line.
@@ -13170,6 +13224,16 @@ return [
     fn location_from_migration_site(
         site: &laravel_lsp::migration_index::MigrationSite,
     ) -> Option<GotoDefinitionResponse> {
+        Self::location_link_from_migration_site(site)
+            .map(|link| GotoDefinitionResponse::Link(vec![link]))
+    }
+
+    /// Build a single `LocationLink` for a migration site. Shared by
+    /// single-target goto and the multi-target ambiguous-column case (issue
+    /// #24), which returns several links so the editor lets the user pick.
+    fn location_link_from_migration_site(
+        site: &laravel_lsp::migration_index::MigrationSite,
+    ) -> Option<LocationLink> {
         let uri = Url::from_file_path(&site.file).ok()?;
         let range = Range {
             start: Position {
@@ -13189,12 +13253,12 @@ return [
             start: range.start,
             end: range.start,
         };
-        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+        Some(LocationLink {
             origin_selection_range: None,
             target_uri: uri,
             target_range: range,
             target_selection_range: caret,
-        }]))
+        })
     }
 
     /// prepare_rename fallback: if the cursor is on a PHP class name that
@@ -17986,6 +18050,11 @@ impl LanguageServer for LaravelLanguageServer {
                 {
                     actions.push(action);
                 }
+                // Ambiguous-column diagnostics offer one "Qualify as `t.col`"
+                // fix per candidate table (issue #24).
+                actions.extend(laravel_lsp::query_chain::code_actions::qualify_actions(
+                    diagnostic, uri,
+                ));
                 if let Some(root) = root {
                     let timestamp =
                         laravel_lsp::query_chain::code_actions::format_migration_timestamp(

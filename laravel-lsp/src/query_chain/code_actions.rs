@@ -34,6 +34,9 @@ struct ChainDiagData {
     replacement: Option<String>,
     replacement_label: Option<String>,
     table: Option<String>,
+    /// For an ambiguous-column diagnostic: the candidate tables (qualifiers)
+    /// the column could belong to, driving one "Qualify as …" fix each.
+    tables: Vec<String>,
 }
 
 /// Pull the `data` payload off a chain diagnostic. Returns `None` for any
@@ -44,13 +47,61 @@ fn parse(diagnostic: &Diagnostic) -> Option<ChainDiagData> {
     }
     let data = diagnostic.data.as_ref()?;
     let str_field = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let tables = data
+        .get("tables")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(ChainDiagData {
         kind: str_field("kind")?,
         name: str_field("name")?,
         replacement: str_field("replacement"),
         replacement_label: str_field("replacementLabel"),
         table: str_field("table"),
+        tables,
     })
+}
+
+/// Build "Qualify as `<table>.<col>`" quick-fixes for an ambiguous-column
+/// diagnostic (issue #24) — one per candidate table. Each replaces the bare
+/// column (the diagnostic's range) with a qualified reference, resolving the
+/// ambiguity. Empty for any non-ambiguity diagnostic.
+pub fn qualify_actions(diagnostic: &Diagnostic, doc_uri: &Url) -> Vec<CodeActionOrCommand> {
+    let Some(data) = parse(diagnostic) else {
+        return Vec::new();
+    };
+    if data.kind != "ambiguous-column" {
+        return Vec::new();
+    }
+    data.tables
+        .iter()
+        .map(|table| {
+            let qualified = format!("{table}.{}", data.name);
+            let mut changes = HashMap::new();
+            changes.insert(
+                doc_uri.clone(),
+                vec![TextEdit {
+                    range: diagnostic.range,
+                    new_text: qualified.clone(),
+                }],
+            );
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Qualify as `{qualified}`"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 /// Build the "Rename to `<suggestion>`" quick-fix for a chain diagnostic, if it

@@ -1,20 +1,21 @@
 //! Build LSP `CompletionItem`s from a resolved [`ChainContext`].
 //!
-//! Three column-completion helpers, picked by `BuilderMode`:
+//! Three column-completion entry points, picked by `BuilderMode`, all funnel
+//! through the shared [`assemble_columns`] multi-table assembler — they differ
+//! only in how the ROOT table and its cast/accessor metadata are resolved:
 //!
-//! - [`columns_raw`] — DB schema only. Used by `BaseBuilder` chains
-//!   (`DB::table(...)` and post-`toBase()` Eloquent chains). No casts, no
-//!   accessors, no relations.
-//! - `columns_for_builder` (Phase 4) — DB columns with cast-aware PHP types
-//!   in `detail`. Eloquent builder pre-execution.
-//! - `columns_for_collection` (Phase 6) — DB columns + accessors + cast
-//!   property names. Eloquent collection post-execution.
+//! - [`columns_raw`] — `BaseBuilder` chains (`DB::table(...)` / post-`toBase()`).
+//!   Schema-only root, no casts, no accessors.
+//! - [`columns_for_builder`] — Eloquent builder pre-execution. Root from the
+//!   model with cast-aware PHP types.
+//! - [`columns_for_collection`] — Eloquent collection post-execution. Adds the
+//!   model's accessors to the root's columns.
 //!
-//! `relations` (Phase 5) — Eloquent-only relation list for `with()` /
-//! `whereHas()` / `load()` etc.
+//! Joined tables (issue #24) are offered as `qualifier.column` in every mode;
+//! a `from()` override replaces the root, `fromRaw`/`fromSub` makes it opaque.
 //!
-//! Phase 3 ships only `columns_raw`. The other functions are stubbed so
-//! their wiring sites can compile against the same module surface.
+//! [`relations`] — Eloquent-only relation list for `with()` / `whereHas()` /
+//! `load()` etc.
 
 use super::chain::*;
 use crate::class_locator::find_php_class_file;
@@ -72,208 +73,458 @@ pub async fn tables(
         .collect()
 }
 
-/// Build column completions for a `BaseBuilder` chain. Reads the schema
-/// directly — no model lookup, no casts, no accessors.
+/// Per-table cast/accessor metadata for building the ROOT table's items.
+/// Base-builder roots (and `from()`-replaced roots) use the empty default —
+/// schema-only, no casts, no accessors. Eloquent roots fill `casts` (column →
+/// raw cast name) and, in collection mode, `accessors`.
+#[derive(Default)]
+struct RootMeta {
+    /// column name → raw cast (e.g. `"array"`), mapped to a PHP type at build.
+    casts: std::collections::HashMap<String, String>,
+    /// (property name, PHP return type) accessor entries — collection mode only.
+    accessors: Vec<(String, String)>,
+}
+
+/// Build column completions for a `BaseBuilder` chain (`DB::table(...)` or a
+/// post-`toBase()` Eloquent chain). Schema-only — no casts, no accessors.
 ///
-/// Returns an empty `Vec` when:
-/// - The context has no `effective_table` (shouldn't happen for Base chains
-///   coming out of the cursor resolver, but guarded for safety)
-/// - The database schema isn't introspected yet (cold start, no DB connection,
-///   or the table doesn't exist in the introspected schema)
+/// Joined tables (issue #24) are offered as `qualifier.column`; `from()`
+/// replaces the root; `fromRaw`/`fromSub` make it opaque. See
+/// [`assemble_columns`] for the full multi-table behavior.
 pub async fn columns_raw(
     ctx: &ChainContext,
     db: &DatabaseSchemaProvider,
     wrap_with_quote: Option<char>,
 ) -> Vec<CompletionItem> {
-    let Some(table) = &ctx.effective_table else {
-        info!("🔗 columns_raw: ctx.effective_table is None — returning 0 items");
-        return Vec::new();
-    };
+    let root = base_root_table(ctx);
+    assemble_columns(
+        db,
+        wrap_with_quote,
+        ctx.dotted_prefix.as_deref(),
+        root.as_ref(),
+        &RootMeta::default(),
+        &ctx.joined_tables,
+    )
+    .await
+}
 
-    let columns = db.get_columns_with_types(table).await;
-    if columns.is_empty() {
+/// Resolve the root (FROM) table for a base-builder chain, honoring any
+/// `from*()` override. `None` means no bare root columns should be offered
+/// (an opaque `fromRaw`/`fromSub`, or no resolvable table at all).
+fn base_root_table(ctx: &ChainContext) -> Option<AccessibleTable> {
+    match &ctx.from_clause {
+        FromClause::Replace(table) => Some(table.clone()),
+        FromClause::Opaque => None,
+        FromClause::Inherit => ctx.effective_table.clone().map(AccessibleTable::bare),
+    }
+}
+
+/// Given a chain's accessible tables and a column literal under the cursor,
+/// produce the ordered `(real_table, column)` candidates to probe for
+/// goto-definition (issue #24).
+///
+/// - **Qualified** (`orders.status`, `o.status`): resolve the qualifier
+///   (alias or table name) through `accessible` to its real table; if nothing
+///   matches, fall back to treating the qualifier as a literal table name
+///   (covers schema-qualified or untracked tables). One candidate.
+/// - **Bare** (`status`): one candidate per accessible table, in order (root
+///   first), so the lookup returns the first table that defines the column.
+///
+/// Pure (no I/O) so the resolution order is unit-testable; the caller probes
+/// each candidate against the migration index and takes the first hit.
+pub fn goto_column_candidates(
+    accessible: &[AccessibleTable],
+    value: &str,
+) -> Vec<(String, String)> {
+    match value.rsplit_once('.') {
+        Some((qualifier, column)) => {
+            let table = accessible
+                .iter()
+                .find(|t| t.qualifier() == qualifier)
+                .map(|t| t.table.clone())
+                .unwrap_or_else(|| qualifier.to_string());
+            vec![(table, column.to_string())]
+        }
+        None => accessible
+            .iter()
+            .map(|t| (t.table.clone(), value.to_string()))
+            .collect(),
+    }
+}
+
+/// Resolve the root table + cast/accessor metadata for an Eloquent chain,
+/// honoring any `from*()` override (issue #24):
+/// - `from('admins')` redirects to a plain schema-only table — the model→table
+///   mapping no longer applies, so casts/accessors are dropped.
+/// - `fromRaw(...)` / `fromSub(...)` (Opaque) leave no root (joined tables
+///   still resolve in [`assemble_columns`]).
+/// - Otherwise the root is the model's table (from `$table` or the
+///   snake-pluralize convention) with its casts, plus accessors when
+///   `want_accessors` (collection mode).
+///
+/// Returns `(None, default)` on any model-resolution failure — the caller then
+/// offers only joined-table columns (or nothing), logging the cause at INFO.
+async fn resolve_eloquent_root(
+    ctx: &ChainContext,
+    project_root: &Path,
+    want_accessors: bool,
+) -> (Option<AccessibleTable>, RootMeta) {
+    match &ctx.from_clause {
+        FromClause::Replace(table) => (Some(table.clone()), RootMeta::default()),
+        FromClause::Opaque => (None, RootMeta::default()),
+        FromClause::Inherit => {
+            let Some(class) = &ctx.effective_model else {
+                info!("🔗 resolve_eloquent_root: ctx.effective_model is None");
+                return (None, RootMeta::default());
+            };
+            let Some(path) = find_php_class_file(class, project_root) else {
+                info!(
+                    "🔗 resolve_eloquent_root: no PHP file found for class {:?} under {:?}",
+                    class, project_root
+                );
+                return (None, RootMeta::default());
+            };
+            // Walk `extends` chains so a child inherits its parent's
+            // `$table`/casts/accessors. Runs the sync walker on a blocking
+            // thread so the LSP runtime stays responsive on slow disks.
+            let path_for_blocking = path.clone();
+            let root_for_blocking = project_root.to_path_buf();
+            let metadata = match tokio::task::spawn_blocking(move || {
+                ModelMetadata::from_file_with_inheritance(&path_for_blocking, &root_for_blocking)
+            })
+            .await
+            {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    info!(
+                        "🔗 resolve_eloquent_root: failed to read/parse {:?} (or no inheritable parent)",
+                        path
+                    );
+                    return (None, RootMeta::default());
+                }
+                Err(err) => {
+                    info!("🔗 resolve_eloquent_root: blocking task panicked: {}", err);
+                    return (None, RootMeta::default());
+                }
+            };
+            let simple_class = class.rsplit('\\').next().unwrap_or(class);
+            let table = metadata
+                .table_name
+                .clone()
+                .unwrap_or_else(|| snake_pluralize(simple_class));
+            let accessors = if want_accessors {
+                metadata
+                    .accessors
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.property_name.clone(),
+                            a.return_type.clone().unwrap_or_else(|| "mixed".to_string()),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (
+                Some(AccessibleTable::bare(table)),
+                RootMeta {
+                    casts: metadata.casts,
+                    accessors,
+                },
+            )
+        }
+    }
+}
+
+/// Assemble multi-table column completions, shared by every builder mode.
+///
+/// - **No `dotted_prefix`**: bare columns for the root table, plus
+///   `qualifier.column` for every accessible table (root + joined) once joins
+///   make qualification meaningful — so a join-free query stays bare-only.
+///   Root accessors (collection mode) are appended bare.
+/// - **`dotted_prefix = Some(qual)`** (`where('orders.|')`): narrow to the one
+///   accessible table whose qualifier (alias or name) matches `qual`; columns
+///   insert bare because the `qualifier.` is already typed.
+///
+/// `root_meta` carries cast/accessor info for the root; joined tables are
+/// always schema-only (there's no model behind them).
+async fn assemble_columns(
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+    dotted_prefix: Option<&str>,
+    root: Option<&AccessibleTable>,
+    root_meta: &RootMeta,
+    joined: &[AccessibleTable],
+) -> Vec<CompletionItem> {
+    // Narrowing: the user typed `qualifier.` — resolve it to one table.
+    if let Some(qualifier) = dotted_prefix {
+        if let Some(r) = root {
+            if r.qualifier() == qualifier {
+                return build_table_items(db, wrap_with_quote, r, root_meta, ColEmit::Narrow).await;
+            }
+        }
+        if let Some(jt) = joined.iter().find(|t| t.qualifier() == qualifier) {
+            return build_table_items(
+                db,
+                wrap_with_quote,
+                jt,
+                &RootMeta::default(),
+                ColEmit::Narrow,
+            )
+            .await;
+        }
         info!(
-            "🔗 columns_raw: get_columns_with_types({:?}) returned 0 columns \
-             (schema cache may not have this table, or DB not yet warmed)",
-            table
+            "🔗 assemble_columns: qualifier {:?} matches no accessible table — returning 0 items",
+            qualifier
+        );
+        return Vec::new();
+    }
+
+    let has_joins = !joined.is_empty();
+    let mut items = Vec::new();
+    if let Some(r) = root {
+        let emit = if has_joins {
+            ColEmit::BareAndQualified
+        } else {
+            ColEmit::BareOnly
+        };
+        items.extend(build_table_items(db, wrap_with_quote, r, root_meta, emit).await);
+    }
+    for jt in joined {
+        items.extend(
+            build_table_items(
+                db,
+                wrap_with_quote,
+                jt,
+                &RootMeta::default(),
+                ColEmit::QualifiedOnly,
+            )
+            .await,
         );
     }
-    columns
-        .into_iter()
-        .map(|(name, php_type)| {
-            let insert_text = match wrap_with_quote {
-                Some(q) => format!("{q}{name}{q}"),
-                None => name.clone(),
-            };
-            CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                // Use `label_details` (LSP 3.17) so the type renders right
-                // next to the column name (e.g., "email   string") and the
-                // source table renders as a dimmer suffix on the right
-                // ("from users"). Editors that support it (Zed, VS Code)
-                // render each piece distinctly; older clients fall back to
-                // `detail` below, which we still set as a single-string
-                // approximation.
-                label_details: Some(CompletionItemLabelDetails {
-                    detail: Some(format!("  {php_type}")),
-                    description: Some(table.clone()),
-                }),
-                detail: Some(format!("{php_type} ({table})")),
-                documentation: Some(
-                    CompletionDoc::new()
-                        .header(format!("{}.{}", table, name))
-                        .summary(format!("Database column of type `{}`.", php_type))
-                        .into_documentation(),
-                ),
-                // DB columns rank first; later modes will add accessors at
-                // sort_text = "2_…" so columns still rank above them.
-                sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name.clone()),
-                insert_text: Some(insert_text),
-                ..Default::default()
+    if items.is_empty() {
+        info!("🔗 assemble_columns: no accessible tables/columns resolved — returning 0 items");
+    }
+    items
+}
+
+/// Which item variants [`build_table_items`] emits for one table.
+#[derive(Clone, Copy)]
+enum ColEmit {
+    /// Bare columns only — the narrowed `qualifier.|` case (the qualifier is
+    /// already typed). Accessors are NOT included (they're not table-qualified).
+    Narrow,
+    /// Bare columns + accessors — the root of a join-free query.
+    BareOnly,
+    /// Bare + `qualifier.column` columns + accessors — the root when joins are
+    /// present.
+    BareAndQualified,
+    /// `qualifier.column` only, no accessors — a joined table.
+    QualifiedOnly,
+}
+
+/// Fetch one table's columns and emit completion items per `emit`, applying
+/// `meta`'s casts (and accessors, when listing the root fully).
+async fn build_table_items(
+    db: &DatabaseSchemaProvider,
+    wrap_with_quote: Option<char>,
+    table: &AccessibleTable,
+    meta: &RootMeta,
+    emit: ColEmit,
+) -> Vec<CompletionItem> {
+    // Virtual (subquery) tables carry their columns directly — the SELECT
+    // list, with no DB types known (so `mixed`). Real tables hit the schema.
+    let columns: Vec<(String, String)> = match &table.virtual_columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| (c.clone(), "mixed".to_string()))
+            .collect(),
+        None => db.get_columns_with_types(&table.table).await,
+    };
+    if columns.is_empty() {
+        info!(
+            "🔗 build_table_items: get_columns_with_types({:?}) returned 0 columns \
+             (schema cache may not have this table, or DB not yet warmed)",
+            table.table
+        );
+    }
+    let mut items = Vec::new();
+    for (name, sql_php_type) in &columns {
+        // Cast override: if the model declares a cast for this column, its PHP
+        // type wins (a JSON column with `'options' => 'array'` shows `array`).
+        let (php_type, has_cast) = match meta.casts.get(name) {
+            Some(cast) => (map_cast_to_php_type(cast), true),
+            None => (sql_php_type.clone(), false),
+        };
+        match emit {
+            ColEmit::Narrow | ColEmit::BareOnly => {
+                items.push(col_item(
+                    name,
+                    &php_type,
+                    &table.table,
+                    None,
+                    has_cast,
+                    wrap_with_quote,
+                    1,
+                ));
             }
-        })
-        .collect()
+            ColEmit::QualifiedOnly => {
+                items.push(col_item(
+                    name,
+                    &php_type,
+                    &table.table,
+                    Some(table.qualifier()),
+                    has_cast,
+                    wrap_with_quote,
+                    2,
+                ));
+            }
+            ColEmit::BareAndQualified => {
+                items.push(col_item(
+                    name,
+                    &php_type,
+                    &table.table,
+                    None,
+                    has_cast,
+                    wrap_with_quote,
+                    1,
+                ));
+                items.push(col_item(
+                    name,
+                    &php_type,
+                    &table.table,
+                    Some(table.qualifier()),
+                    has_cast,
+                    wrap_with_quote,
+                    2,
+                ));
+            }
+        }
+    }
+    // Accessors only when listing the root fully — never narrowed (not
+    // table-qualified) and never for joined tables (no model behind them).
+    if matches!(emit, ColEmit::BareOnly | ColEmit::BareAndQualified) {
+        for (name, php_type) in &meta.accessors {
+            items.push(accessor_item(name, php_type, wrap_with_quote));
+        }
+    }
+    items
+}
+
+/// Build a column completion item.
+///
+/// - `qualifier = None` → bare item (`label`/`insert` = `name`).
+/// - `qualifier = Some(q)` → qualified item (`label`/`insert` = `q.name`).
+///
+/// `has_cast` annotates the type with `· cast` when a model cast overrode the
+/// raw SQL type. `sort_rank` groups items (1 = bare, 2 = qualified) so bare
+/// columns surface first.
+fn col_item(
+    name: &str,
+    php_type: &str,
+    source_table: &str,
+    qualifier: Option<&str>,
+    has_cast: bool,
+    wrap_with_quote: Option<char>,
+    sort_rank: u8,
+) -> CompletionItem {
+    let text = match qualifier {
+        Some(q) => format!("{q}.{name}"),
+        None => name.to_string(),
+    };
+    let insert_text = match wrap_with_quote {
+        Some(quote) => format!("{quote}{text}{quote}"),
+        None => text.clone(),
+    };
+    let detail_suffix = if has_cast { " · cast" } else { "" };
+    let summary = if has_cast {
+        format!("Database column of type `{php_type}` (overridden by model cast).")
+    } else {
+        format!("Database column of type `{php_type}`.")
+    };
+    CompletionItem {
+        label: text.clone(),
+        kind: Some(CompletionItemKind::FIELD),
+        // Use `label_details` (LSP 3.17) so the type renders right next to the
+        // column name and the source table renders as a dimmer suffix on the
+        // right. Older clients fall back to `detail`.
+        label_details: Some(CompletionItemLabelDetails {
+            detail: Some(format!("  {php_type}{detail_suffix}")),
+            description: Some(source_table.to_string()),
+        }),
+        detail: Some(format!("{php_type}{detail_suffix} ({source_table})")),
+        documentation: Some(
+            CompletionDoc::new()
+                .header(format!("{source_table}.{name}"))
+                .summary(summary)
+                .into_documentation(),
+        ),
+        sort_text: Some(format!("{sort_rank}_{text}")),
+        filter_text: Some(text.clone()),
+        insert_text: Some(insert_text),
+        ..Default::default()
+    }
+}
+
+/// Build a model-accessor completion item (collection mode). Accessors are
+/// in-memory computed properties, so they're kinded `PROPERTY` and ranked
+/// after DB columns (`2_`).
+fn accessor_item(name: &str, php_type: &str, wrap_with_quote: Option<char>) -> CompletionItem {
+    let insert_text = match wrap_with_quote {
+        Some(quote) => format!("{quote}{name}{quote}"),
+        None => name.to_string(),
+    };
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::PROPERTY),
+        label_details: Some(CompletionItemLabelDetails {
+            detail: Some(format!("  {php_type}")),
+            description: Some("accessor".to_string()),
+        }),
+        detail: Some(format!("{php_type} (accessor)")),
+        documentation: Some(
+            CompletionDoc::new()
+                .header(name)
+                .summary(format!("Model accessor returning `{php_type}`."))
+                .into_documentation(),
+        ),
+        sort_text: Some(format!("2_{name}")),
+        filter_text: Some(name.to_string()),
+        insert_text: Some(insert_text),
+        ..Default::default()
+    }
 }
 
 /// Build column completions for an `EloquentBuilder` chain — a chain rooted
 /// at a static call on a model class (`User::where('|')`, `User::query()->
 /// where('|')`, `User::firstWhere('|')`, etc.).
 ///
-/// Two extra hops compared to [`columns_raw`]:
-/// 1. Resolve the class FQCN in `ctx.effective_model` to a model file path
-///    (uses [`find_php_class_file`]) and parse it to a [`ModelMetadata`].
-/// 2. Determine the table: prefer the model's `$table` property, else
-///    snake-pluralize the class basename (Laravel convention).
+/// The root table comes from the model (`$table` or the snake-pluralize
+/// convention) with cast-aware PHP types — a column's model cast wins over the
+/// raw SQL→PHP mapping and is annotated `· cast`. Joined tables (issue #24)
+/// are offered as `qualifier.column` (schema-only), and a `from()` override
+/// redirects the root; see [`resolve_eloquent_root`] and [`assemble_columns`].
 ///
-/// Once the table is known, fetch DB columns and apply cast-aware PHP types
-/// — if the model has a cast for a column, the cast's PHP type wins over
-/// the raw SQL → PHP mapping. The cast is also surfaced in `label_details`
-/// so the user can tell at a glance which columns are auto-cast.
-///
-/// Returns an empty `Vec` for any of the failure modes (model not found,
-/// not actually an Eloquent model, table missing from DB schema, etc.) and
-/// logs the cause at INFO so the LSP log is the source of truth for "why
-/// did completion produce nothing here?"
+/// Returns an empty `Vec` for failure modes (model not found, table missing
+/// from the DB schema, …) when there are no joined tables to fall back on;
+/// the cause is logged at INFO.
 pub async fn columns_for_builder(
     ctx: &ChainContext,
     db: &DatabaseSchemaProvider,
     wrap_with_quote: Option<char>,
     project_root: &Path,
 ) -> Vec<CompletionItem> {
-    let Some(class) = &ctx.effective_model else {
-        info!("🔗 columns_for_builder: ctx.effective_model is None — returning 0 items");
-        return Vec::new();
-    };
-
-    // Resolve class FQCN → file path.
-    let Some(path) = find_php_class_file(class, project_root) else {
-        info!(
-            "🔗 columns_for_builder: no PHP file found for class {:?} under {:?}",
-            class, project_root
-        );
-        return Vec::new();
-    };
-
-    // Read + parse to ModelMetadata, walking `extends` chains so the
-    // child inherits its parent's `$table` / casts / accessors /
-    // relationships when it doesn't declare them itself. Runs the sync
-    // walker on a blocking thread so the LSP runtime stays responsive
-    // even for deep inheritance trees on slow disks.
-    let path_for_blocking = path.clone();
-    let root_for_blocking = project_root.to_path_buf();
-    let metadata = match tokio::task::spawn_blocking(move || {
-        ModelMetadata::from_file_with_inheritance(&path_for_blocking, &root_for_blocking)
-    })
+    let (root, meta) = resolve_eloquent_root(ctx, project_root, false).await;
+    assemble_columns(
+        db,
+        wrap_with_quote,
+        ctx.dotted_prefix.as_deref(),
+        root.as_ref(),
+        &meta,
+        &ctx.joined_tables,
+    )
     .await
-    {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            info!(
-                "🔗 columns_for_builder: failed to read/parse {:?} (or no inheritable parent found)",
-                path
-            );
-            return Vec::new();
-        }
-        Err(err) => {
-            info!("🔗 columns_for_builder: blocking task panicked: {}", err);
-            return Vec::new();
-        }
-    };
-
-    // Resolve the table: prefer `$table`, fall back to Laravel's
-    // snake_case + pluralize convention on the class basename. Naive plural
-    // rules — covers >95% of real models. Custom-pluralized models declare
-    // `$table` explicitly.
-    let simple_class = class.rsplit('\\').next().unwrap_or(class);
-    let table = metadata
-        .table_name
-        .clone()
-        .unwrap_or_else(|| snake_pluralize(simple_class));
-
-    let columns = db.get_columns_with_types(&table).await;
-    if columns.is_empty() {
-        info!(
-            "🔗 columns_for_builder: get_columns_with_types({:?}) returned 0 columns \
-             (model class {:?}, resolved file {:?}, table derived from {})",
-            table,
-            class,
-            path,
-            if metadata.table_name.is_some() {
-                "$table property"
-            } else {
-                "snake_pluralize convention"
-            }
-        );
-    }
-
-    columns
-        .into_iter()
-        .map(|(name, sql_php_type)| {
-            // Cast override: if the model declares a cast for this column,
-            // its PHP type wins. Example: a JSON column with
-            // `'options' => 'array'` cast surfaces as `array`, not `string`.
-            let (php_type, has_cast) = match metadata.casts.get(&name) {
-                Some(cast) => (map_cast_to_php_type(cast), true),
-                None => (sql_php_type, false),
-            };
-            let insert_text = match wrap_with_quote {
-                Some(q) => format!("{q}{name}{q}"),
-                None => name.clone(),
-            };
-            // Annotate cast-overridden types so the user can tell at a
-            // glance which columns are model-cast vs raw DB-typed.
-            let detail_suffix = if has_cast { " · cast" } else { "" };
-            let summary = if has_cast {
-                format!(
-                    "Database column of type `{}` (overridden by model cast).",
-                    php_type
-                )
-            } else {
-                format!("Database column of type `{}`.", php_type)
-            };
-            CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                label_details: Some(CompletionItemLabelDetails {
-                    detail: Some(format!("  {php_type}{detail_suffix}")),
-                    description: Some(table.clone()),
-                }),
-                detail: Some(format!("{php_type}{detail_suffix} ({table})")),
-                documentation: Some(
-                    CompletionDoc::new()
-                        .header(format!("{}.{}", table, name))
-                        .summary(summary)
-                        .into_documentation(),
-                ),
-                sort_text: Some(format!("1_{name}")),
-                filter_text: Some(name.clone()),
-                insert_text: Some(insert_text),
-                ..Default::default()
-            }
-        })
-        .collect()
 }
 
 /// Build relation completions for an `EloquentBuilder` chain — the first
@@ -515,6 +766,27 @@ pub async fn resolve_table_for_model(class: &str, project_root: &Path) -> Option
     )
 }
 
+/// Fold a join closure's Eloquent *parent* table into the accessible set
+/// (issue #24). When the cursor is inside `User::query()->join('orders',
+/// fn ($join) => …)`, the parent model's table can't be resolved
+/// synchronously, so the cursor resolver leaves it in `ctx.join_parent_model`.
+/// Consumers (completion, diagnostics, goto) call this to resolve it (async)
+/// and append it to `joined_tables`, so the parent side of an ON clause
+/// (`$join->on('orders.id', '=', 'users.|')`) completes. No-op when the field
+/// is unset.
+pub async fn enrich_join_parent_tables(ctx: &mut ChainContext, project_root: &Path) {
+    let Some(model) = ctx.join_parent_model.take() else {
+        return;
+    };
+    let Some(table) = resolve_table_for_model(&model, project_root).await else {
+        return;
+    };
+    // Dedup by qualifier — don't double-list a table already accessible.
+    if ctx.joined_tables.iter().all(|t| t.qualifier() != table) {
+        ctx.joined_tables.push(AccessibleTable::bare(table));
+    }
+}
+
 /// Phase 6: column completion for an `EloquentCollection` chain — a
 /// chain that's been executed via `->get()` / `->all()` / `->pluck()` /
 /// `->cursor()` etc. After execution, the result is a hydrated
@@ -524,72 +796,26 @@ pub async fn resolve_table_for_model(class: &str, project_root: &Path) -> Option
 /// args even though they don't exist as DB columns.
 ///
 /// Returns DB columns (with cast-aware types) FIRST, then accessor items
-/// after them via sort_text ordering. Accessors are kinded as `PROPERTY`
-/// to visually distinguish them from `FIELD` DB columns.
+/// after them via sort_text ordering (`1_` vs `2_`). Joined-table columns
+/// (issue #24) are offered as `qualifier.column`, same as builder mode.
 pub async fn columns_for_collection(
     ctx: &ChainContext,
     db: &DatabaseSchemaProvider,
     wrap_with_quote: Option<char>,
     project_root: &Path,
 ) -> Vec<CompletionItem> {
-    // Start with DB columns + cast-aware types — same set the builder
-    // mode returns. Collection adds to this; doesn't replace.
-    let mut items = columns_for_builder(ctx, db, wrap_with_quote, project_root).await;
-
-    // Add accessors. Read metadata again (cheap: OS cache + tokio
-    // blocking pool); we don't plumb metadata through columns_for_builder's
-    // return since the helper's signature is shaped for the pre-execution
-    // case where accessors don't apply.
-    let Some(class) = &ctx.effective_model else {
-        return items;
-    };
-    let Some(path) = find_php_class_file(class, project_root) else {
-        return items;
-    };
-    let path_clone = path.clone();
-    let root_clone = project_root.to_path_buf();
-    let metadata = match tokio::task::spawn_blocking(move || {
-        ModelMetadata::from_file_with_inheritance(&path_clone, &root_clone)
-    })
+    // `want_accessors = true`: the root's accessors join its DB columns in the
+    // assembled set (they're valid in-memory `where()` args post-execution).
+    let (root, meta) = resolve_eloquent_root(ctx, project_root, true).await;
+    assemble_columns(
+        db,
+        wrap_with_quote,
+        ctx.dotted_prefix.as_deref(),
+        root.as_ref(),
+        &meta,
+        &ctx.joined_tables,
+    )
     .await
-    {
-        Ok(Some(m)) => m,
-        _ => return items,
-    };
-
-    for accessor in metadata.accessors {
-        let name = accessor.property_name;
-        let php_type = accessor.return_type.unwrap_or_else(|| "mixed".to_string());
-        let insert_text = match wrap_with_quote {
-            Some(q) => format!("{q}{name}{q}"),
-            None => name.clone(),
-        };
-        items.push(CompletionItem {
-            label: name.clone(),
-            // PROPERTY kind — semantically "computed property of the
-            // hydrated model", distinct from FIELD (DB column).
-            kind: Some(CompletionItemKind::PROPERTY),
-            label_details: Some(CompletionItemLabelDetails {
-                detail: Some(format!("  {php_type}")),
-                description: Some("accessor".to_string()),
-            }),
-            detail: Some(format!("{php_type} (accessor)")),
-            documentation: Some(
-                CompletionDoc::new()
-                    .header(&name)
-                    .summary(format!("Model accessor returning `{}`.", php_type))
-                    .into_documentation(),
-            ),
-            // Sort AFTER DB columns (which use "1_…"). When the popup
-            // is fuzzy-filtered the explicit DB columns rank first.
-            sort_text: Some(format!("2_{name}")),
-            filter_text: Some(name.clone()),
-            insert_text: Some(insert_text),
-            ..Default::default()
-        });
-    }
-
-    items
 }
 
 /// Convert a PascalCase class basename to Laravel's default table name:

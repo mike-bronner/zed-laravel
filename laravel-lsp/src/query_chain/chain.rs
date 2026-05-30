@@ -52,6 +52,13 @@ pub enum ClosureScopeKind {
     /// `where(closure)` / `when($cond, closure)` / `having(closure)` /
     /// `tap(closure)` etc. — bind to the same model as the outer chain.
     SameModel,
+    /// `join('orders', fn ($join) => …)` — `$join` is a `JoinClause` builder
+    /// rooted at the joined table (issue #24). `table_ref` is the raw
+    /// first-arg string (`"orders"`, `"orders as o"`, `"mydb.orders"`); the
+    /// cursor resolver parses it to an [`AccessibleTable`] and models it as a
+    /// `from()` override so column completion inside the closure resolves
+    /// against that table (alias included).
+    JoinTable { table_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -91,6 +98,14 @@ pub struct ChainLink {
     pub effect: ChainEffect,
     pub span_byte_range: (usize, usize),
     pub args: Vec<ChainArg>,
+    /// For subquery methods (`fromSub`/`joinSub`/lateral, issue #24): the
+    /// column names the subquery's SELECT list exposes, extracted from the
+    /// first argument's AST at parse time (the cursor resolver only sees
+    /// [`ChainArg`]s, which don't carry the nested selects). `None` for every
+    /// other method; `Some(empty)` when the subquery has no resolvable SELECT
+    /// (e.g. `select('*')`), meaning the virtual table is opaque.
+    #[serde(default)]
+    pub subquery_columns: Option<Vec<String>>,
 }
 
 /// What kind of argument the cursor's link expects. Used at the cursor only —
@@ -170,6 +185,109 @@ pub struct ClosureParam {
     pub php_type: Option<String>,
 }
 
+/// A table reachable for column references within a chain — either the root
+/// (the receiver, or a `from()` replacement) or one made available by a
+/// join. Carries the real schema name (used to fetch columns) separately
+/// from the alias the user types, so `join('users as u', …)` offers `u.*`
+/// while looking columns up under `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessibleTable {
+    /// Real table name as it appears in the database. May be schema-qualified
+    /// (`mydb.orders`) for cross-database joins; column lookup passes it
+    /// through to the schema provider, which resolves it best-effort. For a
+    /// virtual (subquery) table this holds the alias — there's no real table,
+    /// so [`virtual_columns`](Self::virtual_columns) supplies the columns.
+    pub table: String,
+    /// Alias the user references columns by — `u` from `users as u`, or a
+    /// subquery alias. `None` for a plain `join('orders', …)`, where the
+    /// qualifier IS the table name.
+    pub alias: Option<String>,
+    /// For virtual tables synthesized from a subquery (`fromSub`/`joinSub`,
+    /// issue #24): the columns the subquery's SELECT list exposes. `Some` →
+    /// completion/validation use these instead of a DB schema lookup. `None`
+    /// for ordinary tables backed by the database.
+    pub virtual_columns: Option<Vec<String>>,
+}
+
+impl AccessibleTable {
+    /// Construct an unaliased, database-backed accessible table from a bare
+    /// name.
+    pub fn bare(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            alias: None,
+            virtual_columns: None,
+        }
+    }
+
+    /// Construct a virtual (subquery) table: the `alias` is both the qualifier
+    /// and the stored name, and `columns` are the subquery's SELECT list.
+    pub fn virtual_table(alias: impl Into<String>, columns: Vec<String>) -> Self {
+        Self {
+            table: alias.into(),
+            alias: None,
+            virtual_columns: Some(columns),
+        }
+    }
+
+    /// The qualifier the user types before a column: the alias if present,
+    /// else the table name. For a schema-qualified table with no alias this
+    /// is the full `mydb.orders`; for a virtual table it's the subquery alias.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table)
+    }
+}
+
+/// Parse a Laravel table reference string into an [`AccessibleTable`].
+///
+/// Handles the three shapes that appear in `join()` / `from()` arguments:
+/// - `'orders'` → table `orders`, no alias
+/// - `'mydb.orders'` → schema-qualified table `mydb.orders`, no alias
+/// - `'users as u'` / `'users AS u'` → table `users`, alias `u`
+/// - `'users u'` → implicit alias (MySQL-style), table `users`, alias `u`
+///
+/// The `as` keyword is matched case-insensitively. The table portion is kept
+/// verbatim (dots and all) so schema qualifiers survive to the column lookup.
+pub fn parse_table_ref(raw: &str) -> AccessibleTable {
+    let trimmed = raw.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    match tokens.as_slice() {
+        // `table as alias`
+        [table, kw, alias] if kw.eq_ignore_ascii_case("as") => AccessibleTable {
+            table: (*table).to_string(),
+            alias: Some((*alias).to_string()),
+            virtual_columns: None,
+        },
+        // `table alias` (implicit alias)
+        [table, alias] => AccessibleTable {
+            table: (*table).to_string(),
+            alias: Some((*alias).to_string()),
+            virtual_columns: None,
+        },
+        // `table` (no alias) — also the fallback for any unexpected shape,
+        // where keeping the whole trimmed string as the table name is the
+        // least-surprising behavior.
+        _ => AccessibleTable::bare(trimmed.to_string()),
+    }
+}
+
+/// How the chain's root (FROM) table is determined, after accounting for any
+/// receiver-replacing `from*()` call in the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromClause {
+    /// No `from*()` override — the root is the receiver's table (`DB::table`)
+    /// or the model's table (Eloquent).
+    Inherit,
+    /// `from('admins')` / `from('admins as a')` replaced the root with a
+    /// concrete table. Columns come from the schema only (no model casts —
+    /// the model→table mapping no longer applies once `from()` redirects it).
+    Replace(AccessibleTable),
+    /// `fromRaw(...)` (and, until Phase 4, `fromSub(...)`) made the root an
+    /// opaque expression — no bare root columns can be offered, though any
+    /// joined tables remain valid.
+    Opaque,
+}
+
 /// Completion-time context produced fresh from a `BuilderChain` plus a cursor
 /// position. Not stored — recomputed on each completion request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,10 +304,35 @@ pub struct ChainContext {
     /// completion; `ClosureCarrier` is handled by closure-scope descent;
     /// `None` means no completion.
     pub expecting: ArgKind,
-    /// For dotted relation paths like `with('posts.author.|')`, the prefix the
-    /// user has already typed after the last dot. Completion items filter
-    /// against this and `insert_text` is just the current segment.
+    /// Everything the user has typed before the last dot of the literal under
+    /// the cursor. Two meanings depending on `expecting`:
+    /// - **Relation** (`with('posts.author.|')`) — the relation segments to
+    ///   walk; the final model's relations are then offered.
+    /// - **Column** (`where('orders.|')`) — the table qualifier (alias or
+    ///   table name) the column belongs to; completion narrows to that one
+    ///   table's columns.
     pub dotted_prefix: Option<String>,
+    /// Tables made accessible by `join()`-family calls, in source order.
+    /// Global to the chain — Laravel compiles the whole chain into one SQL
+    /// query regardless of textual order, so a join anywhere in the chain
+    /// makes its table referenceable everywhere. Columns from these are
+    /// offered as `qualifier.column`.
+    ///
+    /// Inside a join closure (`join('orders', fn ($join) => …)`) this also
+    /// carries the *parent* query's accessible tables that resolve
+    /// synchronously (a `DB::table()` / `from()` root and the parent's other
+    /// joins), so both sides of an ON clause complete.
+    pub joined_tables: Vec<AccessibleTable>,
+    /// Whether a `from*()` call replaced or obscured the chain's root table.
+    /// `Inherit` for the common case (no `from()` override).
+    pub from_clause: FromClause,
+    /// Inside a join closure whose *parent* query is rooted at an Eloquent
+    /// model (`User::query()->join('orders', fn ($join) => …)`), the parent
+    /// model's FQCN. Its table needs async model→table resolution, so the
+    /// cursor resolver can't add it to `joined_tables` synchronously —
+    /// consumers resolve it and fold it into the accessible set (mirrors how
+    /// `closure_relation_hop` defers a relation hop). `None` otherwise.
+    pub join_parent_model: Option<String>,
     /// Set when the chain is inside a recognized relation closure
     /// (`whereHas('posts', fn ($q) => $q->where('|'))` or
     /// `with(['posts' => fn ($q) => $q->where('|')])`). When `Some(rel)`,
@@ -215,3 +358,6 @@ pub enum BuilderMode {
     /// via `load()`.
     EloquentCollection,
 }
+
+#[cfg(test)]
+mod tests;

@@ -664,14 +664,16 @@ fn dotted_relation_path_no_dot_means_no_prefix() {
 }
 
 #[test]
-fn dotted_path_only_applies_to_relation_args_not_columns() {
-    // `User::where('a.b|', 1)` — column args don't have dotted-path
-    // semantics. We should NOT set dotted_prefix here.
+fn dotted_column_sets_qualifier_prefix() {
+    // `User::where('a.b|', 1)` — issue #24: a dotted column carries a table
+    // qualifier ("a"), so completion can narrow to that one table. The
+    // segment after the last dot is the typing prefix the editor filters on.
     let ctx = detect("User::where('a.b|', 1);").expect("ctx");
     assert_eq!(ctx.expecting, ArgKind::Column);
-    assert!(
-        ctx.dotted_prefix.is_none(),
-        "dotted prefix should only fire for Relation/ClosureCarrier args"
+    assert_eq!(
+        ctx.dotted_prefix.as_deref(),
+        Some("a"),
+        "dotted column should expose its table qualifier as the dotted prefix"
     );
 }
 
@@ -879,4 +881,354 @@ fn position_byte_round_trip_is_stable() {
             position_to_byte_offset(content, pos.line, pos.character).expect("round-trip offset");
         assert_eq!(back, byte, "round-trip failed for byte {byte}");
     }
+}
+
+// ---- accessible-table scan: joins + from*() (issue #24) ----------------
+
+#[test]
+fn join_adds_accessible_table() {
+    let ctx = detect(
+        "DB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('emai|l');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.joined_tables.len(), 1);
+    assert_eq!(ctx.joined_tables[0].table, "orders");
+    assert_eq!(ctx.joined_tables[0].alias, None);
+    assert_eq!(ctx.from_clause, FromClause::Inherit);
+}
+
+#[test]
+fn multiple_joins_compose() {
+    let ctx = detect(
+        "DB::table('users')\
+         ->join('orders', 'orders.user_id', '=', 'users.id')\
+         ->leftJoin('roles', 'roles.id', '=', 'users.role_id')\
+         ->where('|');",
+    )
+    .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(tables, vec!["orders", "roles"]);
+}
+
+#[test]
+fn join_visibility_is_global_even_before_the_join() {
+    // The cursor sits in a `where` that textually PRECEDES the join. Global
+    // visibility means the joined table is still accessible.
+    let ctx = detect(
+        "DB::table('users')->where('|')->join('orders', 'orders.user_id', '=', 'users.id');",
+    )
+    .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(tables, vec!["orders"]);
+}
+
+#[test]
+fn aliased_join_captures_table_and_alias() {
+    let ctx = detect(
+        "DB::table('users')->join('orders as o', 'o.user_id', '=', 'users.id')->where('|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.joined_tables[0].table, "orders");
+    assert_eq!(ctx.joined_tables[0].alias.as_deref(), Some("o"));
+    assert_eq!(ctx.joined_tables[0].qualifier(), "o");
+}
+
+#[test]
+fn cross_join_is_tracked() {
+    let ctx = detect("DB::table('users')->crossJoin('roles')->where('|');").expect("ctx");
+    assert_eq!(ctx.joined_tables[0].table, "roles");
+}
+
+#[test]
+fn closure_form_join_still_captures_table_from_first_arg() {
+    // The closure is the 2nd arg; the table name is still the first string.
+    let ctx = detect(
+        "DB::table('users')->join('orders', function ($join) { $join->on('a', '=', 'b'); })->where('|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.joined_tables[0].table, "orders");
+}
+
+#[test]
+fn from_replace_sets_from_clause() {
+    let ctx = detect("DB::table('users')->from('admins')->where('|');").expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("admins"))
+    );
+}
+
+#[test]
+fn from_raw_is_opaque() {
+    let ctx = detect("DB::table('users')->fromRaw('(select 1)')->where('|');").expect("ctx");
+    assert_eq!(ctx.from_clause, FromClause::Opaque);
+}
+
+#[test]
+fn last_from_wins() {
+    let ctx =
+        detect("DB::table('users')->from('admins')->from('managers')->where('|');").expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("managers"))
+    );
+}
+
+#[test]
+fn column_qualifier_populates_dotted_prefix() {
+    // `where('orders.|')` — the table qualifier becomes the dotted prefix so
+    // completion can narrow to that one table.
+    let ctx = detect("DB::table('users')->join('orders', 'a', '=', 'b')->where('orders.sta|');")
+        .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("orders"));
+}
+
+#[test]
+fn unqualified_column_has_no_dotted_prefix() {
+    let ctx = detect("DB::table('users')->where('emai|l');").expect("ctx");
+    assert_eq!(ctx.dotted_prefix, None);
+}
+
+#[test]
+fn plain_chain_has_no_accessible_extras() {
+    let ctx = detect("DB::table('users')->where('|');").expect("ctx");
+    assert!(ctx.joined_tables.is_empty());
+    assert_eq!(ctx.from_clause, FromClause::Inherit);
+}
+
+// ---- table-name completion inside join/from args (issue #24) -----------
+
+#[test]
+fn cross_join_first_arg_expects_table() {
+    // `crossJoin('|')` should offer table names, same as `DB::table('|')`.
+    let ctx = detect("DB::table('users')->crossJoin('|');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Table);
+}
+
+#[test]
+fn join_first_arg_expects_table() {
+    let ctx = detect("DB::table('users')->join('|', 'a', '=', 'b');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Table);
+}
+
+#[test]
+fn from_first_arg_expects_table() {
+    let ctx = detect("DB::table('users')->from('|');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Table);
+}
+
+#[test]
+fn join_condition_arg_expects_column_not_table() {
+    // The 2nd arg of join is an ON column — column completion, not table.
+    let ctx = detect("DB::table('users')->join('orders', 'col|', '=', 'b');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+}
+
+#[test]
+fn join_condition_qualified_column_narrows_to_that_table() {
+    // `join('orders', 'orders.|', …)` — the ON column references `orders`, so
+    // the qualifier becomes the dotted prefix and completion narrows to it.
+    let ctx =
+        detect("DB::table('users')->join('orders', 'orders.us|', '=', 'users.id');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("orders"));
+    // The joined table is accessible from inside its own ON clause.
+    assert!(ctx.joined_tables.iter().any(|t| t.table == "orders"));
+}
+
+#[test]
+fn join_second_condition_column_also_completes() {
+    // The 4th arg (second ON column) references the root table.
+    let ctx = detect("DB::table('users')->join('orders', 'orders.user_id', '=', 'users.i|');")
+        .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("users"));
+}
+
+#[test]
+fn db_table_still_expects_table() {
+    // Regression guard: the original `DB::table('|')` path is unaffected.
+    let ctx = detect("DB::table('|');").expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Table);
+}
+
+// ---- closure-form joins (issue #24, Phase 3) --------------------------
+
+#[test]
+fn join_closure_binds_receiver_to_joined_table() {
+    // Inside `join('orders', fn ($join) => $join->where('|'))`, `$join` is a
+    // builder rooted at orders — modeled as a from() override.
+    let ctx =
+        detect("DB::table('users')->join('orders', function ($join) { $join->where('|'); });")
+            .expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_closure_arrow_fn_form() {
+    let ctx = detect("DB::table('users')->join('orders', fn ($join) => $join->where('|'));")
+        .expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_closure_aliased_table_narrows_on_alias() {
+    let ctx = detect(
+        "DB::table('users')->join('orders as o', function ($join) { $join->where('o.sta|'); });",
+    )
+    .expect("ctx");
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable {
+            table: "orders".to_string(),
+            alias: Some("o".to_string()),
+            virtual_columns: None,
+        })
+    );
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("o"));
+}
+
+#[test]
+fn join_closure_on_eloquent_parent_resolves_joined_table() {
+    // The parent is an Eloquent chain; the join closure still resolves to the
+    // joined table without needing the parent model.
+    let ctx = detect("User::query()->join('orders', function ($join) { $join->where('|'); });")
+        .expect("ctx");
+    assert_eq!(ctx.mode, BuilderMode::BaseBuilder);
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+}
+
+#[test]
+fn join_clause_on_method_completes_columns() {
+    // `$join->on('orders.id', '=', 'users.id')` — `on` on the query builder
+    // takes columns. The first ON arg narrows on its qualifier.
+    let ctx = detect(
+        "DB::table('users')->join('orders', function ($join) { $join->on('orders.us|', '=', 'users.id'); });",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("orders"));
+}
+
+#[test]
+fn model_static_on_is_connection_not_column() {
+    // `User::on('mysql')` is the connection setter, called directly on the
+    // model (static) — it must NOT offer column completion.
+    let ctx = detect("User::on('mys|ql');");
+    assert!(
+        ctx.is_none(),
+        "Model::on(connection) must not be column completion: {ctx:?}"
+    );
+}
+
+#[test]
+fn join_closure_includes_parent_dbtable_root() {
+    // Inside the join closure, the parent's `users` table is accessible (the
+    // other side of the ON clause).
+    let ctx =
+        detect("DB::table('users')->join('orders', function ($join) { $join->where('|'); });")
+            .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert!(
+        tables.contains(&"users"),
+        "parent root should be accessible inside the join closure; got {tables:?}"
+    );
+    assert_eq!(
+        ctx.from_clause,
+        FromClause::Replace(AccessibleTable::bare("orders"))
+    );
+    assert!(ctx.join_parent_model.is_none());
+}
+
+#[test]
+fn join_closure_eloquent_parent_sets_pending_model() {
+    // The parent root is an Eloquent model — its table needs async
+    // resolution, so it's deferred via join_parent_model.
+    let ctx = detect("User::query()->join('orders', function ($join) { $join->where('|'); });")
+        .expect("ctx");
+    assert_eq!(ctx.join_parent_model.as_deref(), Some("User"));
+}
+
+// ---- subquery virtual tables (issue #24, Phase 4) ---------------------
+
+#[test]
+fn from_sub_creates_virtual_root_table() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->select('id', 'name'); }, 'u')->where('|');",
+    )
+    .expect("ctx");
+    match &ctx.from_clause {
+        FromClause::Replace(t) => {
+            assert_eq!(t.qualifier(), "u");
+            assert_eq!(
+                t.virtual_columns.as_deref(),
+                Some(["id".to_string(), "name".to_string()].as_slice())
+            );
+        }
+        other => panic!("expected Replace(virtual table), got {other:?}"),
+    }
+}
+
+#[test]
+fn from_sub_without_select_is_opaque() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->where('x', 1); }, 'u')->where('|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.from_clause, FromClause::Opaque);
+}
+
+#[test]
+fn join_sub_creates_virtual_joined_table() {
+    let ctx = detect(
+        "DB::table('users')->joinSub(function ($q) { $q->select('total'); }, 'agg', 'agg.user_id', '=', 'users.id')->where('|');",
+    )
+    .expect("ctx");
+    let virt = ctx
+        .joined_tables
+        .iter()
+        .find(|t| t.qualifier() == "agg")
+        .expect("virtual joined table 'agg'");
+    assert_eq!(
+        virt.virtual_columns.as_deref(),
+        Some(["total".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn from_sub_narrows_on_alias() {
+    let ctx = detect(
+        "DB::table('orders')->fromSub(function ($q) { $q->select('id', 'name'); }, 'u')->where('u.|');",
+    )
+    .expect("ctx");
+    assert_eq!(ctx.expecting, ArgKind::Column);
+    assert_eq!(ctx.dotted_prefix.as_deref(), Some("u"));
+}
+
+#[test]
+fn join_closure_includes_sibling_joins_excludes_own() {
+    let ctx = detect(
+        "DB::table('users')->join('orders', function ($join) { $join->where('|'); })\
+         ->join('roles', 'roles.id', '=', 'users.role_id');",
+    )
+    .expect("ctx");
+    let tables: Vec<&str> = ctx.joined_tables.iter().map(|t| t.table.as_str()).collect();
+    assert!(tables.contains(&"users"), "parent root; got {tables:?}");
+    assert!(tables.contains(&"roles"), "sibling join; got {tables:?}");
+    assert!(
+        !tables.contains(&"orders"),
+        "the join's own table is the root, not a sibling; got {tables:?}"
+    );
 }

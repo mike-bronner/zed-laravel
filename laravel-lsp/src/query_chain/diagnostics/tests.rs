@@ -124,6 +124,7 @@ fn link(method: &str, arg: ArgKind, args: Vec<ChainArg>) -> ChainLink {
         effect: ChainEffect::None,
         span_byte_range: (0, 0),
         args,
+        subquery_columns: None,
     }
 }
 
@@ -892,5 +893,202 @@ async fn where_array_values_are_not_flagged() {
     assert!(
         diags.is_empty(),
         "where-array values must not be flagged: {diags:?}"
+    );
+}
+
+// ---- joined-table columns (issue #24) ---------------------------------
+
+#[tokio::test]
+async fn bare_column_from_joined_table_is_not_flagged() {
+    // `status` lives only on `orders`, but the join makes it a legal bare
+    // column — diagnostics must not flag it as missing on `users`.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('status', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "bare joined-table column must not be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn typo_still_flagged_with_joins_present() {
+    // A genuine typo absent from EVERY accessible table is still caught.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'a', '=', 'b')->where('stattus', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "real typo should still be flagged: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_UNKNOWN_COLUMN);
+}
+
+#[tokio::test]
+async fn eloquent_bare_joined_column_not_flagged() {
+    // `status` is on `orders`, joined onto a `User::query()` chain — must not
+    // be flagged as missing on the model's `users` table.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nuse App\\Models\\User;\nUser::query()->join('orders', 'orders.user_id', '=', 'users.id')->where('status', 'active')->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "Eloquent joined-table column must not be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn eloquent_from_replace_validates_against_new_table() {
+    // `User::query()->from('admins')` redirects the root — a column on
+    // `admins` is valid; one only on the replaced `users` table is flagged.
+    let (_dir, root) = project_with_models(&[("User", USER_MODEL)]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("admins", &[("admin_id", "int"), ("level", "int")]),
+        ],
+    )
+    .await;
+
+    let ok =
+        "<?php\nuse App\\Models\\User;\nUser::query()->from('admins')->where('level', 1)->get();\n";
+    let diags =
+        chain_diagnostics(&chains_of(ok), &db, &root, ok, DiagnosticSeverity::WARNING).await;
+    assert!(diags.is_empty(), "admins column must be valid: {diags:?}");
+
+    let bad =
+        "<?php\nuse App\\Models\\User;\nUser::query()->from('admins')->where('name', 1)->get();\n";
+    let diags = chain_diagnostics(
+        &chains_of(bad),
+        &db,
+        &root,
+        bad,
+        DiagnosticSeverity::WARNING,
+    )
+    .await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "column from the replaced table should be flagged: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_bare_column_is_flagged() {
+    // `id` exists on BOTH users and the joined orders — bare `id` is
+    // ambiguous and must be qualified.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source = "<?php\nDB::table('users')->join('orders', 'orders.user_id', '=', 'users.id')->where('id', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert_eq!(
+        diags.len(),
+        1,
+        "ambiguous column should be flagged: {diags:?}"
+    );
+    assert_eq!(code_of(&diags[0]), super::CODE_AMBIGUOUS_COLUMN);
+    assert!(
+        diags[0].message.contains("ambiguous"),
+        "{}",
+        diags[0].message
+    );
+    assert!(diags[0].message.contains("users"));
+    assert!(diags[0].message.contains("orders"));
+}
+
+#[tokio::test]
+async fn column_on_a_single_accessible_table_is_valid() {
+    // `name` lives only on users — unambiguous, so no diagnostic (and not
+    // flagged unknown either).
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(
+        root.clone(),
+        &[
+            ("users", &[("id", "int"), ("name", "string")]),
+            ("orders", &[("id", "int"), ("status", "string")]),
+        ],
+    )
+    .await;
+    let source =
+        "<?php\nDB::table('users')->join('orders', 'a', '=', 'b')->where('name', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "column on exactly one table is valid: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_check_does_not_fire_without_joins() {
+    // A single-table query can't be ambiguous — `id` is just valid.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source = "<?php\nDB::table('users')->where('id', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "single-table column is unambiguous: {diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn virtual_table_in_scope_suppresses_column_diagnostics() {
+    // A `fromSub` virtual table exposes best-effort columns; diagnostics stay
+    // quiet rather than risk a false positive on a column the subquery might
+    // legitimately expose.
+    let (_dir, root) = project_with_models(&[]);
+    let db = provider_with(root.clone(), &[("users", &[("id", "int")])]).await;
+    let source = "<?php\nDB::table('users')->fromSub(function ($q) { $q->select('id', 'total'); }, 'u')->where('whatever', 1)->get();\n";
+    let chains = chains_of(source);
+
+    let diags = chain_diagnostics(&chains, &db, &root, source, DiagnosticSeverity::WARNING).await;
+    assert!(
+        diags.is_empty(),
+        "virtual table in scope should suppress column diagnostics: {diags:?}"
     );
 }

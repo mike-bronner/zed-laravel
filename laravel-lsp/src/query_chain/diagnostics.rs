@@ -45,7 +45,8 @@
 use super::chain::*;
 use super::cursor::{byte_offset_to_position, chain_context_for_link};
 use super::eloquent_completion::{
-    resolve_related_model, resolve_table_for_model, snake_pluralize, walk_dotted_hops,
+    enrich_join_parent_tables, resolve_related_model, resolve_table_for_model, snake_pluralize,
+    walk_dotted_hops,
 };
 use crate::class_locator::find_php_class_file;
 use crate::database::DatabaseSchemaProvider;
@@ -73,6 +74,9 @@ const COLUMN_DIAG_DENY: &[&str] = &["having"];
 pub const CODE_UNKNOWN_COLUMN: &str = "laravel-lsp.unknown-column";
 pub const CODE_UNKNOWN_RELATION: &str = "laravel-lsp.unknown-relation";
 pub const CODE_UNKNOWN_TABLE: &str = "laravel-lsp.unknown-table";
+/// A bare column that exists on more than one accessible table (issue #24) —
+/// the query would be ambiguous at runtime, so the user must qualify it.
+pub const CODE_AMBIGUOUS_COLUMN: &str = "laravel-lsp.ambiguous-column";
 
 /// What kind of identifier a link's first string arg names. Derived from the
 /// link's `ArgKind`, collapsed to the three things we can validate.
@@ -158,24 +162,85 @@ pub async fn chain_diagnostics(
             };
 
             match kind {
-                // Columns/tables share one legal set across all targets (no
-                // per-element hop), so resolve it once.
-                DiagKind::Column | DiagKind::Table => {
-                    let Some((legal, subject)) =
-                        legal_names(kind, &base_ctx, db, project_root).await
+                // Columns: validate against the per-table column sets of every
+                // accessible table, so we can tell unknown (on none) from
+                // ambiguous (on more than one, issue #24) apart.
+                DiagKind::Column => {
+                    let Some((tables, extras)) =
+                        accessible_column_sets(&base_ctx, db, project_root).await
                     else {
-                        continue; // resolution gap / schema not loaded — stay quiet
+                        continue; // resolution gap / schema not loaded / virtual — stay quiet
                     };
                     for (value, span) in targets {
                         if !is_simple_identifier(&value) {
                             continue; // qualified / expression / aliased / wildcard
                         }
+                        let hits: Vec<&str> = tables
+                            .iter()
+                            .filter(|(_, cols)| cols.iter().any(|c| c == &value))
+                            .map(|(name, _)| name.as_str())
+                            .collect();
+                        match hits.len() {
+                            // On exactly one table — unambiguous, valid.
+                            1 => {}
+                            // On more than one — ambiguous; must be qualified.
+                            n if n > 1 => out.push(ambiguous_column_diagnostic(
+                                &value, &hits, span, content, severity,
+                            )),
+                            // On none — valid only if it's a model accessor;
+                            // otherwise an unknown column.
+                            _ => {
+                                if extras.iter().any(|e| e == &value) {
+                                    continue;
+                                }
+                                let union: Vec<String> = tables
+                                    .iter()
+                                    .flat_map(|(_, cols)| cols.iter().cloned())
+                                    .chain(extras.iter().cloned())
+                                    .collect();
+                                let subject = tables
+                                    .first()
+                                    .map(|(name, _)| name.clone())
+                                    .unwrap_or_default();
+                                let suggestion = best_suggestion(&value, &union);
+                                out.push(make_diagnostic(
+                                    DiagKind::Column,
+                                    &value,
+                                    &subject,
+                                    suggestion,
+                                    span,
+                                    &value,
+                                    content,
+                                    severity,
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Tables resolve a single legal set across all targets.
+                DiagKind::Table => {
+                    let Some((legal, subject)) =
+                        legal_names(DiagKind::Table, &base_ctx, db, project_root).await
+                    else {
+                        continue; // resolution gap / schema not loaded — stay quiet
+                    };
+                    for (value, span) in targets {
+                        if !is_simple_identifier(&value) {
+                            continue;
+                        }
                         if legal.iter().any(|name| name == &value) {
-                            continue; // valid
+                            continue;
                         }
                         let suggestion = best_suggestion(&value, &legal);
                         out.push(make_diagnostic(
-                            kind, &value, &subject, suggestion, span, &value, content, severity,
+                            DiagKind::Table,
+                            &value,
+                            &subject,
+                            suggestion,
+                            span,
+                            &value,
+                            content,
+                            severity,
                         ));
                     }
                 }
@@ -232,6 +297,10 @@ async fn finalize_context(mut ctx: ChainContext, root: &Path) -> Option<ChainCon
             ctx.effective_table = resolve_table_for_model(&model, root).await;
         }
     }
+    // Join-closure parent table (issue #24): fold an Eloquent parent's table
+    // into the accessible set so a bare parent column inside the closure isn't
+    // false-flagged.
+    enrich_join_parent_tables(&mut ctx, root).await;
     Some(ctx)
 }
 
@@ -253,50 +322,9 @@ async fn legal_names(
             }
             Some((tables, String::new()))
         }
-        DiagKind::Column => {
-            let (table, casts, accessors) = match ctx.mode {
-                BuilderMode::BaseBuilder => (ctx.effective_table.clone()?, Vec::new(), Vec::new()),
-                BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
-                    let model = ctx.effective_model.as_deref()?;
-                    let meta = load_metadata(model, root).await?;
-                    let simple = model.rsplit('\\').next().unwrap_or(model);
-                    let table = meta
-                        .table_name
-                        .clone()
-                        .unwrap_or_else(|| snake_pluralize(simple));
-                    let casts: Vec<String> = meta.casts.keys().cloned().collect();
-                    // Accessors are valid `where` args only post-execution, when
-                    // filtering happens in memory on a hydrated collection.
-                    let accessors: Vec<String> = if ctx.mode == BuilderMode::EloquentCollection {
-                        meta.accessors
-                            .iter()
-                            .map(|a| a.property_name.clone())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    (table, casts, accessors)
-                }
-            };
-
-            let mut names: Vec<String> = db
-                .get_columns_with_types(&table)
-                .await
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
-            if names.is_empty() {
-                // Table not in the introspected schema — can't validate. Note
-                // this fires BEFORE folding in casts/accessors, so a model with
-                // casts but an unreachable table still stays quiet.
-                return None;
-            }
-            names.extend(casts);
-            names.extend(accessors);
-            // Subject = the raw table name; `make_diagnostic` formats the
-            // message and the code-action layer reads it from `data.table`.
-            Some((names, table))
-        }
+        // Columns are validated via `accessible_column_sets` (it needs
+        // per-table sets to distinguish ambiguous from unknown), never here.
+        DiagKind::Column => unreachable!("columns use accessible_column_sets"),
         DiagKind::Relation => {
             // Relations only exist on Eloquent builders/collections. A relation
             // method on a `DB::table()` base builder is user error, but flagging
@@ -323,6 +351,103 @@ async fn legal_names(
             Some((names, model))
         }
     }
+}
+
+/// Per-table DB column sets for every table a chain can reference, plus
+/// root-bound extras (model accessors). Used for ambiguity-aware column
+/// validation: a bare column on >1 table is ambiguous, on exactly 1 is valid,
+/// on 0 (and not an accessor) is unknown (issue #24).
+///
+/// Returns `None` — stay quiet — when nothing resolves confidently: no
+/// accessible table has columns, the schema isn't loaded, or a virtual
+/// (subquery) table is in scope (its best-effort columns shouldn't drive
+/// ambiguity). Each entry is `(table_name, db_column_names)`; the root entry's
+/// columns include the model's cast keys (which are columns of the root).
+async fn accessible_column_sets(
+    ctx: &ChainContext,
+    db: &DatabaseSchemaProvider,
+    root: &Path,
+) -> Option<(Vec<(String, Vec<String>)>, Vec<String>)> {
+    // Virtual (subquery) tables carry best-effort SELECT columns — don't let
+    // them drive ambiguity/unknown decisions; stay quiet entirely.
+    let has_virtual = matches!(&ctx.from_clause, FromClause::Replace(t) if t.virtual_columns.is_some())
+        || ctx
+            .joined_tables
+            .iter()
+            .any(|t| t.virtual_columns.is_some());
+    if has_virtual {
+        return None;
+    }
+
+    // Resolve the root (FROM) table plus, for Eloquent chains, the model's
+    // casts (columns whose type is overridden) and accessors. Mirrors
+    // `eloquent_completion::resolve_eloquent_root`. The root is an
+    // `AccessibleTable` so its DB lookup uses the real name while the reported
+    // identifier (and qualify-fix) uses the qualifier (alias if aliased).
+    let (root_at, casts, accessors): (Option<AccessibleTable>, Vec<String>, Vec<String>) =
+        match &ctx.from_clause {
+            FromClause::Replace(at) => (Some(at.clone()), Vec::new(), Vec::new()),
+            FromClause::Opaque => (None, Vec::new(), Vec::new()),
+            FromClause::Inherit => match ctx.mode {
+                BuilderMode::BaseBuilder => (
+                    ctx.effective_table.clone().map(AccessibleTable::bare),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                BuilderMode::EloquentBuilder | BuilderMode::EloquentCollection => {
+                    let model = ctx.effective_model.as_deref()?;
+                    let meta = load_metadata(model, root).await?;
+                    let simple = model.rsplit('\\').next().unwrap_or(model);
+                    let table = meta
+                        .table_name
+                        .clone()
+                        .unwrap_or_else(|| snake_pluralize(simple));
+                    let casts: Vec<String> = meta.casts.keys().cloned().collect();
+                    let accessors: Vec<String> = if ctx.mode == BuilderMode::EloquentCollection {
+                        meta.accessors
+                            .iter()
+                            .map(|a| a.property_name.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (Some(AccessibleTable::bare(table)), casts, accessors)
+                }
+            },
+        };
+
+    // Each entry's identifier is the qualifier the user references (alias if
+    // present), used for the ambiguity message and the qualify quick-fix; the
+    // DB lookup uses the real table name.
+    let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(at) = root_at {
+        let mut cols: Vec<String> = db
+            .get_columns_with_types(&at.table)
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        if !cols.is_empty() {
+            cols.extend(casts); // cast keys are columns of the root table
+            tables.push((at.qualifier().to_string(), cols));
+        }
+    }
+    for jt in &ctx.joined_tables {
+        let cols: Vec<String> = db
+            .get_columns_with_types(&jt.table)
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        if !cols.is_empty() {
+            tables.push((jt.qualifier().to_string(), cols));
+        }
+    }
+
+    if tables.is_empty() {
+        return None; // no accessible table resolved any columns — can't validate
+    }
+    Some((tables, accessors))
 }
 
 /// Read + parse a model class to [`ModelMetadata`], walking its `extends`
@@ -814,6 +939,53 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// LSP `Range` covering just the `needle` at the end of a string literal's
+/// content. The literal span includes its quotes (single-byte ASCII), so the
+/// closing quote is one byte before the span end; the needle is the trailing
+/// `needle.len()` content bytes (for dotted relations, the tail segment).
+fn needle_range(lit_span: (usize, usize), needle: &str, content: &str) -> Range {
+    let content_end = lit_span.1.saturating_sub(1);
+    let needle_start = content_end.saturating_sub(needle.len());
+    Range {
+        start: byte_offset_to_position(content, needle_start),
+        end: byte_offset_to_position(content, content_end),
+    }
+}
+
+/// Build the `laravel-lsp.ambiguous-column` diagnostic for a bare column that
+/// exists on more than one accessible table (issue #24). `tables` are the
+/// tables that define it; the message suggests qualifying with the first.
+fn ambiguous_column_diagnostic(
+    needle: &str,
+    tables: &[&str],
+    lit_span: (usize, usize),
+    content: &str,
+    severity: DiagnosticSeverity,
+) -> Diagnostic {
+    let range = needle_range(lit_span, needle, content);
+    let table_list = tables.join("`, `");
+    let qualify_hint = tables
+        .first()
+        .map(|t| format!(" Qualify it, e.g. `{t}.{needle}`."))
+        .unwrap_or_default();
+    let message =
+        format!("Column \"{needle}\" is ambiguous — it exists on `{table_list}`.{qualify_hint}");
+    let data = serde_json::json!({
+        "kind": "ambiguous-column",
+        "name": needle,
+        "tables": tables,
+    });
+    Diagnostic {
+        range,
+        severity: Some(severity),
+        code: Some(NumberOrString::String(CODE_AMBIGUOUS_COLUMN.to_string())),
+        source: Some("laravel-lsp".to_string()),
+        message,
+        data: Some(data),
+        ..Default::default()
+    }
+}
+
 /// Build the LSP `Diagnostic` for one unknown identifier. The squiggle is
 /// narrowed to the offending segment (e.g. just `authorr` in `posts.authorr`).
 /// A structured `data` payload carries everything the code-action handler needs
@@ -829,16 +1001,7 @@ fn make_diagnostic(
     content: &str,
     severity: DiagnosticSeverity,
 ) -> Diagnostic {
-    // Content lives between the quotes: span includes them, so the closing
-    // quote sits one byte before the literal's end (quotes are single-byte
-    // ASCII). `content_end` is the position just past the last content char.
-    let content_end = lit_span.1.saturating_sub(1);
-    // Narrow to the needle: for dotted relations it's the tail segment.
-    let needle_start = content_end.saturating_sub(needle.len());
-    let range = Range {
-        start: byte_offset_to_position(content, needle_start),
-        end: byte_offset_to_position(content, content_end),
-    };
+    let range = needle_range(lit_span, needle, content);
 
     let (code, data_kind) = match kind {
         DiagKind::Column => (CODE_UNKNOWN_COLUMN, "column"),

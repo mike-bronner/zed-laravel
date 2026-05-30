@@ -10,6 +10,7 @@
 #![allow(clippy::type_complexity)]
 
 // Core modules
+pub mod blade_directive_tokens;
 pub mod blade_embedded_php;
 pub mod blade_loops;
 pub mod blade_php_block;

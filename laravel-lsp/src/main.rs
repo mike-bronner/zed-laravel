@@ -1878,6 +1878,11 @@ struct LaravelLanguageServer {
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
     cached_validation_rule_names: Arc<RwLock<Vec<String>>>,
+    /// Cached set of known Blade directive names (standard ∪ scanned custom),
+    /// lowercased and including closing names (e.g. `endif`). `None` until first
+    /// built; cleared on a provider/composer rescan. Used by semantic-token
+    /// highlighting to reject non-directive `@`-text.
+    cached_directive_names: Arc<RwLock<Option<HashSet<String>>>>,
     /// Database schema provider for exists:/unique: validation rules
     database_schema: Arc<RwLock<Option<laravel_lsp::database::DatabaseSchemaProvider>>>,
     /// Whether we've shown the database connection error diagnostic this session
@@ -3517,6 +3522,7 @@ impl LaravelLanguageServer {
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
+            cached_directive_names: Arc::new(RwLock::new(None)),
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
@@ -3565,86 +3571,48 @@ impl LaravelLanguageServer {
         }
     }
 
-    /// Extract Blade directive tokens for semantic highlighting
+    /// The set of Blade directive names to highlight — standard directives plus
+    /// names registered via `Blade::directive()` — lowercased and including
+    /// closing names (e.g. `endif`). Built lazily from the project (falling back
+    /// to the core list when no root is known) and cached; the cache is cleared
+    /// by [`Self::invalidate_directive_cache`] on a provider/composer rescan.
     ///
-    /// Finds all `@directive` patterns in the content and converts them to
-    /// LSP semantic tokens with delta encoding. Each token is marked as FUNCTION
-    /// type (index 0 in our legend).
-    ///
-    /// The delta encoding format is:
-    /// - delta_line: lines since previous token
-    /// - delta_start: characters since previous token (or start of line if new line)
-    /// - length: token length in characters
-    /// - token_type: 0 for FUNCTION
-    /// - token_modifiers: 0 (no modifiers)
-    fn extract_blade_directive_tokens(&self, content: &str) -> Vec<SemanticToken> {
-        use lazy_static::lazy_static;
-        use regex::Regex;
-
-        lazy_static! {
-            // Match Blade directives: @if, @foreach, @feature, @customDirective, etc.
-            // Also matches @end... directives
-            static ref DIRECTIVE_RE: Regex = Regex::new(r"@[a-zA-Z]+").unwrap();
+    /// This is the same discovery used for directive completion, reused here so
+    /// highlighting only colours real directives — never `@param` in a docblock,
+    /// `@media` in CSS, or the `@example` in an email.
+    async fn get_directive_name_set(&self) -> HashSet<String> {
+        if let Some(set) = self.cached_directive_names.read().await.as_ref() {
+            return set.clone();
         }
 
-        // First pass: collect all directive positions with line/column
-        let mut directives: Vec<(u32, u32, u32)> = Vec::new(); // (line, col, length)
-
-        // Build a line/column map by scanning through the content
-        let bytes = content.as_bytes();
-        let mut line_starts: Vec<usize> = vec![0]; // byte offset of each line start
-
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'\n' {
-                line_starts.push(i + 1);
+        let directives = {
+            let root_guard = self.root_path.read().await;
+            match root_guard.as_ref() {
+                Some(root) => get_all_blade_directives(root),
+                None => get_fallback_blade_directives(),
             }
-        }
+        };
 
-        // Find all directive matches
-        for mat in DIRECTIVE_RE.find_iter(content) {
-            let start_byte = mat.start();
-            let length = mat.len() as u32;
+        let set: HashSet<String> = directives
+            .iter()
+            .flat_map(|d| {
+                let mut names = vec![d.name.to_lowercase()];
+                if let Some(closing) = &d.closing {
+                    names.push(closing.to_lowercase());
+                }
+                names
+            })
+            .collect();
 
-            // Find which line this byte offset is on
-            let line = line_starts
-                .iter()
-                .position(|&start| start > start_byte)
-                .map(|i| i - 1)
-                .unwrap_or(line_starts.len() - 1) as u32;
+        *self.cached_directive_names.write().await = Some(set.clone());
+        set
+    }
 
-            // Calculate column (character offset from line start)
-            let line_start_byte = line_starts[line as usize];
-            let col = (start_byte - line_start_byte) as u32;
-
-            directives.push((line, col, length));
-        }
-
-        // Second pass: convert to delta-encoded semantic tokens
-        let mut tokens: Vec<SemanticToken> = Vec::new();
-        let mut prev_line: u32 = 0;
-        let mut prev_col: u32 = 0;
-
-        for (line, col, length) in directives {
-            let delta_line = line - prev_line;
-            let delta_start = if delta_line == 0 {
-                col - prev_col
-            } else {
-                col // Reset to absolute column on new line
-            };
-
-            tokens.push(SemanticToken {
-                delta_line,
-                delta_start,
-                length,
-                token_type: 0, // FUNCTION (index 0 in our legend)
-                token_modifiers_bitset: 0,
-            });
-
-            prev_line = line;
-            prev_col = col;
-        }
-
-        tokens
+    /// Clear the cached directive-name set so the next semantic-token request
+    /// rebuilds it. Called when a service provider or composer file changes, as
+    /// the set of registered custom directives may have changed.
+    async fn invalidate_directive_cache(&self) {
+        *self.cached_directive_names.write().await = None;
     }
 
     /// Register config files with Salsa for incremental computation
@@ -4523,6 +4491,9 @@ impl LaravelLanguageServer {
         info!("🔍 Rescanning vendor providers...");
         let start = std::time::Instant::now();
 
+        // Registered custom Blade::directive() calls may have changed.
+        self.invalidate_directive_cache().await;
+
         let documents = self.documents.read().await;
         let mut registered_count = 0;
         let mut middleware_count = 0;
@@ -4636,6 +4607,9 @@ impl LaravelLanguageServer {
     async fn rescan_app_providers(&self, root: &Path) {
         info!("🔍 Rescanning app providers...");
         let start = std::time::Instant::now();
+
+        // Registered custom Blade::directive() calls may have changed.
+        self.invalidate_directive_cache().await;
 
         let documents = self.documents.read().await;
         let mut registered_count = 0;
@@ -13668,6 +13642,7 @@ return [
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
+            cached_directive_names: self.cached_directive_names.clone(),
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
@@ -19612,8 +19587,11 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
-        // Extract directive tokens
-        let tokens = self.extract_blade_directive_tokens(&content);
+        // Extract directive tokens, keeping only names we recognise as real
+        // directives (standard + registered custom) and skipping commented-out ones.
+        let known = self.get_directive_name_set().await;
+        let tokens =
+            laravel_lsp::blade_directive_tokens::extract_blade_directive_tokens(&content, &known);
 
         info!("   Found {} directive tokens", tokens.len());
 

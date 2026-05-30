@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-<a href="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml"><img src="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml/badge.svg" alt="Build Status"></a>
+<a href="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml"><img src="https://github.com/GeneaLabs/zed-laravel/actions/workflows/release.yml/badge.svg?event=release" alt="Release"></a>
 <a href="https://github.com/GeneaLabs/zed-laravel/releases"><img src="https://img.shields.io/github/v/release/GeneaLabs/zed-laravel?label=version" alt="Latest Release"></a>
 <img src="https://img.shields.io/github/downloads/GeneaLabs/zed-laravel/total" alt="Downloads">
 <img src="https://img.shields.io/github/stars/GeneaLabs/zed-laravel?style=flat" alt="GitHub Stars">
@@ -28,7 +28,7 @@
 
 ---
 
-## 💛 Why we built this
+## ❤️ Why we built this
 
 We love Laravel, and we love Zed. When we moved our Laravel work into Zed, the deep, framework-aware tooling we'd relied on elsewhere wasn't there yet — so we built it. This extension exists to give Laravel first-class support in Zed, because a framework this good deserves great tooling everywhere its developers work.
 
@@ -38,6 +38,8 @@ The intelligence lives in a standalone language server (LSP) — the same protoc
 
 Everything is parsed statically with tree-sitter: the extension reads your files, it never runs them. It only touches your database when *you* opt into schema-backed completion, and it keeps working even when your app won't boot — a half-applied migration, a missing `.env`, or a dirty branch won't stop it. The honest trade-off: some deeply dynamic runtime behaviour (fully dynamic Eloquent magic, runtime-registered routes) is harder to reach through static analysis alone.
 
+**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
+
 ### Laravel across editors
 
 Laravel developers are spoiled for choice — every major editor has a strong way to work with the framework. Here's roughly where things stand and what each needs, so you can pick whatever fits how you work:
@@ -46,7 +48,7 @@ Laravel developers are spoiled for choice — every major editor has a strong wa
 |---|---|---|
 | **PHPStorm** | Laravel support built in, powered by the [Laravel Idea](https://laravel-idea.com/) plugin | Paid IDE (free for non-commercial use) |
 | **VS Code** | [Official Laravel extension](https://github.com/laravel/vs-code-extension), maintained by the Laravel team | Free |
-| **Zed** | This extension, plus [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) for syntax highlighting | Free |
+| **Zed** | This extension, in addition to companion extensions:  [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade), [PHP](https://github.com/zed-extensions/php) (Intelephense), [phpcs](https://github.com/GeneaLabs/zed-phpcs-lsp), and [phpmd](https://github.com/GeneaLabs/zed-phpmd-lsp) | Free |
 
 <sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
 
@@ -54,15 +56,27 @@ Laravel developers are spoiled for choice — every major editor has a strong wa
 
 Search **"Laravel"** in Zed Extensions and click Install.
 
-**🤝 Recommended companion:** Also install the [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) extension (`bajrangCoder/zed-laravel-blade`) for Blade syntax highlighting, bracket matching, and PHP language server integration. The two extensions complement each other — Blade handles the language definition and grammar, while this extension handles Laravel-specific intelligence (go-to-definition, autocomplete, diagnostics).
+### 🤝 Recommended companions
 
-**From source:** Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: install dev extension".
+Also install the following extensions for a more complete experience:
+- [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) extension (`bajrangCoder/zed-laravel-blade`) for Blade-related fetures, syntax highlighting, etc.
+- [**PHP**](https://github.com/zed-extensions/php) (Intelephense) for php intellisense functionality
+- [**phpcs**](https://github.com/GeneaLabs/zed-phpcs-lsp) PHP CodeSniffer linting
+- [**phpmd**](https://github.com/GeneaLabs/zed-phpmd-lsp) PHP Mess Detector linting
+
+### From source
+
+Clone the repo, run `cargo build --release` in `laravel-lsp/`, then use "zed: install dev extension".
 
 ## ⚙️ Configuration
 
 The extension works out of the box with zero configuration. It automatically discovers your Laravel project structure, including view paths, component namespaces, route files, and service providers.
 
-**Optional settings** can be added to your Zed `settings.json`:
+Everything below is optional.
+
+### 🎛️ Extension settings
+
+Add any of these to your Zed `settings.json`:
 
 ```json
 {
@@ -88,7 +102,9 @@ The extension works out of the box with zero configuration. It automatically dis
 | `blade.directiveSpacing` | `false` | Add space between directive name and parentheses. `false`: `@if($condition)` / `true`: `@if ($condition)` |
 | `diagnostics.severity` | `"warning"` | Severity for query-chain diagnostics (unknown column/relation/table in Eloquent & `DB::table()` chains). One of `"warning"`, `"error"`, `"info"`, or `"off"` to disable. Requires a working database connection — diagnostics stay silent when the schema can't be introspected. |
 
-**🗄️ Database autocomplete** (`exists:`, `unique:` rules, Eloquent properties) requires a working database connection. Configure in your `.env`:
+### 🗄️ Database connection
+
+**Database autocomplete** (`exists:` / `unique:` rules, Eloquent properties) and query-chain diagnostics only work with a live database connection. Configure it in your `.env`:
 
 ```env
 DB_CONNECTION=mysql
@@ -100,9 +116,9 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
-**⚡ Indexing performance.** The extension indexes every PHP and Blade file in your project (including `vendor/`) at startup so find-references and goto-definition return instantly. A persistent on-disk cache makes subsequent project opens near-instant — only files whose `mtime` has changed since they were last indexed get re-parsed. External changes (a `git pull`, a `composer install`, a formatter running outside Zed) are picked up live via `workspace/didChangeWatchedFiles`. The status bar shows progress during the initial warmup.
+### 🎨 Blade directive highlighting
 
-**🎨 Enhanced Blade directive highlighting** uses LSP semantic tokens to give directives like `@if`, `@foreach`, and `@section` distinct function-style coloring. This is also the only way to get correct highlighting for **custom directives** (e.g., `@myCustomDirective`, Livewire's `@teleport`, Pennant's `@feature`) that tree-sitter doesn't know about. Enable it in your Zed `settings.json`:
+The [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension already highlights standard directives and paired `@custom … @endcustom` blocks through tree-sitter. This optional setting adds the one case tree-sitter can't see: your app's **custom inline directives** registered via `Blade::directive()` (e.g. a `@money($amount)` macro). The LSP highlights them precisely — it colors only directives it has actually discovered (the same scan that drives directive completion), so PHPDoc `@param` tags, CSS at-rules like `@media`, and the `@` in email addresses are left alone, and commented-out directives stay dark. Enable it in your Zed `settings.json`:
 
 ```json
 {
@@ -114,7 +130,9 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 }
 ```
 
-**🗺️ Laravel-aware outline panel** populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server understands:
+### 🗺️ Outline panel
+
+The extension populates Zed's outline panel and breadcrumbs with Laravel-specific structure that no PHP language server understands:
 
 - **Route files** — every `Route::get/post/...` call labelled `METHOD URI [name=...]`, with nested `Route::group(...)` calls becoming hierarchical containers labelled `group [prefix=..., name=...]`. Prefix and name chains propagate to children. Covers all Route methods including `resource`, `apiResource`, `singleton`, `livewire`, `view`, `redirect`, `fallback`, etc.
 - **Blade templates** — `@extends`, `@section`, `@push`, `@yield`, `@stack`, `@include*`, `@props`, plus the modern tag syntax: `<x-component>`, `<livewire:counter>`, `<flux:icon>`, `<x-slot:name>`. Paired tags nest their children; self-closing tags appear as leaves.
@@ -128,8 +146,6 @@ PHP class outlines (controllers, models, Livewire components, jobs, services) co
 | Route files | This extension, plus `document_symbols: on` for `PHP` (route files use the `PHP` language). |
 | Blade templates | This extension, the [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension (for the `Blade` language definition), plus `document_symbols: on` for `Blade`. |
 | PHP class files | A PHP language server (the [PHP](https://github.com/zed-extensions/php) extension provides Intelephense / Phpactor / PhpTools), plus `document_symbols: on` for `PHP`. |
-
-**Configuration**
 
 Zed defaults to tree-sitter outlines, which don't call any LSP — opt into LSP outlines per-language ([`zed#48780`](https://github.com/zed-industries/zed/pull/48780)):
 

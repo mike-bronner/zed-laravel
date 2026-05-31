@@ -30,7 +30,7 @@ serde_json = "1.0"
 # but bincode is ~3-5× smaller on disk and ~10× faster to deserialize on
 # a 40k-file project, which matters because the disk-cache load is on the
 # critical path of LSP startup.
-bincode = { version = "2.0", features = ["serde"] }
+bincode = { version = "3.0", features = ["serde"] }
 
 # Logging
 tracing = "0.1"

@@ -9,7 +9,7 @@ license = "MIT"
 [dependencies]
 # LSP framework
 tower-lsp = "0.20"
-lsp-types = "0.94"
+lsp-types = "0.97"
 
 # Salsa incremental computation
 salsa = "0.26"

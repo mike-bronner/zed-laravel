@@ -76,9 +76,30 @@ jobs:
 
       - name: Commit and push changes
         id: commit_changes
+        env:
+          GH_TOKEN: ${{ env.GITHUB_TOKEN }}
+          SIGNING_KEY: ${{ secrets.COMMIT_SIGNING_SSH_KEY }}
         run: |
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          # Commit as the token owner (not github-actions[bot]) and SSH-sign so the
+          # version-bump commit is "Verified" and satisfies the signed-commits rule
+          # on main without relying on the admin bypass.
+          GIT_USER_LOGIN=$(gh api user --jq .login)
+          GIT_USER_ID=$(gh api user --jq .id)
+          GIT_USER_NAME=$(gh api user --jq '.name // .login')
+          git config --local user.name "${GIT_USER_NAME}"
+          git config --local user.email "${GIT_USER_ID}+${GIT_USER_LOGIN}@users.noreply.github.com"
+
+          if [ -n "${SIGNING_KEY:-}" ]; then
+            SSH_KEY_FILE="$(mktemp)"
+            printf '%s\n' "${SIGNING_KEY}" > "${SSH_KEY_FILE}"
+            chmod 600 "${SSH_KEY_FILE}"
+            git config --local gpg.format ssh
+            git config --local user.signingkey "${SSH_KEY_FILE}"
+            git config --local commit.gpgsign true
+            echo "SSH commit signing enabled"
+          else
+            echo "::warning::COMMIT_SIGNING_SSH_KEY not set — version-bump commit will be unsigned"
+          fi
 
           # Check if there are any changes to commit
           if git diff --quiet && git diff --cached --quiet; then

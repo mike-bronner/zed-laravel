@@ -51,7 +51,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Database connectivity for exists:/unique: validation rules
-sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres", "sqlite"], default-features = false }
+sqlx = { version = "0.9", features = ["runtime-tokio", "mysql", "postgres", "sqlite"], default-features = false }
 tiberius = { version = "0.12", default-features = false, features = ["tokio", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 

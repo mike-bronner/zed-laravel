@@ -47,7 +47,7 @@ Laravel developers are spoiled for choice — every major editor has a strong wa
 |---|---|---|
 | **PHPStorm** | Laravel support built in, powered by the [Laravel Idea](https://laravel-idea.com/) plugin | Paid IDE (free for non-commercial use) |
 | **VS Code** | [Official Laravel extension](https://github.com/laravel/vs-code-extension), maintained by the Laravel team | Free |
-| **Zed** | This extension, in addition to companion extensions:  [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade), [PHP](https://github.com/zed-extensions/php) (Intelephense), [phpcs](https://github.com/GeneaLabs/zed-phpcs-lsp), and [phpmd](https://github.com/GeneaLabs/zed-phpmd-lsp) | Free |
+| **Zed** | This extension, in addition to companion extensions:  [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade), [PHP](https://github.com/zed-extensions/php) (Intelephense), [phpcs](https://github.com/mike-bronner/zed-phpcs-lsp), and [phpmd](https://github.com/mike-bronner/zed-phpmd-lsp) | Free |
 
 <sub>A high-level snapshot as of 2026-05-30 — not a feature-by-feature scorecard. Every option here is capable and actively developed. (As of 2025, the Laravel Idea plugin is bundled free with PhpStorm.) Corrections welcome via PR.</sub>
 
@@ -76,8 +76,8 @@ Search **"Laravel"** in Zed Extensions and click Install.
 Also install the following extensions for a more complete experience:
 - [**Laravel Blade**](https://github.com/bajrangCoder/zed-laravel-blade) extension (`bajrangCoder/zed-laravel-blade`) for Blade-related fetures, syntax highlighting, etc.
 - [**PHP**](https://github.com/zed-extensions/php) (Intelephense) for php intellisense functionality
-- [**phpcs**](https://github.com/GeneaLabs/zed-phpcs-lsp) PHP CodeSniffer linting
-- [**phpmd**](https://github.com/GeneaLabs/zed-phpmd-lsp) PHP Mess Detector linting
+- [**phpcs**](https://github.com/mike-bronner/zed-phpcs-lsp) PHP CodeSniffer linting
+- [**phpmd**](https://github.com/mike-bronner/zed-phpmd-lsp) PHP Mess Detector linting
 
 ### From source
 

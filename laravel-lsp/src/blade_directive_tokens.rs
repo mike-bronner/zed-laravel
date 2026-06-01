@@ -27,8 +27,8 @@
 use std::collections::HashSet;
 
 use lazy_static::lazy_static;
-use tower_lsp::lsp_types::SemanticToken;
 use regex::Regex;
+use tower_lsp::lsp_types::SemanticToken;
 
 lazy_static! {
     /// A `@`-prefixed directive candidate: `@` followed by a PHP-identifier-shaped

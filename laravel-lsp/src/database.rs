@@ -1142,10 +1142,13 @@ impl DatabaseSchemaProvider {
         // entirely. If this returns a non-zero count but SHOW TABLES below
         // returns zero, we know the problem is specific to SHOW (driver
         // quirk, connection state, etc.) and not actual visibility.
-        match sqlx::query(&format!(
+        // Dynamic SQL: the schema name is interpolated as a quoted string
+        // literal with `'` doubled. Audited safe; sqlx 0.9 requires the
+        // explicit AssertSqlSafe opt-in for non-'static query strings.
+        match sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = '{}'",
             config.database.replace('\'', "''")
-        ))
+        )))
         .fetch_one(&pool)
         .await
         {
@@ -1162,10 +1165,12 @@ impl DatabaseSchemaProvider {
         }
         // Also try listing them via information_schema, so we can compare
         // shape against SHOW TABLES below.
-        match sqlx::query(&format!(
+        // Dynamic SQL: schema name as a quoted string literal, `'` doubled.
+        // Audited safe; AssertSqlSafe satisfies the sqlx 0.9 guard.
+        match sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = '{}' LIMIT 5",
             config.database.replace('\'', "''")
-        ))
+        )))
         .fetch_all(&pool)
         .await
         {
@@ -1209,10 +1214,16 @@ impl DatabaseSchemaProvider {
         let mut columns = HashMap::new();
         let mut columns_with_types = HashMap::new();
         for table in &tables {
-            let rows = sqlx::query(&format!("SHOW COLUMNS FROM `{}`", table))
-                .fetch_all(&pool)
-                .await
-                .ok()?;
+            // Dynamic SQL: `table` is a backtick-quoted identifier from
+            // SHOW TABLES (the DB's own schema). Escape embedded backticks
+            // and assert safe for the sqlx 0.9 guard.
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SHOW COLUMNS FROM `{}`",
+                table.replace('`', "``")
+            )))
+            .fetch_all(&pool)
+            .await
+            .ok()?;
 
             let mut col_names = Vec::new();
             let mut col_types = Vec::new();
@@ -1533,10 +1544,16 @@ impl DatabaseSchemaProvider {
         let mut columns = HashMap::new();
         let mut columns_with_types = HashMap::new();
         for table in &tables {
-            let rows = sqlx::query(&format!("PRAGMA table_info('{}')", table))
-                .fetch_all(&pool)
-                .await
-                .ok()?;
+            // Dynamic SQL: `table` is a quoted string literal from
+            // sqlite_master (the DB's own schema). Escape embedded quotes
+            // and assert safe for the sqlx 0.9 guard.
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA table_info('{}')",
+                table.replace('\'', "''")
+            )))
+            .fetch_all(&pool)
+            .await
+            .ok()?;
 
             let mut col_names = Vec::new();
             let mut col_types = Vec::new();

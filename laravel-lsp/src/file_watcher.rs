@@ -44,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lsp_types::{
+use tower_lsp::lsp_types::{
     DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern, Registration,
     WatchKind,
 };

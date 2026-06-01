@@ -16,9 +16,9 @@
 
 use std::time::{Duration, Instant};
 
-use lsp_types::notification::Progress as ProgressNotification;
-use lsp_types::request::WorkDoneProgressCreate;
-use lsp_types::{
+use tower_lsp::lsp_types::notification::Progress as ProgressNotification;
+use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
+use tower_lsp::lsp_types::{
     NumberOrString, ProgressParams, ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
     WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };

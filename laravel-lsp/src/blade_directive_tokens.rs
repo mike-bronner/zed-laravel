@@ -27,7 +27,7 @@
 use std::collections::HashSet;
 
 use lazy_static::lazy_static;
-use lsp_types::SemanticToken;
+use tower_lsp::lsp_types::SemanticToken;
 use regex::Regex;
 
 lazy_static! {

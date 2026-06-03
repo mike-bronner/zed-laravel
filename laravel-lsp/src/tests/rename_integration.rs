@@ -50,6 +50,8 @@ fn fake_config(root: &Path) -> LaravelConfigData {
         has_livewire: true,
         view_namespaces: HashMap::new(),
         component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
     }

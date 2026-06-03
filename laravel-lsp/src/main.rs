@@ -193,14 +193,6 @@ struct ViewNameCompletion {
     path: String,
 }
 
-/// A Blade component for autocomplete
-struct BladeComponentCompletion {
-    /// The component name (e.g., "button", "forms.input")
-    name: String,
-    /// Relative path to the component file
-    path: String,
-}
-
 /// A Livewire component for autocomplete
 struct LivewireComponentCompletion {
     /// The component name in kebab-case (e.g., "user-profile", "admin.dashboard")
@@ -4367,8 +4359,12 @@ impl LaravelLanguageServer {
                     component_paths: cached_config.component_paths.clone(),
                     livewire_path: cached_config.livewire_path.clone(),
                     has_livewire: cached_config.has_livewire,
-                    view_namespaces: std::collections::HashMap::new(),
-                    component_namespaces: std::collections::HashMap::new(),
+                    view_namespaces: cached_config.view_namespaces.clone(),
+                    component_namespaces: cached_config.component_namespaces.clone(),
+                    anonymous_component_paths: cached_config.anonymous_component_paths.clone(),
+                    anonymous_component_namespaces: cached_config
+                        .anonymous_component_namespaces
+                        .clone(),
                     component_aliases: laravel_lsp::config::load_component_aliases(
                         &cached_config.root,
                     ),
@@ -4436,8 +4432,10 @@ impl LaravelLanguageServer {
                 component_paths: c.component_paths.clone(),
                 livewire_path: c.livewire_path.clone(),
                 has_livewire: c.has_livewire,
-                view_namespaces: std::collections::HashMap::new(),
-                component_namespaces: std::collections::HashMap::new(),
+                view_namespaces: c.view_namespaces.clone(),
+                component_namespaces: c.component_namespaces.clone(),
+                anonymous_component_paths: c.anonymous_component_paths.clone(),
+                anonymous_component_namespaces: c.anonymous_component_namespaces.clone(),
                 component_aliases: laravel_lsp::config::load_component_aliases(&c.root),
                 icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&c.root),
             });
@@ -4856,23 +4854,45 @@ impl LaravelLanguageServer {
 
     /// Populate cache with all data from Salsa (config, env, middleware, bindings)
     async fn populate_cache_from_salsa(&self) {
+        // Fetch the authoritative Laravel config from Salsa once, up front. This
+        // is called after the vendor/app rescans have registered the service
+        // providers, so it now carries the namespace maps (view, component, and
+        // anonymous-component) that the initial config — built before those
+        // rescans — was missing.
+        let salsa_config = self.salsa.get_laravel_config().await.ok().flatten();
+
+        // Refresh the in-memory cached config so diagnostics THIS session see the
+        // namespace maps immediately. Without this the config first built during
+        // init (before providers were parsed) lingers with empty namespaces, and
+        // `<x-ns::component>` reports a false "not found" until a provider edit
+        // forces a rebuild. The on-disk cache below persists the same maps for
+        // the next launch.
+        if let Some(ref config) = salsa_config {
+            *self.cached_config.write().await = Some(config.clone());
+        }
+
         let mut cache_guard = self.cache.write().await;
         let Some(ref mut cache) = *cache_guard else {
             return;
         };
 
-        // 1. Cache Laravel config
-        if let Ok(Some(config)) = self.salsa.get_laravel_config().await {
+        // 1. Cache Laravel config (including namespace maps, for next launch)
+        if let Some(ref config) = salsa_config {
             let cached_config = CachedLaravelConfig {
                 root: config.root.clone(),
                 view_paths: config.view_paths.clone(),
                 component_paths: config.component_paths.clone(),
                 livewire_path: config.livewire_path.clone(),
                 has_livewire: config.has_livewire,
+                view_namespaces: config.view_namespaces.clone(),
+                component_namespaces: config.component_namespaces.clone(),
+                anonymous_component_paths: config.anonymous_component_paths.clone(),
+                anonymous_component_namespaces: config.anonymous_component_namespaces.clone(),
             };
             info!(
-                "📋 Caching Laravel config: {} view paths",
-                config.view_paths.len()
+                "📋 Caching Laravel config: {} view paths, {} anon-component paths",
+                config.view_paths.len(),
+                config.anonymous_component_paths.len()
             );
             cache.set_laravel_config(cached_config);
         }
@@ -6731,6 +6751,9 @@ impl LaravelLanguageServer {
     /// - `<x-` returns Some(StringContext { prefix: "", start_col: 3, end_col: 3, ... })
     /// - `<x-button` returns Some(StringContext { prefix: "button", start_col: 3, end_col: 9, ... })
     /// - `<x-forms.` returns Some(StringContext { prefix: "forms.", start_col: 3, end_col: 9, ... })
+    /// - `<x-test::` returns Some(StringContext { prefix: "test::", ... }) — namespaced
+    ///   components (anonymous or class-based) are completed too, so `:` is a
+    ///   valid character in the partial name.
     fn get_blade_component_context(line_text: &str, character: u32) -> Option<StringContext> {
         let cursor = character as usize;
         if cursor > line_text.len() {
@@ -6757,10 +6780,12 @@ impl LaravelLanguageServer {
                 return None;
             }
 
-            // Validate that after_prefix only contains valid component name characters
+            // Validate that after_prefix only contains valid component name characters.
+            // `:` is allowed so namespaced components (`<x-test::backstage>`,
+            // `<x-flux::button>`) are recognized as a completion context.
             if after_prefix
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ':')
             {
                 return Some(StringContext {
                     prefix: after_prefix.to_string(),
@@ -10548,136 +10573,92 @@ impl LaravelLanguageServer {
     }
 
     /// Get all Blade component names from component directories for autocomplete
-    async fn get_all_blade_components(&self) -> Vec<BladeComponentCompletion> {
+    async fn get_all_blade_components(
+        &self,
+    ) -> Vec<laravel_lsp::component_completion::ComponentCandidate> {
+        use laravel_lsp::component_completion::{
+            dedup_and_sort, scan_anonymous_dir, scan_class_dir,
+        };
+
         let root = match self.root_path.read().await.clone() {
             Some(r) => r,
             None => return Vec::new(),
         };
 
-        // Get component paths from cached config
-        let component_paths = match self.cached_config.read().await.as_ref() {
-            Some(config) => config.component_paths.clone(),
-            None => {
-                // Default to resources/views/components if no config
-                vec![(String::new(), root.join("resources/views/components"))]
-            }
+        let mut candidates = Vec::new();
+
+        // Snapshot the config maps we need, then drop the lock before walking
+        // the filesystem (which can be slow and shouldn't hold the read lock).
+        let (
+            component_paths,
+            view_namespaces,
+            anon_paths,
+            anon_namespaces,
+            class_namespaces,
+            view_paths,
+        ) = match self.cached_config.read().await.as_ref() {
+            Some(config) => (
+                config.component_paths.clone(),
+                config.view_namespaces.clone(),
+                config.anonymous_component_paths.clone(),
+                config.anonymous_component_namespaces.clone(),
+                config.component_namespaces.clone(),
+                config.view_paths.clone(),
+            ),
+            None => (
+                vec![(String::new(), root.join("resources/views/components"))],
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                vec![root.join("resources/views")],
+            ),
         };
 
-        let mut completions = Vec::new();
+        // 1. Root anonymous components — `resources/views/components/*.blade.php`
+        //    (also where class-paired views live). No namespace prefix.
+        for (_namespace, component_path) in &component_paths {
+            candidates.extend(scan_anonymous_dir(component_path, "", &root));
+        }
 
-        for (namespace, component_path) in component_paths {
-            if !component_path.exists() {
-                continue;
+        // 2. Package view namespaces (loadViewsFrom) — `{path}/components/`.
+        for (namespace, package_path) in &view_namespaces {
+            let dir = package_path.join("components");
+            candidates.extend(scan_anonymous_dir(&dir, &format!("{namespace}::"), &root));
+        }
+
+        // 3. Anonymous component paths (Blade::anonymousComponentPath) — the
+        //    registered directory IS the components dir.
+        for (namespace, dir) in &anon_paths {
+            candidates.extend(scan_anonymous_dir(dir, &format!("{namespace}::"), &root));
+        }
+
+        // 4. Anonymous component namespaces (Blade::anonymousComponentNamespace)
+        //    — directory is relative to each view path.
+        for (namespace, rel_dir) in &anon_namespaces {
+            for view_path in &view_paths {
+                let dir = root.join(view_path).join(rel_dir);
+                candidates.extend(scan_anonymous_dir(&dir, &format!("{namespace}::"), &root));
             }
+        }
 
-            // Walk the directory recursively
-            for entry in walkdir::WalkDir::new(&component_path)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "php")
-                })
-            {
-                let path = entry.into_path();
-
-                // Convert file path to component name
-                if let Ok(relative) = path.strip_prefix(&component_path) {
-                    let relative_str = relative.to_string_lossy();
-
-                    // Remove .blade.php or .php extension
-                    let component_name = if relative_str.ends_with(".blade.php") {
-                        relative_str.trim_end_matches(".blade.php")
-                    } else if relative_str.ends_with(".php") {
-                        relative_str.trim_end_matches(".php")
-                    } else {
-                        continue;
-                    };
-
-                    // Convert path separators to dots for nested components
-                    let component_name = component_name.replace(['/', '\\'], ".");
-
-                    // Convert to kebab-case (Laravel convention for Blade components)
-                    // PascalCase files become kebab-case: "Button" -> "button", "AlertDialog" -> "alert-dialog"
-                    let component_name = Self::to_kebab_case(&component_name);
-
-                    // Add namespace prefix if present
-                    let full_name = if namespace.is_empty() {
-                        component_name
-                    } else {
-                        format!("{}::{}", namespace, component_name)
-                    };
-
-                    // Get relative path from project root for display
-                    let display_path = path
-                        .strip_prefix(&root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
-
-                    completions.push(BladeComponentCompletion {
-                        name: full_name,
-                        path: display_path,
-                    });
+        // 5. Class component namespaces (Blade::componentNamespace) — resolve
+        //    the PHP namespace to a source directory via PSR-4 and walk classes.
+        if !class_namespaces.is_empty() {
+            let autoload = laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root);
+            for (namespace, php_namespace) in &class_namespaces {
+                for dir in autoload.resolve_namespace_dirs(php_namespace) {
+                    candidates.extend(scan_class_dir(&dir, &format!("{namespace}::"), &root));
                 }
             }
         }
 
-        // Add package components from view_namespaces
-        // Package anonymous components live in {package_view_path}/components/
-        if let Some(config) = self.cached_config.read().await.as_ref() {
-            for (namespace, package_path) in &config.view_namespaces {
-                let components_path = package_path.join("components");
-                if !components_path.exists() {
-                    continue;
-                }
+        // 6. Non-namespaced class components — `app/View/Components/*.php`.
+        //    These have no blade file of their own when render() is inline, so
+        //    they're invisible to the view scans above.
+        candidates.extend(scan_class_dir(&root.join("app/View/Components"), "", &root));
 
-                for entry in walkdir::WalkDir::new(&components_path)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().is_some_and(|ext| ext == "php")
-                    })
-                {
-                    let path = entry.into_path();
-
-                    if let Ok(relative) = path.strip_prefix(&components_path) {
-                        let relative_str = relative.to_string_lossy();
-
-                        // Remove .blade.php or .php extension
-                        let component_name = if relative_str.ends_with(".blade.php") {
-                            relative_str.trim_end_matches(".blade.php")
-                        } else if relative_str.ends_with(".php") {
-                            relative_str.trim_end_matches(".php")
-                        } else {
-                            continue;
-                        };
-
-                        // Convert path separators to dots for nested components
-                        let component_name = component_name.replace(['/', '\\'], ".");
-
-                        // Convert to kebab-case
-                        let component_name = Self::to_kebab_case(&component_name);
-
-                        // Package components use namespace::component format
-                        let full_name = format!("{}::{}", namespace, component_name);
-
-                        // For display, show relative to package path or absolute
-                        let display_path = path.to_string_lossy().to_string();
-
-                        completions.push(BladeComponentCompletion {
-                            name: full_name,
-                            path: display_path,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Sort by name for consistent ordering
-        completions.sort_by(|a, b| a.name.cmp(&b.name));
-        completions
+        dedup_and_sort(candidates)
     }
 
     /// Get all Livewire component names from app/Livewire directory for autocomplete
@@ -10834,21 +10815,9 @@ impl LaravelLanguageServer {
     /// "AlertDialog" -> "alert-dialog"
     /// "forms.Input" -> "forms.input"
     fn to_kebab_case(s: &str) -> String {
-        let mut result = String::new();
-        for (i, c) in s.chars().enumerate() {
-            if c == '.' {
-                // Preserve dots for nested components
-                result.push('.');
-            } else if c.is_uppercase() {
-                if i > 0 && !result.ends_with('.') && !result.ends_with('-') {
-                    result.push('-');
-                }
-                result.push(c.to_lowercase().next().unwrap());
-            } else {
-                result.push(c);
-            }
-        }
-        result
+        // Single source of truth lives in the component-completion module so
+        // Blade-component and Livewire naming stay in lockstep.
+        laravel_lsp::component_completion::to_kebab_case(s)
     }
 
     /// Locate any PHP class file under `app/` (or `src/`) and return its
@@ -18633,36 +18602,48 @@ impl LanguageServer for LaravelLanguageServer {
                 // Get all Blade components
                 let components = self.get_all_blade_components().await;
 
+                use laravel_lsp::component_completion::CandidateKind;
+
                 // Build completion items, filtering by prefix (case-insensitive)
                 let prefix_lower = component_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = components
                     .into_iter()
                     .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
-                    .map(|c| CompletionItem {
-                        label: c.name.clone(),
-                        kind: Some(CompletionItemKind::CLASS),
-                        detail: Some(c.path.clone()),
-                        documentation: Some(
-                            CompletionDoc::new()
-                                .header(format!("<x-{}>", c.name))
-                                .summary("Blade component.")
-                                .section(format!("Source: {}", c.path))
-                                .into_documentation(),
-                        ),
-                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: Range {
-                                start: Position {
-                                    line: position.line,
-                                    character: component_ctx.start_col,
+                    .map(|c| {
+                        let (item_kind, summary) = match c.kind {
+                            CandidateKind::Class => {
+                                (CompletionItemKind::CLASS, "Class-based Blade component.")
+                            }
+                            CandidateKind::AnonymousView => {
+                                (CompletionItemKind::STRUCT, "Anonymous Blade component.")
+                            }
+                        };
+                        CompletionItem {
+                            label: c.name.clone(),
+                            kind: Some(item_kind),
+                            detail: Some(c.detail.clone()),
+                            documentation: Some(
+                                CompletionDoc::new()
+                                    .header(format!("<x-{}>", c.name))
+                                    .summary(summary)
+                                    .section(format!("Source: {}", c.detail))
+                                    .into_documentation(),
+                            ),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: position.line,
+                                        character: component_ctx.start_col,
+                                    },
+                                    end: Position {
+                                        line: position.line,
+                                        character: component_ctx.end_col,
+                                    },
                                 },
-                                end: Position {
-                                    line: position.line,
-                                    character: component_ctx.end_col,
-                                },
-                            },
-                            new_text: c.name.clone(),
-                        })),
-                        ..Default::default()
+                                new_text: c.name.clone(),
+                            })),
+                            ..Default::default()
+                        }
                     })
                     .collect();
 

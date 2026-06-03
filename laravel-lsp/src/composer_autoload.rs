@@ -77,6 +77,48 @@ impl ComposerAutoload {
         None
     }
 
+    /// Resolve a PHP **namespace** (not a class) to the source directory/-ies
+    /// that hold it, for every PSR-4 prefix that's an ancestor. The inverse of
+    /// [`resolve`]: where `resolve` maps `Acme\Foo\Bar` → `.../Bar.php`, this
+    /// maps the namespace `Acme\Foo` → `.../Foo/` so callers can walk it.
+    ///
+    /// Used by class-based component completion (`Blade::componentNamespace`):
+    /// the registered PHP namespace is turned into a directory whose class
+    /// files become `<x-prefix::name>` candidates. Only directories that exist
+    /// on disk are returned; a namespace with no matching prefix yields empty.
+    pub fn resolve_namespace_dirs(&self, namespace: &str) -> Vec<PathBuf> {
+        let normalized = namespace.trim_start_matches('\\').trim_end_matches('\\');
+        let mut dirs = Vec::new();
+        for (prefix, source_roots) in &self.prefixes {
+            // The namespace either equals the PSR-4 prefix exactly, or extends
+            // it past a `\` boundary (so prefix `App` matches `App\View` but
+            // not `Application`). `prefix` is stored without a trailing `\`.
+            let rel = if normalized == prefix {
+                Some(PathBuf::new())
+            } else if let Some(after) = normalized.strip_prefix(prefix.as_str()) {
+                after.strip_prefix('\\').map(|rest| {
+                    let mut p = PathBuf::new();
+                    for seg in rest.split('\\') {
+                        p.push(seg);
+                    }
+                    p
+                })
+            } else {
+                None
+            };
+
+            if let Some(rel) = rel {
+                for source_root in source_roots {
+                    let dir = source_root.join(&rel);
+                    if dir.is_dir() {
+                        dirs.push(dir);
+                    }
+                }
+            }
+        }
+        dirs
+    }
+
     /// Parse autoload data fresh from disk. Doesn't touch the cache —
     /// callers should normally use [`for_project`] instead.
     pub fn load(project_root: &Path) -> Self {

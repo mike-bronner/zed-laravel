@@ -187,3 +187,44 @@ fn leading_backslash_in_fqcn_is_tolerated() {
         "got {resolved:?}"
     );
 }
+
+#[test]
+fn resolve_namespace_dirs_maps_namespace_to_existing_directory() {
+    // Blade::componentNamespace('App\\View\\Components\\Nightshade', 'nightshade')
+    // must resolve to the on-disk directory so its class files can be walked
+    // for completion candidates.
+    let composer = r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#;
+    let (_dir, root) = project_with_files(&[
+        ("composer.json", composer),
+        (
+            "app/View/Components/Nightshade/Alert.php",
+            "<?php class Alert {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+
+    let dirs = autoload.resolve_namespace_dirs("App\\View\\Components\\Nightshade");
+
+    assert_eq!(dirs.len(), 1, "expected one resolved dir, got {dirs:?}");
+    assert!(
+        dirs[0].ends_with("app/View/Components/Nightshade"),
+        "got {:?}",
+        dirs[0],
+    );
+}
+
+#[test]
+fn resolve_namespace_dirs_returns_empty_for_unknown_or_nonexistent() {
+    let composer = r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#;
+    let (_dir, root) = project_with_files(&[("composer.json", composer)]);
+    let autoload = ComposerAutoload::load(&root);
+
+    // No matching PSR-4 prefix.
+    assert!(autoload
+        .resolve_namespace_dirs("Vendor\\Pkg\\Components")
+        .is_empty());
+    // Matching prefix but the directory doesn't exist on disk.
+    assert!(autoload
+        .resolve_namespace_dirs("App\\View\\Components")
+        .is_empty());
+}

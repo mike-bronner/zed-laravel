@@ -3241,9 +3241,12 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<()>,
     },
 
-    /// Register Laravel config from disk cache (bypasses parsing)
+    /// Register Laravel config from disk cache (bypasses parsing).
+    /// Boxed because `LaravelConfigData` is by far the largest payload of any
+    /// `SalsaRequest` variant; keeping it inline bloats every message (see
+    /// clippy::large_enum_variant).
     RegisterCachedConfig {
-        config: LaravelConfigData,
+        config: Box<LaravelConfigData>,
         reply: oneshot::Sender<()>,
     },
 
@@ -4082,7 +4085,7 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::RegisterCachedConfig {
-                config,
+                config: Box::new(config),
                 reply: reply_tx,
             })
             .await
@@ -4729,7 +4732,7 @@ impl SalsaActor {
                 SalsaRequest::RegisterCachedConfig { config, reply } => {
                     // Set config directly from cache, bypassing parsing
                     self.config_root = Some(config.root.clone());
-                    self.config_cache = Some((self.config_version, config));
+                    self.config_cache = Some((self.config_version, *config));
                     tracing::info!("📋 Registered cached Laravel config");
                     let _ = reply.send(());
                 }

@@ -1490,6 +1490,44 @@ pub struct ParsedComponentNamespaceReg<'db> {
     pub source_file: PathBuf,
 }
 
+/// A parsed anonymous component path registration from
+/// Blade::anonymousComponentPath() (Salsa tracked).
+/// Example: Blade::anonymousComponentPath(resource_path('views/backstage/components'), 'backstage')
+#[salsa::tracked]
+pub struct ParsedAnonymousComponentPathReg<'db> {
+    /// Component prefix (e.g., "backstage")
+    pub prefix: PackageNamespace<'db>,
+    /// Resolved absolute directory holding the anonymous components
+    #[returns(ref)]
+    pub directory: PathBuf,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
+/// A parsed anonymous component namespace registration from
+/// Blade::anonymousComponentNamespace() (Salsa tracked).
+/// Example: Blade::anonymousComponentNamespace('components.flux', 'flux')
+#[salsa::tracked]
+pub struct ParsedAnonymousComponentNamespaceReg<'db> {
+    /// Component prefix (e.g., "flux")
+    pub prefix: PackageNamespace<'db>,
+    /// Directory relative to the view paths (dots normalized to slashes)
+    #[returns(ref)]
+    pub directory: String,
+    /// Line in source file where registered
+    pub source_line: u32,
+    /// Priority (0=framework, 1=package, 2=app)
+    pub priority: u8,
+    /// Source file where registered
+    #[returns(ref)]
+    pub source_file: PathBuf,
+}
+
 /// Parsed service provider content
 #[salsa::tracked]
 pub struct ParsedServiceProvider<'db> {
@@ -1508,6 +1546,12 @@ pub struct ParsedServiceProvider<'db> {
     /// Component namespace registrations from Blade::componentNamespace()
     #[returns(ref)]
     pub component_namespaces: Vec<ParsedComponentNamespaceReg<'db>>,
+    /// Anonymous component path registrations from Blade::anonymousComponentPath()
+    #[returns(ref)]
+    pub anonymous_component_paths: Vec<ParsedAnonymousComponentPathReg<'db>>,
+    /// Anonymous component namespace registrations from Blade::anonymousComponentNamespace()
+    #[returns(ref)]
+    pub anonymous_component_namespaces: Vec<ParsedAnonymousComponentNamespaceReg<'db>>,
 }
 
 /// Parse a service provider file and extract middleware, bindings, views, and components
@@ -1842,6 +1886,37 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
+    // Parse Blade::anonymousComponentPath() registrations.
+    // Example: Blade::anonymousComponentPath(resource_path('views/backstage/components'), 'backstage')
+    let provider_dir = path.parent().unwrap_or(path.as_path());
+    let mut anonymous_component_paths = Vec::new();
+    for (prefix, directory, line) in extract_anonymous_component_paths(text, &root, provider_dir) {
+        let pkg_namespace = PackageNamespace::new(db, prefix);
+        anonymous_component_paths.push(ParsedAnonymousComponentPathReg::new(
+            db,
+            pkg_namespace,
+            directory,
+            line,
+            priority,
+            path.clone(),
+        ));
+    }
+
+    // Parse Blade::anonymousComponentNamespace() registrations.
+    // Example: Blade::anonymousComponentNamespace('components.flux', 'flux')
+    let mut anonymous_component_namespaces = Vec::new();
+    for (prefix, directory, line) in extract_anonymous_component_namespaces(text) {
+        let pkg_namespace = PackageNamespace::new(db, prefix);
+        anonymous_component_namespaces.push(ParsedAnonymousComponentNamespaceReg::new(
+            db,
+            pkg_namespace,
+            directory,
+            line,
+            priority,
+            path.clone(),
+        ));
+    }
+
     ParsedServiceProvider::new(
         db,
         middleware,
@@ -1849,7 +1924,139 @@ pub fn parse_service_provider_source<'db>(
         view_namespaces,
         blade_components,
         component_namespaces,
+        anonymous_component_paths,
+        anonymous_component_namespaces,
     )
+}
+
+/// Resolve a PHP path expression to an absolute filesystem path without
+/// executing PHP. Handles the path forms that appear in real service-provider
+/// `anonymousComponentPath()` calls:
+///
+/// - Laravel path helpers: `resource_path('x')`, `base_path('x')`, `app_path('x')`,
+///   `storage_path('x')`, `public_path('x')`, `config_path('x')`,
+///   `database_path('x')`, `lang_path('x')` — and their no-argument forms.
+/// - `__DIR__ . '/relative'` — resolved against the provider file's directory.
+/// - A plain string literal — absolute as-is, otherwise joined to the project root.
+///
+/// Returns `None` for expressions we can't statically resolve (e.g. a variable).
+fn resolve_php_path_expr(expr: &str, root: &Path, provider_dir: &Path) -> Option<PathBuf> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        /// `helper('sub/dir')` or `helper()` for the Laravel path helpers.
+        static ref HELPER_RE: Regex = Regex::new(
+            r#"^(resource_path|base_path|app_path|storage_path|public_path|config_path|database_path|lang_path)\s*\(\s*(?:['"]([^'"]*)['"]\s*)?\)$"#
+        ).unwrap();
+        /// `__DIR__ . '/relative'`
+        static ref DIR_CONST_RE: Regex = Regex::new(
+            r#"^__DIR__\s*\.\s*['"]([^'"]+)['"]$"#
+        ).unwrap();
+        /// A bare string literal.
+        static ref LITERAL_RE: Regex = Regex::new(r#"^['"]([^'"]+)['"]$"#).unwrap();
+    }
+
+    let expr = expr.trim();
+
+    if let Some(cap) = HELPER_RE.captures(expr) {
+        let helper = cap.get(1).unwrap().as_str();
+        let sub = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let base = match helper {
+            "base_path" => root.to_path_buf(),
+            "resource_path" => root.join("resources"),
+            "app_path" => root.join("app"),
+            "storage_path" => root.join("storage"),
+            "public_path" => root.join("public"),
+            "config_path" => root.join("config"),
+            "database_path" => root.join("database"),
+            "lang_path" => root.join("lang"),
+            _ => return None,
+        };
+        let joined = if sub.is_empty() {
+            base
+        } else {
+            base.join(sub.trim_start_matches('/'))
+        };
+        return Some(normalize_path(&joined));
+    }
+
+    if let Some(cap) = DIR_CONST_RE.captures(expr) {
+        let sub = cap.get(1).unwrap().as_str().trim_start_matches('/');
+        return Some(normalize_path(&provider_dir.join(sub)));
+    }
+
+    if let Some(cap) = LITERAL_RE.captures(expr) {
+        let lit = cap.get(1).unwrap().as_str();
+        let p = Path::new(lit);
+        let joined = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(lit)
+        };
+        return Some(normalize_path(&joined));
+    }
+
+    None
+}
+
+/// Extract `Blade::anonymousComponentPath(<path>, 'prefix')` registrations from
+/// service-provider source. Pure (regex + path resolution) so it can be unit
+/// tested without a Salsa database. Returns `(prefix, absolute_directory,
+/// source_line)` tuples; registrations whose path argument can't be statically
+/// resolved are skipped.
+fn extract_anonymous_component_paths(
+    text: &str,
+    root: &Path,
+    provider_dir: &Path,
+) -> Vec<(String, PathBuf, u32)> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        /// Group 1 is the path expression (non-greedy, single line); group 2 is
+        /// the string prefix. The two-argument (prefixed) form is the only one
+        /// that produces `<x-prefix::component>` namespaced usage.
+        static ref ANON_PATH_RE: Regex = Regex::new(
+            r#"Blade::anonymousComponentPath\s*\(\s*(.+?)\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+    }
+
+    let mut out = Vec::new();
+    for cap in ANON_PATH_RE.captures_iter(text) {
+        if let (Some(path_expr), Some(prefix)) = (cap.get(1), cap.get(2)) {
+            if let Some(directory) = resolve_php_path_expr(path_expr.as_str(), root, provider_dir) {
+                let line = text[..prefix.start()].lines().count() as u32;
+                out.push((prefix.as_str().to_string(), directory, line));
+            }
+        }
+    }
+    out
+}
+
+/// Extract `Blade::anonymousComponentNamespace('dir', 'prefix')` registrations.
+/// The directory is relative to the registered view paths; dots are normalized
+/// to slashes (Laravel resolves it through the dot-notation view finder).
+/// Returns `(prefix, view_relative_directory, source_line)` tuples.
+fn extract_anonymous_component_namespaces(text: &str) -> Vec<(String, String, u32)> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        static ref ANON_NS_RE: Regex = Regex::new(
+            r#"Blade::anonymousComponentNamespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+    }
+
+    let mut out = Vec::new();
+    for cap in ANON_NS_RE.captures_iter(text) {
+        if let (Some(directory), Some(prefix)) = (cap.get(1), cap.get(2)) {
+            let line = text[..prefix.start()].lines().count() as u32;
+            let normalized = directory.as_str().replace('.', "/");
+            out.push((prefix.as_str().to_string(), normalized, line));
+        }
+    }
+    out
 }
 
 /// Normalize a path by resolving . and .. components without requiring the path to exist
@@ -2070,6 +2277,17 @@ pub struct LaravelConfigData {
     /// Package component namespaces from Blade::componentNamespace() calls
     /// Maps prefix (e.g., "nightshade") to PHP namespace
     pub component_namespaces: HashMap<String, String>,
+    /// Anonymous component paths from Blade::anonymousComponentPath($path, 'prefix').
+    /// Maps prefix (e.g., "backstage") to the **absolute** directory holding the
+    /// anonymous components. Resolution is `{dir}/{component}.blade.php` — no
+    /// `components/` segment is appended, because Laravel registers the directory
+    /// itself (unlike the package-publish `resources/views/vendor/<ns>/` convention).
+    pub anonymous_component_paths: HashMap<String, PathBuf>,
+    /// Anonymous component namespaces from Blade::anonymousComponentNamespace($dir, 'prefix').
+    /// Maps prefix (e.g., "flux") to a directory **relative to the view paths**
+    /// (dots normalized to slashes). Resolution is
+    /// `{view_path}/{dir}/{component}.blade.php`.
+    pub anonymous_component_namespaces: HashMap<String, String>,
     /// Component aliases registered via Blade::component($view, $alias) or via
     /// config-based registration loops. Maps alias (e.g., "light-button") to
     /// the target view path in dot notation (e.g., "components.buttons.light-button").
@@ -2180,6 +2398,31 @@ impl LaravelConfigData {
         let component_path = actual_component.replace('.', "/");
 
         if let Some(ns) = namespace {
+            // Anonymous component path (Blade::anonymousComponentPath): the
+            // registered directory IS the components directory, so resolve
+            // directly with no `components/` segment. Both the flat file and
+            // Laravel's `{component}/index.blade.php` index convention are valid.
+            // Pushed first so the correct path is `paths.first()` — the
+            // diagnostic reports that as the "Expected at:" location.
+            if let Some(dir) = self.anonymous_component_paths.get(ns) {
+                let mut direct = dir.join(&component_path);
+                direct.set_extension("blade.php");
+                paths.push(direct);
+                paths.push(dir.join(&component_path).join("index.blade.php"));
+            }
+
+            // Anonymous component namespace (Blade::anonymousComponentNamespace):
+            // the registered directory is relative to each view path.
+            if let Some(dir) = self.anonymous_component_namespaces.get(ns) {
+                for view_path in &self.view_paths {
+                    let base = self.root.join(view_path).join(dir);
+                    let mut direct = base.join(&component_path);
+                    direct.set_extension("blade.php");
+                    paths.push(direct);
+                    paths.push(base.join(&component_path).join("index.blade.php"));
+                }
+            }
+
             // Package component - check package view path first
             if let Some(package_view_path) = self.view_namespaces.get(ns) {
                 // Anonymous package component: {package_views}/components/{component}.blade.php
@@ -5153,6 +5396,8 @@ impl SalsaActor {
         // Collect view namespaces from all parsed service providers
         let mut view_namespaces: HashMap<String, PathBuf> = HashMap::new();
         let mut component_namespaces: HashMap<String, String> = HashMap::new();
+        let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
+        let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
 
         if let Some(sp_root) = self.salsa_sp_root.as_ref() {
             for sp_file in self.salsa_sp_files.values() {
@@ -5183,6 +5428,22 @@ impl SalsaActor {
                         }
                     }
                 }
+
+                // Collect anonymous component paths (Blade::anonymousComponentPath)
+                for acp in parsed.anonymous_component_paths(&self.db) {
+                    let prefix = acp.prefix(&self.db).namespace(&self.db).clone();
+                    let directory = acp.directory(&self.db).clone();
+                    anonymous_component_paths.entry(prefix).or_insert(directory);
+                }
+
+                // Collect anonymous component namespaces (Blade::anonymousComponentNamespace)
+                for acn in parsed.anonymous_component_namespaces(&self.db) {
+                    let prefix = acn.prefix(&self.db).namespace(&self.db).clone();
+                    let directory = acn.directory(&self.db).clone();
+                    anonymous_component_namespaces
+                        .entry(prefix)
+                        .or_insert(directory);
+                }
             }
         }
 
@@ -5212,6 +5473,8 @@ impl SalsaActor {
             has_livewire: config_ref.has_livewire(&self.db),
             view_namespaces,
             component_namespaces,
+            anonymous_component_paths,
+            anonymous_component_namespaces,
             component_aliases,
             icon_aliases,
         };
@@ -6007,6 +6270,16 @@ impl SalsaActor {
         use salsa::Setter;
         self.salsa_sp_version += 1;
         self.salsa_sp_root = Some(root_path);
+
+        // The Laravel config's namespace maps (view namespaces, component
+        // namespaces, and anonymous-component paths/namespaces) are derived by
+        // parsing these service-provider files. Registering or updating one can
+        // therefore change the config, so the memoized config_cache must be
+        // dropped — otherwise `get_laravel_config` keeps serving the config that
+        // was built before this provider was known, and namespaced components
+        // resolve as "not found". Bumping salsa_sp_version alone is not enough;
+        // config_cache is keyed on config_version, which this doesn't touch.
+        self.config_cache = None;
 
         if let Some(file) = self.salsa_sp_files.get(&path) {
             // Update existing file

@@ -105,6 +105,8 @@ fn make_config_with_alias(alias: &str, view: &str) -> LaravelConfigData {
         has_livewire: false,
         view_namespaces: HashMap::new(),
         component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
         component_aliases: aliases,
         icon_aliases: HashMap::new(),
     }
@@ -122,6 +124,8 @@ fn make_config_with_icon(tag: &str, svg_path: &str) -> LaravelConfigData {
         has_livewire: false,
         view_namespaces: HashMap::new(),
         component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: icons,
     }
@@ -201,6 +205,335 @@ fn namespaced_component_bypasses_alias_map() {
             .all(|p| !p.to_string_lossy().contains("components/never/this")),
         "namespaced lookup must bypass alias map: {:?}",
         paths,
+    );
+}
+
+// ─── Anonymous component path / namespace resolution (issue #44) ────────
+
+fn make_config_with_anonymous_path(prefix: &str, abs_dir: &str) -> LaravelConfigData {
+    let mut anon = HashMap::new();
+    anon.insert(prefix.to_string(), PathBuf::from(abs_dir));
+
+    LaravelConfigData {
+        root: PathBuf::from("/project"),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: anon,
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+    }
+}
+
+fn make_config_with_anonymous_namespace(prefix: &str, dir: &str) -> LaravelConfigData {
+    let mut anon = HashMap::new();
+    anon.insert(prefix.to_string(), dir.to_string());
+
+    LaravelConfigData {
+        root: PathBuf::from("/project"),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: anon,
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+    }
+}
+
+#[test]
+fn anonymous_component_path_resolves_to_registered_directory() {
+    // Issue #44: Blade::anonymousComponentPath(resource_path('views/backstage/components'), 'backstage')
+    // <x-backstage::layout> must resolve to the registered directory directly —
+    // not the package-publish `resources/views/vendor/backstage/...` guess.
+    let config = make_config_with_anonymous_path(
+        "backstage",
+        "/project/resources/views/backstage/components",
+    );
+
+    let paths = config.resolve_component_path("backstage::layout");
+
+    assert_eq!(
+        paths.first(),
+        Some(&PathBuf::from(
+            "/project/resources/views/backstage/components/layout.blade.php"
+        )),
+        "registered anonymousComponentPath must be the first (expected) candidate: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn anonymous_component_path_supports_index_convention() {
+    let config = make_config_with_anonymous_path(
+        "backstage",
+        "/project/resources/views/backstage/components",
+    );
+
+    let paths = config.resolve_component_path("backstage::layout");
+
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/resources/views/backstage/components/layout/index.blade.php"
+            )),
+        "expected the index.blade.php convention candidate, got: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn anonymous_component_path_resolves_dotted_component_name() {
+    let config = make_config_with_anonymous_path(
+        "backstage",
+        "/project/resources/views/backstage/components",
+    );
+
+    let paths = config.resolve_component_path("backstage::forms.input");
+
+    assert!(
+        paths.iter().any(|p| p
+            == &PathBuf::from(
+                "/project/resources/views/backstage/components/forms/input.blade.php"
+            )),
+        "dotted component name must map dots to slashes: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn anonymous_component_namespace_resolves_relative_to_view_paths() {
+    // Blade::anonymousComponentNamespace('components.flux', 'flux')
+    // <x-flux::button> -> resources/views/components/flux/button.blade.php
+    let config = make_config_with_anonymous_namespace("flux", "components/flux");
+
+    let paths = config.resolve_component_path("flux::button");
+
+    assert!(
+        paths
+            .iter()
+            .any(|p| p
+                == &PathBuf::from("/project/resources/views/components/flux/button.blade.php")),
+        "anonymous namespace must resolve under the view path: {:?}",
+        paths,
+    );
+}
+
+#[test]
+fn unregistered_anonymous_prefix_does_not_borrow_registered_directory() {
+    let config = make_config_with_anonymous_path(
+        "backstage",
+        "/project/resources/views/backstage/components",
+    );
+
+    // A different prefix must not resolve into the backstage directory.
+    let paths = config.resolve_component_path("other::layout");
+
+    assert!(
+        paths
+            .iter()
+            .all(|p| !p.to_string_lossy().contains("backstage/components")),
+        "unregistered prefix must not resolve into a registered anon directory: {:?}",
+        paths,
+    );
+}
+
+// ─── PHP path-expression resolution ─────────────────────────────────────
+
+#[test]
+fn resolve_php_path_expr_handles_resource_path() {
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+    assert_eq!(
+        resolve_php_path_expr(
+            "resource_path('views/backstage/components')",
+            &root,
+            &provider_dir
+        ),
+        Some(PathBuf::from(
+            "/project/resources/views/backstage/components"
+        )),
+    );
+}
+
+#[test]
+fn resolve_php_path_expr_handles_base_and_app_path() {
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+    assert_eq!(
+        resolve_php_path_expr("base_path('resources/views/x')", &root, &provider_dir),
+        Some(PathBuf::from("/project/resources/views/x")),
+    );
+    assert_eq!(
+        resolve_php_path_expr("app_path('View/Components')", &root, &provider_dir),
+        Some(PathBuf::from("/project/app/View/Components")),
+    );
+}
+
+#[test]
+fn resolve_php_path_expr_handles_dir_constant() {
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/pkg/src/Providers");
+    assert_eq!(
+        resolve_php_path_expr(
+            "__DIR__ . '/../resources/views/components'",
+            &root,
+            &provider_dir
+        ),
+        Some(PathBuf::from("/pkg/src/resources/views/components")),
+    );
+}
+
+#[test]
+fn resolve_php_path_expr_handles_absolute_literal() {
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+    assert_eq!(
+        resolve_php_path_expr("'/abs/components'", &root, &provider_dir),
+        Some(PathBuf::from("/abs/components")),
+    );
+}
+
+#[test]
+fn resolve_php_path_expr_rejects_unresolvable_expression() {
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+    assert_eq!(
+        resolve_php_path_expr("$this->componentPath", &root, &provider_dir),
+        None,
+    );
+}
+
+// ─── Service-provider registration extraction ───────────────────────────
+
+#[test]
+fn extract_anonymous_component_paths_reads_registration() {
+    let src = r#"
+        public function boot(): void
+        {
+            Blade::anonymousComponentPath(resource_path('views/backstage/components'), 'backstage');
+        }
+    "#;
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+
+    let regs = extract_anonymous_component_paths(src, &root, &provider_dir);
+
+    assert_eq!(regs.len(), 1);
+    assert_eq!(regs[0].0, "backstage");
+    assert_eq!(
+        regs[0].1,
+        PathBuf::from("/project/resources/views/backstage/components"),
+    );
+}
+
+#[test]
+fn extract_anonymous_component_namespaces_normalizes_dots() {
+    let src = "Blade::anonymousComponentNamespace('components.flux', 'flux');";
+
+    let regs = extract_anonymous_component_namespaces(src);
+
+    assert_eq!(regs.len(), 1);
+    assert_eq!(regs[0].0, "flux");
+    assert_eq!(regs[0].1, "components/flux");
+}
+
+// ─── Salsa actor: config reflects provider registrations (issue #44) ────
+
+/// A provider that registers both anonymous-component forms. Parsing is
+/// text-based, so the paths need not exist on disk.
+fn anon_component_provider_src() -> String {
+    r#"<?php
+namespace App\Providers;
+use Illuminate\Support\Facades\Blade;
+class AppServiceProvider {
+    public function boot(): void {
+        Blade::anonymousComponentPath(resource_path('views/test/components'), 'test');
+        Blade::anonymousComponentNamespace('components.flux', 'flux');
+    }
+}
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn salsa_config_indexes_anonymous_component_registrations() {
+    let handle = SalsaActor::spawn();
+    let root = PathBuf::from("/tmp/zed-laravel-issue44");
+
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .register_service_provider_source(
+            root.join("app/Providers/AppServiceProvider.php"),
+            anon_component_provider_src(),
+            2,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+
+    let config = handle.get_laravel_config().await.unwrap().unwrap();
+
+    assert_eq!(
+        config.anonymous_component_paths.get("test"),
+        Some(&root.join("resources/views/test/components")),
+        "anonymousComponentPath must be indexed into the Laravel config",
+    );
+    assert_eq!(
+        config.anonymous_component_namespaces.get("flux"),
+        Some(&"components/flux".to_string()),
+        "anonymousComponentNamespace must be indexed into the Laravel config",
+    );
+}
+
+#[tokio::test]
+async fn salsa_config_refreshes_when_provider_registered_after_first_build() {
+    // Regression for the stale-config bug: the config is built (and memoized)
+    // before the provider is registered, then the provider arrives via the
+    // init-time app rescan. get_laravel_config must rebuild — not serve the
+    // cached empty-namespace config — or `<x-test::...>` stays a false
+    // "not found" until an unrelated provider edit forces an invalidation.
+    let handle = SalsaActor::spawn();
+    let root = PathBuf::from("/tmp/zed-laravel-issue44-late");
+
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+
+    // First build — no providers registered yet. This memoizes config_cache.
+    let before = handle.get_laravel_config().await.unwrap().unwrap();
+    assert!(
+        before.anonymous_component_paths.is_empty(),
+        "precondition: no anon paths before the provider is registered",
+    );
+
+    // Provider registered late, as during the init-time app rescan.
+    handle
+        .register_service_provider_source(
+            root.join("app/Providers/AppServiceProvider.php"),
+            anon_component_provider_src(),
+            2,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+
+    let after = handle.get_laravel_config().await.unwrap().unwrap();
+    assert_eq!(
+        after.anonymous_component_paths.get("test"),
+        Some(&root.join("resources/views/test/components")),
+        "config must refresh after late provider registration (config_cache must be invalidated)",
     );
 }
 

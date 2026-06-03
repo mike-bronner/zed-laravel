@@ -4367,8 +4367,12 @@ impl LaravelLanguageServer {
                     component_paths: cached_config.component_paths.clone(),
                     livewire_path: cached_config.livewire_path.clone(),
                     has_livewire: cached_config.has_livewire,
-                    view_namespaces: std::collections::HashMap::new(),
-                    component_namespaces: std::collections::HashMap::new(),
+                    view_namespaces: cached_config.view_namespaces.clone(),
+                    component_namespaces: cached_config.component_namespaces.clone(),
+                    anonymous_component_paths: cached_config.anonymous_component_paths.clone(),
+                    anonymous_component_namespaces: cached_config
+                        .anonymous_component_namespaces
+                        .clone(),
                     component_aliases: laravel_lsp::config::load_component_aliases(
                         &cached_config.root,
                     ),
@@ -4436,8 +4440,10 @@ impl LaravelLanguageServer {
                 component_paths: c.component_paths.clone(),
                 livewire_path: c.livewire_path.clone(),
                 has_livewire: c.has_livewire,
-                view_namespaces: std::collections::HashMap::new(),
-                component_namespaces: std::collections::HashMap::new(),
+                view_namespaces: c.view_namespaces.clone(),
+                component_namespaces: c.component_namespaces.clone(),
+                anonymous_component_paths: c.anonymous_component_paths.clone(),
+                anonymous_component_namespaces: c.anonymous_component_namespaces.clone(),
                 component_aliases: laravel_lsp::config::load_component_aliases(&c.root),
                 icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&c.root),
             });
@@ -4856,23 +4862,45 @@ impl LaravelLanguageServer {
 
     /// Populate cache with all data from Salsa (config, env, middleware, bindings)
     async fn populate_cache_from_salsa(&self) {
+        // Fetch the authoritative Laravel config from Salsa once, up front. This
+        // is called after the vendor/app rescans have registered the service
+        // providers, so it now carries the namespace maps (view, component, and
+        // anonymous-component) that the initial config — built before those
+        // rescans — was missing.
+        let salsa_config = self.salsa.get_laravel_config().await.ok().flatten();
+
+        // Refresh the in-memory cached config so diagnostics THIS session see the
+        // namespace maps immediately. Without this the config first built during
+        // init (before providers were parsed) lingers with empty namespaces, and
+        // `<x-ns::component>` reports a false "not found" until a provider edit
+        // forces a rebuild. The on-disk cache below persists the same maps for
+        // the next launch.
+        if let Some(ref config) = salsa_config {
+            *self.cached_config.write().await = Some(config.clone());
+        }
+
         let mut cache_guard = self.cache.write().await;
         let Some(ref mut cache) = *cache_guard else {
             return;
         };
 
-        // 1. Cache Laravel config
-        if let Ok(Some(config)) = self.salsa.get_laravel_config().await {
+        // 1. Cache Laravel config (including namespace maps, for next launch)
+        if let Some(ref config) = salsa_config {
             let cached_config = CachedLaravelConfig {
                 root: config.root.clone(),
                 view_paths: config.view_paths.clone(),
                 component_paths: config.component_paths.clone(),
                 livewire_path: config.livewire_path.clone(),
                 has_livewire: config.has_livewire,
+                view_namespaces: config.view_namespaces.clone(),
+                component_namespaces: config.component_namespaces.clone(),
+                anonymous_component_paths: config.anonymous_component_paths.clone(),
+                anonymous_component_namespaces: config.anonymous_component_namespaces.clone(),
             };
             info!(
-                "📋 Caching Laravel config: {} view paths",
-                config.view_paths.len()
+                "📋 Caching Laravel config: {} view paths, {} anon-component paths",
+                config.view_paths.len(),
+                config.anonymous_component_paths.len()
             );
             cache.set_laravel_config(cached_config);
         }

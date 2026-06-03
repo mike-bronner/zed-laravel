@@ -28,7 +28,12 @@ use tracing::{debug, info, warn};
 ///     line above the actual alias). v3 caches still parse but encode
 ///     the wrong line — drop them on read so rebuilt entries get the
 ///     correct line.
-const CACHE_VERSION: u32 = 4;
+/// v5: CachedLaravelConfig now persists the service-provider namespace maps
+///     (view namespaces, component namespaces, and anonymous-component
+///     paths/namespaces). v4 caches lack them, so namespaced components would
+///     resolve as "not found" until a provider edit forced a rebuild — drop
+///     v4 on read so the namespace maps are indexed and cached up front.
+const CACHE_VERSION: u32 = 5;
 
 /// Get the XDG-compliant cache directory for a project
 ///
@@ -150,6 +155,21 @@ pub struct CachedLaravelConfig {
     pub component_paths: Vec<(String, PathBuf)>,
     pub livewire_path: Option<PathBuf>,
     pub has_livewire: bool,
+    /// Package view namespaces from loadViewsFrom() — prefix → view path.
+    #[serde(default)]
+    pub view_namespaces: HashMap<String, PathBuf>,
+    /// Class-based component namespaces from Blade::componentNamespace() —
+    /// prefix → PHP namespace.
+    #[serde(default)]
+    pub component_namespaces: HashMap<String, String>,
+    /// Anonymous component paths from Blade::anonymousComponentPath() —
+    /// prefix → absolute components directory.
+    #[serde(default)]
+    pub anonymous_component_paths: HashMap<String, PathBuf>,
+    /// Anonymous component namespaces from Blade::anonymousComponentNamespace()
+    /// — prefix → view-relative directory.
+    #[serde(default)]
+    pub anonymous_component_namespaces: HashMap<String, String>,
 }
 
 /// Cached environment variables

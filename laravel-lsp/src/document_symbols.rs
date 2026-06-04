@@ -116,8 +116,25 @@ pub fn classify_file(path: &Path) -> FileKind {
 /// Dispatch to the right extractor based on file kind. `Php` returns
 /// empty — see module-level docs.
 pub fn extract_symbols(content: &str, kind: FileKind) -> Vec<SymbolEntry> {
+    extract_symbols_with_external(content, kind, &[])
+}
+
+/// [`extract_symbols`], but applying external-file group name prefixes (issue
+/// #43) to route-file symbols. `external_prefixes` is ignored for non-route
+/// kinds; an empty slice yields byte-identical output to [`extract_symbols`].
+///
+/// This is NOT used on the Salsa-cached path (that stays keyed on file mtime
+/// with no cross-file input — see `salsa_impl::document_symbols_query`). The
+/// `document_symbol` handler calls it directly for the rare route file reached
+/// through an external `->group(<path>)` load, so the outline shows the
+/// project-level prefixed names there.
+pub fn extract_symbols_with_external(
+    content: &str,
+    kind: FileKind,
+    external_prefixes: &[String],
+) -> Vec<SymbolEntry> {
     match kind {
-        FileKind::RouteFile => extract_route_symbols(content),
+        FileKind::RouteFile => extract_route_symbols_with_external(content, external_prefixes),
         FileKind::Blade => extract_blade_symbols(content),
         FileKind::Php | FileKind::Other => Vec::new(),
     }
@@ -132,8 +149,19 @@ pub fn extract_symbols(content: &str, kind: FileKind) -> Vec<SymbolEntry> {
 /// become hierarchical `Namespace`-kind symbols with their child routes
 /// nested inside; leaf routes become `Function`-kind symbols with label
 /// `METHOD URI` and a `[name=…]` detail when named.
+/// Test-only thin wrapper preserving the original no-prefix entry point used
+/// by `document_symbols/tests.rs`.
+#[cfg(test)]
 fn extract_route_symbols(content: &str) -> Vec<SymbolEntry> {
-    let outline = crate::route_outline::extract_route_outline(content);
+    extract_route_symbols_with_external(content, &[])
+}
+
+fn extract_route_symbols_with_external(
+    content: &str,
+    external_prefixes: &[String],
+) -> Vec<SymbolEntry> {
+    let outline =
+        crate::route_outline::extract_route_outline_with_external(content, external_prefixes);
     outline.iter().map(route_outline_to_symbol).collect()
 }
 

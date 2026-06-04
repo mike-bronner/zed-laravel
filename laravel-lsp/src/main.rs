@@ -26,7 +26,9 @@ use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
 use laravel_lsp::migration_index::{build_migration_index, MigrationIndex};
-use laravel_lsp::route_discovery::{build_route_index, discover_route_files, RouteIndex};
+use laravel_lsp::route_discovery::{
+    build_route_index, discover_route_files, normalize_path, RouteIndex,
+};
 
 // Salsa 0.25 database - integrated via actor pattern for async compatibility
 use laravel_lsp::salsa_impl::{
@@ -183,6 +185,17 @@ struct RouteNameCompletion {
     name: String,
     /// Source file (e.g., "routes/web.php")
     source: String,
+}
+
+/// Render a route definition's file as a short, project-relative label for the
+/// completion detail line (e.g. `routes/api.php`). Falls back to the file name,
+/// then the lossy full path, when the file isn't under `root`.
+fn route_source_label(file: &Path, root: &Path) -> String {
+    file.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .or_else(|| file.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| file.to_string_lossy().into_owned())
 }
 
 /// A view name for autocomplete
@@ -4021,6 +4034,16 @@ impl LaravelLanguageServer {
             .await
             .insert(path.to_path_buf(), (disk_mtime, decls.clone()));
         Some(decls)
+    }
+
+    /// Return the current content of `uri` — the editor buffer if the file is
+    /// open (so unsaved edits are reflected), otherwise the on-disk text.
+    /// Returns `None` only when neither source is readable.
+    async fn document_or_disk_content(&self, uri: &Url, path: &Path) -> Option<String> {
+        if let Some((content, _version)) = self.documents.read().await.get(uri).cloned() {
+            return Some(content);
+        }
+        tokio::fs::read_to_string(path).await.ok()
     }
 
     /// Register environment files directly with Salsa for parsing
@@ -11004,161 +11027,58 @@ impl LaravelLanguageServer {
         properties
     }
 
-    /// Get all route names from routes/*.php files for autocomplete
+    /// Get all route names for autocomplete from the unified route index.
+    ///
+    /// Reads the pre-built [`RouteIndex`] (the SAME source hover/goto use), so
+    /// completions cover every discovered file, carry group/inherited prefixes,
+    /// and include `Route::resource`/`apiResource`-derived names — all without
+    /// the old per-call regex extraction. Falls back to building an index on the
+    /// fly if one hasn't been populated yet.
     async fn get_all_route_names(&self) -> Vec<RouteNameCompletion> {
         let root = match self.root_path.read().await.clone() {
             Some(r) => r,
             None => return Vec::new(),
         };
 
-        let routes_dir = root.join("routes");
-        if !routes_dir.exists() {
-            return Vec::new();
-        }
-
-        let mut completions = Vec::new();
-        let route_files = ["web.php", "api.php", "channels.php", "console.php"];
-
-        // Regex to match ->name('route.name') or ->name("route.name")
-        let name_pattern = regex::Regex::new(r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
-
-        // Regex to match Route::resource('name', Controller::class) with optional modifiers
-        // Captures: 1=resource name, 2=rest of the chain (for only/except parsing)
-        let resource_pattern =
-            regex::Regex::new(r#"Route::resource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#)
-                .unwrap();
-
-        // Regex to match Route::apiResource('name', Controller::class) with optional modifiers
-        let api_resource_pattern =
-            regex::Regex::new(r#"Route::apiResource\s*\(\s*['"]([^'"]+)['"]\s*,[^)]+\)([^;]*)"#)
-                .unwrap();
-
-        // Regex to extract ->only([...]) actions
-        let only_pattern = regex::Regex::new(r#"->only\s*\(\s*\[([^\]]*)\]"#).unwrap();
-
-        // Regex to extract ->except([...]) actions
-        let except_pattern = regex::Regex::new(r#"->except\s*\(\s*\[([^\]]*)\]"#).unwrap();
-
-        // Standard resource actions
-        let resource_actions = [
-            "index", "create", "store", "show", "edit", "update", "destroy",
-        ];
-        // API resource actions (no create/edit - those are for forms)
-        let api_resource_actions = ["index", "store", "show", "update", "destroy"];
-
-        for file_name in route_files {
-            let route_file = routes_dir.join(file_name);
-            if route_file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&route_file) {
-                    let source = format!("routes/{}", file_name);
-
-                    // Find all ->name('...') patterns
-                    for caps in name_pattern.captures_iter(&content) {
-                        if let Some(name_match) = caps.get(1) {
-                            completions.push(RouteNameCompletion {
-                                name: name_match.as_str().to_string(),
-                                source: source.clone(),
-                            });
-                        }
-                    }
-
-                    // Find all Route::resource() patterns
-                    for caps in resource_pattern.captures_iter(&content) {
-                        if let Some(resource_name) = caps.get(1) {
-                            let chain = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let actions = Self::get_resource_actions(
-                                chain,
-                                &resource_actions,
-                                &only_pattern,
-                                &except_pattern,
-                            );
-
-                            for action in actions {
-                                completions.push(RouteNameCompletion {
-                                    name: format!("{}.{}", resource_name.as_str(), action),
-                                    source: source.clone(),
-                                });
-                            }
-                        }
-                    }
-
-                    // Find all Route::apiResource() patterns
-                    for caps in api_resource_pattern.captures_iter(&content) {
-                        if let Some(resource_name) = caps.get(1) {
-                            let chain = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let actions = Self::get_resource_actions(
-                                chain,
-                                &api_resource_actions,
-                                &only_pattern,
-                                &except_pattern,
-                            );
-
-                            for action in actions {
-                                completions.push(RouteNameCompletion {
-                                    name: format!("{}.{}", resource_name.as_str(), action),
-                                    source: source.clone(),
-                                });
-                            }
-                        }
-                    }
+        // Prefer the already-built index. Clone out the (name, file) pairs so we
+        // can drop the read lock before doing any string work.
+        let entries: Vec<(String, PathBuf)> = {
+            let guard = self.route_index.read().await;
+            match guard.as_ref() {
+                Some(index) => index
+                    .routes
+                    .iter()
+                    .map(|(name, def)| (name.clone(), def.file.clone()))
+                    .collect(),
+                None => {
+                    // Index not ready yet — build one synchronously as a fallback.
+                    let root = root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let files = discover_route_files(&root);
+                        let index = build_route_index(&root, &files);
+                        index
+                            .routes
+                            .into_iter()
+                            .map(|(name, def)| (name, def.file))
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default()
                 }
             }
-        }
+        };
 
-        // Sort by name for consistent ordering
+        let mut completions: Vec<RouteNameCompletion> = entries
+            .into_iter()
+            .map(|(name, file)| RouteNameCompletion {
+                name,
+                source: route_source_label(&file, &root),
+            })
+            .collect();
+
+        // Sort by name for consistent ordering.
         completions.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Remove duplicates (same route name from different files - keep first occurrence)
-        completions.dedup_by(|a, b| a.name == b.name);
-
         completions
-    }
-
-    /// Parse ->only() and ->except() modifiers to determine which resource actions to include
-    fn get_resource_actions<'a>(
-        chain: &str,
-        all_actions: &'a [&'a str],
-        only_pattern: &regex::Regex,
-        except_pattern: &regex::Regex,
-    ) -> Vec<&'a str> {
-        // Check for ->only([...])
-        if let Some(only_caps) = only_pattern.captures(chain) {
-            if let Some(only_list) = only_caps.get(1) {
-                let only_actions: Vec<&str> = only_list
-                    .as_str()
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
-                return all_actions
-                    .iter()
-                    .filter(|a| only_actions.contains(a))
-                    .copied()
-                    .collect();
-            }
-        }
-
-        // Check for ->except([...])
-        if let Some(except_caps) = except_pattern.captures(chain) {
-            if let Some(except_list) = except_caps.get(1) {
-                let except_actions: Vec<&str> = except_list
-                    .as_str()
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
-                return all_actions
-                    .iter()
-                    .filter(|a| !except_actions.contains(a))
-                    .copied()
-                    .collect();
-            }
-        }
-
-        // No modifiers - return all actions
-        all_actions.to_vec()
     }
 
     /// Get all translation keys from lang/*.php files for autocomplete
@@ -12907,7 +12827,7 @@ return [
         let index = tokio::task::spawn_blocking(move || {
             let files = discover_route_files(&root);
             let count = files.len();
-            let index = build_route_index(&files);
+            let index = build_route_index(&root, &files);
             (count, index)
         })
         .await;
@@ -13620,6 +13540,50 @@ return [
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
         }
+    }
+
+    /// Build "route not found" ERROR diagnostics for every `route('name')`
+    /// reference whose name is absent from the project route index (issue #43).
+    ///
+    /// Fires ONLY when the index is built AND non-empty — during startup, before
+    /// the index exists, every route would otherwise look missing, so an absent
+    /// or empty index yields no diagnostics.
+    fn route_not_found_diagnostics(
+        index: Option<&laravel_lsp::route_discovery::RouteIndex>,
+        route_refs: &[std::sync::Arc<laravel_lsp::salsa_impl::RouteReferenceData>],
+    ) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        let Some(index) = index else {
+            return out;
+        };
+        if index.is_empty() {
+            return out;
+        }
+        for r in route_refs {
+            if index.get(&r.name).is_none() {
+                out.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: r.line,
+                            character: r.column,
+                        },
+                        end: Position {
+                            line: r.line,
+                            character: r.end_column,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    source: Some("laravel".to_string()),
+                    message: format!("Route not found in index: '{}'", r.name),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                });
+            }
+        }
+        out
     }
 
     /// Validate a document (Blade or PHP) and publish diagnostics
@@ -14429,6 +14393,15 @@ return [
             let validation_diagnostics = self.validate_validation_rules(source).await;
             diagnostics.extend(validation_diagnostics);
 
+            // Check route('name') calls against the route index (issue #43).
+            {
+                let idx = self.route_index.read().await;
+                diagnostics.extend(Self::route_not_found_diagnostics(
+                    idx.as_ref(),
+                    &patterns.route_refs,
+                ));
+            }
+
             // Store and publish diagnostics for PHP files
             self.diagnostics
                 .write()
@@ -14807,6 +14780,16 @@ return [
         }
 
         // Store diagnostics for hover filtering
+        // Check route('name') calls against the route index (issue #43) — Blade
+        // `{{ route('…') }}` usages, same check as the PHP branch above.
+        {
+            let idx = self.route_index.read().await;
+            diagnostics.extend(Self::route_not_found_diagnostics(
+                idx.as_ref(),
+                &patterns.route_refs,
+            ));
+        }
+
         self.diagnostics
             .write()
             .await
@@ -15560,6 +15543,7 @@ return [
 /// the locator's full route name.
 async fn classify_with_decl_fallback(
     server: &LaravelLanguageServer,
+    root: Option<&Path>,
     file_path: &Path,
     patterns: &laravel_lsp::salsa_impl::ParsedPatternsData,
     position: Position,
@@ -15580,17 +15564,26 @@ async fn classify_with_decl_fallback(
         return None;
     }
     let decls = server.cached_route_decls(file_path).await?;
-    for decl in decls.iter() {
-        if decl.line == position.line
+    let decl = decls.iter().find(|decl| {
+        decl.line == position.line
             && position.character >= decl.start_column
             && position.character <= decl.end_column
-        {
-            return Some(laravel_lsp::references::SymbolRef::Route(
-                decl.full_name.clone(),
-            ));
-        }
-    }
-    None
+    })?;
+
+    // If this file is loaded by an external `->group(<path>)` with a name
+    // prefix (issue #43), its in-file `->name('x')` resolves to a prefixed
+    // project-level name (`admin.x`). Anchor the symbol to that resolved name
+    // so find-references / rename match every contributing site across files.
+    // The raw name still matches via `find_declarations_named_with_external`'s
+    // always-present `""` prefix. `external_prefixes_for_file` runs the
+    // cross-file load graph, so it's only worth paying when `root` is known.
+    let resolved = root
+        .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
+        .and_then(|prefixes| prefixes.into_iter().find(|p| !p.is_empty()))
+        .map(|primary| format!("{}{}", primary, decl.full_name))
+        .unwrap_or_else(|| decl.full_name.clone());
+
+    Some(laravel_lsp::references::SymbolRef::Route(resolved))
 }
 
 /// Look up the source-text range a `prepare_rename` should return when the
@@ -15598,6 +15591,7 @@ async fn classify_with_decl_fallback(
 /// locator did). Used for prepare_rename's editor-highlight range.
 async fn decl_range_at(
     server: &LaravelLanguageServer,
+    root: Option<&Path>,
     file_path: &Path,
     position: Position,
     symbol: &laravel_lsp::references::SymbolRef,
@@ -15608,7 +15602,16 @@ async fn decl_range_at(
         return None;
     };
     let decls = server.cached_route_decls(file_path).await?;
-    for d in decls.iter().filter(|d| d.full_name == *name) {
+    // `name` may carry an external-file group prefix (issue #43); match a raw
+    // in-file decl whose name equals `name` once that prefix is prepended.
+    let external = root
+        .map(|r| laravel_lsp::route_discovery::external_prefixes_for_file(r, file_path))
+        .unwrap_or_else(|| vec![String::new()]);
+    for d in decls.iter().filter(|d| {
+        external
+            .iter()
+            .any(|ext| format!("{}{}", ext, d.full_name) == *name)
+    }) {
         if d.line == position.line
             && position.character >= d.start_column
             && position.character <= d.end_column
@@ -15732,6 +15735,10 @@ async fn collect_declaration_locations(
             if !routes_dir.exists() {
                 return out;
             }
+            // Inherited external-load prefixes for EVERY route file, computed
+            // once per request instead of re-running the project load graph per
+            // file inside the loop below (avoids O(files²)).
+            let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
             for entry in WalkDir::new(&routes_dir)
                 .max_depth(6)
                 .into_iter()
@@ -15744,7 +15751,18 @@ async fn collect_declaration_locations(
                 let Some(all_decls) = server.cached_route_decls(path).await else {
                     continue;
                 };
-                for d in all_decls.iter().filter(|d| d.full_name == *name) {
+                // A file loaded via `Route::as('admin.')->group(<path>)` has
+                // its raw in-file names match `name` only once the external
+                // prefix is prepended (issue #43).
+                let external = external_prefix_map
+                    .get(&laravel_lsp::route_discovery::normalize_path(path))
+                    .cloned()
+                    .unwrap_or_else(|| vec![String::new()]);
+                for d in all_decls.iter().filter(|d| {
+                    external
+                        .iter()
+                        .any(|ext| format!("{}{}", ext, d.full_name) == *name)
+                }) {
                     if let Ok(uri) = Url::from_file_path(path) {
                         out.push(Location {
                             uri,
@@ -15899,6 +15917,10 @@ async fn collect_route_declaration_targets(
     if !routes_dir.exists() {
         return targets;
     }
+    // Inherited external-load prefixes for EVERY route file, computed once per
+    // request instead of re-running the project load graph per file inside the
+    // loop below (avoids O(files²)).
+    let external_prefix_map = laravel_lsp::route_discovery::external_prefixes_map(root);
     for entry in WalkDir::new(&routes_dir)
         .max_depth(6)
         .into_iter()
@@ -15914,7 +15936,31 @@ async fn collect_route_declaration_targets(
         let Some(all_decls) = server.cached_route_decls(path).await else {
             continue;
         };
-        for d in all_decls.iter().filter(|d| d.full_name == target) {
+        // External-file group prefixes (issue #43): a file loaded via
+        // `Route::as('admin.')->group(<path>)` resolves its raw `->name('x')`
+        // to `admin.x` at the project level. For each matching decl we
+        // re-anchor `full_name` to that combined prefix so `rewritten_segment`
+        // strips the WHOLE prefix (external + in-file group) and rewrites only
+        // the leaf — never doubling either prefix in source. The always-present
+        // `""` prefix preserves the plain (non-external) match.
+        let external = external_prefix_map
+            .get(&laravel_lsp::route_discovery::normalize_path(path))
+            .cloned()
+            .unwrap_or_else(|| vec![String::new()]);
+        for d in all_decls.iter() {
+            let Some(ext) = external
+                .iter()
+                .find(|ext| format!("{}{}", ext, d.full_name) == target)
+            else {
+                continue;
+            };
+            let resolved = laravel_lsp::route_name_locator::RouteNameDeclaration {
+                full_name: format!("{}{}", ext, d.full_name),
+                local_segment: d.local_segment.clone(),
+                line: d.line,
+                start_column: d.start_column,
+                end_column: d.end_column,
+            };
             targets.push(laravel_lsp::rename::EditTarget {
                 file_path: path.to_path_buf(),
                 line: d.line,
@@ -15922,7 +15968,7 @@ async fn collect_route_declaration_targets(
                 end_column: d.end_column,
                 // Decl spans only this segment; the group prefix (if any)
                 // lives elsewhere and must not be re-written here.
-                new_text: d.rewritten_segment(new_name).to_string(),
+                new_text: resolved.rewritten_segment(new_name).to_string(),
             });
         }
     }
@@ -16462,6 +16508,38 @@ impl LanguageServer for LaravelLanguageServer {
                 }
                 _ => {}
             }
+
+            // Route files: rebuild the route-name index on save so completion,
+            // hover and goto reflect the change. The index reads from disk, and
+            // did_save fires after the editor has flushed the buffer, so the
+            // content is current. (App-provider / bootstrap route registration
+            // already triggers an App rescan above, which also rebuilds it.)
+            //
+            // A saved `.php` triggers a rebuild when EITHER it already
+            // contributes to the current index (covers files reached via
+            // `->group(<path>)` external loads that live outside `routes/`,
+            // issue #43), OR it lives under a `/routes/` directory (fallback so
+            // brand-new route files not yet in the index still trigger). Both
+            // sides are normalized before comparing.
+            if file_name.is_some_and(|n| n.ends_with(".php")) {
+                let normalized = normalize_path(&path);
+                let in_index = {
+                    let guard = self.route_index.read().await;
+                    guard
+                        .as_ref()
+                        .is_some_and(|idx| idx.source_files.contains(&normalized))
+                };
+                if in_index || path_str.contains("/routes/") {
+                    if let Some(root) = self.root_path.read().await.clone() {
+                        info!("🛣️  Route file saved — rebuilding route index");
+                        self.rebuild_route_index(&root).await;
+                        // Route names changed — re-validate open documents so
+                        // `route('…')` not-found diagnostics elsewhere reflect
+                        // the added/removed/renamed routes.
+                        self.revalidate_open_documents().await;
+                    }
+                }
+            }
         }
 
         // Cancel any pending debounced diagnostics for this file
@@ -16986,6 +17064,36 @@ impl LanguageServer for LaravelLanguageServer {
             }
         };
 
+        // Route files reached through an external `->group(<path>)` load (issue
+        // #43) need their outline names prefixed with the inherited group name
+        // (e.g. `admin.users.index`). That depends on a cross-file load graph,
+        // which the mtime-keyed Salsa document-symbols query deliberately does
+        // NOT see (it must stay cacheable on this file alone). So for the rare
+        // externally-prefixed route file we recompute the route symbols here
+        // with the prefix applied; every other file uses the cached Salsa
+        // result unchanged.
+        let root_path = self.root_path.read().await.clone();
+        if laravel_lsp::document_symbols::classify_file(&file_path)
+            == laravel_lsp::document_symbols::FileKind::RouteFile
+        {
+            if let Some(root) = root_path.as_ref() {
+                let external =
+                    laravel_lsp::route_discovery::external_prefixes_for_file(root, &file_path);
+                if external.iter().any(|p| !p.is_empty()) {
+                    if let Some(content) = self.document_or_disk_content(uri, &file_path).await {
+                        let entries = laravel_lsp::document_symbols::extract_symbols_with_external(
+                            &content,
+                            laravel_lsp::document_symbols::FileKind::RouteFile,
+                            &external,
+                        );
+                        let symbols: Vec<DocumentSymbol> =
+                            entries.iter().map(symbol_entry_to_lsp).collect();
+                        return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
+                    }
+                }
+            }
+        }
+
         let entries = match self.salsa.get_document_symbols(file_path).await {
             Ok(Some(arc)) => arc,
             Ok(None) => {
@@ -17035,7 +17143,15 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        let root_path = self.root_path.read().await.clone();
+        let symbol = match classify_with_decl_fallback(
+            self,
+            root_path.as_deref(),
+            &file_path,
+            &patterns,
+            position,
+        )
+        .await
         {
             Some(s) => s,
             None => return Ok(None),
@@ -17070,7 +17186,6 @@ impl LanguageServer for LaravelLanguageServer {
         // separately. Per the LSP spec (and Zed's default), we include them
         // when `include_declaration` is set.
         if include_declaration {
-            let root_path = self.root_path.read().await.clone();
             if let Some(root) = root_path.as_ref() {
                 lsp_locations.extend(collect_declaration_locations(self, root, &symbol).await);
             }
@@ -17107,7 +17222,15 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        let root_path = self.root_path.read().await.clone();
+        let symbol = match classify_with_decl_fallback(
+            self,
+            root_path.as_deref(),
+            &file_path,
+            &patterns,
+            position,
+        )
+        .await
         {
             Some(s) => {
                 debug!(
@@ -17143,7 +17266,7 @@ impl LanguageServer for LaravelLanguageServer {
         let pattern_range = pattern_range_at(&patterns, position.line, position.character);
         let range = match pattern_range {
             Some(r) => Some(r),
-            None => decl_range_at(self, &file_path, position, &symbol).await,
+            None => decl_range_at(self, root_path.as_deref(), &file_path, position, &symbol).await,
         };
         match &range {
             Some(r) => debug!(
@@ -17185,7 +17308,15 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
-        let symbol = match classify_with_decl_fallback(self, &file_path, &patterns, position).await
+        let root_path = self.root_path.read().await.clone();
+        let symbol = match classify_with_decl_fallback(
+            self,
+            root_path.as_deref(),
+            &file_path,
+            &patterns,
+            position,
+        )
+        .await
         {
             Some(s) => {
                 debug!("rename: classified as {:?}", s);
@@ -17274,8 +17405,8 @@ impl LanguageServer for LaravelLanguageServer {
         //
         // Phase 3+: kinds whose "declaration" is a file (not a source
         // position) push into `file_renames` instead of `targets`. Both
-        // travel together in the final WorkspaceEdit.
-        let root_path = self.root_path.read().await.clone();
+        // travel together in the final WorkspaceEdit. `root_path` was already
+        // read above for the decl-fallback classifier.
         let mut file_renames: Vec<laravel_lsp::rename::FileRename> = Vec::new();
         match &symbol {
             laravel_lsp::references::SymbolRef::Route(name) => {

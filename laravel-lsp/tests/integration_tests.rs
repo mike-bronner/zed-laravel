@@ -347,7 +347,7 @@ mod routes {
 
         let root = test_project_path();
         let files = discover_route_files(&root);
-        let index = build_route_index(&files);
+        let index = build_route_index(&root, &files);
 
         let def = index
             .get("home")
@@ -370,7 +370,7 @@ mod routes {
 
         let root = test_project_path();
         let files = discover_route_files(&root);
-        let index = build_route_index(&files);
+        let index = build_route_index(&root, &files);
 
         let def = index
             .get("login")

@@ -32,6 +32,22 @@ struct RouteGroupSpan {
     body_end: usize,
 }
 
+/// A `->group(...)`/`::group(...)` callsite that loads an *external file*
+/// instead of running a closure body (issue #43). Laravel `require`s the file
+/// and applies the group's attributes — including its `->as('admin.')` name
+/// prefix — to every route declared in it.
+#[derive(Debug, Clone)]
+struct ExternalGroupLoad {
+    /// Byte offset of the `->`/`::` that introduces this `group(...)` call.
+    /// Used to locate enclosing closure groups in the same file.
+    offset: usize,
+    /// This load's OWN name prefix (from a chained `->as(...)`/`->name(...)`
+    /// link or an `['as' => ...]` array literal). May be empty.
+    own_prefix: String,
+    /// Resolved absolute path of the file this group loads.
+    target: PathBuf,
+}
+
 /// A located route definition. Stored in [`RouteIndex`] keyed by route name.
 #[derive(Debug, Clone)]
 pub struct RouteDefinition {
@@ -73,6 +89,13 @@ pub const PRIORITY_APP: u8 = 2;
 #[derive(Debug, Default, Clone)]
 pub struct RouteIndex {
     pub routes: HashMap<String, RouteDefinition>,
+    /// Every file that contributed to this index, keyed by normalized
+    /// (lexically-cleaned) absolute path. Includes both files found by
+    /// [`discover_route_files`] AND files reached transitively through
+    /// `->group(<path>)` external loads — even when they live outside `routes/`
+    /// (issue #43). Used by `did_save` to decide whether a saved file should
+    /// trigger a route-index rebuild.
+    pub source_files: std::collections::HashSet<PathBuf>,
 }
 
 impl RouteIndex {
@@ -182,18 +205,279 @@ pub fn discover_route_files(root: &Path) -> Vec<RouteFile> {
 }
 
 /// Build a complete route name → location index from the given files.
-pub fn build_route_index(files: &[RouteFile]) -> RouteIndex {
+///
+/// `root` is the project root, used to resolve `base_path(...)` arguments in
+/// external-file group loads (issue #43). The working set is BFS-expanded along
+/// `->group(<path>)` load edges, so a file referenced via
+/// `Route::as('admin.')->group(base_path('app/Custom/admin.php'))` is indexed
+/// even when it lives OUTSIDE `routes/` and was never returned by
+/// [`discover_route_files`]. Referenced files inherit their loader's priority.
+///
+/// Files reached by such loads inherit the loading group's name prefix
+/// transitively, so their routes are indexed under both their bare and prefixed
+/// names. The resulting [`RouteIndex::source_files`] lists every contributing
+/// file (discovered + referenced), keyed by normalized path.
+pub fn build_route_index(root: &Path, files: &[RouteFile]) -> RouteIndex {
+    let expansion = expand_load_graph(root, files);
+    let effective = compute_effective_prefixes(root, &expansion.files, &expansion.contents);
+
     let mut index = RouteIndex::new();
-    for file in files {
-        if let Ok(content) = std::fs::read_to_string(&file.path) {
-            for def in extract_named_routes(&content, &file.path, file.priority) {
-                if let Some(name) = def.0 {
-                    index.insert(name, def.1);
-                }
+    for file in &expansion.files {
+        let key = normalize_path(&file.path);
+        index.source_files.insert(key.clone());
+        let Some(content) = expansion.contents.get(&key) else {
+            continue;
+        };
+        let inherited = effective.get(&key).cloned().unwrap_or_default();
+        for def in extract_named_routes(content, &file.path, file.priority, &inherited) {
+            if let Some(name) = def.0 {
+                index.insert(name, def.1);
             }
         }
     }
     index
+}
+
+/// Return the inherited external-file name prefixes that apply to `file`
+/// (issue #43), ALWAYS including `""` and deduplicated.
+///
+/// A file referenced via `Route::as('admin.')->group(base_path('that.php'))`
+/// from somewhere in the project inherits the loading group's name prefix
+/// (`"admin."`) transitively across the entire `->group(<path>)` load graph.
+/// This is exactly the set [`build_route_index`] applies when indexing the file
+/// — exposed standalone so rename / find-references / document-symbols can
+/// resolve a route's project-level name without re-running a full index build.
+///
+/// Runs [`discover_route_files`] + the same BFS load-graph expansion and
+/// prefix propagation as [`build_route_index`], then looks up `file`'s
+/// normalized key. Returns `["".into()]` when `file` isn't reachable (it's
+/// still scanned directly, so the empty prefix always applies).
+pub fn external_prefixes_for_file(root: &Path, file: &Path) -> Vec<String> {
+    let files = discover_route_files(root);
+    let expansion = expand_load_graph(root, &files);
+    let effective = compute_effective_prefixes(root, &expansion.files, &expansion.contents);
+
+    let key = normalize_path(file);
+    let mut out = vec![String::new()];
+    if let Some(prefixes) = effective.get(&key) {
+        for p in prefixes {
+            if !p.is_empty() && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Like [`external_prefixes_for_file`] but computes the inherited external-load
+/// prefixes for EVERY route file in one pass, keyed by normalized path. Callers
+/// iterating many files (rename / find-references) build this once instead of
+/// re-running the whole project load graph per file (avoids O(files²)).
+///
+/// Each returned entry always includes `""`. A file with no inherited prefix is
+/// simply absent from the map — callers should treat a miss as `["".into()]`.
+pub fn external_prefixes_map(root: &Path) -> HashMap<PathBuf, Vec<String>> {
+    let files = discover_route_files(root);
+    let expansion = expand_load_graph(root, &files);
+    let effective = compute_effective_prefixes(root, &expansion.files, &expansion.contents);
+
+    let mut map: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for (key, prefixes) in effective {
+        let mut out = vec![String::new()];
+        for p in prefixes {
+            if !p.is_empty() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        map.insert(key, out);
+    }
+    map
+}
+
+/// The fully-expanded working set produced by following `->group(<path>)`
+/// external loads from a seed file list. Keyed by normalized path so a file
+/// reached more than once is read and indexed exactly once.
+struct LoadGraphExpansion {
+    /// Every contributing file (seed + transitively referenced), with the
+    /// highest priority observed for each.
+    files: Vec<RouteFile>,
+    /// Each file's source text, keyed by normalized path.
+    contents: HashMap<PathBuf, String>,
+}
+
+/// BFS-expand `files` along external `->group(<path>)` load edges, reading each
+/// reachable file's contents. Shared by [`build_route_index`] and
+/// [`external_prefixes_for_file`] so both see the identical working set.
+fn expand_load_graph(root: &Path, files: &[RouteFile]) -> LoadGraphExpansion {
+    // `contents`/`paths`/`priorities` are all keyed by normalized path so a file
+    // reached by two routes (discovered + referenced, or via two loaders) is
+    // read and indexed exactly once.
+    let mut contents: HashMap<PathBuf, String> = HashMap::new();
+    // Original (non-normalized) path to use for the RouteDefinition's `file`.
+    let mut paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut priorities: HashMap<PathBuf, u8> = HashMap::new();
+
+    // Queue of (path, priority, depth) still to read/expand.
+    let mut queue: std::collections::VecDeque<(PathBuf, u8, usize)> =
+        std::collections::VecDeque::new();
+    for file in files {
+        queue.push_back((file.path.clone(), file.priority, 0));
+    }
+
+    while let Some((path, priority, depth)) = queue.pop_front() {
+        let key = normalize_path(&path);
+
+        // Record the best (highest) priority and remember the path/contents the
+        // first time we see this file.
+        let already_seen = contents.contains_key(&key);
+        priorities
+            .entry(key.clone())
+            .and_modify(|p| {
+                if priority > *p {
+                    *p = priority;
+                }
+            })
+            .or_insert(priority);
+        if already_seen {
+            // Contents already read and this file's edges already expanded;
+            // just merging priority above is enough.
+            continue;
+        }
+
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // Unreadable target (e.g. a referenced file that doesn't exist) —
+            // record nothing; it simply contributes no routes.
+            continue;
+        };
+
+        // Discover this file's external `->group(<path>)` targets and enqueue
+        // any not yet read. Depth is capped in the spirit of MAX_LOAD_DEPTH so a
+        // pathological chain can't loop forever (the `already_seen` check breaks
+        // cycles directly).
+        if depth < MAX_LOAD_DEPTH {
+            let loader_dir = path.parent().unwrap_or(root).to_path_buf();
+            for load in find_external_group_loads(text.as_bytes(), root, &loader_dir) {
+                let target_key = normalize_path(&load.target);
+                if !contents.contains_key(&target_key) {
+                    queue.push_back((load.target, priority, depth + 1));
+                }
+            }
+        }
+
+        paths.insert(key.clone(), path);
+        contents.insert(key, text);
+    }
+
+    // Build the full expanded file set.
+    let expanded: Vec<RouteFile> = paths
+        .iter()
+        .map(|(key, original)| RouteFile {
+            path: original.clone(),
+            priority: priorities.get(key).copied().unwrap_or(PRIORITY_APP),
+        })
+        .collect();
+
+    LoadGraphExpansion {
+        files: expanded,
+        contents,
+    }
+}
+
+/// Maximum transitive load depth — a backstop against pathological chains even
+/// with the cycle guard in place.
+const MAX_LOAD_DEPTH: usize = 10;
+
+/// Build the per-file set of inherited name prefixes contributed by
+/// external-file group loads, propagated transitively across the load graph.
+///
+/// Returns a map keyed by normalized file path. Every entry includes `""`
+/// (every file is also scanned directly). Cycles are broken by a per-target
+/// visited set, and chains are capped at [`MAX_LOAD_DEPTH`].
+fn compute_effective_prefixes(
+    root: &Path,
+    files: &[RouteFile],
+    contents: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, Vec<String>> {
+    // Set of files we actually index — only these can receive inherited
+    // prefixes, and only loads pointing at one matter.
+    let known: std::collections::HashSet<PathBuf> =
+        files.iter().map(|f| normalize_path(&f.path)).collect();
+
+    // edges[source] = Vec<(target, edge_prefix)>
+    let mut edges: HashMap<PathBuf, Vec<(PathBuf, String)>> = HashMap::new();
+    for file in files {
+        let source = normalize_path(&file.path);
+        let Some(content) = contents.get(&source) else {
+            continue;
+        };
+        let bytes = content.as_bytes();
+        let loader_dir = file.path.parent().unwrap_or(root).to_path_buf();
+        let loads = find_external_group_loads(bytes, root, &loader_dir);
+        if loads.is_empty() {
+            continue;
+        }
+        // Closure-group spans in the SAME file — needed to prepend any enclosing
+        // closure prefixes to each load's edge.
+        let groups = find_route_groups(bytes);
+        for load in loads {
+            let target = normalize_path(&load.target);
+            if !known.contains(&target) {
+                continue;
+            }
+            let mut edge_prefix = String::new();
+            for grp in &groups {
+                if grp.body_start <= load.offset && load.offset < grp.body_end {
+                    edge_prefix.push_str(&grp.prefix);
+                }
+            }
+            edge_prefix.push_str(&load.own_prefix);
+            edges
+                .entry(source.clone())
+                .or_default()
+                .push((target, edge_prefix));
+        }
+    }
+
+    // Propagate. For each known file, the inherited prefixes are the set of
+    // accumulated edge-prefix concatenations along every load path that reaches
+    // it. We DFS from each source so cycles are naturally bounded per traversal.
+    let mut effective: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for start in &known {
+        propagate(start, "", &edges, &mut effective, &mut Vec::new(), 0);
+    }
+    effective
+}
+
+/// Depth-first propagation of accumulated prefixes along load edges. `acc` is
+/// the prefix accumulated from the root of this traversal up to (but excluding)
+/// `current`. `stack` holds the files on the current path for cycle detection.
+fn propagate(
+    current: &Path,
+    acc: &str,
+    edges: &HashMap<PathBuf, Vec<(PathBuf, String)>>,
+    effective: &mut HashMap<PathBuf, Vec<String>>,
+    stack: &mut Vec<PathBuf>,
+    depth: usize,
+) {
+    if stack.iter().any(|p| p == current) || depth > MAX_LOAD_DEPTH {
+        return;
+    }
+    // Record this accumulated prefix for `current` (skip the empty root case —
+    // every file already gets "" implicitly in `extract_named_routes`).
+    if !acc.is_empty() {
+        let entry = effective.entry(current.to_path_buf()).or_default();
+        if !entry.iter().any(|p| p == acc) {
+            entry.push(acc.to_string());
+        }
+    }
+    stack.push(current.to_path_buf());
+    if let Some(targets) = edges.get(current) {
+        for (target, edge_prefix) in targets {
+            let next_acc = format!("{}{}", acc, edge_prefix);
+            propagate(target, &next_acc, edges, effective, stack, depth + 1);
+        }
+    }
+    stack.pop();
 }
 
 /// Extract every `->name('X')` callsite from the given source.
@@ -204,13 +488,32 @@ pub fn build_route_index(files: &[RouteFile]) -> RouteIndex {
 /// Only matches single-quoted or double-quoted string literals. Variable
 /// arguments (`->name($var)`) are skipped because we can't resolve them
 /// statically.
+///
+/// `inherited_prefixes` carries name prefixes contributed by *external-file*
+/// group loads that target this file (issue #43). For each callsite, one
+/// `RouteDefinition` is emitted per inherited prefix, with the final name being
+/// `inherited_prefix + in_file_closure_prefix + leaf`. A file that is loaded
+/// both directly and via a prefixed group therefore contributes both its bare
+/// and prefixed names. Passing `&[]` (or `&["".into()]`) means "no inherited
+/// prefix" and yields byte-identical behavior to a plain direct scan.
 pub fn extract_named_routes(
     content: &str,
     file: &Path,
     priority: u8,
+    inherited_prefixes: &[String],
 ) -> Vec<(Option<String>, RouteDefinition)> {
     let mut results = Vec::new();
     let bytes = content.as_bytes();
+
+    // Normalize inherited prefixes to a non-empty set that always contains the
+    // empty string (the file is always scanned directly too). Dedupe so a load
+    // graph that reaches this file by two equal-prefix paths doesn't duplicate.
+    let mut effective: Vec<&str> = vec![""];
+    for p in inherited_prefixes {
+        if !p.is_empty() && !effective.contains(&p.as_str()) {
+            effective.push(p.as_str());
+        }
+    }
 
     // Build group-span index once per file. Each span tells us "any
     // `->name('X')` inside body_start..body_end gets `prefix` prepended."
@@ -271,16 +574,16 @@ pub fn extract_named_routes(
             }
         };
 
-        // Compose the final route name from enclosing group prefixes plus the
-        // literal `->name('X')` value. Groups are pre-sorted by body_start so
-        // iterating in order yields outermost-first.
-        let mut name = String::new();
+        // Compose the in-file portion of the name from enclosing closure-group
+        // prefixes plus the literal `->name('X')` value. Groups are pre-sorted
+        // by body_start so iterating in order yields outermost-first.
+        let mut in_file_name = String::new();
         for grp in &groups {
             if grp.body_start <= i && i < grp.body_end {
-                name.push_str(&grp.prefix);
+                in_file_name.push_str(&grp.prefix);
             }
         }
-        name.push_str(&literal_name);
+        in_file_name.push_str(&literal_name);
 
         let (line, column) = byte_to_line_col(bytes, i);
         let end_column = column + (j - i + 1) as u32; // include closing quote
@@ -290,24 +593,288 @@ pub fn extract_named_routes(
         // controller@action target for hover display.
         let metadata = extract_route_metadata(bytes, i);
 
-        results.push((
-            Some(name),
-            RouteDefinition {
-                file: file.to_path_buf(),
-                line,
-                column,
-                end_column,
-                priority,
-                method: metadata.method,
-                uri: metadata.uri,
-                action: metadata.action,
-            },
-        ));
+        // Emit one definition per inherited prefix (always including ""), so a
+        // file reachable via an external-file group load contributes both its
+        // bare and prefixed names.
+        for prefix in &effective {
+            let mut name = String::with_capacity(prefix.len() + in_file_name.len());
+            name.push_str(prefix);
+            name.push_str(&in_file_name);
+            results.push((
+                Some(name),
+                RouteDefinition {
+                    file: file.to_path_buf(),
+                    line,
+                    column,
+                    end_column,
+                    priority,
+                    method: metadata.method.clone(),
+                    uri: metadata.uri.clone(),
+                    action: metadata.action.clone(),
+                },
+            ));
+        }
 
         i = j + 1;
     }
 
+    // Second pass: derive route names from `Route::resource(...)` /
+    // `Route::apiResource(...)` (and their `->resource(...)` / `->apiResource(...)`
+    // fluent forms). Laravel synthesizes one named route per CRUD action — e.g.
+    // `Route::resource('photos', PhotoController::class)` registers
+    // `photos.index`, `photos.create`, ... `photos.destroy`. We compose these
+    // leaf names with the same group/inherited prefixes as `->name()` routes.
+    extract_resource_routes(bytes, file, priority, &effective, &groups, &mut results);
+
     results
+}
+
+/// Default action set for `Route::resource(...)` — full CRUD.
+const RESOURCE_ACTIONS: &[&str] = &[
+    "index", "create", "store", "show", "edit", "update", "destroy",
+];
+
+/// Default action set for `Route::apiResource(...)` — no `create`/`edit` (those
+/// render forms, which an API doesn't serve).
+const API_RESOURCE_ACTIONS: &[&str] = &["index", "store", "show", "update", "destroy"];
+
+/// Append resource-derived route definitions to `results`.
+///
+/// Detects `resource(` / `apiResource(` callsites preceded by `->` or `::`,
+/// extracts the first string-literal argument (the resource URI/name), strips
+/// leading AND trailing `/`, applies any `->only([...])`/`->except([...])`
+/// filter found in the same statement, then emits one [`RouteDefinition`] per
+/// surviving action × effective prefix × enclosing closure-group prefix.
+///
+/// Punted (common case only): `->names([...])` / `->name('…')` overrides on the
+/// resource, `Route::resources([...])` plural registration, and shallow/nested
+/// resources. These are uncommon and would need substantially more parsing.
+fn extract_resource_routes(
+    bytes: &[u8],
+    file: &Path,
+    priority: u8,
+    effective: &[&str],
+    groups: &[RouteGroupSpan],
+    results: &mut Vec<(Option<String>, RouteDefinition)>,
+) {
+    // Scan for `->`/`::` connectors and read the method identifier that follows.
+    // We can't keyword-match on `resource` alone because `apiResource` spells it
+    // with a capital `R` (`api` + `Resource`); matching the connector + full
+    // identifier handles both spellings cleanly.
+    let paren_pairs = build_paren_pairs(bytes);
+    let mut i = 0usize;
+
+    while i + 2 < bytes.len() {
+        let connector = &bytes[i..i + 2];
+        if connector != b"->" && connector != b"::" {
+            i += 1;
+            continue;
+        }
+
+        // Read the identifier immediately after the connector.
+        let name_start = i + 2;
+        let mut name_end = name_start;
+        while name_end < bytes.len() && is_identifier_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        let method = match std::str::from_utf8(&bytes[name_start..name_end]) {
+            Ok(s) => s,
+            Err(_) => {
+                i += 2;
+                continue;
+            }
+        };
+        let is_api = match method {
+            "resource" => false,
+            "apiResource" => true,
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+
+        // Right boundary: an opening `(` (after optional whitespace).
+        let mut j = name_end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            i += 2;
+            continue;
+        }
+        let args_open = j;
+        let Some(&args_close) = paren_pairs.get(&args_open) else {
+            i = args_open + 1;
+            continue;
+        };
+
+        // First argument: the resource name/URI. Must be a string literal.
+        let stripped = match nth_arg_slice(bytes, args_open + 1, args_close, 0)
+            .and_then(parse_string_literal)
+        {
+            Some(name) => {
+                let trimmed = name.trim_matches('/');
+                if trimmed.is_empty() {
+                    i = args_open + 1;
+                    continue;
+                }
+                trimmed.to_string()
+            }
+            None => {
+                i = args_open + 1;
+                continue;
+            }
+        };
+
+        // Determine the action set, honoring `->only([...])` / `->except([...])`
+        // appearing anywhere in the same statement.
+        let (_stmt_start, stmt_end) = statement_containing(bytes, name_start);
+        let defaults = if is_api {
+            API_RESOURCE_ACTIONS
+        } else {
+            RESOURCE_ACTIONS
+        };
+        let actions = resource_actions_in_statement(bytes, args_open, stmt_end, defaults);
+
+        // Position of the call (for goto-definition). Point at the start of the
+        // method identifier, ending after the closing `)` of the arg list.
+        let (line, column) = byte_to_line_col(bytes, name_start);
+        let end_column = column + (args_close + 1 - name_start) as u32;
+
+        // Enclosing closure-group prefix(es) for this call's offset.
+        let mut in_file_prefix = String::new();
+        for grp in groups {
+            if grp.body_start <= name_start && name_start < grp.body_end {
+                in_file_prefix.push_str(&grp.prefix);
+            }
+        }
+
+        for action in &actions {
+            let leaf = format!("{}.{}", stripped, action);
+            for prefix in effective {
+                let mut name =
+                    String::with_capacity(prefix.len() + in_file_prefix.len() + leaf.len());
+                name.push_str(prefix);
+                name.push_str(&in_file_prefix);
+                name.push_str(&leaf);
+                results.push((
+                    Some(name),
+                    RouteDefinition {
+                        file: file.to_path_buf(),
+                        line,
+                        column,
+                        end_column,
+                        priority,
+                        // Resource routes register multiple verbs; no single
+                        // method applies, so leave it unresolved.
+                        method: None,
+                        uri: Some(stripped.clone()),
+                        action: Some((*action).to_string()),
+                    },
+                ));
+            }
+        }
+
+        i = args_open + 1;
+    }
+}
+
+/// Resolve the surviving action set for a resource registration by scanning the
+/// statement (`start..end`) for `->only([...])` then `->except([...])`. `only`
+/// wins when both are present (matching Laravel's runtime, where the last
+/// applied modifier governs, but `only` is the common explicit case). Returns a
+/// filtered, owned subset of `defaults` preserving their canonical order.
+fn resource_actions_in_statement<'a>(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    defaults: &'a [&'a str],
+) -> Vec<&'a str> {
+    if let Some(list) = method_array_arg(bytes, start, end, b"only") {
+        return defaults
+            .iter()
+            .filter(|a| list.contains(&a.to_string()))
+            .copied()
+            .collect();
+    }
+    if let Some(list) = method_array_arg(bytes, start, end, b"except") {
+        return defaults
+            .iter()
+            .filter(|a| !list.contains(&a.to_string()))
+            .copied()
+            .collect();
+    }
+    defaults.to_vec()
+}
+
+/// Find `->{method}([ ... ])` within `start..end` and return the string-literal
+/// elements of its array argument. Returns `None` if the method isn't called.
+fn method_array_arg(bytes: &[u8], start: usize, end: usize, method: &[u8]) -> Option<Vec<String>> {
+    let mut i = start;
+    while i + method.len() < end {
+        // Match `->{method}` with a `->` connector and a word boundary after.
+        if i >= 2
+            && &bytes[i - 2..i] == b"->"
+            && i + method.len() <= end
+            && &bytes[i..i + method.len()] == method
+        {
+            let after = i + method.len();
+            let boundary_ok = after >= end || !is_identifier_byte(bytes[after]);
+            if boundary_ok {
+                let mut j = after;
+                while j < end && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < end && bytes[j] == b'(' {
+                    return Some(parse_string_array(bytes, j + 1, end));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Collect string-literal elements from an array literal opening at `start`
+/// (the byte just after the `(`). Reads up to the matching `]`, returning each
+/// quoted element's inner text. Tolerant of a missing `[` (treats the call
+/// argument list as the element source).
+fn parse_string_array(bytes: &[u8], start: usize, end: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < end && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < end && bytes[i] == b'[' {
+        i += 1;
+    }
+    while i < end {
+        let b = bytes[i];
+        if b == b']' || b == b')' {
+            break;
+        }
+        if b == b'\'' || b == b'"' {
+            let quote = b;
+            i += 1;
+            let lit_start = i;
+            while i < end && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < end {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i < end {
+                if let Ok(s) = std::str::from_utf8(&bytes[lit_start..i]) {
+                    out.push(s.to_string());
+                }
+                i += 1; // skip closing quote
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Resolved data describing the verb call that opens a route's fluent chain.
@@ -818,6 +1385,222 @@ fn find_route_groups(bytes: &[u8]) -> Vec<RouteGroupSpan> {
     groups
 }
 
+/// Scan `bytes` for every `->group(...)`/`::group(...)` callsite that loads an
+/// *external file* rather than running a closure body (issue #43). A load is
+/// recorded only when the call has NO closure body and its (path) argument
+/// resolves to a file path. The own-prefix (which may be empty) is captured the
+/// same way closure groups capture theirs.
+///
+/// `root` is the project root (for `base_path(...)`); `loader_dir` is the
+/// directory of the file being scanned (for `__DIR__ . '...'`).
+fn find_external_group_loads(
+    bytes: &[u8],
+    root: &Path,
+    loader_dir: &Path,
+) -> Vec<ExternalGroupLoad> {
+    let paren_pairs = build_paren_pairs(bytes);
+    let mut loads = Vec::new();
+    let keyword = b"group";
+    let mut i = 0usize;
+
+    while i + keyword.len() < bytes.len() {
+        if &bytes[i..i + keyword.len()] != keyword {
+            i += 1;
+            continue;
+        }
+        if i < 2 {
+            i += 1;
+            continue;
+        }
+        let connector = &bytes[i - 2..i];
+        if connector != b"->" && connector != b"::" {
+            i += 1;
+            continue;
+        }
+        let after_g = i + keyword.len();
+        if after_g < bytes.len() && is_identifier_byte(bytes[after_g]) {
+            i = after_g;
+            continue;
+        }
+        let mut j = after_g;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            i = j.max(i + 1);
+            continue;
+        }
+        let args_open = j;
+        let Some(&args_close) = paren_pairs.get(&args_open) else {
+            i = args_open + 1;
+            continue;
+        };
+
+        // An external load never has a closure body — skip closure groups so we
+        // don't double-handle them (they're owned by `find_route_groups`).
+        if find_function_body(bytes, args_open + 1, args_close).is_some() {
+            i += 1;
+            continue;
+        }
+
+        let group_offset = i - 2;
+        let chain_prefix = extract_chain_name_prefix(bytes, group_offset, &paren_pairs);
+        let array_prefix = extract_array_as_prefix(bytes, args_open + 1, args_close);
+
+        // Determine which argument holds the path. With an array `['as' => ...]`
+        // first arg (array form), the path is the SECOND argument; otherwise the
+        // fluent `->as(...)->group($path)` form puts it FIRST.
+        let array_first = first_arg_is_array_literal(bytes, args_open + 1, args_close);
+        let path_slice = if array_first {
+            nth_arg_slice(bytes, args_open + 1, args_close, 1)
+        } else {
+            nth_arg_slice(bytes, args_open + 1, args_close, 0)
+        };
+
+        if let Some(slice) = path_slice {
+            if let Some(target) = resolve_path_argument(slice, root, loader_dir) {
+                loads.push(ExternalGroupLoad {
+                    offset: group_offset,
+                    own_prefix: chain_prefix.or(array_prefix).unwrap_or_default(),
+                    target,
+                });
+            }
+        }
+
+        i += 1;
+    }
+
+    loads
+}
+
+/// Does the first argument in `[start..end]` begin with a `[` array literal?
+fn first_arg_is_array_literal(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut i = start;
+    while i < end && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i < end && bytes[i] == b'['
+}
+
+/// Return the trimmed byte slice of the `n`-th (0-based) comma-separated
+/// argument inside `[start..end)`, respecting nested parens/brackets/braces and
+/// string literals. `None` if there is no such argument.
+fn nth_arg_slice(bytes: &[u8], start: usize, end: usize, n: usize) -> Option<&[u8]> {
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut depth_brace = 0i32;
+    let mut in_string: Option<u8> = None;
+    let mut arg_index = 0usize;
+    let mut arg_start = start;
+    let mut i = start;
+    while i < end {
+        let b = bytes[i];
+        if let Some(quote) = in_string {
+            if b == b'\\' && i + 1 < end {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_string = Some(b),
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b'[' => depth_bracket += 1,
+            b']' => depth_bracket -= 1,
+            b'{' => depth_brace += 1,
+            b'}' => depth_brace -= 1,
+            b',' if depth_paren == 0 && depth_bracket == 0 && depth_brace == 0 => {
+                if arg_index == n {
+                    return trimmed_slice(bytes, arg_start, i);
+                }
+                arg_index += 1;
+                arg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if arg_index == n {
+        trimmed_slice(bytes, arg_start, end)
+    } else {
+        None
+    }
+}
+
+/// Resolve a `->group(...)` path argument to an absolute path. Recognized
+/// forms (the file need not exist — `.`/`..` are normalized lexically):
+/// - `base_path('sub/dir')` → `root/sub/dir`; `base_path()` → `root`
+/// - `__DIR__ . '/sub'` / `__DIR__.'sub'` → `loader_dir/sub`
+/// - bare string literal `'x'` → absolute as-is, else `root/x`
+/// - anything else → `None` (skip).
+fn resolve_path_argument(slice: &[u8], root: &Path, loader_dir: &Path) -> Option<PathBuf> {
+    let text = std::str::from_utf8(slice).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    // base_path('...') / base_path()
+    if let Some(rest) = text.strip_prefix("base_path") {
+        let rest = rest.trim_start();
+        let inner = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
+        if inner.is_empty() {
+            return Some(normalize_path(root));
+        }
+        let sub = parse_string_literal(inner.as_bytes())?;
+        return Some(normalize_path(&root.join(sub)));
+    }
+
+    // __DIR__ . '...'  (the dot and surrounding whitespace are optional spacing)
+    if let Some(rest) = text.strip_prefix("__DIR__") {
+        let rest = rest.trim_start().strip_prefix('.')?.trim_start();
+        let sub = parse_string_literal(rest.as_bytes())?;
+        let sub = sub.trim_start_matches('/');
+        return Some(normalize_path(&loader_dir.join(sub)));
+    }
+
+    // Bare string literal.
+    if let Some(s) = parse_string_literal(text.as_bytes()) {
+        let p = Path::new(&s);
+        if p.is_absolute() {
+            return Some(normalize_path(p));
+        }
+        return Some(normalize_path(&root.join(s)));
+    }
+
+    None
+}
+
+/// Lexically normalize a path: collapse `.` and resolve `..` against prior
+/// components without touching the filesystem (the target may not exist).
+///
+/// Public so callers (e.g. `did_save` in `main.rs`) can normalize a path the
+/// same way before comparing it against [`RouteIndex::source_files`].
+pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop only a real directory segment; preserve root/prefix and
+                // any leading `..` that can't be resolved lexically.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Walk backward from a `->group(` offset through prior chain links looking
 /// for a `->name('X')` whose string argument should prefix routes in this
 /// group. Returns the prefix string (e.g. `"admin."`).
@@ -871,12 +1654,14 @@ fn extract_chain_name_prefix(
             return None;
         }
 
-        if method == "name" {
+        // `Route::name('admin.')` and its alias `Route::as('admin.')` both set
+        // a group's name prefix.
+        if method == "name" || method == "as" {
             // Extract the string literal first-argument from the `()`.
             return read_first_string_literal(bytes, open_paren + 1, close_paren);
         }
 
-        // Not `name` — continue walking back from the connector position.
+        // Not a name-setter — continue walking back from the connector position.
         cursor = name_start - 2;
     }
 }

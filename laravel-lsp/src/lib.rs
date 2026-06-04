@@ -53,6 +53,7 @@ pub mod query_chain;
 pub mod references;
 pub mod rename;
 pub mod route_binding;
+pub mod route_chain;
 pub mod route_discovery;
 pub mod route_name_locator;
 pub mod route_outline;

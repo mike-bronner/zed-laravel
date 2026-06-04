@@ -532,7 +532,7 @@ pub fn extract_translation_from_echo(php_content: &str) -> Option<(String, usize
 /// - @vite(['resources/css/app.css', 'resources/js/app.js'])
 ///
 /// Returns Vec of (path, line, column, end_column) for each file path
-fn parse_vite_directive_assets(
+pub fn parse_vite_directive_assets(
     args: &str,
     directive_row: usize,
     directive_col: usize,
@@ -570,18 +570,24 @@ fn parse_vite_directive_assets(
 
         if pos < chars.len() {
             let path: String = path_chars.into_iter().collect();
-            if !path.is_empty() {
-                // Calculate column positions for the path content (excluding quotes)
-                // directive_col is where @ starts
-                // directive_len is length of @vite (5)
-                // quote_start is position of opening quote within args (which includes the paren)
-                // +1 to skip the opening quote itself and point to the path content
-                // +1 more because LSP columns are 0-based but we need to account for the @ symbol position
-                let col = (directive_col + directive_len + quote_start + 2) as u32;
-                let end_col = col + path.len() as u32; // Just the path, no quotes
+            // Calculate column positions for the path content (excluding quotes)
+            // directive_col is where @ starts
+            // directive_len is length of @vite (5)
+            // quote_start is position of opening quote within args (which includes the paren)
+            // +1 to skip the opening quote itself and point to the path content
+            // +1 more because LSP columns are 0-based but we need to account for the @ symbol position
+            let col = (directive_col + directive_len + quote_start + 2) as u32;
+            // Empty entries (`@vite('')`) are kept, not dropped: Laravel can't
+            // resolve them and throws at build time, so they must be flagged. A
+            // zero-width range wouldn't render a squiggle, so span the two quote
+            // characters around the (absent) content instead.
+            let (col, end_col) = if path.is_empty() {
+                (col.saturating_sub(1), col + 1)
+            } else {
+                (col, col + path.len() as u32) // Just the path, no quotes
+            };
 
-                results.push((path, directive_row as u32, col, end_col));
-            }
+            results.push((path, directive_row as u32, col, end_col));
             pos += 1; // Move past closing quote
         }
     }

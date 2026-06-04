@@ -13646,6 +13646,80 @@ return [
         (base.join(arg), name)
     }
 
+    /// Build a "missing asset" diagnostic for a single asset reference, or
+    /// `None` if it resolves to a real target.
+    ///
+    /// Severity follows *runtime* behavior, per the rule "if a bad value breaks
+    /// the app, it's an error":
+    /// - `@vite()` entries are looked up in the build manifest by `Vite::chunk`,
+    ///   which throws `ViteException` on a miss (a production 500). Any bad
+    ///   entry — typo, directory, or empty — is app-breaking, so it's an ERROR
+    ///   and must resolve to a real *file* (`is_file`), not just any path.
+    /// - Other helpers (`asset()`, `mix()`, `resource_path()`, …) only yield a
+    ///   dead URL/path string at runtime; the page still renders, so a miss is a
+    ///   WARNING and mere existence (file or directory) clears it.
+    ///
+    /// This is the single source of severity + detection so the Blade and PHP
+    /// validation passes can never disagree (they once emitted ERROR vs WARNING
+    /// for identical references).
+    fn asset_diagnostic(
+        asset_ref: &laravel_lsp::salsa_impl::AssetReferenceData,
+        root: &Path,
+    ) -> Option<Diagnostic> {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        let (asset_path, helper_name) =
+            Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
+
+        let is_vite = matches!(asset_ref.helper_type, AssetHelperType::ViteAsset);
+        let is_empty = asset_ref.path.trim().is_empty();
+        let broken = is_empty
+            || if is_vite {
+                !asset_path.is_file()
+            } else {
+                !asset_path.exists()
+            };
+        if !broken {
+            return None;
+        }
+
+        let severity = if is_vite {
+            DiagnosticSeverity::ERROR
+        } else {
+            DiagnosticSeverity::WARNING
+        };
+        let message = if is_empty {
+            format!("Empty {helper_name}() entry.")
+        } else {
+            format!(
+                "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
+                asset_ref.path,
+                asset_path.to_string_lossy(),
+                helper_name
+            )
+        };
+
+        Some(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: asset_ref.line,
+                    character: asset_ref.column,
+                },
+                end: Position {
+                    line: asset_ref.line,
+                    character: asset_ref.end_column,
+                },
+            },
+            severity: Some(severity),
+            code: None,
+            source: Some("laravel".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        })
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function uses Salsa-cached patterns for efficient incremental validation:
@@ -14313,35 +14387,7 @@ return [
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
                 for asset_ref in &patterns.asset_refs {
-                    let (asset_path, helper_name) =
-                        Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
-
-                    if !asset_path.exists() {
-                        let diagnostic = Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: asset_ref.line,
-                                    character: asset_ref.column,
-                                },
-                                end: Position {
-                                    line: asset_ref.line,
-                                    character: asset_ref.end_column,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            source: Some("laravel".to_string()),
-                            message: format!(
-                                "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
-                                asset_ref.path,
-                                asset_path.to_string_lossy(),
-                                helper_name
-                            ),
-                            related_information: None,
-                            tags: None,
-                            code_description: None,
-                            data: None,
-                        };
+                    if let Some(diagnostic) = Self::asset_diagnostic(asset_ref, root) {
                         diagnostics.push(diagnostic);
                     }
                 }
@@ -14724,35 +14770,7 @@ return [
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
             for asset_ref in &patterns.asset_refs {
-                let (asset_path, helper_name) =
-                    Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
-
-                if !asset_path.exists() {
-                    let diagnostic = Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: asset_ref.line,
-                                character: asset_ref.column,
-                            },
-                            end: Position {
-                                line: asset_ref.line,
-                                character: asset_ref.end_column,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        code: None,
-                        source: Some("laravel".to_string()),
-                        message: format!(
-                            "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
-                            asset_ref.path,
-                            asset_path.to_string_lossy(),
-                            helper_name
-                        ),
-                        related_information: None,
-                        tags: None,
-                        code_description: None,
-                        data: None,
-                    };
+                if let Some(diagnostic) = Self::asset_diagnostic(asset_ref, root) {
                     diagnostics.push(diagnostic);
                 }
             }

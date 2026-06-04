@@ -15265,29 +15265,6 @@ return [
         })
     }
 
-    /// Map a Salsa `AssetHelperType` to the function-call form a developer
-    /// would have literally written. No current caller (asset hovers don't
-    /// surface the helper label anymore now that the unified template
-    /// dropped the call-form header) but kept available for future use —
-    /// e.g. a completion item that wants to render the helper name.
-    #[allow(dead_code)]
-    fn asset_helper_label(t: laravel_lsp::salsa_impl::AssetHelperType) -> &'static str {
-        use laravel_lsp::salsa_impl::AssetHelperType;
-        match t {
-            AssetHelperType::Asset => "asset",
-            AssetHelperType::PublicPath => "public_path",
-            AssetHelperType::Mix => "mix",
-            AssetHelperType::BasePath => "base_path",
-            AssetHelperType::AppPath => "app_path",
-            AssetHelperType::StoragePath => "storage_path",
-            AssetHelperType::DatabasePath => "database_path",
-            AssetHelperType::LangPath => "lang_path",
-            AssetHelperType::ConfigPath => "config_path",
-            AssetHelperType::ResourcePath => "resource_path",
-            AssetHelperType::ViteAsset => "Vite::asset",
-        }
-    }
-
     /// Resolve an asset reference to its on-disk file path. Mirrors the
     /// directory mapping used by `create_asset_location_from_salsa` for
     /// goto-definition — `asset()`/`Vite::asset()` look under `public/` or

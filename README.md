@@ -131,6 +131,26 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
+### 🌱 `.env` "appears unused" warnings
+
+Open a `.env` and Zed underlines every line — `APP_NAME appears unused. Verify use (or export if used externally)`. That's **shellcheck's SC2034**, not this extension: Zed lints `.env` files as *Shell Script*, where the `KEY=value` lines Laravel reads at runtime look like unused variables. Silence just that rule while keeping shell highlighting, via your `settings.json`:
+
+```json
+{
+  "lsp": {
+    "bash-language-server": {
+      "settings": {
+        "bashIde": {
+          "shellcheckArguments": ["--exclude=SC2034"]
+        }
+      }
+    }
+  }
+}
+```
+
+The `bashIde` wrapper is required — the bash server won't see the setting without it. Prefer a project-scoped `.shellcheckrc`, a per-file directive, or reclassifying `.env` away from Shell Script entirely (so real shell scripts keep SC2034)? See the **[environment files guide](docs/environment.md)** for all the options and trade-offs.
+
 ### 🎨 Blade directive highlighting
 
 The [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension already highlights standard directives and paired `@custom … @endcustom` blocks through tree-sitter. This optional setting adds the one case tree-sitter can't see: your app's **custom inline directives** registered via `Blade::directive()` (e.g. a `@money($amount)` macro). The LSP highlights them precisely — it colors only directives it has actually discovered (the same scan that drives directive completion), so PHPDoc `@param` tags, CSS at-rules like `@media`, and the `@` in email addresses are left alone, and commented-out directives stay dark. Enable it in your Zed `settings.json`:

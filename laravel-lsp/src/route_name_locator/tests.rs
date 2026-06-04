@@ -202,6 +202,82 @@ Route::get('/home', [HomeController::class, 'index'])->name('home');
     assert_eq!(d.rewritten_segment("users.index"), "users.index");
 }
 
+// ============================================================================
+// External-file group prefixes (issue #43)
+// ============================================================================
+
+#[test]
+fn find_with_external_matches_prefixed_target() {
+    // A file loaded via `Route::as('admin.')->group(base_path('that.php'))`
+    // has its in-file `->name('x')` resolve to `admin.x` at the project level.
+    // `find_declarations_named_with_external` must match target `admin.x` and
+    // still yield the leaf `x` for rewrite.
+    let src = r#"<?php
+Route::get('/x', [X::class, 'i'])->name('x');
+"#;
+    let found = find_declarations_named_with_external(
+        src,
+        "admin.x",
+        &["".to_string(), "admin.".to_string()],
+    );
+    assert_eq!(found.len(), 1, "the prefixed target must match");
+    let d = &found[0];
+    // The decl is re-anchored to the resolved project-level name so
+    // `rewritten_segment` strips the WHOLE prefix and rewrites only the leaf.
+    assert_eq!(d.full_name, "admin.x");
+    assert_eq!(d.local_segment, "x");
+    assert_eq!(d.rewritten_segment("admin.accounts"), "accounts");
+}
+
+#[test]
+fn find_with_external_still_matches_bare_target() {
+    // The same call must keep matching the bare name `x` via the always-present
+    // empty prefix — the loaded file is also scanned directly.
+    let src = r#"<?php
+Route::get('/x', [X::class, 'i'])->name('x');
+"#;
+    let found =
+        find_declarations_named_with_external(src, "x", &["".to_string(), "admin.".to_string()]);
+    assert_eq!(found.len(), 1, "the bare target must still match");
+    assert_eq!(found[0].full_name, "x");
+    assert_eq!(found[0].local_segment, "x");
+}
+
+#[test]
+fn find_with_external_empty_prefixes_behaves_like_plain() {
+    // An empty external-prefix slice is treated as `[""]`, so this is exactly
+    // `find_declarations_named`.
+    let src = r#"<?php
+Route::get('/x', [X::class, 'i'])->name('x');
+"#;
+    let found = find_declarations_named_with_external(src, "x", &[]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].full_name, "x");
+    let none = find_declarations_named_with_external(src, "admin.x", &[]);
+    assert!(none.is_empty(), "no external prefix → no prefixed match");
+}
+
+#[test]
+fn find_with_external_combines_with_in_file_group_prefix() {
+    // External prefix `admin.` + in-file group `api.` → the leaf `x` resolves
+    // to `admin.api.x`. The decl's source position still spans only `x`, so the
+    // rewrite must strip the full `admin.api.` prefix.
+    let src = r#"<?php
+Route::name('api.')->group(function () {
+    Route::get('/x', [X::class, 'i'])->name('x');
+});
+"#;
+    let found = find_declarations_named_with_external(
+        src,
+        "admin.api.x",
+        &["".to_string(), "admin.".to_string()],
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].full_name, "admin.api.x");
+    assert_eq!(found[0].local_segment, "x");
+    assert_eq!(found[0].rewritten_segment("admin.api.accounts"), "accounts");
+}
+
 #[test]
 fn rewritten_segment_falls_back_when_prefix_mismatches() {
     // The user rewrote the group portion (`admin.` → `web.`) — something a

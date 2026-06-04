@@ -289,3 +289,67 @@ fn positions_are_zero_based() {
     assert_eq!(routes[0].start_line, 1, "second line is index 1");
     assert_eq!(routes[0].start_column, 0, "line starts at column 0");
 }
+
+// ============================================================================
+// External-file group prefixes (issue #43)
+// ============================================================================
+
+#[test]
+fn external_prefix_prepends_to_route_names() {
+    // A file loaded via `Route::as('admin.')->group(base_path('that.php'))`
+    // should display its routes' names with the inherited `admin.` prefix.
+    let content = "<?php\nRoute::get('/users', fn () => 1)->name('users.index');\n";
+    let routes = extract_route_outline_with_external(content, &["admin.".to_string()]);
+    assert_eq!(routes.len(), 1);
+    assert_eq!(
+        routes[0].uri, "/users",
+        "URIs are unaffected by name prefix"
+    );
+    assert_eq!(routes[0].name.as_deref(), Some("admin.users.index"));
+}
+
+#[test]
+fn external_prefix_combines_with_in_file_group() {
+    // External `admin.` + in-file `api.` group → `admin.api.users`.
+    let content = r#"<?php
+Route::name('api.')->group(function () {
+    Route::get('/users', fn () => 1)->name('users');
+});
+"#;
+    let routes = extract_route_outline_with_external(content, &["admin.".to_string()]);
+    assert_eq!(routes.len(), 1);
+    assert!(routes[0].is_group);
+    assert_eq!(routes[0].name.as_deref(), Some("admin.api."));
+    assert_eq!(
+        routes[0].children[0].name.as_deref(),
+        Some("admin.api.users")
+    );
+}
+
+#[test]
+fn external_prefix_uses_first_non_empty() {
+    // The slice always contains "" (file scanned directly); the first non-empty
+    // entry is the display prefix.
+    let content = "<?php\nRoute::get('/x', fn () => 1)->name('x');\n";
+    let routes =
+        extract_route_outline_with_external(content, &["".to_string(), "admin.".to_string()]);
+    assert_eq!(routes[0].name.as_deref(), Some("admin.x"));
+}
+
+#[test]
+fn external_prefix_empty_matches_plain_extraction() {
+    // No external prefix → byte-identical to `extract_route_outline`.
+    let content = r#"<?php
+Route::name('api.')->group(function () {
+    Route::get('/users', fn () => 1)->name('users');
+});
+"#;
+    assert_eq!(
+        extract_route_outline_with_external(content, &[]),
+        extract_route_outline(content),
+    );
+    assert_eq!(
+        extract_route_outline_with_external(content, &["".to_string()]),
+        extract_route_outline(content),
+    );
+}

@@ -1,7 +1,9 @@
 mod array_context_detection;
+mod asset_path_resolution;
 mod blade_component_context;
 mod cast_type_context;
 mod class_locator_and_properties;
+mod diagnostic_severity;
 mod dynamic_where_sparseness;
 mod generic_type_parsing;
 mod livewire_component_resolution;
@@ -10,3 +12,4 @@ mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
 mod slot_variable_resolution;
+mod vite_completion_context;

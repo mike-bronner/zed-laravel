@@ -222,6 +222,37 @@ fn blade_component_column_positions() {
 }
 
 #[test]
+fn empty_vite_array_entry_survives_blade_extraction() {
+    // End-to-end guard for `@vite([..., ''])`: parse Blade → pull the @vite
+    // directive's arguments → run parse_vite_directive_assets, exactly as the
+    // Salsa path does. The empty trailing entry must survive — it used to be
+    // dropped, so the editor showed no diagnostic for it at all.
+    let blade_code = "@vite(['resources/css/app.css', ''])";
+    let tree = parse_blade(blade_code).expect("Should parse Blade");
+    let lang = language_blade();
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
+
+    let vite = patterns
+        .directives
+        .iter()
+        .find(|d| d.directive_name == "vite")
+        .expect("@vite directive should be extracted");
+    let args = vite.arguments.expect("@vite should carry its arguments");
+
+    let entries = crate::salsa_impl::parse_vite_directive_assets(
+        args,
+        vite.row,
+        vite.column,
+        "vite".len() + 1,
+    );
+    assert!(
+        entries.iter().any(|(p, ..)| p.is_empty()),
+        "empty @vite entry must survive extraction: args={args:?} entries={entries:?}",
+    );
+}
+
+#[test]
 fn livewire_component_column_positions() {
     let blade_code = "<div><livewire:counter /></div>";
     let tree = parse_blade(blade_code).expect("Should parse Blade");

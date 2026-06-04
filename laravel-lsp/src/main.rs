@@ -6941,34 +6941,77 @@ impl LaravelLanguageServer {
 
         let before_cursor = &line_text[..cursor];
 
-        let patterns: Vec<(&str, char, usize)> = vec![
-            ("@vite('", '\'', 7),
-            ("@vite(\"", '"', 7),
-            ("@vite(['", '\'', 8),
-            ("@vite([\"", '"', 8),
-            ("Vite::asset('", '\'', 13),
-            ("Vite::asset(\"", '"', 13),
-        ];
+        // Find the directive opener. `@vite()` takes a single path OR an array
+        // of paths, so we can't match a fixed opening pattern per quote — the
+        // cursor may be in the 2nd, 3rd, … array element.
+        let open = before_cursor
+            .rfind("@vite(")
+            .map(|p| p + "@vite(".len())
+            .or_else(|| {
+                before_cursor
+                    .rfind("Vite::asset(")
+                    .map(|p| p + "Vite::asset(".len())
+            })?;
 
-        for (pattern, quote_char, pattern_len) in patterns {
-            if let Some(pos) = before_cursor.rfind(pattern) {
-                let start_pos = pos + pattern_len;
-                let after_quote = &before_cursor[start_pos..];
-
-                // Check that we haven't hit the closing quote
-                if !after_quote.contains(quote_char) {
-                    let end_col = Self::find_string_end(line_text, start_pos, quote_char);
-                    return Some(StringContext {
-                        prefix: after_quote.to_string(),
-                        start_col: start_pos as u32,
-                        end_col,
-                        quote_char,
-                    });
-                }
+        // Scan the arguments from the opener to the cursor, tracking string
+        // open/close state. Quotes (`'`/`"`) are single ASCII bytes that can't
+        // occur inside a multi-byte UTF-8 sequence, so byte scanning is safe.
+        // If the cursor lands inside an open string, that string is the active
+        // completion context — whether it's `@vite('x')` or any element of
+        // `@vite(['a', 'b', …])`.
+        let args = &before_cursor.as_bytes()[open..];
+        let mut in_string: Option<(u8, usize)> = None; // (quote byte, content start in line)
+        for (i, &b) in args.iter().enumerate() {
+            match in_string {
+                None if b == b'\'' || b == b'"' => in_string = Some((b, open + i + 1)),
+                Some((quote, _)) if b == quote => in_string = None,
+                _ => {}
             }
         }
 
-        None
+        let (quote, content_start) = in_string?;
+        let quote_char = quote as char;
+        let end_col = Self::find_string_end(line_text, content_start, quote_char);
+        Some(StringContext {
+            prefix: line_text[content_start..cursor].to_string(),
+            start_col: content_start as u32,
+            end_col,
+            quote_char,
+        })
+    }
+
+    /// Collect candidate Vite entry files: every asset-extension file under the
+    /// project root that isn't git-ignored. Uses ripgrep's `ignore` walker so
+    /// `vendor/`, `node_modules/`, build output, etc. (git-ignored in a Laravel
+    /// app) are pruned at the directory level — keeping the walk fast even on
+    /// huge repos. Returns paths relative to `root`, forward-slashed and sorted,
+    /// ready to drop into `@vite(...)` (which is project-root-relative).
+    fn vite_entry_files(root: &Path) -> Vec<String> {
+        const VITE_EXTS: &[&str] = &[
+            "js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
+        ];
+        let mut out = Vec::new();
+        for entry in ignore::WalkBuilder::new(root)
+            .require_git(false) // honor .gitignore even when .git isn't present
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let is_asset = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| VITE_EXTS.contains(&e));
+            if is_asset {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Check if cursor is inside a path helper call like app_path('...'), base_path('...'), etc.
@@ -11842,7 +11885,6 @@ return [
         line: u32,
         column: u32,
         end_column: u32,
-        dotted_severity: DiagnosticSeverity,
     ) -> Diagnostic {
         let expected_path_str = check
             .expected_path
@@ -11860,7 +11902,12 @@ return [
                 "\nFile does not exist".to_string()
             };
             (
-                dotted_severity,
+                // A missing translation key does NOT throw — Laravel's
+                // Translator::get returns the key string verbatim — so the page
+                // still renders. That's a WARNING, not an error, and the same
+                // severity regardless of call form (`__()`, `trans()`, `@lang`),
+                // which previously disagreed (ERROR vs WARNING).
+                DiagnosticSeverity::WARNING,
                 format!(
                     "Translation not found: '{}'\nExpected at: {}{}",
                     translation_key, expected_path_str, action_hint
@@ -12658,22 +12705,10 @@ return [
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
-        // Determine the base path based on helper type
-        use laravel_lsp::salsa_impl::AssetHelperType;
-        let base_path = match asset.helper_type {
-            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
-                root.join("public")
-            }
-            AssetHelperType::BasePath => root.clone(),
-            AssetHelperType::AppPath => root.join("app"),
-            AssetHelperType::StoragePath => root.join("storage"),
-            AssetHelperType::DatabasePath => root.join("database"),
-            AssetHelperType::LangPath => root.join("lang"),
-            AssetHelperType::ConfigPath => root.join("config"),
-            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
-        };
-
-        let asset_path = base_path.join(&asset.path);
+        // Resolve through the single asset-path brain so goto/hover/diagnostics
+        // never disagree — notably @vite, whose entry is project-root-relative
+        // and must NOT be re-prefixed with `resources/` (issue #46).
+        let (asset_path, _) = Self::asset_expected_path(asset.helper_type, root, &asset.path);
 
         if self.file_exists_cached(&asset_path).await {
             if let Ok(target_uri) = Url::from_file_path(&asset_path) {
@@ -13586,6 +13621,109 @@ return [
         out
     }
 
+    /// Resolve an asset-helper reference to the absolute path the helper points
+    /// at, plus the helper's display name. Each helper's base directory follows
+    /// its Laravel convention.
+    fn asset_expected_path(
+        helper_type: laravel_lsp::salsa_impl::AssetHelperType,
+        root: &Path,
+        arg: &str,
+    ) -> (PathBuf, &'static str) {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        let (base, name) = match helper_type {
+            AssetHelperType::Asset => (root.join("public"), "asset"),
+            AssetHelperType::PublicPath => (root.join("public"), "public_path"),
+            AssetHelperType::Mix => (root.join("public"), "mix"),
+            AssetHelperType::BasePath => (root.to_path_buf(), "base_path"),
+            AssetHelperType::AppPath => (root.join("app"), "app_path"),
+            AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
+            AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
+            AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
+            AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
+            AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
+            // `@vite()` entry paths are PROJECT-ROOT-relative and already begin
+            // with `resources/` — matching Laravel's `Vite::hotAsset`/`chunk`,
+            // which use the entry verbatim. Joining to `root/resources` doubled
+            // the `resources/` segment (issue #46).
+            AssetHelperType::ViteAsset => (root.to_path_buf(), "@vite"),
+        };
+        (base.join(arg), name)
+    }
+
+    /// Build a "missing asset" diagnostic for a single asset reference, or
+    /// `None` if it resolves to a real target.
+    ///
+    /// Severity follows *runtime* behavior, per the rule "if a bad value breaks
+    /// the app, it's an error":
+    /// - `@vite()` entries are looked up in the build manifest by `Vite::chunk`,
+    ///   which throws `ViteException` on a miss (a production 500). Any bad
+    ///   entry — typo, directory, or empty — is app-breaking, so it's an ERROR
+    ///   and must resolve to a real *file* (`is_file`), not just any path.
+    /// - Other helpers (`asset()`, `mix()`, `resource_path()`, …) only yield a
+    ///   dead URL/path string at runtime; the page still renders, so a miss is a
+    ///   WARNING and mere existence (file or directory) clears it.
+    ///
+    /// This is the single source of severity + detection so the Blade and PHP
+    /// validation passes can never disagree (they once emitted ERROR vs WARNING
+    /// for identical references).
+    fn asset_diagnostic(
+        asset_ref: &laravel_lsp::salsa_impl::AssetReferenceData,
+        root: &Path,
+    ) -> Option<Diagnostic> {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        let (asset_path, helper_name) =
+            Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
+
+        let is_vite = matches!(asset_ref.helper_type, AssetHelperType::ViteAsset);
+        let is_empty = asset_ref.path.trim().is_empty();
+        let broken = is_empty
+            || if is_vite {
+                !asset_path.is_file()
+            } else {
+                !asset_path.exists()
+            };
+        if !broken {
+            return None;
+        }
+
+        let severity = if is_vite {
+            DiagnosticSeverity::ERROR
+        } else {
+            DiagnosticSeverity::WARNING
+        };
+        let message = if is_empty {
+            format!("Empty {helper_name}() entry.")
+        } else {
+            format!(
+                "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
+                asset_ref.path,
+                asset_path.to_string_lossy(),
+                helper_name
+            )
+        };
+
+        Some(Diagnostic {
+            range: Range {
+                start: Position {
+                    line: asset_ref.line,
+                    character: asset_ref.column,
+                },
+                end: Position {
+                    line: asset_ref.line,
+                    character: asset_ref.end_column,
+                },
+            },
+            severity: Some(severity),
+            code: None,
+            source: Some("laravel".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            code_description: None,
+            data: None,
+        })
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function uses Salsa-cached patterns for efficient incremental validation:
@@ -14079,7 +14217,6 @@ return [
                             trans_ref.line,
                             trans_ref.column,
                             trans_ref.end_column,
-                            DiagnosticSeverity::ERROR, // ERROR for dotted keys in PHP
                         ));
                     }
                 }
@@ -14253,51 +14390,7 @@ return [
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
                 for asset_ref in &patterns.asset_refs {
-                    use laravel_lsp::salsa_impl::AssetHelperType;
-
-                    // Determine base path based on helper type
-                    let (base_path, helper_name) = match asset_ref.helper_type {
-                        AssetHelperType::Asset => (root.join("public"), "asset"),
-                        AssetHelperType::PublicPath => (root.join("public"), "public_path"),
-                        AssetHelperType::Mix => (root.join("public"), "mix"),
-                        AssetHelperType::BasePath => (root.clone(), "base_path"),
-                        AssetHelperType::AppPath => (root.join("app"), "app_path"),
-                        AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
-                        AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
-                        AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
-                        AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
-                        AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
-                        AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
-                    };
-
-                    let asset_path = base_path.join(&asset_ref.path);
-
-                    if !asset_path.exists() {
-                        let diagnostic = Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: asset_ref.line,
-                                    character: asset_ref.column,
-                                },
-                                end: Position {
-                                    line: asset_ref.line,
-                                    character: asset_ref.end_column,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            source: Some("laravel".to_string()),
-                            message: format!(
-                                "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
-                                asset_ref.path,
-                                asset_path.to_string_lossy(),
-                                helper_name
-                            ),
-                            related_information: None,
-                            tags: None,
-                            code_description: None,
-                            data: None,
-                        };
+                    if let Some(diagnostic) = Self::asset_diagnostic(asset_ref, root) {
                         diagnostics.push(diagnostic);
                     }
                 }
@@ -14333,7 +14426,11 @@ return [
                                             character: feature_ref.end_column,
                                         },
                                     },
-                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    // An undefined Pennant feature does NOT throw:
+                                    // the driver dispatches UnknownFeatureResolved
+                                    // and returns the unknown-feature value (false).
+                                    // The app keeps running, so this is a WARNING.
+                                    severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
                                     source: Some("laravel".to_string()),
                                     message: format!(
@@ -14369,7 +14466,9 @@ return [
                                         character: feature_ref.end_column,
                                     },
                                 },
-                                severity: Some(DiagnosticSeverity::ERROR),
+                                // Undefined feature → driver returns false, no
+                                // throw (see UnknownFeatureResolved). WARNING.
+                                severity: Some(DiagnosticSeverity::WARNING),
                                 code: None,
                                 source: Some("laravel".to_string()),
                                 message: format!(
@@ -14433,7 +14532,6 @@ return [
                         trans_ref.line,
                         trans_ref.column,
                         trans_ref.end_column,
-                        DiagnosticSeverity::ERROR, // ERROR for dotted keys in Blade __()
                     ));
                 }
             }
@@ -14609,7 +14707,6 @@ return [
                                     dir_ref.line,
                                     dir_ref.column,
                                     dir_ref.end_column,
-                                    DiagnosticSeverity::WARNING, // WARNING for dotted keys in @lang
                                 ));
                             }
                         }
@@ -14654,7 +14751,9 @@ return [
                                             character: dir_ref.string_end_column,
                                         },
                                     },
-                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    // Undefined feature → driver returns false, no
+                                    // throw (see UnknownFeatureResolved). WARNING.
+                                    severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
                                     source: Some("laravel".to_string()),
                                     message: format!(
@@ -14680,51 +14779,7 @@ return [
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
             for asset_ref in &patterns.asset_refs {
-                use laravel_lsp::salsa_impl::AssetHelperType;
-
-                // Determine base path based on helper type
-                let (base_path, helper_name) = match asset_ref.helper_type {
-                    AssetHelperType::Asset => (root.join("public"), "asset"),
-                    AssetHelperType::PublicPath => (root.join("public"), "public_path"),
-                    AssetHelperType::Mix => (root.join("public"), "mix"),
-                    AssetHelperType::BasePath => (root.clone(), "base_path"),
-                    AssetHelperType::AppPath => (root.join("app"), "app_path"),
-                    AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
-                    AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
-                    AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
-                    AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
-                    AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
-                    AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
-                };
-
-                let asset_path = base_path.join(&asset_ref.path);
-
-                if !asset_path.exists() {
-                    let diagnostic = Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: asset_ref.line,
-                                character: asset_ref.column,
-                            },
-                            end: Position {
-                                line: asset_ref.line,
-                                character: asset_ref.end_column,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        code: None,
-                        source: Some("laravel".to_string()),
-                        message: format!(
-                            "Asset file not found: '{}'\nExpected at: {}\nHelper: {}()",
-                            asset_ref.path,
-                            asset_path.to_string_lossy(),
-                            helper_name
-                        ),
-                        related_information: None,
-                        tags: None,
-                        code_description: None,
-                        data: None,
-                    };
+                if let Some(diagnostic) = Self::asset_diagnostic(asset_ref, root) {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -15237,29 +15292,6 @@ return [
         })
     }
 
-    /// Map a Salsa `AssetHelperType` to the function-call form a developer
-    /// would have literally written. No current caller (asset hovers don't
-    /// surface the helper label anymore now that the unified template
-    /// dropped the call-form header) but kept available for future use —
-    /// e.g. a completion item that wants to render the helper name.
-    #[allow(dead_code)]
-    fn asset_helper_label(t: laravel_lsp::salsa_impl::AssetHelperType) -> &'static str {
-        use laravel_lsp::salsa_impl::AssetHelperType;
-        match t {
-            AssetHelperType::Asset => "asset",
-            AssetHelperType::PublicPath => "public_path",
-            AssetHelperType::Mix => "mix",
-            AssetHelperType::BasePath => "base_path",
-            AssetHelperType::AppPath => "app_path",
-            AssetHelperType::StoragePath => "storage_path",
-            AssetHelperType::DatabasePath => "database_path",
-            AssetHelperType::LangPath => "lang_path",
-            AssetHelperType::ConfigPath => "config_path",
-            AssetHelperType::ResourcePath => "resource_path",
-            AssetHelperType::ViteAsset => "Vite::asset",
-        }
-    }
-
     /// Resolve an asset reference to its on-disk file path. Mirrors the
     /// directory mapping used by `create_asset_location_from_salsa` for
     /// goto-definition — `asset()`/`Vite::asset()` look under `public/` or
@@ -15268,21 +15300,9 @@ return [
         &self,
         asset: &laravel_lsp::salsa_impl::AssetReferenceData,
     ) -> Option<String> {
-        use laravel_lsp::salsa_impl::AssetHelperType;
         let root = self.root_path.read().await.clone()?;
-        let base = match asset.helper_type {
-            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
-                root.join("public")
-            }
-            AssetHelperType::BasePath => root.clone(),
-            AssetHelperType::AppPath => root.join("app"),
-            AssetHelperType::StoragePath => root.join("storage"),
-            AssetHelperType::DatabasePath => root.join("database"),
-            AssetHelperType::LangPath => root.join("lang"),
-            AssetHelperType::ConfigPath => root.join("config"),
-            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
-        };
-        let asset_path = base.join(&asset.path);
+        // Single asset-path brain — see asset_expected_path (issue #46).
+        let (asset_path, _) = Self::asset_expected_path(asset.helper_type, &root, &asset.path);
         if self.file_exists_cached(&asset_path).await {
             Some(self.source_link(&asset_path, None).await)
         } else {
@@ -18906,25 +18926,23 @@ impl LanguageServer for LaravelLanguageServer {
                     None => return Ok(None),
                 };
 
-                // Vite assets are typically in resources/ directory
-                let resources_dir = root.join("resources");
-                let vite_extensions = &[
-                    "js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
-                ];
-                let files = self
-                    .get_directory_files(&resources_dir, Some(vite_extensions))
-                    .await;
+                // Every non-git-ignored asset file in the project, relative to
+                // the root (the form `@vite()` expects). The walk runs off the
+                // async runtime; Zed fuzzy-filters the list against the typed
+                // text, so we return the full candidate set rather than
+                // prefix-filtering here.
+                let walk_root = root.clone();
+                let files = tokio::task::spawn_blocking(move || Self::vite_entry_files(&walk_root))
+                    .await
+                    .unwrap_or_default();
 
-                // Prefix paths with "resources/" for proper Vite resolution
-                let prefix_lower = vite_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = files
                     .into_iter()
-                    .map(|f| format!("resources/{}", f.path))
-                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
                     .map(|path| CompletionItem {
                         label: path.clone(),
                         kind: Some(CompletionItemKind::FILE),
                         detail: Some("vite entry".to_string()),
+                        filter_text: Some(path.clone()),
                         documentation: Some(
                             CompletionDoc::new()
                                 .header(&path)

@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # File system and paths
 walkdir = "2.5"
+ignore = "0.4"  # ripgrep's .gitignore-respecting directory walker
 glob = "0.3"
 directories = "6"  # Cross-platform XDG cache directories
 

@@ -11,3 +11,4 @@ mod rename_integration;
 mod route_binding_resolution;
 mod route_diagnostics;
 mod slot_variable_resolution;
+mod vite_completion_context;

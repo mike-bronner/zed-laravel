@@ -6941,34 +6941,77 @@ impl LaravelLanguageServer {
 
         let before_cursor = &line_text[..cursor];
 
-        let patterns: Vec<(&str, char, usize)> = vec![
-            ("@vite('", '\'', 7),
-            ("@vite(\"", '"', 7),
-            ("@vite(['", '\'', 8),
-            ("@vite([\"", '"', 8),
-            ("Vite::asset('", '\'', 13),
-            ("Vite::asset(\"", '"', 13),
-        ];
+        // Find the directive opener. `@vite()` takes a single path OR an array
+        // of paths, so we can't match a fixed opening pattern per quote — the
+        // cursor may be in the 2nd, 3rd, … array element.
+        let open = before_cursor
+            .rfind("@vite(")
+            .map(|p| p + "@vite(".len())
+            .or_else(|| {
+                before_cursor
+                    .rfind("Vite::asset(")
+                    .map(|p| p + "Vite::asset(".len())
+            })?;
 
-        for (pattern, quote_char, pattern_len) in patterns {
-            if let Some(pos) = before_cursor.rfind(pattern) {
-                let start_pos = pos + pattern_len;
-                let after_quote = &before_cursor[start_pos..];
-
-                // Check that we haven't hit the closing quote
-                if !after_quote.contains(quote_char) {
-                    let end_col = Self::find_string_end(line_text, start_pos, quote_char);
-                    return Some(StringContext {
-                        prefix: after_quote.to_string(),
-                        start_col: start_pos as u32,
-                        end_col,
-                        quote_char,
-                    });
-                }
+        // Scan the arguments from the opener to the cursor, tracking string
+        // open/close state. Quotes (`'`/`"`) are single ASCII bytes that can't
+        // occur inside a multi-byte UTF-8 sequence, so byte scanning is safe.
+        // If the cursor lands inside an open string, that string is the active
+        // completion context — whether it's `@vite('x')` or any element of
+        // `@vite(['a', 'b', …])`.
+        let args = &before_cursor.as_bytes()[open..];
+        let mut in_string: Option<(u8, usize)> = None; // (quote byte, content start in line)
+        for (i, &b) in args.iter().enumerate() {
+            match in_string {
+                None if b == b'\'' || b == b'"' => in_string = Some((b, open + i + 1)),
+                Some((quote, _)) if b == quote => in_string = None,
+                _ => {}
             }
         }
 
-        None
+        let (quote, content_start) = in_string?;
+        let quote_char = quote as char;
+        let end_col = Self::find_string_end(line_text, content_start, quote_char);
+        Some(StringContext {
+            prefix: line_text[content_start..cursor].to_string(),
+            start_col: content_start as u32,
+            end_col,
+            quote_char,
+        })
+    }
+
+    /// Collect candidate Vite entry files: every asset-extension file under the
+    /// project root that isn't git-ignored. Uses ripgrep's `ignore` walker so
+    /// `vendor/`, `node_modules/`, build output, etc. (git-ignored in a Laravel
+    /// app) are pruned at the directory level — keeping the walk fast even on
+    /// huge repos. Returns paths relative to `root`, forward-slashed and sorted,
+    /// ready to drop into `@vite(...)` (which is project-root-relative).
+    fn vite_entry_files(root: &Path) -> Vec<String> {
+        const VITE_EXTS: &[&str] = &[
+            "js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
+        ];
+        let mut out = Vec::new();
+        for entry in ignore::WalkBuilder::new(root)
+            .require_git(false) // honor .gitignore even when .git isn't present
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let is_asset = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| VITE_EXTS.contains(&e));
+            if is_asset {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Check if cursor is inside a path helper call like app_path('...'), base_path('...'), etc.
@@ -18903,25 +18946,23 @@ impl LanguageServer for LaravelLanguageServer {
                     None => return Ok(None),
                 };
 
-                // Vite assets are typically in resources/ directory
-                let resources_dir = root.join("resources");
-                let vite_extensions = &[
-                    "js", "ts", "jsx", "tsx", "css", "scss", "sass", "less", "vue", "svelte",
-                ];
-                let files = self
-                    .get_directory_files(&resources_dir, Some(vite_extensions))
-                    .await;
+                // Every non-git-ignored asset file in the project, relative to
+                // the root (the form `@vite()` expects). The walk runs off the
+                // async runtime; Zed fuzzy-filters the list against the typed
+                // text, so we return the full candidate set rather than
+                // prefix-filtering here.
+                let walk_root = root.clone();
+                let files = tokio::task::spawn_blocking(move || Self::vite_entry_files(&walk_root))
+                    .await
+                    .unwrap_or_default();
 
-                // Prefix paths with "resources/" for proper Vite resolution
-                let prefix_lower = vite_ctx.prefix.to_lowercase();
                 let items: Vec<CompletionItem> = files
                     .into_iter()
-                    .map(|f| format!("resources/{}", f.path))
-                    .filter(|p| p.to_lowercase().starts_with(&prefix_lower))
                     .map(|path| CompletionItem {
                         label: path.clone(),
                         kind: Some(CompletionItemKind::FILE),
                         detail: Some("vite entry".to_string()),
+                        filter_text: Some(path.clone()),
                         documentation: Some(
                             CompletionDoc::new()
                                 .header(&path)

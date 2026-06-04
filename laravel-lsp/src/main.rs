@@ -13586,6 +13586,35 @@ return [
         out
     }
 
+    /// Resolve an asset-helper reference to the absolute path the helper points
+    /// at, plus the helper's display name. Each helper's base directory follows
+    /// its Laravel convention.
+    fn asset_expected_path(
+        helper_type: laravel_lsp::salsa_impl::AssetHelperType,
+        root: &Path,
+        arg: &str,
+    ) -> (PathBuf, &'static str) {
+        use laravel_lsp::salsa_impl::AssetHelperType;
+        let (base, name) = match helper_type {
+            AssetHelperType::Asset => (root.join("public"), "asset"),
+            AssetHelperType::PublicPath => (root.join("public"), "public_path"),
+            AssetHelperType::Mix => (root.join("public"), "mix"),
+            AssetHelperType::BasePath => (root.to_path_buf(), "base_path"),
+            AssetHelperType::AppPath => (root.join("app"), "app_path"),
+            AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
+            AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
+            AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
+            AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
+            AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
+            // `@vite()` entry paths are PROJECT-ROOT-relative and already begin
+            // with `resources/` — matching Laravel's `Vite::hotAsset`/`chunk`,
+            // which use the entry verbatim. Joining to `root/resources` doubled
+            // the `resources/` segment (issue #46).
+            AssetHelperType::ViteAsset => (root.to_path_buf(), "@vite"),
+        };
+        (base.join(arg), name)
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function uses Salsa-cached patterns for efficient incremental validation:
@@ -14253,24 +14282,8 @@ return [
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
                 for asset_ref in &patterns.asset_refs {
-                    use laravel_lsp::salsa_impl::AssetHelperType;
-
-                    // Determine base path based on helper type
-                    let (base_path, helper_name) = match asset_ref.helper_type {
-                        AssetHelperType::Asset => (root.join("public"), "asset"),
-                        AssetHelperType::PublicPath => (root.join("public"), "public_path"),
-                        AssetHelperType::Mix => (root.join("public"), "mix"),
-                        AssetHelperType::BasePath => (root.clone(), "base_path"),
-                        AssetHelperType::AppPath => (root.join("app"), "app_path"),
-                        AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
-                        AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
-                        AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
-                        AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
-                        AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
-                        AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
-                    };
-
-                    let asset_path = base_path.join(&asset_ref.path);
+                    let (asset_path, helper_name) =
+                        Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
 
                     if !asset_path.exists() {
                         let diagnostic = Diagnostic {
@@ -14680,24 +14693,8 @@ return [
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
             for asset_ref in &patterns.asset_refs {
-                use laravel_lsp::salsa_impl::AssetHelperType;
-
-                // Determine base path based on helper type
-                let (base_path, helper_name) = match asset_ref.helper_type {
-                    AssetHelperType::Asset => (root.join("public"), "asset"),
-                    AssetHelperType::PublicPath => (root.join("public"), "public_path"),
-                    AssetHelperType::Mix => (root.join("public"), "mix"),
-                    AssetHelperType::BasePath => (root.clone(), "base_path"),
-                    AssetHelperType::AppPath => (root.join("app"), "app_path"),
-                    AssetHelperType::StoragePath => (root.join("storage"), "storage_path"),
-                    AssetHelperType::DatabasePath => (root.join("database"), "database_path"),
-                    AssetHelperType::LangPath => (root.join("lang"), "lang_path"),
-                    AssetHelperType::ConfigPath => (root.join("config"), "config_path"),
-                    AssetHelperType::ResourcePath => (root.join("resources"), "resource_path"),
-                    AssetHelperType::ViteAsset => (root.join("resources"), "@vite"),
-                };
-
-                let asset_path = base_path.join(&asset_ref.path);
+                let (asset_path, helper_name) =
+                    Self::asset_expected_path(asset_ref.helper_type, root, &asset_ref.path);
 
                 if !asset_path.exists() {
                     let diagnostic = Diagnostic {

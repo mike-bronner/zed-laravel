@@ -1,4 +1,5 @@
 mod array_context_detection;
+mod asset_path_resolution;
 mod blade_component_context;
 mod cast_type_context;
 mod class_locator_and_properties;

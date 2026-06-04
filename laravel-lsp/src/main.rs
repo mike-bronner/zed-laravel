@@ -13542,6 +13542,50 @@ return [
         }
     }
 
+    /// Build "route not found" ERROR diagnostics for every `route('name')`
+    /// reference whose name is absent from the project route index (issue #43).
+    ///
+    /// Fires ONLY when the index is built AND non-empty — during startup, before
+    /// the index exists, every route would otherwise look missing, so an absent
+    /// or empty index yields no diagnostics.
+    fn route_not_found_diagnostics(
+        index: Option<&laravel_lsp::route_discovery::RouteIndex>,
+        route_refs: &[std::sync::Arc<laravel_lsp::salsa_impl::RouteReferenceData>],
+    ) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        let Some(index) = index else {
+            return out;
+        };
+        if index.is_empty() {
+            return out;
+        }
+        for r in route_refs {
+            if index.get(&r.name).is_none() {
+                out.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: r.line,
+                            character: r.column,
+                        },
+                        end: Position {
+                            line: r.line,
+                            character: r.end_column,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    source: Some("laravel".to_string()),
+                    message: format!("Route not found in index: '{}'", r.name),
+                    related_information: None,
+                    tags: None,
+                    code_description: None,
+                    data: None,
+                });
+            }
+        }
+        out
+    }
+
     /// Validate a document (Blade or PHP) and publish diagnostics
     ///
     /// This function uses Salsa-cached patterns for efficient incremental validation:
@@ -14349,6 +14393,15 @@ return [
             let validation_diagnostics = self.validate_validation_rules(source).await;
             diagnostics.extend(validation_diagnostics);
 
+            // Check route('name') calls against the route index (issue #43).
+            {
+                let idx = self.route_index.read().await;
+                diagnostics.extend(Self::route_not_found_diagnostics(
+                    idx.as_ref(),
+                    &patterns.route_refs,
+                ));
+            }
+
             // Store and publish diagnostics for PHP files
             self.diagnostics
                 .write()
@@ -14727,6 +14780,16 @@ return [
         }
 
         // Store diagnostics for hover filtering
+        // Check route('name') calls against the route index (issue #43) — Blade
+        // `{{ route('…') }}` usages, same check as the PHP branch above.
+        {
+            let idx = self.route_index.read().await;
+            diagnostics.extend(Self::route_not_found_diagnostics(
+                idx.as_ref(),
+                &patterns.route_refs,
+            ));
+        }
+
         self.diagnostics
             .write()
             .await
@@ -16470,6 +16533,10 @@ impl LanguageServer for LaravelLanguageServer {
                     if let Some(root) = self.root_path.read().await.clone() {
                         info!("🛣️  Route file saved — rebuilding route index");
                         self.rebuild_route_index(&root).await;
+                        // Route names changed — re-validate open documents so
+                        // `route('…')` not-found diagnostics elsewhere reflect
+                        // the added/removed/renamed routes.
+                        self.revalidate_open_documents().await;
                     }
                 }
             }

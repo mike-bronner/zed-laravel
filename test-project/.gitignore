@@ -21,3 +21,13 @@ yarn-error.log
 /.nova
 /.vscode
 /.zed
+
+# Dependency lockfiles + npm manifest — intentionally untracked.
+# This fixture exists only as a parsing target for the LSP integration
+# tests; its transitive deps never ship and never run as an app. Tracking
+# the lockfiles surfaced 50+ Dependabot alerts for vulnerabilities that
+# pose no real risk. CI regenerates vendor/ via `composer update`.
+# composer.json stays tracked (PSR-4 + package-priority routing tests).
+/composer.lock
+/package.json
+/package-lock.json

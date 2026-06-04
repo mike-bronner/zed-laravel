@@ -14,8 +14,20 @@ zed-laravel/
 │   ├── src/main.rs      # LSP server implementation
 │   ├── src/queries.rs   # Tree-sitter pattern extraction
 │   └── tests/           # Integration tests
-└── test-project/        # Laravel fixture for testing
+└── test-project/        # Laravel fixture for testing (dev-only — never shipped)
 ```
+
+> **Note:** `test-project/` and `laravel-lsp/tests/` are development-only and are
+> **never bundled** with the published extension. Installing the extension delivers
+> exactly two artifacts: the Zed package — `extension.toml` + the compiled
+> `extension.wasm` (~70 KB total) — and the `laravel-lsp` binary, downloaded from
+> [GitHub Releases](https://github.com/mike-bronner/zed-laravel/releases) at runtime.
+> Zed's packager only includes the manifest, the compiled WASM, and declared assets
+> (languages/grammars/themes/snippets), so arbitrary directories like the fixture are
+> excluded by default. The fixture exists solely as a parsing target for the
+> integration tests; its `composer.lock` / `package-lock.json` are intentionally
+> untracked (see `test-project/.gitignore`) to keep its transitive dependencies out
+> of Dependabot.
 
 ## Local Development
 

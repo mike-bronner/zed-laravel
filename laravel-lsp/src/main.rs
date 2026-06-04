@@ -12701,22 +12701,10 @@ return [
         let root_guard = self.root_path.read().await;
         let root = root_guard.as_ref()?;
 
-        // Determine the base path based on helper type
-        use laravel_lsp::salsa_impl::AssetHelperType;
-        let base_path = match asset.helper_type {
-            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
-                root.join("public")
-            }
-            AssetHelperType::BasePath => root.clone(),
-            AssetHelperType::AppPath => root.join("app"),
-            AssetHelperType::StoragePath => root.join("storage"),
-            AssetHelperType::DatabasePath => root.join("database"),
-            AssetHelperType::LangPath => root.join("lang"),
-            AssetHelperType::ConfigPath => root.join("config"),
-            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
-        };
-
-        let asset_path = base_path.join(&asset.path);
+        // Resolve through the single asset-path brain so goto/hover/diagnostics
+        // never disagree — notably @vite, whose entry is project-root-relative
+        // and must NOT be re-prefixed with `resources/` (issue #46).
+        let (asset_path, _) = Self::asset_expected_path(asset.helper_type, root, &asset.path);
 
         if self.file_exists_cached(&asset_path).await {
             if let Ok(target_uri) = Url::from_file_path(&asset_path) {
@@ -15308,21 +15296,9 @@ return [
         &self,
         asset: &laravel_lsp::salsa_impl::AssetReferenceData,
     ) -> Option<String> {
-        use laravel_lsp::salsa_impl::AssetHelperType;
         let root = self.root_path.read().await.clone()?;
-        let base = match asset.helper_type {
-            AssetHelperType::Asset | AssetHelperType::PublicPath | AssetHelperType::Mix => {
-                root.join("public")
-            }
-            AssetHelperType::BasePath => root.clone(),
-            AssetHelperType::AppPath => root.join("app"),
-            AssetHelperType::StoragePath => root.join("storage"),
-            AssetHelperType::DatabasePath => root.join("database"),
-            AssetHelperType::LangPath => root.join("lang"),
-            AssetHelperType::ConfigPath => root.join("config"),
-            AssetHelperType::ResourcePath | AssetHelperType::ViteAsset => root.join("resources"),
-        };
-        let asset_path = base.join(&asset.path);
+        // Single asset-path brain — see asset_expected_path (issue #46).
+        let (asset_path, _) = Self::asset_expected_path(asset.helper_type, &root, &asset.path);
         if self.file_exists_cached(&asset_path).await {
             Some(self.source_link(&asset_path, None).await)
         } else {

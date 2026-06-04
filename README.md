@@ -131,6 +131,20 @@ DB_PASSWORD=secret
 
 Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
+### 🌱 `.env` "appears unused" warnings
+
+Open a `.env` and Zed underlines every line — `APP_NAME appears unused. Verify use (or export if used externally)`. That's **shellcheck**, not this extension: Zed classifies `.env` files as *Shell Script* and lints them as shell, where the `KEY=value` lines Laravel reads at runtime look like unused variables. Tell Zed they aren't shell scripts by mapping them to a non-shell language in your `settings.json`:
+
+```json
+{
+  "file_types": {
+    "Ini": [".env*"]
+  }
+}
+```
+
+A `.env` is INI-shaped (`KEY=value`, `#` comments), so the Ini language highlights it cleanly and skips shellcheck. For why a settings change is the only fix (Zed's language-precedence rules), the no-extension Plain Text alternative, and per-project scoping, see the **[environment files guide](docs/environment.md)**.
+
 ### 🎨 Blade directive highlighting
 
 The [Laravel Blade](https://github.com/bajrangCoder/zed-laravel-blade) extension already highlights standard directives and paired `@custom … @endcustom` blocks through tree-sitter. This optional setting adds the one case tree-sitter can't see: your app's **custom inline directives** registered via `Blade::directive()` (e.g. a `@money($amount)` macro). The LSP highlights them precisely — it colors only directives it has actually discovered (the same scan that drives directive completion), so PHPDoc `@param` tags, CSS at-rules like `@media`, and the `@` in email addresses are left alone, and commented-out directives stay dark. Enable it in your Zed `settings.json`:

@@ -11885,7 +11885,6 @@ return [
         line: u32,
         column: u32,
         end_column: u32,
-        dotted_severity: DiagnosticSeverity,
     ) -> Diagnostic {
         let expected_path_str = check
             .expected_path
@@ -11903,7 +11902,12 @@ return [
                 "\nFile does not exist".to_string()
             };
             (
-                dotted_severity,
+                // A missing translation key does NOT throw — Laravel's
+                // Translator::get returns the key string verbatim — so the page
+                // still renders. That's a WARNING, not an error, and the same
+                // severity regardless of call form (`__()`, `trans()`, `@lang`),
+                // which previously disagreed (ERROR vs WARNING).
+                DiagnosticSeverity::WARNING,
                 format!(
                     "Translation not found: '{}'\nExpected at: {}{}",
                     translation_key, expected_path_str, action_hint
@@ -14213,7 +14217,6 @@ return [
                             trans_ref.line,
                             trans_ref.column,
                             trans_ref.end_column,
-                            DiagnosticSeverity::ERROR, // ERROR for dotted keys in PHP
                         ));
                     }
                 }
@@ -14423,7 +14426,11 @@ return [
                                             character: feature_ref.end_column,
                                         },
                                     },
-                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    // An undefined Pennant feature does NOT throw:
+                                    // the driver dispatches UnknownFeatureResolved
+                                    // and returns the unknown-feature value (false).
+                                    // The app keeps running, so this is a WARNING.
+                                    severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
                                     source: Some("laravel".to_string()),
                                     message: format!(
@@ -14459,7 +14466,9 @@ return [
                                         character: feature_ref.end_column,
                                     },
                                 },
-                                severity: Some(DiagnosticSeverity::ERROR),
+                                // Undefined feature → driver returns false, no
+                                // throw (see UnknownFeatureResolved). WARNING.
+                                severity: Some(DiagnosticSeverity::WARNING),
                                 code: None,
                                 source: Some("laravel".to_string()),
                                 message: format!(
@@ -14523,7 +14532,6 @@ return [
                         trans_ref.line,
                         trans_ref.column,
                         trans_ref.end_column,
-                        DiagnosticSeverity::ERROR, // ERROR for dotted keys in Blade __()
                     ));
                 }
             }
@@ -14699,7 +14707,6 @@ return [
                                     dir_ref.line,
                                     dir_ref.column,
                                     dir_ref.end_column,
-                                    DiagnosticSeverity::WARNING, // WARNING for dotted keys in @lang
                                 ));
                             }
                         }
@@ -14744,7 +14751,9 @@ return [
                                             character: dir_ref.string_end_column,
                                         },
                                     },
-                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    // Undefined feature → driver returns false, no
+                                    // throw (see UnknownFeatureResolved). WARNING.
+                                    severity: Some(DiagnosticSeverity::WARNING),
                                     code: None,
                                     source: Some("laravel".to_string()),
                                     message: format!(

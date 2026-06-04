@@ -133,17 +133,23 @@ Supports MySQL, PostgreSQL, SQLite, and SQL Server.
 
 ### 🌱 `.env` "appears unused" warnings
 
-Open a `.env` and Zed underlines every line — `APP_NAME appears unused. Verify use (or export if used externally)`. That's **shellcheck**, not this extension: Zed classifies `.env` files as *Shell Script* and lints them as shell, where the `KEY=value` lines Laravel reads at runtime look like unused variables. Tell Zed they aren't shell scripts by mapping them to a non-shell language in your `settings.json`:
+Open a `.env` and Zed underlines every line — `APP_NAME appears unused. Verify use (or export if used externally)`. That's **shellcheck's SC2034**, not this extension: Zed lints `.env` files as *Shell Script*, where the `KEY=value` lines Laravel reads at runtime look like unused variables. Silence just that rule while keeping shell highlighting, via your `settings.json`:
 
 ```json
 {
-  "file_types": {
-    "Ini": [".env*"]
+  "lsp": {
+    "bash-language-server": {
+      "settings": {
+        "bashIde": {
+          "shellcheckArguments": ["--exclude=SC2034"]
+        }
+      }
+    }
   }
 }
 ```
 
-A `.env` is INI-shaped (`KEY=value`, `#` comments), so the Ini language highlights it cleanly and skips shellcheck. For why a settings change is the only fix (Zed's language-precedence rules), the no-extension Plain Text alternative, and per-project scoping, see the **[environment files guide](docs/environment.md)**.
+The `bashIde` wrapper is required — the bash server won't see the setting without it. Prefer a project-scoped `.shellcheckrc`, a per-file directive, or reclassifying `.env` away from Shell Script entirely (so real shell scripts keep SC2034)? See the **[environment files guide](docs/environment.md)** for all the options and trade-offs.
 
 ### 🎨 Blade directive highlighting
 

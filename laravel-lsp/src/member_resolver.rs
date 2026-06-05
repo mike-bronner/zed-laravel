@@ -20,7 +20,7 @@ use crate::class_hierarchy_index::ClassHierarchyIndex;
 use crate::laravel_introspector::chain::{analyze, ClassView};
 use crate::laravel_introspector::model_metadata::pascal_to_snake;
 use crate::query_chain::flow;
-use crate::query_chain::use_aliases::UseAliases;
+use crate::query_chain::use_aliases::{resolve_class_name, UseAliases};
 use crate::salsa_impl::{Confidence, MagicMemberKind};
 use std::collections::HashMap;
 use std::path::Path;
@@ -236,31 +236,142 @@ fn resolve_receiver(
                 flow::resolve_with_confidence(receiver, bytes, var, aliases)
             }
         }
+        // `$this->prop` — a typed property on the enclosing class.
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            resolve_typed_property(receiver, bytes, aliases)
+        }
         _ => None,
     }
+}
+
+/// Resolve a `$this->prop` receiver via the declared type of `prop` on the
+/// enclosing class — both ordinary typed properties (`private User $prop;`) and
+/// constructor-promoted ones (`public function __construct(private User $prop)`).
+///
+/// An explicitly declared type is as certain as a typed parameter, so this is
+/// [`Confidence::High`]. Only `$this->prop` is handled (the runtime class of
+/// `$other->prop` would itself need resolving first); union / intersection
+/// types are skipped as ambiguous.
+fn resolve_typed_property(
+    receiver: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Option<(String, Confidence)> {
+    let object = receiver.child_by_field_name("object")?;
+    if object.kind() != "variable_name" || object.utf8_text(bytes).ok()? != "$this" {
+        return None;
+    }
+    let name_node = receiver.child_by_field_name("name")?;
+    if name_node.kind() != "name" {
+        return None;
+    }
+    let prop = name_node.utf8_text(bytes).ok()?;
+    let class = enclosing_class_node(receiver)?;
+    let raw_type = property_type_in_class(class, bytes, prop)?;
+    let normalized = normalize_type(&raw_type)?;
+    let resolved = resolve_class_name(&normalized, aliases);
+    Some((qualify_fqcn(resolved, receiver, bytes), Confidence::High))
+}
+
+/// Turn a resolved type name into a fully-qualified one. `resolve_class_name`
+/// expands `use`-aliases and absolute (`\Foo`) names, but leaves a bare
+/// same-namespace name unqualified — so qualify those with the file's
+/// namespace (matching how the class-hierarchy index keys its FQCNs).
+fn qualify_fqcn(name: String, node: Node, bytes: &[u8]) -> String {
+    let trimmed = name.trim_start_matches('\\').to_string();
+    if trimmed.contains('\\') {
+        // Already namespaced (alias-resolved or absolute).
+        trimmed
+    } else if let Some(ns) = file_namespace(node, bytes) {
+        format!("{ns}\\{trimmed}")
+    } else {
+        trimmed
+    }
+}
+
+/// Find the declared type of property `$prop` on `class` — scanning both
+/// `property_declaration`s and constructor-promoted parameters. Does not
+/// descend into nested (anonymous) classes.
+fn property_type_in_class(class: Node, bytes: &[u8], prop: &str) -> Option<String> {
+    let mut stack = vec![class];
+    while let Some(n) = stack.pop() {
+        // Don't leak into a nested class's members.
+        if n.id() != class.id() && matches!(n.kind(), "class_declaration" | "anonymous_class") {
+            continue;
+        }
+
+        if n.kind() == "property_declaration" {
+            if let Some(ty) = n.child_by_field_name("type") {
+                let mut c = n.walk();
+                let matches_name = n.children(&mut c).any(|child| {
+                    child.kind() == "property_element"
+                        && child
+                            .child_by_field_name("name")
+                            .and_then(|nm| nm.utf8_text(bytes).ok())
+                            .map(|t| t.trim_start_matches('$') == prop)
+                            .unwrap_or(false)
+                });
+                if matches_name {
+                    return ty.utf8_text(bytes).ok().map(str::to_string);
+                }
+            }
+        }
+
+        if n.kind() == "property_promotion_parameter" {
+            let is_match = n
+                .child_by_field_name("name")
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                .map(|t| t.trim_start_matches('$') == prop)
+                .unwrap_or(false);
+            if is_match {
+                if let Some(ty) = n.child_by_field_name("type") {
+                    return ty.utf8_text(bytes).ok().map(str::to_string);
+                }
+            }
+        }
+
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+/// Normalize a declared type to a single resolvable class name: strip a
+/// leading `?` (nullable), reject union / intersection types as ambiguous.
+fn normalize_type(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches('?').trim();
+    if t.is_empty() || t.contains('|') || t.contains('&') {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 /// FQCN of the class lexically enclosing `node`, or `None` when `node` isn't
 /// inside a class (e.g. a free function, or a `$this` inside a trait — whose
 /// runtime class is unknowable statically).
 fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
+    let class = enclosing_class_node(node)?;
+    let class_name = class
+        .child_by_field_name("name")
+        .and_then(|x| x.utf8_text(bytes).ok())?;
+    match file_namespace(node, bytes) {
+        Some(ns) => Some(format!("{ns}\\{class_name}")),
+        None => Some(class_name.to_string()),
+    }
+}
+
+/// The `class_declaration` node lexically enclosing `node`, if any.
+fn enclosing_class_node(node: Node) -> Option<Node> {
     let mut cur = node.parent();
-    let mut class_name = None;
     while let Some(n) = cur {
         if n.kind() == "class_declaration" {
-            class_name = n
-                .child_by_field_name("name")
-                .and_then(|x| x.utf8_text(bytes).ok())
-                .map(str::to_string);
-            break;
+            return Some(n);
         }
         cur = n.parent();
     }
-    let class_name = class_name?;
-    match file_namespace(node, bytes) {
-        Some(ns) => Some(format!("{ns}\\{class_name}")),
-        None => Some(class_name),
-    }
+    None
 }
 
 /// The file's `namespace ...;` declaration, if any. Walks to the tree root and

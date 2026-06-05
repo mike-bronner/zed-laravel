@@ -466,3 +466,145 @@ fn classview_cache_reuses_built_view() {
         v2.as_ref().unwrap()
     ));
 }
+
+// ─── Widening: typed properties ($this->prop) ────────────────────────────
+
+/// Build a project from several PSR-4 files, indexing every one.
+fn project_files(files: &[(&str, &str)]) -> Project {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let mut index = ClassHierarchyIndex::default();
+    for (rel, src) in files {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, src).unwrap();
+        index.insert_file(&path, classes_in_file(&path, src));
+    }
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    Project {
+        _dir: dir,
+        index,
+        root,
+    }
+}
+
+const PROFILE_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Profile extends Model {
+    protected $fillable = ['bio'];
+}
+"#;
+
+#[test]
+fn widens_typed_property_this_prop() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    private Profile $profile;
+    public function bio() {
+        return $this->profile->bio;
+    }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    // Receiver of `bio` is `$this->profile`.
+    let r = resolve_in(&p, user, "bio").expect("typed property resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Profile");
+}
+
+#[test]
+fn widens_nullable_typed_property() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected ?Profile $profile = null;
+    public function bio() {
+        return $this->profile->bio;
+    }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    let r = resolve_in(&p, user, "bio").expect("nullable typed property resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Profile");
+}
+
+#[test]
+fn widens_promoted_constructor_property() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function __construct(private Profile $profile) {}
+    public function bio() {
+        return $this->profile->bio;
+    }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    let r = resolve_in(&p, user, "bio").expect("promoted property resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\Profile");
+}
+
+#[test]
+fn untyped_property_does_not_resolve() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    private $profile;
+    public function bio() {
+        return $this->profile->bio;
+    }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    assert!(
+        resolve_in(&p, user, "bio").is_none(),
+        "an untyped property gives the resolver nothing to go on"
+    );
+}
+
+#[test]
+fn union_typed_property_is_ambiguous() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    private Profile|Account $profile;
+    public function bio() {
+        return $this->profile->bio;
+    }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    assert!(
+        resolve_in(&p, user, "bio").is_none(),
+        "a union-typed property is ambiguous and must not resolve"
+    );
+}

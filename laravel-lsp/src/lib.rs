@@ -73,6 +73,9 @@ pub mod symbol_index;
 // Project-wide class-hierarchy + member index (structural code lenses)
 pub mod class_hierarchy_index;
 
+// Magic-member resolve + classify engine (find-references / lens / hover)
+pub mod member_resolver;
+
 // Re-export commonly used types
 pub use config::find_project_root;
 pub use queries::{EchoPhpMatch, ExtractedBladePatterns, ExtractedPhpPatterns};

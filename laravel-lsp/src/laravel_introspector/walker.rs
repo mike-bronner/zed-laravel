@@ -9,7 +9,7 @@
 //! over heredocs, strings, and comments, and gets ambiguous on multi-class
 //! files. The cost is one extra parse per outline request, memoized via Salsa.
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 /// Parsed structure of a PHP file: top-level class-like declarations plus
 /// free-standing functions. Empty default is used as the "parse failed"
@@ -38,6 +38,10 @@ pub struct PhpStructure {
     /// inside the class/trait body. Top-level only — names inside the
     /// conflict-resolution `{ ... }` block are not duplicated.
     pub trait_uses: Vec<String>,
+    /// Raw `implements` interface targets as they appear in source —
+    /// preserves namespace separators and leading `\` for FQCN resolution.
+    /// Empty when the structure implements nothing.
+    pub implements_raw: Vec<String>,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
@@ -149,7 +153,13 @@ pub fn extract_php_structure(content: &str) -> PhpFileStructure {
     let Ok(tree) = crate::parser::parse_php(content) else {
         return PhpFileStructure::default();
     };
-    let source = content.as_bytes();
+    extract_php_structure_from_tree(&tree, content.as_bytes())
+}
+
+/// Extract structure from an already-parsed tree. Lets callers that also need
+/// other tree-derived data (e.g. `use` aliases) parse once and run both
+/// extractions over the same tree — relevant when indexing many files.
+pub fn extract_php_structure_from_tree(tree: &Tree, source: &[u8]) -> PhpFileStructure {
     let mut result = PhpFileStructure::default();
     walk_top_level(tree.root_node(), source, &mut result);
     result
@@ -221,6 +231,7 @@ fn walk_top_level(node: Node, source: &[u8], result: &mut PhpFileStructure) {
 fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<PhpStructure> {
     let name = field_text(node, "name", source)?;
     let (extends, extends_raw) = parse_extends(node, source);
+    let implements_raw = parse_implements(node, source);
     let (start_line, start_column) = pos(node.start_position());
     let (end_line, end_column) = pos(node.end_position());
 
@@ -261,6 +272,7 @@ fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<
         extends,
         extends_raw,
         trait_uses,
+        implements_raw,
         start_line,
         start_column,
         end_line,
@@ -268,6 +280,29 @@ fn parse_structure(node: Node, source: &[u8], kind: PhpStructureKind) -> Option<
         methods,
         properties,
     })
+}
+
+/// Collects the raw `implements` interface names from `class X implements A, B`.
+/// Each entry preserves namespace separators / leading `\` so callers can
+/// resolve to an FQCN through the file's use aliases. Empty when there is no
+/// implements clause (interfaces, traits, enums, or plain classes).
+fn parse_implements(node: Node, source: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "class_interface_clause" {
+            let mut ic_cursor = child.walk();
+            for ic_child in child.children(&mut ic_cursor) {
+                let kind = ic_child.kind();
+                if kind == "name" || kind == "qualified_name" {
+                    if let Ok(text) = ic_child.utf8_text(source) {
+                        out.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Returns `(simplified_name, raw_text)` for the parent in `class X extends Y`.

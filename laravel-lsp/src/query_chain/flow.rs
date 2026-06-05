@@ -62,6 +62,7 @@ use tree_sitter::Node;
 
 use super::methods::is_eloquent_static_starter;
 use super::use_aliases::{resolve_class_name, UseAliases};
+use crate::salsa_impl::Confidence;
 
 /// Cap how many `$a = $b->...; $b = $a->...; ...` hops we'll follow.
 /// In practice a single hop is the common case (`$q = $q->where(...)`),
@@ -69,6 +70,22 @@ use super::use_aliases::{resolve_class_name, UseAliases};
 /// terminate naturally via the monotonically-decreasing byte boundary
 /// (see below), so this guard exists only against pathological inputs.
 const MAX_RECURSION_DEPTH: usize = 8;
+
+/// Confidence for a resolution that bottomed out at recursion `depth`.
+///
+/// A receiver resolved directly (depth 0 — a typed param, `@var`, a direct
+/// local assignment to a static call / `new`, or a closure-captured var that
+/// resolves the same way in its parent scope) is [`Confidence::High`]. One
+/// reached only by following assignment-chain hops (`$a = $b->…; $b = …`)
+/// is indirect flow → [`Confidence::Medium`]. Closure-capture scope walks do
+/// not increment depth, so a captured typed param stays HIGH.
+fn confidence_for(depth: usize) -> Confidence {
+    if depth == 0 {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
+}
 
 /// Public entry point. Returns the resolved FQCN if `var_name`'s type at
 /// `use_site` can be inferred through any of the scope-walking strategies
@@ -81,6 +98,19 @@ pub fn resolve(
     var_name: &str,
     aliases: &UseAliases,
 ) -> Option<String> {
+    resolve_with_confidence(use_site, bytes, var_name, aliases).map(|(fqcn, _)| fqcn)
+}
+
+/// Like [`resolve`], but also reports the [`Confidence`] tier of the
+/// resolution. The magic-member engine (M3) uses this so each resolved site
+/// can be confidence-gated by consumers (find-references/lens take HIGH+MEDIUM;
+/// rename takes HIGH only).
+pub fn resolve_with_confidence(
+    use_site: Node,
+    bytes: &[u8],
+    var_name: &str,
+    aliases: &UseAliases,
+) -> Option<(String, Confidence)> {
     let before_byte = use_site.start_byte();
     resolve_with_boundary(use_site, before_byte, bytes, var_name, aliases, 0)
 }
@@ -101,7 +131,7 @@ fn resolve_with_boundary(
     var_name: &str,
     aliases: &UseAliases,
     depth: usize,
-) -> Option<String> {
+) -> Option<(String, Confidence)> {
     if depth > MAX_RECURSION_DEPTH {
         return None;
     }
@@ -120,8 +150,8 @@ fn resolve_with_boundary(
         if let Some((rhs, assignment_start)) =
             latest_assignment_rhs(scope, bytes, var_name, before_byte)
         {
-            if let Some(class) = classify_rhs(rhs, bytes, aliases, depth, assignment_start) {
-                return Some(class);
+            if let Some(resolved) = classify_rhs(rhs, bytes, aliases, depth, assignment_start) {
+                return Some(resolved);
             }
         }
 
@@ -129,10 +159,10 @@ fn resolve_with_boundary(
         // user-asserted intent that survives an unrecognised
         // reassignment.
         if let Some(raw) = super::var_type::typed_param_in(scope, bytes, var_name) {
-            return Some(resolve_class_name(&raw, aliases));
+            return Some((resolve_class_name(&raw, aliases), confidence_for(depth)));
         }
         if let Some(raw) = super::var_type::docblock_in(scope, bytes, var_name) {
-            return Some(resolve_class_name(&raw, aliases));
+            return Some((resolve_class_name(&raw, aliases), confidence_for(depth)));
         }
 
         // Nothing for `$var` in this scope. If this scope is a closure
@@ -289,25 +319,33 @@ fn classify_rhs(
     aliases: &UseAliases,
     depth: usize,
     boundary_before: usize,
-) -> Option<String> {
+) -> Option<(String, Confidence)> {
     let node = unwrap_parens(rhs);
     match node.kind() {
         // `User::query()` — bottom of a chain or single static call.
-        "scoped_call_expression" => classify_scoped_call(node, bytes, aliases),
+        "scoped_call_expression" => {
+            classify_scoped_call(node, bytes, aliases).map(|c| (c, confidence_for(depth)))
+        }
 
         // `$x->...` chain. Walk down to the chain root and dispatch.
         "member_call_expression" => {
             let root = chain_root(node);
             match root.kind() {
-                "scoped_call_expression" => classify_scoped_call(root, bytes, aliases),
+                "scoped_call_expression" => {
+                    classify_scoped_call(root, bytes, aliases).map(|c| (c, confidence_for(depth)))
+                }
                 "variable_name" => {
                     let raw = node_text(root, bytes)?;
                     let inner = raw.trim_start_matches('$').to_string();
+                    // Resolving another variable is an extra flow hop — the
+                    // deeper recursion carries the (lower) confidence.
                     resolve_with_boundary(root, boundary_before, bytes, &inner, aliases, depth + 1)
                 }
                 "parenthesized_expression" => {
+                    // Unwrapping parens is syntactic, not a flow hop — keep the
+                    // same depth so `(new User)->newQuery()` stays HIGH.
                     let inner = unwrap_parens(root);
-                    classify_rhs(inner, bytes, aliases, depth + 1, boundary_before)
+                    classify_rhs(inner, bytes, aliases, depth, boundary_before)
                 }
                 _ => None,
             }
@@ -315,7 +353,9 @@ fn classify_rhs(
 
         // `new Class` — bare, without parens. `(new Class)->...` lands
         // here too after `unwrap_parens` strips the outer parens.
-        "object_creation_expression" => extract_new_class(node, bytes, aliases),
+        "object_creation_expression" => {
+            extract_new_class(node, bytes, aliases).map(|c| (c, confidence_for(depth)))
+        }
 
         _ => None,
     }

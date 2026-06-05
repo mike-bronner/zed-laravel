@@ -693,3 +693,110 @@ class C {
     assert_eq!(r.kind, MagicMemberKind::Column);
     assert_eq!(r.confidence, Confidence::High);
 }
+
+// ─── Widening: method return-type chains ($obj->m()->...) ────────────────
+
+#[test]
+fn widens_static_return_type_chain() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function activated(): static { return $this; }
+}
+"#;
+    let p = project("app/Models/User.php", user);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->activated()->email;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("static return chain resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(
+        r.confidence,
+        Confidence::Medium,
+        "return-type inference is indirect"
+    );
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn widens_self_return_type_chain() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function refreshed(): self { return $this; }
+}
+"#;
+    let p = project("app/Models/User.php", user);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->refreshed()->email;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("self return chain resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn explicit_class_return_type_is_not_resolved() {
+    // Out of scope: an arbitrary class return type is written in the
+    // declaring file's namespace, which the caller context can't re-qualify.
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function makeProfile(): Profile { return new Profile(); }
+}
+"#;
+    let p = project_files(&[
+        ("app/Models/User.php", user),
+        ("app/Models/Profile.php", PROFILE_MODEL),
+    ]);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->makeProfile()->bio;
+    }
+}
+"#;
+    assert!(resolve_in(&p, caller, "bio").is_none());
+}
+
+#[test]
+fn untyped_return_does_not_resolve() {
+    let user = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function thing() { return $this; }
+}
+"#;
+    let p = project("app/Models/User.php", user);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->thing()->email;
+    }
+}
+"#;
+    assert!(resolve_in(&p, caller, "email").is_none());
+}

@@ -204,7 +204,8 @@ pub fn resolve_and_classify(
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
-    let (fqcn, confidence) = resolve_receiver(receiver, bytes, aliases)?;
+    let (fqcn, confidence) =
+        resolve_receiver(receiver, bytes, aliases, index, classviews, project_root)?;
     let file_path = index.get(&fqcn)?.file_path.clone();
     let view = classviews.get_or_build(&fqcn, &file_path, project_root)?;
     let classified = classify_member(&view, member, form)?;
@@ -217,13 +218,18 @@ pub fn resolve_and_classify(
 
 /// Resolve a receiver expression node to `(FQCN, confidence)`.
 ///
-/// Handles bare variables (`$user`, via flow tracking) and `$this` (the
-/// enclosing class). Later M3 commits widen this to typed properties
-/// (`$this->prop`), `foreach` iterator vars, and method return-type chains.
+/// Handles bare variables (`$user`, via flow tracking, with a `foreach`
+/// fallback), `$this` (the enclosing class), typed properties (`$this->prop`),
+/// and method-call results via the method's `self`/`static` return type
+/// (`$user->fresh()->…`). The index + ClassView cache are threaded through for
+/// the return-type case, which has to read the called method's declared type.
 fn resolve_receiver(
     receiver: Node,
     bytes: &[u8],
     aliases: &UseAliases,
+    index: &ClassHierarchyIndex,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
 ) -> Option<(String, Confidence)> {
     match receiver.kind() {
         "variable_name" => {
@@ -243,8 +249,59 @@ fn resolve_receiver(
         "member_access_expression" | "nullsafe_member_access_expression" => {
             resolve_typed_property(receiver, bytes, aliases)
         }
+        // `$obj->method()` — resolve via the method's return type.
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            resolve_method_return(receiver, bytes, aliases, index, classviews, project_root)
+        }
         _ => None,
     }
+}
+
+/// Resolve a `$obj->method()` receiver via the called method's return type.
+///
+/// Scoped to `self` / `static` return types — the canonical fluent /
+/// return-`$this` shape (`$user->activated()->email`) — which resolve to the
+/// object's own class. Arbitrary class return types are not resolved here:
+/// the return type is written in the *declaring* file's namespace, which this
+/// caller-side context can't reliably re-qualify. Vendor methods (`fresh`,
+/// `refresh`) aren't covered either — the ClassView walk stops at
+/// `Eloquent\Model`. Return-type inference is indirect → [`Confidence::Medium`].
+fn resolve_method_return(
+    call: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    index: &ClassHierarchyIndex,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let object = call.child_by_field_name("object")?;
+    let name_node = call.child_by_field_name("name")?;
+    if name_node.kind() != "name" {
+        return None;
+    }
+    let method = name_node.utf8_text(bytes).ok()?;
+    let (obj_fqcn, _) = resolve_receiver(object, bytes, aliases, index, classviews, project_root)?;
+    let file_path = index.get(&obj_fqcn)?.file_path.clone();
+    let view = classviews.get_or_build(&obj_fqcn, &file_path, project_root)?;
+    let ret = method_return_type(&view, method)?;
+    match normalize_type(&ret)?.as_str() {
+        "self" | "static" => Some((obj_fqcn, Confidence::Medium)),
+        _ => None,
+    }
+}
+
+/// The declared return type of `method` on `view` (raw form preferred so
+/// `self`/`static` survive), searching the inheritance-resolved method set.
+fn method_return_type(view: &ClassView, method: &str) -> Option<String> {
+    view.all_methods
+        .iter()
+        .find(|m| m.value.name == method)
+        .and_then(|m| {
+            m.value
+                .return_type_raw
+                .clone()
+                .or_else(|| m.value.return_type.clone())
+        })
 }
 
 /// Resolve a `$this->prop` receiver via the declared type of `prop` on the

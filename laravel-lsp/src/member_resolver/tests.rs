@@ -259,3 +259,210 @@ class BaseModel extends Model {
     let inherited = classify_member(&view, "uuid", AccessForm::Property).expect("inherited column");
     assert_eq!(inherited.kind, MagicMemberKind::Column);
 }
+
+// ─── Orchestration: resolve_and_classify (M3) ────────────────────────────
+
+use crate::class_hierarchy_index::{classes_in_file, ClassHierarchyIndex};
+use crate::parser::parse_php;
+use crate::query_chain::use_aliases::extract_use_aliases;
+
+/// A temp project: a model file indexed in a `ClassHierarchyIndex`, plus the
+/// project root for `analyze`. Caller source is parsed per-test.
+struct Project {
+    _dir: TempDir,
+    index: ClassHierarchyIndex,
+    root: PathBuf,
+}
+
+/// Build a project with a model at `model_rel` and index it.
+fn project(model_rel: &str, model_php: &str) -> Project {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join(model_rel);
+    fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    fs::write(&model_path, model_php).unwrap();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mut index = ClassHierarchyIndex::default();
+    index.insert_file(&model_path, classes_in_file(&model_path, model_php));
+    Project {
+        _dir: dir,
+        index,
+        root,
+    }
+}
+
+/// Find the receiver (object) node of the first `$x->{member}` access.
+fn receiver_of<'t>(
+    tree: &'t tree_sitter::Tree,
+    bytes: &[u8],
+    member: &str,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "member_access_expression" | "nullsafe_member_access_expression"
+        ) {
+            if let Some(name) = n.child_by_field_name("name") {
+                if name.utf8_text(bytes).ok() == Some(member) {
+                    return n.child_by_field_name("object");
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+const USER_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+}
+"#;
+
+/// Resolve `$x->{member}` in `caller` against project `p`.
+fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberAccess> {
+    let tree = parse_php(caller).expect("parse caller");
+    let bytes = caller.as_bytes();
+    let aliases = extract_use_aliases(&tree, caller);
+    let receiver = receiver_of(&tree, bytes, member)?;
+    let mut cache = ClassViewCache::new();
+    resolve_and_classify(
+        receiver,
+        member,
+        AccessForm::Property,
+        bytes,
+        &aliases,
+        &p.index,
+        &mut cache,
+        &p.root,
+    )
+}
+
+#[test]
+fn resolves_typed_param_property_to_column_high() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->email;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn resolves_typed_param_relationship() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->posts;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "posts").expect("resolves");
+    assert_eq!(r.kind, MagicMemberKind::Relationship);
+}
+
+#[test]
+fn resolves_this_to_enclosing_class() {
+    // `$this->email` inside a User method resolves to the User model.
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function greeting() {
+        return $this->email;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("resolves $this");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::High);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn multi_hop_receiver_lowers_confidence() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    // `$q` is seeded one hop from the typed `$user` → MEDIUM.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        $q = $user->newQuery();
+        return $q->email;
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("resolves multi-hop");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::Medium);
+}
+
+#[test]
+fn unresolvable_receiver_yields_none() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    // `$mystery` has no type info anywhere.
+    let caller = r#"<?php
+function show($mystery) {
+    return $mystery->email;
+}
+"#;
+    assert!(resolve_in(&p, caller, "email").is_none());
+}
+
+#[test]
+fn receiver_class_absent_from_index_yields_none() {
+    // Empty index — even a perfectly typed receiver can't be classified.
+    let p = Project {
+        _dir: TempDir::new().unwrap(),
+        index: ClassHierarchyIndex::default(),
+        root: PathBuf::from("/nonexistent"),
+    };
+    let caller = r#"<?php
+use App\Models\User;
+function show(User $user) {
+    return $user->email;
+}
+"#;
+    assert!(resolve_in(&p, caller, "email").is_none());
+}
+
+#[test]
+fn classview_cache_reuses_built_view() {
+    // Two resolutions against the same FQCN must reuse one ClassView build.
+    let p = project("app/Models/User.php", USER_MODEL);
+    let mut cache = ClassViewCache::new();
+    let node = p.index.get("App\\Models\\User").expect("indexed");
+    let v1 = cache.get_or_build("App\\Models\\User", &node.file_path, &p.root);
+    let v2 = cache.get_or_build("App\\Models\\User", &node.file_path, &p.root);
+    assert!(v1.is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        v1.as_ref().unwrap(),
+        v2.as_ref().unwrap()
+    ));
+}

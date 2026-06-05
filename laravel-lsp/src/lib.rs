@@ -70,6 +70,9 @@ pub mod salsa_impl;
 // Inverted symbol index for O(1) find-references
 pub mod symbol_index;
 
+// Project-wide class-hierarchy + member index (structural code lenses)
+pub mod class_hierarchy_index;
+
 // Re-export commonly used types
 pub use config::find_project_root;
 pub use queries::{EchoPhpMatch, ExtractedBladePatterns, ExtractedPhpPatterns};

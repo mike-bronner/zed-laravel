@@ -3108,6 +3108,13 @@ pub enum SalsaRequest {
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
         reply: oneshot::Sender<usize>,
     },
+    /// Bulk-import class-hierarchy nodes parsed out-of-actor during warming.
+    /// Each entry's nodes replace any existing entry for that path. Replies
+    /// with the total class count after import (for logging).
+    BulkImportHierarchy {
+        entries: Vec<(PathBuf, Vec<crate::class_hierarchy_index::ClassNode>)>,
+        reply: oneshot::Sender<usize>,
+    },
 
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
@@ -3632,6 +3639,27 @@ impl SalsaHandle {
             self.pattern_cache.insert(path, (0, data));
         }
         Ok(total)
+    }
+
+    /// Bulk-import class-hierarchy nodes into the actor-owned index. Unlike
+    /// `bulk_import_patterns` (which writes the shared cache directly), the
+    /// hierarchy index lives inside the actor, so this round-trips through
+    /// the request queue. Replies with the total class count after import.
+    pub async fn bulk_import_hierarchy(
+        &self,
+        entries: Vec<(PathBuf, Vec<crate::class_hierarchy_index::ClassNode>)>,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BulkImportHierarchy {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
     }
 
     // === Service Provider Methods ===
@@ -4302,6 +4330,12 @@ pub struct SalsaActor {
     /// `mark_dirty` / `take_dirty` pattern (see `symbol_index.rs`).
     symbol_index: crate::symbol_index::SymbolIndex,
 
+    /// Project-wide class-hierarchy + member index. Populated at warming from
+    /// the same parse that feeds the pattern cache; powers structural code
+    /// lenses (implementations / usages / overrides / parent) and cross-file
+    /// inheritance resolution. See `class_hierarchy_index.rs`.
+    class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex,
+
     // === Service Provider Registry ===
     /// Cached middleware aliases from service provider analysis
     sp_middleware_aliases: HashMap<String, MiddlewareRegistrationData>,
@@ -4374,6 +4408,7 @@ impl SalsaActor {
                 vendor_files: Vec::new(),
                 project_root_paths: ProjectRootPaths::default(),
                 symbol_index: crate::symbol_index::SymbolIndex::default(),
+                class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
                 // Service provider registry
                 sp_middleware_aliases: HashMap::new(),
                 sp_bindings: HashMap::new(),
@@ -4454,6 +4489,7 @@ impl SalsaActor {
                     // correct: there's no future state to refresh
                     // to — the file is gone.
                     self.symbol_index.remove_file(&path);
+                    self.class_hierarchy_index.remove_file(&path);
                     let _ = reply.send(());
                 }
 
@@ -4563,6 +4599,14 @@ impl SalsaActor {
                         self.pattern_cache.insert(path, (0, data));
                     }
                     let _ = reply.send(total);
+                }
+                SalsaRequest::BulkImportHierarchy { entries, reply } => {
+                    for (path, nodes) in entries {
+                        // remove_file first so a re-warm refreshes cleanly.
+                        self.class_hierarchy_index.remove_file(&path);
+                        self.class_hierarchy_index.insert_file(&path, nodes);
+                    }
+                    let _ = reply.send(self.class_hierarchy_index.class_count());
                 }
 
                 // === Service Provider Handlers ===
@@ -4783,6 +4827,7 @@ impl SalsaActor {
         // new patterns aren't parsed until something asks for them
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
+        self.class_hierarchy_index.mark_dirty(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file

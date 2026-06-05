@@ -3880,6 +3880,7 @@ impl LaravelLanguageServer {
                         return Some((
                             path,
                             Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                            Vec::new(),
                         ));
                     }
 
@@ -3897,24 +3898,28 @@ impl LaravelLanguageServer {
                         return Some((
                             path,
                             Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                            Vec::new(),
                         ));
                     }
                     // Actual parse on the blocking pool — tree-sitter is
                     // CPU-bound and would block the async runtime if run
                     // directly in a tokio task.
                     let path_for_task = path.clone();
-                    let parsed: Option<Arc<laravel_lsp::salsa_impl::ParsedPatternsData>> =
-                        tokio::task::spawn_blocking(move || {
-                            let text = std::fs::read_to_string(&path_for_task).ok()?;
-                            Some(laravel_lsp::pattern_indexer::parse_owned(
-                                &path_for_task,
-                                &text,
-                            ))
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                    parsed.map(|data| (path, data))
+                    type ParsePair = (
+                        Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+                        Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+                    );
+                    let parsed: Option<ParsePair> = tokio::task::spawn_blocking(move || {
+                        let text = std::fs::read_to_string(&path_for_task).ok()?;
+                        Some(laravel_lsp::pattern_indexer::parse_owned_with_hierarchy(
+                            &path_for_task,
+                            &text,
+                        ))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    parsed.map(|(data, nodes)| (path, data, nodes))
                 }));
             }
 
@@ -3929,8 +3934,11 @@ impl LaravelLanguageServer {
             // Progress reports are emitted as each handle completes. The
             // IndexingProgress helper throttles internally so we don't
             // need to be careful about emitting every iteration.
-            let mut buffer: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
-                Vec::with_capacity(to_parse);
+            let mut buffer: Vec<(
+                PathBuf,
+                Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+                Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+            )> = Vec::with_capacity(to_parse);
             let mut completed = 0usize;
             for h in handles {
                 if let Ok(Some(pair)) = h.await {
@@ -3954,7 +3962,22 @@ impl LaravelLanguageServer {
                     .await;
                 }
             }
-            let imported = salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+            // Split the combined parse results: patterns go to the shared
+            // cache, class-hierarchy nodes to the actor-owned index. Files
+            // with no class declarations contribute no hierarchy entry.
+            let mut pattern_entries = Vec::with_capacity(buffer.len());
+            let mut hierarchy_entries = Vec::with_capacity(buffer.len());
+            for (path, data, nodes) in buffer {
+                pattern_entries.push((path.clone(), data));
+                if !nodes.is_empty() {
+                    hierarchy_entries.push((path, nodes));
+                }
+            }
+            let imported = salsa.bulk_import_patterns(pattern_entries).await.unwrap_or(0);
+            let hierarchy_classes = salsa
+                .bulk_import_hierarchy(hierarchy_entries)
+                .await
+                .unwrap_or(0);
 
             // Persist the entire live pattern_cache (cached restores +
             // freshly parsed entries) so the next LSP startup can skip
@@ -3983,6 +4006,10 @@ impl LaravelLanguageServer {
                 Ok(count) => info!("🔍 Symbol index built: {} symbol entries", count),
                 Err(e) => debug!("Symbol index build failed: {}", e),
             }
+            info!(
+                "📐 Class-hierarchy index: {} classes indexed",
+                hierarchy_classes
+            );
 
             let elapsed = started_at.elapsed();
             info!(

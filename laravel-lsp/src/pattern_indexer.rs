@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::blade_embedded_php::{adjust_inner_position, extract_php_regions};
+use crate::class_hierarchy_index::{classes_from_tree, ClassNode};
 use crate::parser::{language_blade, language_php, parse_blade, parse_php};
 use crate::queries::{
     extract_all_blade_patterns, extract_all_php_patterns, AssetHelperType as QAssetHelperType,
@@ -36,8 +37,19 @@ use crate::salsa_impl::{
 /// vs plain PHP from the path extension. Errors during parsing yield empty
 /// data for the affected pass; never panics.
 pub fn parse_owned(path: &Path, text: &str) -> Arc<ParsedPatternsData> {
+    parse_owned_with_hierarchy(path, text).0
+}
+
+/// Like [`parse_owned`], but also returns the file's class-hierarchy nodes,
+/// extracted from the SAME PHP parse (no second tree-sitter pass). Blade
+/// files yield no class nodes — PHP class declarations only live in `.php`.
+pub fn parse_owned_with_hierarchy(
+    path: &Path,
+    text: &str,
+) -> (Arc<ParsedPatternsData>, Vec<ClassNode>) {
     let is_blade = path.to_string_lossy().ends_with(".blade.php");
     let mut data = ParsedPatternsData::default();
+    let mut nodes: Vec<ClassNode> = Vec::new();
 
     // Blade-specific pattern extraction (components, <livewire:…>, directives,
     // and the existing echo→translation special case).
@@ -129,11 +141,13 @@ pub fn parse_owned(path: &Path, text: &str) -> Arc<ParsedPatternsData> {
             if let Ok(patterns) = extract_all_php_patterns(&tree, text, &lang_php) {
                 push_php_patterns(&patterns, &mut data, None);
             }
+            // Class-hierarchy nodes share this same PHP parse.
+            nodes = classes_from_tree(path, &tree, text);
         }
     }
 
     data.build_position_index();
-    Arc::new(data)
+    (Arc::new(data), nodes)
 }
 
 /// Append every PHP-side pattern from `snippet` into `data`. When `offset`

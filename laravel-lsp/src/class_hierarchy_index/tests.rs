@@ -79,7 +79,10 @@ fn reverse_edges_populate_and_query() {
         idx.subclasses_of("App\\Models\\User").to_vec(),
         vec!["App\\Models\\Admin".to_string()]
     );
-    assert_eq!(idx.parent_of("App\\Models\\Admin"), Some("App\\Models\\User"));
+    assert_eq!(
+        idx.parent_of("App\\Models\\Admin"),
+        Some("App\\Models\\User")
+    );
     assert!(idx.get("App\\Models\\User").is_some());
     assert_eq!(idx.class_count(), 3);
 }

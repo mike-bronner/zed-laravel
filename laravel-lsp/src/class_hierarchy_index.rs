@@ -184,7 +184,10 @@ impl ClassHierarchyIndex {
 
     /// Classes that directly implement `fqcn` (an interface).
     pub fn implementers_of(&self, fqcn: &str) -> &[String] {
-        self.implementers.get(fqcn).map(Vec::as_slice).unwrap_or(&[])
+        self.implementers
+            .get(fqcn)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Classes that directly `use` `fqcn` (a trait).

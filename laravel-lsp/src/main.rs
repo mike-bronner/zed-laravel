@@ -3973,7 +3973,10 @@ impl LaravelLanguageServer {
                     hierarchy_entries.push((path, nodes));
                 }
             }
-            let imported = salsa.bulk_import_patterns(pattern_entries).await.unwrap_or(0);
+            let imported = salsa
+                .bulk_import_patterns(pattern_entries)
+                .await
+                .unwrap_or(0);
             let hierarchy_classes = salsa
                 .bulk_import_hierarchy(hierarchy_entries)
                 .await

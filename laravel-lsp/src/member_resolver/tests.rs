@@ -608,3 +608,88 @@ class User extends Model {
         "a union-typed property is ambiguous and must not resolve"
     );
 }
+
+// ─── Widening: foreach iterator vars ─────────────────────────────────────
+
+#[test]
+fn widens_foreach_over_collection_variable() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        $users = User::all();
+        foreach ($users as $user) {
+            echo $user->email;
+        }
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("foreach element resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(
+        r.confidence,
+        Confidence::Medium,
+        "an inferred foreach element type is MEDIUM"
+    );
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn widens_foreach_with_key_value_pair() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        $users = User::all();
+        foreach ($users as $i => $user) {
+            echo $user->email;
+        }
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("foreach pair element resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::Medium);
+}
+
+#[test]
+fn foreach_over_unresolvable_collection_yields_none() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+function index($users) {
+    foreach ($users as $user) {
+        echo $user->email;
+    }
+}
+"#;
+    assert!(
+        resolve_in(&p, caller, "email").is_none(),
+        "an untyped collection gives the foreach widening nothing"
+    );
+}
+
+#[test]
+fn foreach_docblock_var_is_high_via_flow() {
+    // A `@var` on the loop body is found by flow directly (HIGH), before the
+    // foreach fallback runs.
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index($rows) {
+        foreach ($rows as $user) {
+            /** @var User $user */
+            echo $user->email;
+        }
+    }
+}
+"#;
+    let r = resolve_in(&p, caller, "email").expect("docblock resolves");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.confidence, Confidence::High);
+}

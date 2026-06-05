@@ -233,7 +233,10 @@ fn resolve_receiver(
                 // `$this` is the enclosing class — a certain resolution.
                 enclosing_class_fqcn(receiver, bytes).map(|fqcn| (fqcn, Confidence::High))
             } else {
+                // Flow tracking first (assignments / typed params / `@var`);
+                // fall back to a `foreach` element type.
                 flow::resolve_with_confidence(receiver, bytes, var, aliases)
+                    .or_else(|| resolve_foreach_var(receiver, bytes, var, aliases))
             }
         }
         // `$this->prop` — a typed property on the enclosing class.
@@ -346,6 +349,85 @@ fn normalize_type(raw: &str) -> Option<String> {
         return None;
     }
     Some(t.to_string())
+}
+
+/// Resolve a `foreach ($coll as $var)` value variable to its element type.
+///
+/// The element type is the model the collection operates on — `flow::resolve`
+/// already gives that for a collection variable (`$users = User::all()` →
+/// `User`), and the element of that collection is a `User`. Inferring an
+/// element from a collection is indirect, so this is [`Confidence::Medium`].
+/// (A `@var User $var` on the loop is found by flow directly, before this
+/// fallback runs.)
+fn resolve_foreach_var(
+    use_site: Node,
+    bytes: &[u8],
+    var: &str,
+    aliases: &UseAliases,
+) -> Option<(String, Confidence)> {
+    let mut cur = use_site.parent();
+    while let Some(n) = cur {
+        if n.kind() == "foreach_statement" {
+            if let Some((collection, value_var)) = foreach_parts(n, bytes) {
+                if value_var == var {
+                    // Only a collection *variable* is resolvable here; flow
+                    // tracks its model type.
+                    if collection.kind() == "variable_name" {
+                        let cvar = collection.utf8_text(bytes).ok()?.trim_start_matches('$');
+                        if let Some(fqcn) = flow::resolve(collection, bytes, cvar, aliases) {
+                            return Some((fqcn, Confidence::Medium));
+                        }
+                    }
+                    // Matched the binding but couldn't resolve the collection.
+                    return None;
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Extract `(collection_expr, value_var_name)` from a `foreach_statement`.
+/// Handles `foreach ($c as $v)` and `foreach ($c as $k => $v)`; list
+/// destructuring (`as [$a, $b]`) is not handled.
+fn foreach_parts<'t>(foreach: Node<'t>, bytes: &[u8]) -> Option<(Node<'t>, String)> {
+    let body_id = foreach.child_by_field_name("body").map(|b| b.id());
+    let mut named = Vec::new();
+    let mut c = foreach.walk();
+    for ch in foreach.named_children(&mut c) {
+        if Some(ch.id()) == body_id {
+            continue;
+        }
+        named.push(ch);
+    }
+    if named.len() < 2 {
+        return None;
+    }
+    let collection = named[0];
+    let binding = named[named.len() - 1];
+    let value_var = match binding.kind() {
+        "variable_name" => binding
+            .utf8_text(bytes)
+            .ok()?
+            .trim_start_matches('$')
+            .to_string(),
+        "pair" => {
+            // `$key => $value` — the value is the pair's last named child.
+            let mut pc = binding.walk();
+            let kids: Vec<_> = binding.named_children(&mut pc).collect();
+            let last = kids.last()?;
+            if last.kind() != "variable_name" {
+                return None;
+            }
+            last.utf8_text(bytes)
+                .ok()?
+                .trim_start_matches('$')
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some((collection, value_var))
 }
 
 /// FQCN of the class lexically enclosing `node`, or `None` when `node` isn't

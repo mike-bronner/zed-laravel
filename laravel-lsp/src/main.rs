@@ -14941,9 +14941,11 @@ return [
             PatternAtPosition::Asset(asset) => self.hover_for_asset(&asset).await,
             PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
             // Patterns we don't yet surface in hover — silently drop.
+            // `MemberAccess` gets semantic hover cards in M6.
             PatternAtPosition::Directive(_)
             | PatternAtPosition::Action(_)
-            | PatternAtPosition::Feature(_) => return None,
+            | PatternAtPosition::Feature(_)
+            | PatternAtPosition::MemberAccess(_) => return None,
         };
 
         if rendered.is_empty() {
@@ -15730,6 +15732,9 @@ fn pattern_range_at(
         laravel_lsp::salsa_impl::PatternAtPosition::Url(u) => (u.line, u.column, u.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Action(a) => (a.line, a.column, a.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Feature(f) => (f.line, f.column, f.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m) => {
+            (m.line, m.column, m.end_column)
+        }
     };
     Some(Range {
         start: Position {
@@ -16991,6 +16996,11 @@ impl LanguageServer for LaravelLanguageServer {
             PatternAtPosition::Feature(feature) => {
                 debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
+            }
+            PatternAtPosition::MemberAccess(_) => {
+                // Goto-definition for magic members (the inheritance-resolved
+                // declaration locator) lands in M4.
+                None
             }
         };
 

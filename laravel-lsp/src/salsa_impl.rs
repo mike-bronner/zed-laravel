@@ -2269,6 +2269,89 @@ pub struct FeatureReferenceData {
     pub end_column: u32,
 }
 
+/// Confidence that a captured member-access site's receiver was resolved to a
+/// concrete declaring class.
+///
+/// Populated by M3's receiver resolution; at capture time (M2) every site is
+/// [`Confidence::Unresolved`]. The tiers mirror the plan's resolution tiers:
+/// HIGH (static call, `(new X)`, typed param, `@var`, simple local assignment),
+/// MEDIUM (multi-hop reassignment / indirect flow), LOW (foreach iter var,
+/// typed property, return chain — captured but not yet resolvable; widened in
+/// later work, never guessed).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+    /// Not yet run through the resolver — the state at capture time (M2).
+    #[default]
+    Unresolved,
+}
+
+/// The kind of member a resolved access maps to.
+///
+/// `None` on the reference until M3 classifies the site against the
+/// class-hierarchy index. The Eloquent-magic variants are what make
+/// find-references / rename / hover magic-aware; `PlainMember` is a generic
+/// (non-magic) property on a resolved class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MagicMemberKind {
+    /// Eloquent local scope accessed via `__call` (`scopeActive` → `->active()`).
+    Scope,
+    /// Eloquent accessor / attribute (`getFullNameAttribute` / `Attribute`).
+    Accessor,
+    /// Eloquent relationship method accessed as a property (`$user->posts`).
+    Relationship,
+    /// Database column surfaced as a model attribute (`$user->email`).
+    Column,
+    /// Dynamic finder (`User::whereEmail(...)` → `where('email', ...)`).
+    DynamicFinder,
+    /// Generic (non-magic) property on a resolved class.
+    PlainMember,
+}
+
+/// A property-form member access (`$user->email`, `$this->profile`,
+/// `$user?->name`) captured for the magic-member semantic index.
+///
+/// **Capture-only at M2.** The `member`, `receiver`, byte ranges, nullsafe
+/// flag, and position fields are populated now. The resolution fields
+/// (`declaring_fqcn`, `kind`, `confidence`) are a reserved scaffold M3 fills
+/// once receiver resolution + `ClassView` classification land — until then
+/// `declaring_fqcn`/`kind` are `None` and `confidence` is
+/// [`Confidence::Unresolved`]. Wiring the index here once keeps M3 a pure
+/// "fill in resolution" diff with no structural churn.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemberAccessReferenceData {
+    /// The accessed member name (`email`, `posts`, `profile`).
+    pub member: String,
+    /// Raw source text of the receiver expression (`$user`, `$this`).
+    pub receiver: String,
+    /// Byte range of the receiver expression in the file — lets the M3
+    /// resolver locate the receiver node in the live tree for
+    /// `var_type::resolve`.
+    pub receiver_byte_start: usize,
+    pub receiver_byte_end: usize,
+    /// Whether the access used the nullsafe operator (`?->`).
+    pub is_nullsafe: bool,
+    /// Position of the member name (0-based — repo convention).
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+    // ─── Reserved resolution scaffold (filled by M3) ───
+    /// Declaring class FQCN once the receiver resolves (inheritance/trait
+    /// resolved). `None` until M3.
+    #[serde(default)]
+    pub declaring_fqcn: Option<String>,
+    /// What kind of member this resolves to. `None` until M3 classifies.
+    #[serde(default)]
+    pub kind: Option<MagicMemberKind>,
+    /// Resolution confidence. [`Confidence::Unresolved`] until M3.
+    #[serde(default)]
+    pub confidence: Confidence,
+}
+
 /// Laravel configuration data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaravelConfigData {
@@ -2783,6 +2866,16 @@ pub struct ParsedPatternsData {
     /// populates chains properly.
     #[serde(default)]
     pub chains: Vec<Arc<crate::query_chain::BuilderChain>>,
+    /// Property-form member accesses (`$user->email`, `$this->profile`)
+    /// captured for the magic-member semantic index (M2). Like `chains`,
+    /// stored here rather than as a `ParsedPatterns` Salsa field because that
+    /// struct is at its 12-element tuple-Hash cap.
+    ///
+    /// `#[serde(default)]` so older disk-cache entries (written before this
+    /// field existed) deserialize with an empty list; the next edit re-runs
+    /// extraction and repopulates.
+    #[serde(default)]
+    pub member_access_refs: Vec<Arc<MemberAccessReferenceData>>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -2812,6 +2905,7 @@ pub enum PatternAtPosition {
     Url(Arc<UrlReferenceData>),
     Action(Arc<ActionReferenceData>),
     Feature(Arc<FeatureReferenceData>),
+    MemberAccess(Arc<MemberAccessReferenceData>),
 }
 
 impl ParsedPatternsData {
@@ -2944,6 +3038,15 @@ impl ParsedPatternsData {
                 column: feature.column,
                 end_column: feature.end_column,
                 pattern: PatternAtPosition::Feature(feature.clone()),
+            });
+        }
+
+        for member in &self.member_access_refs {
+            entries.push(PositionEntry {
+                line: member.line,
+                column: member.column,
+                end_column: member.end_column,
+                pattern: PatternAtPosition::MemberAccess(member.clone()),
             });
         }
 
@@ -5143,6 +5246,7 @@ impl SalsaActor {
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
+        let mut member_access_refs: Vec<Arc<MemberAccessReferenceData>> = Vec::new();
         let mut chains: Vec<Arc<crate::query_chain::BuilderChain>> = Vec::new();
 
         // Skip the full-file PHP parse for Blade files — same rationale as
@@ -5192,6 +5296,27 @@ impl SalsaActor {
                             line: f.row as u32,
                             column: f.column as u32,
                             end_column: f.end_column as u32,
+                        }));
+                    }
+
+                    // Property-form member-access sites (`$user->email`).
+                    // Captured raw here (M2); the receiver-resolution fields
+                    // stay at their `None`/`Unresolved` defaults until M3.
+                    // Blade-embedded member access is intentionally deferred —
+                    // resolving Blade-scope receivers is M3 work.
+                    for m in php_patterns.member_accesses {
+                        member_access_refs.push(Arc::new(MemberAccessReferenceData {
+                            member: m.member.to_string(),
+                            receiver: m.receiver.to_string(),
+                            receiver_byte_start: m.receiver_byte_start,
+                            receiver_byte_end: m.receiver_byte_end,
+                            is_nullsafe: m.is_nullsafe,
+                            line: m.row as u32,
+                            column: m.column as u32,
+                            end_column: m.end_column as u32,
+                            declaring_fqcn: None,
+                            kind: None,
+                            confidence: Confidence::Unresolved,
                         }));
                     }
                 }
@@ -5339,6 +5464,7 @@ impl SalsaActor {
             action_refs,
             feature_refs,
             chains,
+            member_access_refs,
             sorted_positions: Vec::new(),
         };
 

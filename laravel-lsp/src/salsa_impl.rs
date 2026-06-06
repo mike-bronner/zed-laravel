@@ -2624,6 +2624,16 @@ pub enum SymbolRefData {
     Livewire(String),
     Middleware(String),
     Binding(String),
+    /// An Eloquent magic member (accessor / column / relationship / scope /
+    /// dynamic finder) or a plain class member, keyed by its inheritance-
+    /// resolved declaring class FQCN + member name. Unlike the literal kinds
+    /// above — whose name is a raw string the parser tagged — this key is
+    /// produced by the M3 resolver, so a trait-shared member keys once and
+    /// every inheriting model's usages collapse to the same entry.
+    MagicMember {
+        fqcn: String,
+        member: String,
+    },
 }
 
 /// Location of a single parser-classified reference. Generic across pattern
@@ -6776,6 +6786,12 @@ fn collect_matches_for_symbol(
                 }
             }
         }
+        // Magic members can't be matched by raw pattern scanning — a
+        // `member_access_ref` only resolves to a `(declaring_fqcn, member)` key
+        // through the M3 resolver (which needs the class-hierarchy index). They
+        // are served from the resolved inverted index (`insert_magic_members`),
+        // so this per-file scanner contributes nothing for them.
+        SymbolRefData::MagicMember { .. } => {}
     }
 }
 

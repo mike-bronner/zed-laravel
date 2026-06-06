@@ -177,3 +177,118 @@ fn distinct_kinds_dont_collide() {
     assert_eq!(view_hits[0].line, 10);
     assert_eq!(route_hits[0].line, 11);
 }
+
+// ─── Magic members (M4) ──────────────────────────────────────────────────
+
+fn magic(fqcn: &str, member: &str, line: u32) -> MagicMemberEntry {
+    MagicMemberEntry {
+        fqcn: fqcn.to_string(),
+        member: member.to_string(),
+        line,
+        column: 4,
+        end_column: 12,
+    }
+}
+
+#[test]
+fn magic_member_insert_then_find() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Http/Controllers/UserController.php");
+    idx.insert_magic_members(
+        &path,
+        &[
+            magic("App\\Models\\User", "email", 10),
+            magic("App\\Models\\User", "email", 14),
+            magic("App\\Models\\User", "posts", 20),
+        ],
+    );
+
+    let email = idx.find(&SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\User".into(),
+        member: "email".into(),
+    });
+    assert_eq!(email.len(), 2, "two email usages");
+    assert!(email.iter().all(|l| l.file_path == path));
+
+    let posts = idx.find(&SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\User".into(),
+        member: "posts".into(),
+    });
+    assert_eq!(posts.len(), 1);
+}
+
+#[test]
+fn magic_member_distinct_declaring_classes_dont_collide() {
+    // `email` on User and `email` on Account are different symbols.
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/a.php");
+    idx.insert_magic_members(
+        &path,
+        &[
+            magic("App\\Models\\User", "email", 1),
+            magic("App\\Models\\Account", "email", 2),
+        ],
+    );
+
+    let user = idx.find(&SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\User".into(),
+        member: "email".into(),
+    });
+    let account = idx.find(&SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\Account".into(),
+        member: "email".into(),
+    });
+    assert_eq!(user.len(), 1);
+    assert_eq!(account.len(), 1);
+    assert_eq!(user[0].line, 1);
+    assert_eq!(account[0].line, 2);
+}
+
+#[test]
+fn magic_members_aggregate_across_files() {
+    let mut idx = SymbolIndex::default();
+    let key = SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\User".into(),
+        member: "email".into(),
+    };
+    idx.insert_magic_members(
+        &PathBuf::from("/proj/a.php"),
+        &[magic("App\\Models\\User", "email", 1)],
+    );
+    idx.insert_magic_members(
+        &PathBuf::from("/proj/b.php"),
+        &[magic("App\\Models\\User", "email", 2)],
+    );
+    assert_eq!(idx.find(&key).len(), 2);
+}
+
+#[test]
+fn remove_file_evicts_magic_members_alongside_literals() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/mixed.php");
+    // Literal + magic entries from the same file.
+    idx.insert_file(&path, &fixture("welcome", "home"));
+    idx.insert_magic_members(&path, &[magic("App\\Models\\User", "email", 5)]);
+
+    // Both present.
+    assert_eq!(idx.find(&SymbolRefData::View("welcome".into())).len(), 1);
+    assert_eq!(
+        idx.find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\User".into(),
+            member: "email".into()
+        })
+        .len(),
+        1
+    );
+
+    idx.remove_file(&path);
+
+    // Both gone — magic keys tracked in by_file the same as literals.
+    assert!(idx.find(&SymbolRefData::View("welcome".into())).is_empty());
+    assert!(idx
+        .find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\User".into(),
+            member: "email".into()
+        })
+        .is_empty());
+}

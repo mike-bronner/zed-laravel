@@ -3228,6 +3228,17 @@ pub enum SalsaRequest {
         entries: Vec<(PathBuf, Vec<crate::class_hierarchy_index::ClassNode>)>,
         reply: oneshot::Sender<usize>,
     },
+    /// Snapshot the `fqcn → declaring file` map for the out-of-actor
+    /// magic-member index build (M4).
+    SnapshotClassFiles {
+        reply: oneshot::Sender<std::collections::HashMap<String, PathBuf>>,
+    },
+    /// Bulk-import resolved magic-member occurrences into the symbol index
+    /// (M4). Appends to each path's existing (literal-symbol) entries.
+    BulkImportMagicMembers {
+        entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
+        reply: oneshot::Sender<usize>,
+    },
 
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
@@ -3765,6 +3776,42 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::BulkImportHierarchy {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the actor's `fqcn → declaring file` map. The magic-member
+    /// index build (M4) runs in a parallel pass outside the actor and uses
+    /// this owned copy to resolve receivers without borrowing the index.
+    pub async fn snapshot_class_files(
+        &self,
+    ) -> Result<std::collections::HashMap<String, PathBuf>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Bulk-import resolved magic-member occurrences into the actor-owned
+    /// symbol index (M4). Mirrors `bulk_import_hierarchy`; replies with the
+    /// total magic-member entry count ingested.
+    pub async fn bulk_import_magic_members(
+        &self,
+        entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BulkImportMagicMembers {
                 entries,
                 reply: reply_tx,
             })
@@ -4720,6 +4767,21 @@ impl SalsaActor {
                         self.class_hierarchy_index.insert_file(&path, nodes);
                     }
                     let _ = reply.send(self.class_hierarchy_index.class_count());
+                }
+                SalsaRequest::SnapshotClassFiles { reply } => {
+                    let _ = reply.send(self.class_hierarchy_index.fqcn_file_map());
+                }
+                SalsaRequest::BulkImportMagicMembers { entries, reply } => {
+                    // Append-only: `build_symbol_index` already inserted this
+                    // path's literal-symbol keys, and `insert_magic_members`
+                    // extends `by_file` rather than overwriting, so the two
+                    // coexist and evict together via `remove_file`.
+                    let mut count = 0usize;
+                    for (path, members) in entries {
+                        count += members.len();
+                        self.symbol_index.insert_magic_members(&path, &members);
+                    }
+                    let _ = reply.send(count);
                 }
 
                 // === Service Provider Handlers ===

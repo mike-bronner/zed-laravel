@@ -25,9 +25,31 @@ use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, U
 use crate::salsa_impl::{Confidence, MagicMemberKind, MemberAccessReferenceData};
 use crate::symbol_index::MagicMemberEntry;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
+
+/// Maps a class FQCN to the file that declares it — the only thing receiver
+/// resolution needs from the class graph. Implemented by the actor-owned
+/// [`ClassHierarchyIndex`] (used at query time) and by a plain
+/// `HashMap<String, PathBuf>` snapshot (used by the parallel index-build pass,
+/// which can't borrow the actor-owned index). Decoupling here means resolution
+/// works the same on either.
+pub trait ClassFileResolver {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf>;
+}
+
+impl ClassFileResolver for ClassHierarchyIndex {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        self.get(fqcn).map(|node| node.file_path.clone())
+    }
+}
+
+impl ClassFileResolver for HashMap<String, PathBuf> {
+    fn class_file(&self, fqcn: &str) -> Option<PathBuf> {
+        self.get(fqcn).cloned()
+    }
+}
 
 /// How a member was syntactically accessed. Drives which magic kinds are even
 /// possible: a scope is only reachable via a call, an accessor only via a
@@ -201,7 +223,7 @@ impl ClassViewCache {
 pub fn resolve_member_access_entries(
     source: &str,
     member_refs: &[Arc<MemberAccessReferenceData>],
-    index: &ClassHierarchyIndex,
+    resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Vec<MagicMemberEntry> {
@@ -228,7 +250,7 @@ pub fn resolve_member_access_entries(
             AccessForm::Property,
             bytes,
             &aliases,
-            index,
+            resolver,
             classviews,
             project_root,
         ) else {
@@ -267,13 +289,13 @@ pub fn resolve_and_classify(
     form: AccessForm,
     bytes: &[u8],
     aliases: &UseAliases,
-    index: &ClassHierarchyIndex,
+    resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
     let (fqcn, confidence) =
-        resolve_receiver(receiver, bytes, aliases, index, classviews, project_root)?;
-    let file_path = index.get(&fqcn)?.file_path.clone();
+        resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root)?;
+    let file_path = resolver.class_file(&fqcn)?;
     let view = classviews.get_or_build(&fqcn, &file_path, project_root)?;
     let classified = classify_member(&view, member, form)?;
     Some(ResolvedMemberAccess {
@@ -294,7 +316,7 @@ fn resolve_receiver(
     receiver: Node,
     bytes: &[u8],
     aliases: &UseAliases,
-    index: &ClassHierarchyIndex,
+    resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
@@ -318,7 +340,7 @@ fn resolve_receiver(
         }
         // `$obj->method()` — resolve via the method's return type.
         "member_call_expression" | "nullsafe_member_call_expression" => {
-            resolve_method_return(receiver, bytes, aliases, index, classviews, project_root)
+            resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
         }
         _ => None,
     }
@@ -337,7 +359,7 @@ fn resolve_method_return(
     call: Node,
     bytes: &[u8],
     aliases: &UseAliases,
-    index: &ClassHierarchyIndex,
+    resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
@@ -347,8 +369,9 @@ fn resolve_method_return(
         return None;
     }
     let method = name_node.utf8_text(bytes).ok()?;
-    let (obj_fqcn, _) = resolve_receiver(object, bytes, aliases, index, classviews, project_root)?;
-    let file_path = index.get(&obj_fqcn)?.file_path.clone();
+    let (obj_fqcn, _) =
+        resolve_receiver(object, bytes, aliases, resolver, classviews, project_root)?;
+    let file_path = resolver.class_file(&obj_fqcn)?;
     let view = classviews.get_or_build(&obj_fqcn, &file_path, project_root)?;
     let ret = method_return_type(&view, method)?;
     match normalize_type(&ret)?.as_str() {

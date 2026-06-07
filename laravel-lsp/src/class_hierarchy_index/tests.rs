@@ -127,3 +127,28 @@ fn take_dirty_drains_and_is_idempotent() {
     assert_eq!(idx.take_dirty().len(), 1);
     assert!(idx.take_dirty().is_empty());
 }
+
+#[test]
+fn fqcn_file_map_maps_each_class_to_its_file() {
+    let mut idx = ClassHierarchyIndex::default();
+    let user_path = PathBuf::from("/proj/app/Models/User.php");
+    let post_path = PathBuf::from("/proj/app/Models/Post.php");
+    idx.insert_file(
+        &user_path,
+        extract(
+            "/proj/app/Models/User.php",
+            "<?php\nnamespace App\\Models;\nclass User {}\n",
+        ),
+    );
+    idx.insert_file(
+        &post_path,
+        extract(
+            "/proj/app/Models/Post.php",
+            "<?php\nnamespace App\\Models;\nclass Post {}\n",
+        ),
+    );
+
+    let map = idx.fqcn_file_map();
+    assert_eq!(map.get("App\\Models\\User"), Some(&user_path));
+    assert_eq!(map.get("App\\Models\\Post"), Some(&post_path));
+}

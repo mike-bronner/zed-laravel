@@ -182,6 +182,17 @@ impl ClassHierarchyIndex {
         self.classes.get(fqcn)
     }
 
+    /// Snapshot the `fqcn → declaring file` mapping. The magic-member index
+    /// build (M4) runs in a parallel pass that can't borrow the actor-owned
+    /// index, so it takes this cheap owned copy (paths only, not full nodes)
+    /// to drive receiver resolution.
+    pub fn fqcn_file_map(&self) -> std::collections::HashMap<String, PathBuf> {
+        self.classes
+            .iter()
+            .map(|(fqcn, node)| (fqcn.clone(), node.file_path.clone()))
+            .collect()
+    }
+
     /// Classes that directly implement `fqcn` (an interface).
     pub fn implementers_of(&self, fqcn: &str) -> &[String] {
         self.implementers

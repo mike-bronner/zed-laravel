@@ -101,6 +101,25 @@ pub fn resolve(
     resolve_with_confidence(use_site, bytes, var_name, aliases).map(|(fqcn, _)| fqcn)
 }
 
+/// Classify a standalone expression node to its Eloquent model FQCN +
+/// confidence: a static starter (`User::all()`, `User::find($id)`), a chain on
+/// one (`User::query()->where(…)->first()`), or a construction (`new User`,
+/// `(new User)->…`). Returns `None` for anything that isn't an Eloquent-
+/// producing chain — notably a bare variable, which callers resolve via
+/// [`resolve`]/[`resolve_with_confidence`] instead.
+///
+/// This is the value-expression counterpart to [`resolve`]: it types the
+/// *expression itself* rather than looking up a variable's prior assignment.
+/// Used to type controller `view()` data and Volt `state()`/`with()`/`computed`
+/// values where the model is produced inline.
+pub fn resolve_expression(
+    node: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+) -> Option<(String, Confidence)> {
+    classify_rhs(node, bytes, aliases, 0, node.start_byte())
+}
+
 /// Like [`resolve`], but also reports the [`Confidence`] tier of the
 /// resolution. The magic-member engine (M3) uses this so each resolved site
 /// can be confidence-gated by consumers (find-references/lens take HIGH+MEDIUM;

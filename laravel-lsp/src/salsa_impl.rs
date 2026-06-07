@@ -6560,6 +6560,15 @@ impl SalsaActor {
         // we can't hold a `&mut` on `self.symbol_index` across that
         // call. So `take_dirty` clones the paths out FIRST (releasing
         // the borrow), then we iterate them serially.
+        // Magic members are never refreshed by this drain — `insert_file`
+        // re-adds only *literal* patterns; magic entries come from the separate
+        // resolution pass (warm / save). So the (potentially multi-second)
+        // re-parse below can't change a magic-member result — skip straight to
+        // the O(1) lookup for them.
+        if matches!(symbol, SymbolRefData::MagicMember { .. }) {
+            return self.symbol_index.find(symbol);
+        }
+
         let start = std::time::Instant::now();
         let dirty = self.symbol_index.take_dirty();
         let dirty_count = dirty.len();

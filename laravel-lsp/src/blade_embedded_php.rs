@@ -64,6 +64,11 @@ pub fn extract_php_regions(source: &str) -> Vec<BladePhpRegion> {
                 });
             }
         }
+        // Bound-attribute (`:icon="$post->x"`) and directive-attribute
+        // (`@class(['x' => $post->y])`) expressions — PHP that lives in HTML
+        // attribute values, which the echo/`@php` passes don't reach. Reuses
+        // the parse above.
+        collect_attribute_php_regions(tree.root_node(), source, &mut regions);
     }
 
     // `@php ... @endphp` blocks. The Blade grammar's representation here is
@@ -90,6 +95,83 @@ pub fn extract_php_regions(source: &str) -> Vec<BladePhpRegion> {
     // Stable sort by row/column for the public ordering contract.
     regions.sort_by_key(|r| (r.row, r.column));
     regions
+}
+
+/// Collect PHP expressions embedded in HTML attribute values into `regions`:
+///
+/// - **Bound attributes** — `:icon="$post->is_published ? 'a' : 'b'"`. The
+///   `attribute_value` text is a PHP expression. (`::escaped` is a literal —
+///   skipped. `wire:`/`x-` are Livewire/Alpine property-path/JS strings, not
+///   PHP expressions — skipped.)
+/// - **Directive attributes** — `@class(['x' => $post->active])`,
+///   `@checked($post->active)`. The `parameter` text is PHP.
+///
+/// The region position is the expression's own start, so the standard
+/// `<?php `-wrap + [`adjust_inner_position`] maps captures back to the file.
+fn collect_attribute_php_regions(
+    root: tree_sitter::Node,
+    source: &str,
+    regions: &mut Vec<BladePhpRegion>,
+) {
+    let bytes = source.as_bytes();
+    let mut push_region = |node: tree_sitter::Node| {
+        if let Ok(content) = node.utf8_text(bytes) {
+            if content.is_empty() {
+                return;
+            }
+            let start = node.start_position();
+            regions.push(BladePhpRegion {
+                content: content.to_string(),
+                row: start.row as u32,
+                column: start.column as u32,
+                byte_offset: node.start_byte(),
+            });
+        }
+    };
+
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "attribute" {
+            // Gather the relevant child nodes in one pass (avoids nested
+            // cursor borrows), then act.
+            let mut name_node = None;
+            let mut quoted = None;
+            let mut param = None;
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                match ch.kind() {
+                    "attribute_name" => name_node = Some(ch),
+                    "quoted_attribute_value" => quoted = Some(ch),
+                    "parameter" => param = Some(ch),
+                    _ => {}
+                }
+            }
+
+            // Bound attribute (`:attr`, not literal `::attr`): the value is PHP.
+            let bound = name_node
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                .map(|s| s.starts_with(':') && !s.starts_with("::"))
+                .unwrap_or(false);
+            if bound {
+                if let Some(q) = quoted {
+                    let mut vc = q.walk();
+                    let val = q.children(&mut vc).find(|x| x.kind() == "attribute_value");
+                    if let Some(v) = val {
+                        push_region(v);
+                    }
+                }
+            }
+
+            // Directive attribute (`@class([...])`, `@checked($x)`): param is PHP.
+            if let Some(p) = param {
+                push_region(p);
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
 }
 
 /// Map a snippet-local `(row, col)` produced by tree-sitter on a

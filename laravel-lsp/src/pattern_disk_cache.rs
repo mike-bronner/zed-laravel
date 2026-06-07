@@ -77,7 +77,11 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        now captured into `member_access_refs` for Blade files (directive
 ///        args the echo/PHP capture misses). Caches from before lack them on
 ///        restored files; bump to force a re-parse that captures them.
-const SCHEMA_VERSION: u32 = 7;
+///   v8 — member accesses inside Blade attribute expressions — bound (`:icon=
+///        "$post->is_published ? …"`) and directive (`@class(['x' => $p->y])`)
+///        — now captured. Caches from before lack these usages on restored
+///        files; bump to force a re-parse that captures them.
+const SCHEMA_VERSION: u32 = 8;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

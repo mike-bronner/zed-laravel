@@ -173,3 +173,34 @@ fn blade_embedded_member_access_is_captured_with_outer_positions() {
     assert_eq!(email.line, 0);
     assert_eq!(email.column, 15);
 }
+
+#[test]
+fn blade_bound_attribute_member_access_is_captured() {
+    // PHP inside a bound attribute (`:tooltip="$post->is_published ? …"`) is a
+    // real member access the echo/@php passes don't reach.
+    let path = PathBuf::from("/fixture/resources/views/x.blade.php");
+    let src = "<flux:button :tooltip=\"$post->is_published ? 'a' : 'b'\">Go</flux:button>\n";
+    let data = parse_owned(&path, src);
+    let m = data
+        .member_access_refs
+        .iter()
+        .find(|m| m.member == "is_published")
+        .expect("bound-attribute $post->is_published should be captured");
+    assert_eq!(m.receiver, "$post");
+    assert_eq!(m.line, 0);
+}
+
+#[test]
+fn blade_directive_attribute_param_member_access_is_captured() {
+    // `@class(['x' => $post->active])` — the directive parameter is PHP.
+    let path = PathBuf::from("/fixture/resources/views/y.blade.php");
+    let src = "<div @class(['on' => $post->active])>x</div>\n";
+    let data = parse_owned(&path, src);
+    assert!(
+        data.member_access_refs
+            .iter()
+            .any(|m| m.member == "active" && m.receiver == "$post"),
+        "directive-attribute param member access captured, got {:?}",
+        data.member_access_refs
+    );
+}

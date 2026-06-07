@@ -302,11 +302,9 @@ fn first_class_fqcn(root: Node, bytes: &[u8]) -> Option<String> {
                     namespace = nm.utf8_text(bytes).ok().map(str::to_string);
                 }
             }
-            "class_declaration" => {
-                if class_name.is_none() {
-                    if let Some(nm) = n.child_by_field_name("name") {
-                        class_name = nm.utf8_text(bytes).ok().map(str::to_string);
-                    }
+            "class_declaration" if class_name.is_none() => {
+                if let Some(nm) = n.child_by_field_name("name") {
+                    class_name = nm.utf8_text(bytes).ok().map(str::to_string);
                 }
             }
             _ => {}

@@ -17024,38 +17024,75 @@ impl LanguageServer for LaravelLanguageServer {
                     },
                 },
                 command: None,
-                data: serde_json::to_value(&t.symbol).ok(),
+                // Carry the symbol key + the document URI so `resolve` can both
+                // count and build the `showReferences` command (resolve doesn't
+                // receive the document URI otherwise).
+                data: Some(serde_json::json!({
+                    "symbol": &t.symbol,
+                    "uri": uri.as_str(),
+                })),
             })
             .collect();
         Ok(Some(lenses))
     }
 
-    /// Fill in a lens's reference count from the inverted index (lazy). Unused
-    /// symbols (0 references) get a distinct marker; #59's warning-diagnostic
-    /// half is emitted separately during validation.
+    /// Fill in a lens's reference count + make it open the references when
+    /// clicked. Resolves the symbol's reference locations from the index, sets
+    /// the title to the count, and wires `editor.action.showReferences` so the
+    /// client opens a multi-file references view (the vtsls `referencesCodeLens`
+    /// pattern Zed supports) rather than going to the definition.
     async fn code_lens_resolve(&self, mut lens: CodeLens) -> jsonrpc::Result<CodeLens> {
         let Some(data) = lens.data.clone() else {
             return Ok(lens);
         };
-        let Ok(symbol) = serde_json::from_value::<laravel_lsp::salsa_impl::SymbolRefData>(data)
-        else {
-            return Ok(lens);
-        };
-        let count = self
+        let symbol =
+            match data.get("symbol").cloned().and_then(|s| {
+                serde_json::from_value::<laravel_lsp::salsa_impl::SymbolRefData>(s).ok()
+            }) {
+                Some(s) => s,
+                None => return Ok(lens),
+            };
+        let uri = data
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|s| Url::parse(s).ok());
+
+        // Reference locations — fast for magic members (the index lookup skips
+        // the literal dirty-refresh).
+        let locations: Vec<Location> = self
             .salsa
-            .count_symbol_references(symbol)
+            .find_references(symbol, false)
             .await
-            .unwrap_or(0);
+            .unwrap_or_default()
+            .iter()
+            .filter_map(reference_location_to_lsp)
+            .collect();
+
+        let count = locations.len();
         let title = match count {
-            0 => "⚠ 0 references".to_string(),
+            0 => "0 references".to_string(),
             1 => "1 reference".to_string(),
             n => format!("{n} references"),
         };
-        // Display-only lens (no command) — the count is the signal.
-        lens.command = Some(Command {
-            title,
-            command: String::new(),
-            arguments: None,
+
+        // `editor.action.showReferences` opens the references peek/multibuffer
+        // with `[uri, anchor position, locations]`. Fall back to display-only
+        // (count text, no navigation) if the URI didn't round-trip.
+        lens.command = Some(match uri {
+            Some(uri) => Command {
+                title,
+                command: "editor.action.showReferences".to_string(),
+                arguments: Some(vec![
+                    serde_json::to_value(uri).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(lens.range.start).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&locations).unwrap_or(serde_json::Value::Null),
+                ]),
+            },
+            None => Command {
+                title,
+                command: String::new(),
+                arguments: None,
+            },
         });
         Ok(lens)
     }

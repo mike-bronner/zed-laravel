@@ -2978,12 +2978,21 @@ async fn build_magic_member_entries(
             tokio::task::spawn_blocking(move || {
                 let source = std::fs::read_to_string(&path).ok()?;
                 let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                let entries = laravel_lsp::member_resolver::resolve_member_access_entries(
+                let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
                     &data.member_access_refs,
                     &*class_files,
                     &mut classviews,
                     &root,
+                );
+                // Volt SFC `.php` components: index `$this->member` reads under
+                // the component's synthetic key (no-op for plain/model .php).
+                entries.extend(
+                    laravel_lsp::view_var_index::resolve_component_member_accesses(
+                        &path,
+                        &source,
+                        &data.member_access_refs,
+                    ),
                 );
                 (!entries.is_empty()).then_some((path, entries))
             })
@@ -3027,32 +3036,35 @@ async fn build_magic_member_entries(
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                    // Establish Volt property context, if any:
-                    //  - SFC: the file's own front-matter (`is_volt`, captured
-                    //    at parse — re-read source to extract props).
-                    //  - MFC: a `$this->`-using template paired with an
-                    //    inline-class `.php` sibling (read the sibling).
-                    // Files with no `$this->` receiver or loop iterable (e.g.
-                    // the ~58k published icon templates) skip both — no read, no
-                    // sibling stat — and resolve via the view-var index.
+                    // A Volt component (own front-matter, or an MFC template
+                    // referencing `$this->`) needs the file source — for property
+                    // typing AND for keying `$this->member` component references.
+                    // Files with no `$this->` (e.g. the ~58k published icon
+                    // templates) read nothing and resolve via the view-var index.
+                    let uses_this = data
+                        .member_access_refs
+                        .iter()
+                        .any(|m| m.receiver.trim() == "$this")
+                        || data
+                            .blade_loops
+                            .iter()
+                            .any(|l| l.iterable.starts_with("$this->"));
+                    let source = if data.is_volt || uses_this {
+                        std::fs::read_to_string(&path).ok()
+                    } else {
+                        None
+                    };
+
                     let volt_props = if data.is_volt {
-                        std::fs::read_to_string(&path).ok().map(|src| {
+                        source.as_deref().map(|src| {
                             laravel_lsp::view_var_index::volt_property_types(
-                                &src,
+                                src,
                                 &*class_files,
                                 &mut classviews,
                                 &root,
                             )
                         })
-                    } else if data
-                        .member_access_refs
-                        .iter()
-                        .any(|m| m.receiver.starts_with("$this->"))
-                        || data
-                            .blade_loops
-                            .iter()
-                            .any(|l| l.iterable.starts_with("$this->"))
-                    {
+                    } else if uses_this {
                         laravel_lsp::view_var_index::mfc_volt_property_types(
                             &path,
                             &*class_files,
@@ -3063,7 +3075,7 @@ async fn build_magic_member_entries(
                         None
                     };
 
-                    let entries = if let Some(prop_types) = volt_props {
+                    let mut entries = if let Some(prop_types) = volt_props {
                         laravel_lsp::view_var_index::resolve_volt_member_accesses(
                             &data.member_access_refs,
                             &prop_types,
@@ -3085,6 +3097,18 @@ async fn build_magic_member_entries(
                             &root,
                         )
                     };
+                    // Component `$this->member` references (SFC own class, or MFC
+                    // sibling). Additive — these are component-self refs, not
+                    // model/view-var resolutions.
+                    if let Some(src) = &source {
+                        entries.extend(
+                            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                &path,
+                                src,
+                                &data.member_access_refs,
+                            ),
+                        );
+                    }
                     (!entries.is_empty()).then_some((path, entries))
                 })
                 .await
@@ -5252,7 +5276,7 @@ impl LaravelLanguageServer {
         }
 
         let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-        let entries = if is_volt {
+        let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
                 content,
                 &*class_files,
@@ -5276,6 +5300,14 @@ impl LaravelLanguageServer {
                 &root,
             )
         };
+        // Component `$this->member` references (Volt SFC `.php` or Blade SFC).
+        entries.extend(
+            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                path,
+                content,
+                &patterns.member_access_refs,
+            ),
+        );
 
         if let Err(e) = self
             .salsa

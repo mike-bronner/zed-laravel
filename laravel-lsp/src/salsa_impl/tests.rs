@@ -893,3 +893,27 @@ fn collect_source_files_covers_app_and_views_skips_vendor() {
     assert!(!found.contains(&vendor), "vendor must be skipped");
     assert!(!found.contains(&node), "node_modules must be skipped");
 }
+
+// ─── Blade @foreach iterable member-access capture ──────────────────────
+
+#[test]
+fn blade_loop_iterable_captures_this_member_access() {
+    let content =
+        "<div>\n    @foreach ($this->entities as $entity)\n        {{ $entity->name }}\n    @endforeach\n</div>\n";
+    let accesses = blade_loop_iterable_accesses(content);
+    assert_eq!(accesses.len(), 1, "got {accesses:?}");
+    let a = &accesses[0];
+    assert_eq!(a.member, "entities");
+    assert_eq!(a.receiver, "$this");
+    assert_eq!(a.line, 1); // 0-based; @foreach is the 2nd line
+    let line = content.lines().nth(1).unwrap();
+    assert_eq!(a.column, line.find("entities").unwrap() as u32);
+    assert_eq!(a.end_column, a.column + "entities".len() as u32);
+}
+
+#[test]
+fn blade_loop_iterable_bare_var_has_no_member_access() {
+    // `@foreach($users as $user)` — a bare collection var, no `->member`.
+    let content = "@foreach ($users as $user)\n{{ $user->x }}\n@endforeach\n";
+    assert!(blade_loop_iterable_accesses(content).is_empty());
+}

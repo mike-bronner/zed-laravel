@@ -73,7 +73,11 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        be typed from its iterable. Caches written before this deserialize it
 ///        empty (serde default), so loop-variable usages wouldn't resolve on
 ///        restored files; bump to force a re-parse that captures the loops.
-const SCHEMA_VERSION: u32 = 6;
+///   v7 — member accesses inside `@foreach` iterables (`$this->entities`) are
+///        now captured into `member_access_refs` for Blade files (directive
+///        args the echo/PHP capture misses). Caches from before lack them on
+///        restored files; bump to force a re-parse that captures them.
+const SCHEMA_VERSION: u32 = 7;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

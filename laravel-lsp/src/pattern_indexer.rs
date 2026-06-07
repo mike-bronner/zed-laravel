@@ -61,6 +61,11 @@ pub fn parse_owned_with_hierarchy(
         // Capture `@foreach` loops so the magic build can type loop variables
         // (`{{ $user->email }}` in `@foreach($users as $user)`) without a read.
         data.blade_loops = crate::salsa_impl::blade_loop_vars(text);
+        // Capture member accesses inside `@foreach` iterables (`$this->entities`)
+        // — directive args the `{{ }}`/PHP capture below would otherwise miss.
+        for m in crate::salsa_impl::blade_loop_iterable_accesses(text) {
+            data.member_access_refs.push(std::sync::Arc::new(m));
+        }
         let lang = language_blade();
         if let Ok(tree) = parse_blade(text) {
             if let Ok(bp) = extract_all_blade_patterns(&tree, text, &lang) {

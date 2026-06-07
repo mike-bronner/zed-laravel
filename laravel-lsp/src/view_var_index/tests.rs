@@ -707,3 +707,77 @@ fn loop_var_outside_loop_range_is_dropped() {
         resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root);
     assert!(entries.is_empty(), "got {entries:?}");
 }
+
+// ---- Livewire/Volt component member references ----------------------------
+
+#[test]
+fn component_member_this_access_keyed_under_synthetic_id() {
+    // Volt SFC: anonymous class, so `$this->entities` keys under a synthetic
+    // per-file component id. Only declared members are indexed (not framework
+    // calls like `$this->dispatch`).
+    let src = r#"<?php
+use Illuminate\Database\Eloquent\Collection;
+use Livewire\Volt\Component;
+new class extends Component {
+    public ?int $editingId = null;
+    #[Computed]
+    public function entities(): Collection { return Entity::all(); }
+    public function loadStuff(): void {
+        foreach ($this->entities as $e) {}
+    }
+};
+"#;
+    let path = Path::new("/proj/resources/views/pages/permissions.php");
+    let refs = vec![
+        member_ref("$this", "entities", 8, 30),
+        member_ref("$this", "editingId", 5, 10),
+        member_ref("$this", "dispatch", 9, 10), // framework method, not declared
+    ];
+    let entries = resolve_component_member_accesses(path, src, &refs);
+    let key = format!("volt::{}", path.display());
+    assert_eq!(entries.len(), 2, "got {entries:?}");
+    assert!(entries.iter().all(|e| e.fqcn == key));
+    assert!(entries.iter().any(|e| e.member == "entities"));
+    assert!(entries.iter().any(|e| e.member == "editingId"));
+    assert!(!entries.iter().any(|e| e.member == "dispatch"));
+}
+
+#[test]
+fn non_component_php_yields_no_component_entries() {
+    let src = "<?php\nclass UserController { public function show() { return $this->foo; } }\n";
+    let refs = vec![member_ref("$this", "foo", 1, 10)];
+    let entries = resolve_component_member_accesses(
+        Path::new("/proj/app/Http/Controllers/UserController.php"),
+        src,
+        &refs,
+    );
+    assert!(entries.is_empty(), "got {entries:?}");
+}
+
+#[test]
+fn volt_component_key_variants() {
+    // .php SFC (inline anonymous component class)
+    assert_eq!(
+        volt_component_key(
+            Path::new("/proj/x/users.php"),
+            "<?php\nnew class extends Component {};\n"
+        ),
+        Some("volt::/proj/x/users.php".to_string())
+    );
+    // .blade SFC (own Volt signature)
+    assert_eq!(
+        volt_component_key(
+            Path::new("/proj/x/page.blade.php"),
+            "<?php\nuse Livewire\\Volt\\Component;\nnew class extends Component {};\n?>\n<div></div>"
+        ),
+        Some("volt::/proj/x/page.blade.php".to_string())
+    );
+    // plain model — not a component
+    assert_eq!(
+        volt_component_key(
+            Path::new("/proj/app/Models/User.php"),
+            "<?php\nclass User {}\n"
+        ),
+        None
+    );
+}

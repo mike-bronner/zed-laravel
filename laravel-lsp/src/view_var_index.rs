@@ -302,6 +302,144 @@ fn first_expression(tree: &tree_sitter::Tree) -> Option<Node<'_>> {
     None
 }
 
+// ── Livewire/Volt component member references ─────────────────────────────
+//
+// A Volt SFC is an anonymous class (`new class extends Component`) with no
+// FQCN, so `$this->entities` (a reference to the component's own property /
+// `#[Computed]` method) can't key into the magic-member index the way a model
+// member does. We give each component a synthetic, stable identity derived from
+// its file — shared across the `.php` class and its `.blade.php` template — and
+// key every `$this->member` read under it, so find-references on a component
+// member works within the component (both files).
+
+/// The synthetic reverse-index FQCN for the Livewire/Volt component `path`
+/// belongs to, or `None` if it isn't a component file. One component → one key,
+/// shared between its `.php` class and `.blade.php` template (an MFC template
+/// resolves to its sibling `.php`'s key).
+pub fn volt_component_key(path: &Path, source: &str) -> Option<String> {
+    let is_blade = path.to_string_lossy().ends_with(".blade.php");
+    if is_blade {
+        if crate::livewire_resolver::source_contains_volt_signature(source) {
+            // Single-file Volt component: the Blade file is the component.
+            Some(format!("volt::{}", path.display()))
+        } else {
+            // MFC template: identity is the sibling `.php` class file.
+            crate::livewire_resolver::mfc_sibling(path)
+                .map(|sib| format!("volt::{}", sib.display()))
+        }
+    } else if crate::php_class::detect_inline_livewire_class(source) {
+        Some(format!("volt::{}", path.display()))
+    } else {
+        None
+    }
+}
+
+/// The declared member names (properties + methods, any visibility) of the
+/// component class in `class_source`. Used to gate which `$this->member` reads
+/// are real component members worth indexing (vs. framework calls like
+/// `$this->dispatch`).
+fn volt_component_member_names(class_source: &str) -> HashSet<String> {
+    let Ok(tree) = parse_php(class_source) else {
+        return HashSet::new();
+    };
+    let bytes = class_source.as_bytes();
+    let mut names = HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "property_declaration" => {
+                let mut c = n.walk();
+                for ch in n.children(&mut c) {
+                    if ch.kind() == "property_element" {
+                        if let Some(nm) = ch
+                            .child_by_field_name("name")
+                            .and_then(|x| x.utf8_text(bytes).ok())
+                        {
+                            names.insert(nm.trim_start_matches('$').to_string());
+                        }
+                    }
+                }
+            }
+            "property_promotion_parameter" => {
+                if let Some(nm) = n
+                    .child_by_field_name("name")
+                    .and_then(|x| x.utf8_text(bytes).ok())
+                {
+                    names.insert(nm.trim_start_matches('$').to_string());
+                }
+            }
+            "method_declaration" => {
+                if let Some(nm) = n
+                    .child_by_field_name("name")
+                    .and_then(|x| x.utf8_text(bytes).ok())
+                {
+                    names.insert(nm.to_string());
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    names
+}
+
+/// Index `$this->member` reads in a Livewire/Volt component file under the
+/// component's synthetic key, so find-references on a component property /
+/// `#[Computed]` method works across the `.php` and `.blade.php`. Only members
+/// actually declared on the component class are keyed. Returns empty for
+/// non-component files.
+pub fn resolve_component_member_accesses(
+    path: &Path,
+    source: &str,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+) -> Vec<MagicMemberEntry> {
+    let Some(key) = volt_component_key(path, source) else {
+        return Vec::new();
+    };
+
+    // The component class source: the `.php` itself, a Blade SFC's front-matter,
+    // or — for an MFC template — the sibling `.php`.
+    let is_blade = path.to_string_lossy().ends_with(".blade.php");
+    let class_source: String = if !is_blade {
+        source.to_string()
+    } else if crate::livewire_resolver::source_contains_volt_signature(source) {
+        volt_frontmatter(source).unwrap_or_default().to_string()
+    } else {
+        match crate::livewire_resolver::mfc_sibling(path) {
+            Some(sib) => std::fs::read_to_string(&sib).unwrap_or_default(),
+            None => return Vec::new(),
+        }
+    };
+    if class_source.is_empty() {
+        return Vec::new();
+    }
+    let members = volt_component_member_names(&class_source);
+    if members.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    for m in member_refs {
+        if m.receiver.trim() != "$this" || !members.contains(&m.member) {
+            continue;
+        }
+        if seen.insert((m.line, m.column)) {
+            out.push(MagicMemberEntry {
+                fqcn: key.clone(),
+                member: m.member.clone(),
+                line: m.line,
+                column: m.column,
+                end_column: m.end_column,
+            });
+        }
+    }
+    out
+}
+
 // ── Volt component view variables (phase 5) ───────────────────────────────
 //
 // A Volt page (`resources/views/livewire/users.blade.php`) declares its own

@@ -2359,6 +2359,52 @@ pub fn blade_loop_vars(content: &str) -> Vec<BladeLoopVar> {
         .collect()
 }
 
+/// Member accesses written inside `@foreach`/`@forelse` *iterable* expressions
+/// (`@foreach($this->entities as $e)` → a read of `$this->entities`). These
+/// live in directive arguments, not `{{ }}` echoes or PHP blocks, so the normal
+/// capture misses them — yet they're real references a find-references should
+/// surface. We synthesize a `MemberAccessReferenceData` for the last `->member`
+/// of each member-access iterable, positioned at the member name in the
+/// directive line.
+pub fn blade_loop_iterable_accesses(content: &str) -> Vec<MemberAccessReferenceData> {
+    let mut out = Vec::new();
+    for loop_var in blade_loop_vars(content) {
+        let iter = loop_var.iterable.trim();
+        // Only member-access iterables (`$x->y`, `$this->y`); a bare `$users`
+        // collection has no member to reference.
+        let Some(arrow) = iter.rfind("->") else {
+            continue;
+        };
+        let member = &iter[arrow + 2..];
+        let receiver = &iter[..arrow];
+        if member.is_empty() || !member.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        // Locate the iterable on its directive line to position the member.
+        let Some(line_text) = content.lines().nth(loop_var.start_line as usize) else {
+            continue;
+        };
+        let Some(iter_col) = line_text.find(iter) else {
+            continue;
+        };
+        let member_col = (iter_col + arrow + 2) as u32;
+        out.push(MemberAccessReferenceData {
+            member: member.to_string(),
+            receiver: receiver.to_string(),
+            receiver_byte_start: 0,
+            receiver_byte_end: 0,
+            is_nullsafe: false,
+            line: loop_var.start_line,
+            column: member_col,
+            end_column: member_col + member.len() as u32,
+            declaring_fqcn: None,
+            kind: None,
+            confidence: Confidence::Unresolved,
+        });
+    }
+    out
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemberAccessReferenceData {
     /// The accessed member name (`email`, `posts`, `profile`).
@@ -5777,6 +5823,14 @@ impl SalsaActor {
             }
         }
 
+        // Capture member accesses inside `@foreach` iterables (`$this->entities`)
+        // — directive args the region loop above doesn't reach.
+        if path_is_blade {
+            for m in blade_loop_iterable_accesses(text) {
+                member_access_refs.push(Arc::new(m));
+            }
+        }
+
         let mut data = ParsedPatternsData {
             views,
             components,
@@ -6411,33 +6465,50 @@ impl SalsaActor {
         };
         let bytes = text.as_bytes();
         let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
-        let Some(receiver) = tree.root_node().descendant_for_byte_range(
-            member_ref.receiver_byte_start,
-            member_ref.receiver_byte_end,
-        ) else {
-            return Vec::new();
-        };
+
+        // Model magic member: resolve the receiver node to its class and key on
+        // that. Needs the receiver node (located by byte range — valid for PHP;
+        // Blade-embedded refs may not locate, which is fine — the component
+        // fallback below is text-based).
         let mut classviews = crate::member_resolver::ClassViewCache::new();
-        let Some(resolved) = crate::member_resolver::resolve_and_classify(
-            receiver,
-            &member_ref.member,
-            crate::member_resolver::AccessForm::Property,
-            bytes,
-            &aliases,
-            &self.class_hierarchy_index,
-            &mut classviews,
-            &project_root,
-        ) else {
-            return Vec::new();
-        };
-        // find-references threshold: HIGH + MEDIUM.
-        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
-            return Vec::new();
+        if let Some(receiver) = tree
+            .root_node()
+            .descendant_for_byte_range(member_ref.receiver_byte_start, member_ref.receiver_byte_end)
+        {
+            if let Some(resolved) = crate::member_resolver::resolve_and_classify(
+                receiver,
+                &member_ref.member,
+                crate::member_resolver::AccessForm::Property,
+                bytes,
+                &aliases,
+                &self.class_hierarchy_index,
+                &mut classviews,
+                &project_root,
+            ) {
+                // find-references threshold: HIGH + MEDIUM.
+                if matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+                    return self.symbol_index.find(&SymbolRefData::MagicMember {
+                        fqcn: resolved.declaring_fqcn,
+                        member: member_ref.member.clone(),
+                    });
+                }
+            }
         }
-        self.symbol_index.find(&SymbolRefData::MagicMember {
-            fqcn: resolved.declaring_fqcn,
-            member: member_ref.member.clone(),
-        })
+
+        // Component-member fallback: `$this->member` in a Livewire/Volt
+        // component. The component is often an anonymous class (no FQCN), so it's
+        // keyed under a synthetic per-component id shared across its `.php` and
+        // `.blade.php`. Text-based, so it works even when the receiver node above
+        // didn't locate (Blade template clicks).
+        if member_ref.receiver.trim() == "$this" {
+            if let Some(key) = crate::view_var_index::volt_component_key(path, &text) {
+                return self.symbol_index.find(&SymbolRefData::MagicMember {
+                    fqcn: key,
+                    member: member_ref.member.clone(),
+                });
+            }
+        }
+        Vec::new()
     }
 
     fn handle_find_references(

@@ -1190,3 +1190,58 @@ fn resolves_request_user_helper_chain() {
         "request()->user()->email should resolve; got {entries:?}"
     );
 }
+
+#[test]
+fn resolves_gate_define_closure_user() {
+    // The HorizonServiceProvider::gate() shape: untyped $user in a Gate::define
+    // closure is the authenticatable.
+    let (dir, index) = auth_project("User");
+    let caller = r#"<?php
+use Illuminate\Support\Facades\Gate;
+Gate::define('viewHorizon', function ($user) {
+    return in_array($user->email, ['admin@example.com']);
+});
+"#;
+    let entries = resolve_auth_caller(&dir, &index, caller);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "Gate::define closure $user should resolve to the auth model; got {entries:?}"
+    );
+}
+
+#[test]
+fn resolves_gate_before_closure_user() {
+    let (dir, index) = auth_project("User");
+    let caller = r#"<?php
+use Illuminate\Support\Facades\Gate;
+Gate::before(function ($user, $ability) {
+    return $user->email === 'root@example.com' ? true : null;
+});
+"#;
+    let entries = resolve_auth_caller(&dir, &index, caller);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "Gate::before closure $user should resolve; got {entries:?}"
+    );
+}
+
+#[test]
+fn non_gate_closure_user_does_not_resolve() {
+    // An untyped $user in an ordinary closure (not a Gate ability) must NOT be
+    // assumed to be the auth model — that would be a false positive.
+    let (dir, index) = auth_project("User");
+    let caller = r#"<?php
+$users->map(function ($user) {
+    return $user->email;
+});
+"#;
+    let entries = resolve_auth_caller(&dir, &index, caller);
+    assert!(
+        entries.is_empty(),
+        "an ordinary closure's untyped $user must not resolve to the auth model; got {entries:?}"
+    );
+}

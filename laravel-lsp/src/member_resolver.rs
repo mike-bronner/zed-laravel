@@ -337,9 +337,11 @@ fn resolve_receiver(
                 enclosing_class_fqcn(receiver, bytes).map(|fqcn| (fqcn, Confidence::High))
             } else {
                 // Flow tracking first (assignments / typed params / `@var`);
-                // fall back to a `foreach` element type.
+                // then a `foreach` element type; then a Gate-ability closure's
+                // first param (the authenticatable, untyped by convention).
                 flow::resolve_with_confidence(receiver, bytes, var, aliases)
                     .or_else(|| resolve_foreach_var(receiver, bytes, var, aliases))
+                    .or_else(|| resolve_gate_closure_user(receiver, bytes, project_root))
             }
         }
         // `$this->prop` — a typed property on the enclosing class.
@@ -351,6 +353,105 @@ fn resolve_receiver(
             resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
         }
         _ => None,
+    }
+}
+
+/// Resolve a `$user`-style receiver that is the first parameter of a Gate
+/// ability closure (`Gate::define('x', function ($user) { … })`,
+/// `Gate::before`/`after`, or the `gate()` helper form) to the auth user model.
+///
+/// Laravel contractually passes the authenticatable as the first argument to
+/// these closures, so an *untyped* first param resolves with HIGH confidence.
+/// This is the common `HorizonServiceProvider::gate()` shape that flow tracking
+/// can't reach (no type hint, no assignment).
+fn resolve_gate_closure_user(
+    var_node: Node,
+    bytes: &[u8],
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let var = var_node.utf8_text(bytes).ok()?.trim_start_matches('$');
+    let closure = enclosing_closure(var_node)?;
+    if !is_first_param(closure, bytes, var) {
+        return None;
+    }
+    if !is_gate_ability_closure(closure, bytes) {
+        return None;
+    }
+    auth_model_fqcn(project_root).map(|m| (m, Confidence::High))
+}
+
+/// Nearest enclosing closure (`function () {}` / `fn () =>`) of `node`.
+fn enclosing_closure(node: Node) -> Option<Node> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "anonymous_function" | "anonymous_function_creation_expression" | "arrow_function"
+        ) {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Whether `var` names the first formal parameter of `closure`.
+fn is_first_param(closure: Node, bytes: &[u8], var: &str) -> bool {
+    let Some(params) = closure.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut c = params.walk();
+    let Some(first) = params
+        .named_children(&mut c)
+        .find(|p| p.kind() == "simple_parameter")
+    else {
+        return false;
+    };
+    first
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .map(|t| t.trim_start_matches('$') == var)
+        .unwrap_or(false)
+}
+
+/// Whether `closure` is an argument to `Gate::define` / `before` / `after`
+/// (facade) or the `gate()->define(...)` helper — the ability-definition calls
+/// whose first closure param is the authenticatable.
+fn is_gate_ability_closure(closure: Node, bytes: &[u8]) -> bool {
+    // Step out through any argument / arguments wrappers to the enclosing call.
+    let mut node = closure;
+    let call = loop {
+        let Some(p) = node.parent() else {
+            return false;
+        };
+        if matches!(p.kind(), "argument" | "arguments") {
+            node = p;
+            continue;
+        }
+        break p;
+    };
+    let name = call
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok());
+    if !matches!(name, Some("define" | "before" | "after")) {
+        return false;
+    }
+    match call.kind() {
+        "scoped_call_expression" => call
+            .child_by_field_name("scope")
+            .and_then(|s| s.utf8_text(bytes).ok())
+            .map(|s| s.rsplit('\\').next().unwrap_or(s) == "Gate")
+            .unwrap_or(false),
+        "member_call_expression" | "nullsafe_member_call_expression" => call
+            .child_by_field_name("object")
+            .map(|o| {
+                o.kind() == "function_call_expression"
+                    && o.child_by_field_name("function")
+                        .and_then(|f| f.utf8_text(bytes).ok())
+                        == Some("gate")
+            })
+            .unwrap_or(false),
+        _ => false,
     }
 }
 

@@ -2860,10 +2860,11 @@ use laravel_lsp::livewire_resolver::{
     blade_contains_inline_class, extract_blade_variable_at_cursor, mfc_sibling,
 };
 
-/// Debounce window for the project-wide magic-member reconverge (the "full"
-/// half of the hybrid incremental refresh). Long enough that a burst of
-/// keystrokes coalesces into one rebuild after the user pauses.
-const MAGIC_REBUILD_DEBOUNCE_MS: u64 = 1500;
+/// Debounce window for the project-wide magic-member reconverge. Triggered on
+/// save (not on typing), so it can be short — long enough to coalesce a
+/// save-all / format-on-save burst into one rebuild, short enough that
+/// find-references is correct soon after a single save.
+const MAGIC_REBUILD_DEBOUNCE_MS: u64 = 750;
 
 /// Parallelism cap for the magic-member resolution passes when rebuilding
 /// incrementally (mirrors the warm build's `MAX_CONCURRENT_PARSES`).
@@ -5129,11 +5130,55 @@ impl LaravelLanguageServer {
         *self.rescan_debounce_handle.write().await = Some(handle);
     }
 
-    /// Instant per-file magic-member refresh after an edit (the "instant" half
-    /// of the hybrid incremental refresh). Re-resolves just the edited file's
-    /// member accesses against the current hierarchy and replaces its entries in
-    /// the reverse index, so find-references on that file is current
-    /// immediately — without waiting for the debounced project-wide rebuild.
+    /// Refresh the magic-member index when a source file is saved — the single
+    /// entry point for incremental updates (typing-pause edits deliberately do
+    /// no magic work). Pushes the saved buffer into Salsa so resolution sees
+    /// current content, runs the instant per-file refresh (which also covers
+    /// very large projects where the full rebuild is gated off), then schedules
+    /// the debounced project-wide reconverge for cross-file ripples. Volt pages
+    /// are self-contained, so they skip the project-wide pass.
+    async fn refresh_magic_on_save(&self, uri: &Url, text: &str) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        // `.blade.php` also ends with `.php`, so this covers both.
+        if !path_str.ends_with(".php") {
+            return;
+        }
+
+        // Ensure Salsa reflects the saved buffer before resolving — a pending
+        // did_change debounce may not have fired yet. Use the buffer's version
+        // so this doesn't regress against a newer in-flight update.
+        let version = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        if let Err(e) = self
+            .salsa
+            .update_file(path.clone(), version, text.to_string())
+            .await
+        {
+            debug!("Failed to update Salsa on save for {}: {}", path_str, e);
+        }
+
+        self.refresh_file_magic(&path, text).await;
+
+        let is_volt_blade = path_str.ends_with(".blade.php")
+            && laravel_lsp::livewire_resolver::source_contains_volt_signature(text);
+        if !is_volt_blade {
+            self.schedule_magic_rebuild().await;
+        }
+    }
+
+    /// Instant per-file magic-member refresh (the "instant" half of the
+    /// save-time refresh). Re-resolves just the saved file's member accesses
+    /// against the current hierarchy and replaces its entries in the reverse
+    /// index, so find-references on that file is current the moment the
+    /// project-wide reconverge is gated off (large projects) or still pending.
     ///
     /// Handles PHP files and self-contained Volt pages. Controller-rendered
     /// Blade needs the project-wide view-variable index (it must know which
@@ -5217,9 +5262,10 @@ impl LaravelLanguageServer {
     }
 
     /// Schedule the debounced project-wide magic-member reconverge (the "full"
-    /// half of the hybrid refresh). Coalesces rapid edits: each call cancels the
-    /// previous pending rebuild and starts a fresh timer, so cross-file ripples
-    /// (controller→Blade, model→usages) reconverge once the user pauses.
+    /// half of the save-time refresh). Coalesces rapid saves (save-all, format-
+    /// on-save bursts): each call cancels the previous pending rebuild and
+    /// starts a fresh timer, so cross-file ripples (controller→Blade,
+    /// model→usages) reconverge shortly after the save settles.
     async fn schedule_magic_rebuild(&self) {
         if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
             handle.abort();
@@ -6562,18 +6608,11 @@ impl LaravelLanguageServer {
                 debug!("Failed to update source file in Salsa: {}", e);
             }
 
-            // Hybrid incremental magic-member refresh: re-resolve this file
-            // immediately (instant), then schedule a debounced project-wide
-            // reconverge for cross-file ripples (controller→Blade, model→usages).
-            self.refresh_file_magic(&path, content).await;
-            // Volt pages are self-contained — the per-file refresh fully handles
-            // them and nothing else references their variables — so they don't
-            // need the heavier project-wide rebuild.
-            let is_volt_blade = filename.ends_with(".blade.php")
-                && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
-            if !is_volt_blade {
-                self.schedule_magic_rebuild().await;
-            }
+            // NOTE: magic-member refresh deliberately does NOT run here. Doing
+            // it on every typing-pause is wasted work — find-references is a
+            // deliberate action, not something queried mid-keystroke. The
+            // refresh (instant per-file + debounced project reconverge) runs on
+            // `did_save` instead. See `refresh_magic_on_save`.
         }
 
         // After Salsa update, re-run diagnostics for this file
@@ -17067,7 +17106,11 @@ impl LanguageServer for LaravelLanguageServer {
             let is_php = uri.path().ends_with(".php");
 
             if is_blade || is_php {
-                // Removed: parse_and_cache_patterns - performance_cache handles this automatically
+                // Refresh the magic-member index on save (not on typing-pause):
+                // instant per-file + a debounced project-wide reconverge for
+                // cross-file ripples. Saves are deliberate and infrequent, so
+                // this keeps typing free of resolution work.
+                self.refresh_magic_on_save(&uri, &text).await;
             }
 
             // Run diagnostics immediately on save

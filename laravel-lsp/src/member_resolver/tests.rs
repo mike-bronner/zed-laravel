@@ -405,6 +405,27 @@ class User extends Model {
 }
 
 #[test]
+fn resolves_typed_property_in_anonymous_volt_class() {
+    // `$this->user->email` inside a Volt SFC (anonymous `new class extends
+    // Component`) must resolve `$this->user` via its typed property declaration,
+    // even though the class itself has no FQCN.
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+new class extends Component {
+    public ?User $user = null;
+    public function render() {
+        return $this->user->email;
+    }
+};
+"#;
+    let r = resolve_in(&p, caller, "email").expect("resolves $this->user in anon class");
+    assert_eq!(r.kind, MagicMemberKind::Column);
+    assert_eq!(r.declaring_fqcn, "App\\Models\\User");
+}
+
+#[test]
 fn multi_hop_receiver_lowers_confidence() {
     let p = project("app/Models/User.php", USER_MODEL);
     // `$q` is seeded one hop from the typed `$user` → MEDIUM.

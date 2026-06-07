@@ -778,11 +778,15 @@ fn enclosing_class_fqcn(node: Node, bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// The `class_declaration` node lexically enclosing `node`, if any.
+/// The class-like node lexically enclosing `node`, if any — a named
+/// `class_declaration` or an `anonymous_class` (Volt SFC `new class extends
+/// Component`). Matching anonymous classes lets `$this->prop` typed-property
+/// resolution work inside Volt components (the class has no FQCN, but its
+/// property declarations carry types just the same).
 fn enclosing_class_node(node: Node) -> Option<Node> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if n.kind() == "class_declaration" {
+        if matches!(n.kind(), "class_declaration" | "anonymous_class") {
             return Some(n);
         }
         cur = n.parent();

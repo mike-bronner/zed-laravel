@@ -922,3 +922,138 @@ fn population_empty_refs_is_empty() {
         resolve_member_access_entries("", &[], &p.index, &mut ClassViewCache::new(), &p.root);
     assert!(entries.is_empty());
 }
+
+#[test]
+fn end_to_end_warming_flow_resolves_this_email() {
+    // Mirror the real warming → magic-build flow exactly:
+    // parse_owned_with_hierarchy → build index → fqcn_file_map snapshot →
+    // resolve_member_access_entries against the snapshot. This is what the
+    // warming pass does; the other tests use the index directly + re-extract.
+    use crate::class_hierarchy_index::ClassHierarchyIndex;
+    use crate::pattern_indexer::parse_owned_with_hierarchy;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app/Models/User.php");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function gravatar(): string { return md5($this->email); }
+}
+"#;
+    fs::write(&path, src).unwrap();
+    fs::write(
+        dir.path().join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+
+    let (data, nodes) = parse_owned_with_hierarchy(&path, src);
+    assert!(
+        !data.member_access_refs.is_empty(),
+        "warming parse must capture $this->email"
+    );
+
+    let mut index = ClassHierarchyIndex::default();
+    index.insert_file(&path, nodes);
+    let snapshot = index.fqcn_file_map();
+    assert!(
+        snapshot.contains_key("App\\Models\\User"),
+        "snapshot must map the model fqcn; keys: {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
+
+    let entries = resolve_member_access_entries(
+        src,
+        &data.member_access_refs,
+        &snapshot,
+        &mut ClassViewCache::new(),
+        dir.path(),
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "end-to-end warming flow should resolve $this->email; got {entries:?}"
+    );
+}
+
+#[test]
+fn realistic_user_resolves_through_full_warm_restart_cycle() {
+    // Mirror the production warm-restart path end to end: parse → save
+    // (patterns + hierarchy nodes) → load → rebuild hierarchy from the
+    // restored nodes → fqcn_file_map snapshot → resolve the restored
+    // patterns' member accesses. Uses a realistic User (extends an aliased
+    // vendor base, uses a trait) to match the real model shape.
+    use crate::class_hierarchy_index::ClassHierarchyIndex;
+    use crate::pattern_indexer::parse_owned_with_hierarchy;
+    use dashmap::DashMap;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("app/Models/User.php");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+class User extends Authenticatable {
+    use Notifiable;
+    protected $fillable = ['name', 'email', 'password'];
+    public function getGravatarAttribute(): string {
+        return md5(strtolower($this->email));
+    }
+}
+"#;
+    fs::write(&path, src).unwrap();
+    fs::write(
+        dir.path().join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+
+    let (data, nodes) = parse_owned_with_hierarchy(&path, src);
+
+    // Save (patterns + hierarchy) then restore — the warm-restart cycle.
+    let cache = Arc::new(DashMap::new());
+    cache.insert(path.clone(), (0, data));
+    let mut hierarchy_by_file = std::collections::HashMap::new();
+    hierarchy_by_file.insert(path.clone(), nodes);
+    crate::pattern_disk_cache::save_from(&cache, &hierarchy_by_file, dir.path()).unwrap();
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = crate::pattern_disk_cache::load_into(&restored_cache, dir.path());
+
+    let mut index = ClassHierarchyIndex::default();
+    for (p, ns) in lr.hierarchy {
+        index.insert_file(&p, ns);
+    }
+    let snapshot = index.fqcn_file_map();
+    assert!(
+        snapshot.contains_key("App\\Models\\User"),
+        "restored snapshot must contain the app model; keys: {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
+
+    let restored = restored_cache.get(&path).unwrap();
+    let refs = restored.value().1.member_access_refs.clone();
+    assert!(
+        !refs.is_empty(),
+        "restored patterns must carry member accesses"
+    );
+
+    let entries = resolve_member_access_entries(
+        src,
+        &refs,
+        &snapshot,
+        &mut ClassViewCache::new(),
+        dir.path(),
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "warm-restart cycle should resolve $this->email; got {entries:?}"
+    );
+}

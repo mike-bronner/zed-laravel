@@ -198,3 +198,46 @@ fn hierarchy_nodes_survive_save_and_load() {
         "hierarchy node should round-trip through the disk cache, got {fqcns:?}"
     );
 }
+
+#[test]
+fn member_access_refs_survive_save_and_load() {
+    // The real bug hunt: views round-trip through the disk cache, but do
+    // member accesses? If this fails, bincode is dropping them and warm
+    // restarts lose all magic-member sites.
+    use crate::salsa_impl::{Confidence, MemberAccessReferenceData};
+
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+    let file = touch(project.path(), "User.php", "<?php class User {}");
+
+    let mut patterns = fake_patterns("x");
+    patterns
+        .member_access_refs
+        .push(Arc::new(MemberAccessReferenceData {
+            member: "email".into(),
+            receiver: "$this".into(),
+            receiver_byte_start: 0,
+            receiver_byte_end: 5,
+            is_nullsafe: false,
+            line: 1,
+            column: 4,
+            end_column: 9,
+            declaring_fqcn: None,
+            kind: None,
+            confidence: Confidence::Unresolved,
+        }));
+    cache.insert(file.clone(), (0, Arc::new(patterns)));
+
+    save_from(&cache, &Default::default(), project.path()).unwrap();
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(lr.restored, 1);
+    let restored = restored_cache.get(&file).unwrap();
+    assert_eq!(
+        restored.value().1.member_access_refs.len(),
+        1,
+        "member accesses must round-trip through the disk cache"
+    );
+    assert_eq!(restored.value().1.member_access_refs[0].member, "email");
+}

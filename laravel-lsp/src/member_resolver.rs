@@ -305,6 +305,21 @@ pub fn resolve_and_classify(
     })
 }
 
+/// Resolve an arbitrary expression node to its class `(FQCN, confidence)` —
+/// the public entry the view-variable inference uses to type a controller's
+/// `view('x', ['user' => $expr])` values. Same resolution as a member-access
+/// receiver (flow, `$this`, typed props, auth helpers, …).
+pub fn resolve_expression_type(
+    expr: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    resolve_receiver(expr, bytes, aliases, resolver, classviews, project_root)
+}
+
 /// Resolve a receiver expression node to `(FQCN, confidence)`.
 ///
 /// Handles bare variables (`$user`, via flow tracking, with a `foreach`

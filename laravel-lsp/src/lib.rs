@@ -76,6 +76,9 @@ pub mod class_hierarchy_index;
 // Magic-member resolve + classify engine (find-references / lens / hover)
 pub mod member_resolver;
 
+// Controller/Volt → Blade view-variable type inference (magic members in Blade)
+pub mod view_var_index;
+
 // Re-export commonly used types
 pub use config::find_project_root;
 pub use queries::{EchoPhpMatch, ExtractedBladePatterns, ExtractedPhpPatterns};

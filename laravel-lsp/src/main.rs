@@ -4194,13 +4194,31 @@ impl LaravelLanguageServer {
                         blade_handles.push(tokio::spawn(async move {
                             let _permit = permit_owner.acquire_owned().await.ok()?;
                             tokio::task::spawn_blocking(move || {
-                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
-                                    &path,
-                                    &view_paths,
-                                )?;
                                 let mut classviews =
                                     laravel_lsp::member_resolver::ClassViewCache::new();
-                                let entries =
+                                // Volt pages declare their own template variables
+                                // in a front-matter `<?php … ?>` block (no external
+                                // controller), so they resolve against extracted
+                                // component property types instead of the view-var
+                                // index. One cheap read covers both the Volt check
+                                // and the property extraction.
+                                let source = std::fs::read_to_string(&path).ok()?;
+                                let entries = if laravel_lsp::livewire_resolver::source_contains_volt_signature(&source) {
+                                    let prop_types =
+                                        laravel_lsp::view_var_index::volt_property_types(&source);
+                                    laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                                        &data.member_access_refs,
+                                        &prop_types,
+                                        &*class_files,
+                                        &mut classviews,
+                                        &root,
+                                    )
+                                } else {
+                                    let view_name =
+                                        laravel_lsp::view_var_index::view_name_for_path(
+                                            &path,
+                                            &view_paths,
+                                        )?;
                                     laravel_lsp::view_var_index::resolve_blade_member_accesses(
                                         &data.member_access_refs,
                                         &view_name,
@@ -4208,7 +4226,8 @@ impl LaravelLanguageServer {
                                         &*class_files,
                                         &mut classviews,
                                         &root,
-                                    );
+                                    )
+                                };
                                 (!entries.is_empty()).then_some((path, entries))
                             })
                             .await

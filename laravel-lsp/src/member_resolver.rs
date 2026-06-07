@@ -19,9 +19,11 @@
 use crate::class_hierarchy_index::ClassHierarchyIndex;
 use crate::laravel_introspector::chain::{analyze, ClassView};
 use crate::laravel_introspector::model_metadata::pascal_to_snake;
+use crate::parser::parse_php;
 use crate::query_chain::flow;
-use crate::query_chain::use_aliases::{resolve_class_name, UseAliases};
-use crate::salsa_impl::{Confidence, MagicMemberKind};
+use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
+use crate::salsa_impl::{Confidence, MagicMemberKind, MemberAccessReferenceData};
+use crate::symbol_index::MagicMemberEntry;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -144,7 +146,9 @@ fn classify_call(view: &ClassView, member: &str) -> Option<ClassifiedMember> {
 
 /// A fully resolved + classified member access: the inheritance-resolved
 /// declaring class, the magic kind, and the confidence with which the
-/// receiver was resolved. This is what M4 writes into the M2 scaffold.
+/// receiver was resolved. M4 maps this into a [`MagicMemberEntry`] for the
+/// reverse reference index (it does not persist back into the per-file
+/// `ParsedPatternsData` cache, whose scaffold fields stay the typed contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMemberAccess {
     pub declaring_fqcn: String,
@@ -180,6 +184,69 @@ impl ClassViewCache {
         self.cache.insert(fqcn.to_string(), view.clone());
         view
     }
+}
+
+/// Resolve + classify every property-form member access captured in one file
+/// into ingestible [`MagicMemberEntry`]s for the reverse reference index (M4).
+///
+/// Parses `source` once, then for each captured `member_access_ref` locates the
+/// receiver node by its byte range and runs [`resolve_and_classify`]. Only
+/// sites that resolve at HIGH or MEDIUM confidence are kept — the find-
+/// references threshold — which also prunes the M2 capture firehose down to
+/// real, classifiable usages. Unresolvable receivers and unknown members are
+/// silently dropped.
+///
+/// `classviews` is reused across files by the caller so each model is analyzed
+/// once per build pass.
+pub fn resolve_member_access_entries(
+    source: &str,
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    index: &ClassHierarchyIndex,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Vec<MagicMemberEntry> {
+    if member_refs.is_empty() {
+        return Vec::new();
+    }
+    let Ok(tree) = parse_php(source) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let aliases = extract_use_aliases(&tree, source);
+    let root = tree.root_node();
+
+    let mut out = Vec::new();
+    for m in member_refs {
+        let Some(receiver) =
+            root.descendant_for_byte_range(m.receiver_byte_start, m.receiver_byte_end)
+        else {
+            continue;
+        };
+        let Some(resolved) = resolve_and_classify(
+            receiver,
+            &m.member,
+            AccessForm::Property,
+            bytes,
+            &aliases,
+            index,
+            classviews,
+            project_root,
+        ) else {
+            continue;
+        };
+        // find-references gate: HIGH + MEDIUM (rename will gate to HIGH later).
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            continue;
+        }
+        out.push(MagicMemberEntry {
+            fqcn: resolved.declaring_fqcn,
+            member: m.member.clone(),
+            line: m.line,
+            column: m.column,
+            end_column: m.end_column,
+        });
+    }
+    out
 }
 
 /// Resolve a property-form receiver to its class, then classify `member`

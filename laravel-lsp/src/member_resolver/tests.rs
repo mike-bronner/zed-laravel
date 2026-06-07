@@ -800,3 +800,125 @@ class C {
 "#;
     assert!(resolve_in(&p, caller, "email").is_none());
 }
+
+// ─── Population helper: resolve_member_access_entries (M4) ────────────────
+
+use crate::parser::language_php;
+use crate::queries::extract_all_php_patterns;
+use crate::salsa_impl::MemberAccessReferenceData;
+use crate::symbol_index::MagicMemberEntry;
+use std::sync::Arc;
+
+/// Capture a caller's property-form member accesses as `MemberAccessReferenceData`
+/// (mirrors what `handle_get_patterns` stores), so we can feed the real capture
+/// shape into `resolve_member_access_entries`.
+fn member_refs_of(source: &str) -> Vec<Arc<MemberAccessReferenceData>> {
+    let tree = parse_php(source).expect("parse");
+    let lang = language_php();
+    extract_all_php_patterns(&tree, source, &lang)
+        .expect("extract")
+        .member_accesses
+        .iter()
+        .map(|m| {
+            Arc::new(MemberAccessReferenceData {
+                member: m.member.to_string(),
+                receiver: m.receiver.to_string(),
+                receiver_byte_start: m.receiver_byte_start,
+                receiver_byte_end: m.receiver_byte_end,
+                is_nullsafe: m.is_nullsafe,
+                line: m.row as u32,
+                column: m.column as u32,
+                end_column: m.end_column as u32,
+                declaring_fqcn: None,
+                kind: None,
+                confidence: Confidence::Unresolved,
+            })
+        })
+        .collect()
+}
+
+fn has_entry(entries: &[MagicMemberEntry], fqcn: &str, member: &str) -> bool {
+    entries.iter().any(|e| e.fqcn == fqcn && e.member == member)
+}
+
+#[test]
+fn population_resolves_typed_param_member_accesses() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        $a = $user->email;
+        $b = $user->posts;
+        return [$a, $b];
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "email"),
+        "{entries:?}"
+    );
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "posts"),
+        "{entries:?}"
+    );
+    // Position is carried from the capture (member-name span), not the receiver.
+    let email = entries.iter().find(|e| e.member == "email").unwrap();
+    assert!(email.end_column > email.column);
+}
+
+#[test]
+fn population_drops_unresolvable_receivers() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+function show($mystery) {
+    return $mystery->email;
+}
+"#;
+    let entries = resolve_member_access_entries(
+        caller,
+        &member_refs_of(caller),
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+    );
+    assert!(
+        entries.is_empty(),
+        "unresolvable receiver must not produce an index entry, got {entries:?}"
+    );
+}
+
+#[test]
+fn population_drops_unknown_members_on_resolved_receiver() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    // `$user` resolves to User, but `notAColumn` isn't a known member.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->notAColumn;
+    }
+}
+"#;
+    let entries = resolve_member_access_entries(
+        caller,
+        &member_refs_of(caller),
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+    );
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[test]
+fn population_empty_refs_is_empty() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let entries =
+        resolve_member_access_entries("", &[], &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(entries.is_empty());
+}

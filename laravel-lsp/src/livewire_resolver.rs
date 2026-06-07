@@ -357,16 +357,20 @@ pub fn blade_contains_volt_signature(blade_path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(blade_path) else {
         return false;
     };
-    let lower_window = front_matter_window(&content);
-    if lower_window.contains("Volt\\Component") || lower_window.contains("volt\\component") {
+    source_contains_volt_signature(&content)
+}
+
+/// Same Volt-signature check as [`blade_contains_volt_signature`] but on
+/// already-read source — lets callers that already hold the file contents avoid
+/// a second read.
+pub fn source_contains_volt_signature(content: &str) -> bool {
+    let window = front_matter_window(content);
+    if window.contains("Volt\\Component") || window.contains("volt\\component") {
         return true;
     }
-    for needle in VOLT_FUNCTIONAL_CALLS {
-        if lower_window.contains(needle) {
-            return true;
-        }
-    }
-    false
+    VOLT_FUNCTIONAL_CALLS
+        .iter()
+        .any(|needle| window.contains(needle))
 }
 
 /// Volt files put their PHP in a front-matter block — usually the first few

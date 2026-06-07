@@ -350,3 +350,127 @@ fn blade_relationship_resolves() {
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "posts");
 }
+
+// ---- Volt: volt_property_types -------------------------------------------
+
+#[test]
+fn volt_typed_public_property() {
+    let src = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+
+new class extends Component {
+    public User $user;
+    public ?User $maybe;
+    public int $count = 0;
+};
+?>
+<div>{{ $this->user->email }}</div>
+"#;
+    let types = volt_property_types(src);
+    assert_eq!(
+        types.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    // Nullable still resolves.
+    assert_eq!(
+        types.get("maybe").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+    // Builtins are not classes — excluded.
+    assert!(!types.contains_key("count"), "got {types:?}");
+}
+
+#[test]
+fn volt_functional_mount_assignment() {
+    let src = r#"<?php
+use App\Models\User;
+use function Livewire\Volt\{state, mount};
+
+state(['user']);
+
+mount(function (User $user) {
+    $this->user = $user;
+});
+?>
+<div>{{ $this->user->email }}</div>
+"#;
+    let types = volt_property_types(src);
+    assert_eq!(
+        types.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_class_mount_assignment() {
+    let src = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+
+new class extends Component {
+    public $user;
+    public function mount(User $account) {
+        $this->user = $account;
+    }
+};
+?>
+"#;
+    let types = volt_property_types(src);
+    assert_eq!(
+        types.get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_untyped_state_yields_nothing() {
+    let src = r#"<?php
+use function Livewire\Volt\{state};
+state(['count' => 0]);
+?>
+<div>{{ $count }}</div>
+"#;
+    assert!(volt_property_types(src).is_empty());
+}
+
+// ---- Volt: resolve_volt_member_accesses ----------------------------------
+
+#[test]
+fn volt_resolves_this_property_access() {
+    let p = blade_project();
+    let mut types = HashMap::new();
+    types.insert("user".to_string(), "App\\Models\\User".to_string());
+
+    // `{{ $this->user->email }}` — receiver captured as `$this->user`.
+    let refs = vec![member_ref("$this->user", "email", 5, 18)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(entries[0].member, "email");
+}
+
+#[test]
+fn volt_resolves_bare_public_property_access() {
+    let p = blade_project();
+    let mut types = HashMap::new();
+    types.insert("user".to_string(), "App\\Models\\User".to_string());
+
+    // Public properties are also readable bare in the template: `{{ $user->email }}`.
+    let refs = vec![member_ref("$user", "email", 1, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn volt_unknown_property_is_dropped() {
+    let p = blade_project();
+    let types = HashMap::new(); // nothing inferred
+    let refs = vec![member_ref("$this->user", "email", 1, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    assert!(entries.is_empty(), "got {entries:?}");
+}

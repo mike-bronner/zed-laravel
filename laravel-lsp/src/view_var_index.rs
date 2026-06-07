@@ -23,7 +23,7 @@ use crate::member_resolver::{
 };
 use crate::parser::parse_php;
 use crate::query_chain::flow;
-use crate::query_chain::use_aliases::extract_use_aliases;
+use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
 use crate::salsa_impl::{Confidence, MemberAccessReferenceData};
 use crate::symbol_index::MagicMemberEntry;
 
@@ -282,6 +282,288 @@ fn first_expression(tree: &tree_sitter::Tree) -> Option<Node<'_>> {
         }
     }
     None
+}
+
+// ── Volt component view variables (phase 5) ───────────────────────────────
+//
+// A Volt page (`resources/views/livewire/users.blade.php`) declares its own
+// template variables in a leading `<?php … ?>` front-matter block — there is no
+// external controller. The template reads them as `$this->prop` (and bare
+// `$prop` for public properties). We infer types from the two most reliable
+// shapes: typed public properties (`public User $user;`) and `mount()`
+// typed-parameter assignments (`mount(function (User $u) { $this->u = $u; })` /
+// the class-API `public function mount(User $u) { … }`). Untyped `state([…])`
+// and computed closures are out of scope for this pass.
+
+/// Extract a Volt component's typed view variables (prop name → FQCN) from its
+/// front-matter PHP block. Pure: parses the block + its `use` imports for
+/// qualification. The classify step that needs the class graph is separate
+/// ([`resolve_volt_member_accesses`]).
+pub fn volt_property_types(source: &str) -> HashMap<String, String> {
+    let Some(front) = volt_frontmatter(source) else {
+        return HashMap::new();
+    };
+    let Ok(tree) = parse_php(front) else {
+        return HashMap::new();
+    };
+    let bytes = front.as_bytes();
+    let aliases = extract_use_aliases(&tree, front);
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            // Typed public property — authoritative, so plain `insert`.
+            "property_declaration" if is_public(n, bytes) => {
+                if let (Some(ty), Some(name)) = (
+                    n.child_by_field_name("type"),
+                    property_element_name(n, bytes),
+                ) {
+                    if let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) {
+                        out.insert(name, resolve_class_name(&fqcn, &aliases));
+                    }
+                }
+            }
+            // Class-API `public function mount(User $u) { $this->u = $u; }`.
+            "method_declaration" if method_name_is(n, bytes, "mount") => {
+                collect_mount_assignments(n, bytes, &aliases, &mut out);
+            }
+            // Functional-API `mount(function (User $u) { $this->u = $u; });`.
+            "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
+                if let Some(closure) = first_closure_arg(n) {
+                    collect_mount_assignments(closure, bytes, &aliases, &mut out);
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out
+}
+
+/// Resolve a Volt file's captured member accesses against its inferred property
+/// types. Receivers `$this->prop` and bare `$prop` are typed from `prop_types`;
+/// other shapes (`auth()->user()->email`) fall back to standalone resolution.
+/// Entries land in the same reverse index as PHP/Blade accesses.
+pub fn resolve_volt_member_accesses(
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    prop_types: &HashMap<String, String>,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Vec<MagicMemberEntry> {
+    let mut out: Vec<MagicMemberEntry> = Vec::new();
+    let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+
+    for m in member_refs {
+        let receiver = m.receiver.trim();
+        let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
+            prop_types.get(prop).and_then(|fqcn| {
+                classify_fqcn_member(fqcn, &m.member, resolver, classviews, project_root)
+                    .map(|c| c.declaring_fqcn)
+            })
+        } else {
+            resolve_chain_receiver(receiver, &m.member, resolver, classviews, project_root)
+                .map(|c| c.declaring_fqcn)
+        };
+
+        if let Some(fqcn) = declaring {
+            if seen.insert((fqcn.clone(), m.line, m.column)) {
+                out.push(MagicMemberEntry {
+                    fqcn,
+                    member: m.member.clone(),
+                    line: m.line,
+                    column: m.column,
+                    end_column: m.end_column,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `$this->user` or bare `$user` → `Some("user")`; deeper chains
+/// (`$this->user->profile`) and other shapes → `None`.
+fn volt_base_prop(receiver: &str) -> Option<&str> {
+    if let Some(rest) = receiver.strip_prefix("$this->") {
+        return is_ident(rest).then_some(rest);
+    }
+    bare_variable(receiver)
+}
+
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// The leading `<?php … ?>` front-matter block (closing tag included), or the
+/// rest of the file from `<?php` if there is no closing tag.
+fn volt_frontmatter(source: &str) -> Option<&str> {
+    let start = source.find("<?php")?;
+    let after = &source[start..];
+    match after.find("?>") {
+        Some(end) => Some(&after[..end + 2]),
+        None => Some(after),
+    }
+}
+
+/// True if a `property_declaration` / `method_declaration` carries a `public`
+/// visibility modifier.
+fn is_public(node: Node, bytes: &[u8]) -> bool {
+    let mut c = node.walk();
+    let public = node.children(&mut c).any(|child| {
+        child.kind() == "visibility_modifier"
+            && child
+                .utf8_text(bytes)
+                .map(|t| t == "public")
+                .unwrap_or(false)
+    });
+    public
+}
+
+/// The `$name` (stripped) of a `property_declaration`'s first `property_element`.
+fn property_element_name(node: Node, bytes: &[u8]) -> Option<String> {
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        if child.kind() == "property_element" {
+            return child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(|t| t.trim_start_matches('$').to_string());
+        }
+    }
+    None
+}
+
+fn method_name_is(node: Node, bytes: &[u8], name: &str) -> bool {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        == Some(name)
+}
+
+/// The first `function (...) { … }` / `fn (...) => …` argument of a call.
+fn first_closure_arg(call: Node) -> Option<Node> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut c = args.walk();
+    for arg in args.named_children(&mut c) {
+        let inner = if arg.kind() == "argument" {
+            arg.named_child(0)?
+        } else {
+            arg
+        };
+        if matches!(inner.kind(), "anonymous_function" | "arrow_function") {
+            return Some(inner);
+        }
+    }
+    None
+}
+
+/// Read a `mount` closure/method's typed params, then map every
+/// `$this->prop = $param` assignment in its body to the param's type.
+/// Uses `or_insert` so a typed public property already recorded wins.
+fn collect_mount_assignments(
+    func: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    out: &mut HashMap<String, String>,
+) {
+    // param name → FQCN
+    let mut param_types: HashMap<String, String> = HashMap::new();
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.named_children(&mut c) {
+            if p.kind() != "simple_parameter" {
+                continue;
+            }
+            let (Some(ty), Some(nm)) =
+                (p.child_by_field_name("type"), p.child_by_field_name("name"))
+            else {
+                continue;
+            };
+            let Some(fqcn) = clean_type(ty.utf8_text(bytes).unwrap_or("")) else {
+                continue;
+            };
+            if let Ok(name) = nm.utf8_text(bytes) {
+                param_types.insert(
+                    name.trim_start_matches('$').to_string(),
+                    resolve_class_name(&fqcn, aliases),
+                );
+            }
+        }
+    }
+    if param_types.is_empty() {
+        return;
+    }
+
+    let Some(body) = func.child_by_field_name("body") else {
+        return;
+    };
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "assignment_expression" {
+            if let (Some(left), Some(right)) = (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ) {
+                if let (Some(prop), Some(param)) = (
+                    this_property_name(left, bytes),
+                    plain_variable_name(right, bytes),
+                ) {
+                    if let Some(fqcn) = param_types.get(&param) {
+                        out.entry(prop).or_insert_with(|| fqcn.clone());
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+}
+
+/// `$this->prop` member access → `Some("prop")`.
+fn this_property_name(node: Node, bytes: &[u8]) -> Option<String> {
+    if node.kind() != "member_access_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    if object.kind() != "variable_name" || object.utf8_text(bytes).ok()? != "$this" {
+        return None;
+    }
+    node.child_by_field_name("name")?
+        .utf8_text(bytes)
+        .ok()
+        .map(|t| t.trim_start_matches('$').to_string())
+}
+
+/// A bare `$param` variable node → `Some("param")`.
+fn plain_variable_name(node: Node, bytes: &[u8]) -> Option<String> {
+    (node.kind() == "variable_name")
+        .then(|| node.utf8_text(bytes).ok())
+        .flatten()
+        .map(|t| t.trim_start_matches('$').to_string())
+}
+
+/// Normalize a declared type to a single resolvable class name: strip a leading
+/// `?` (nullable), reject union/intersection (ambiguous), drop the leading `\`,
+/// and reject built-in/pseudo types (which name no class).
+fn clean_type(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches('?').trim();
+    if t.is_empty() || t.contains('|') || t.contains('&') {
+        return None;
+    }
+    let t = t.trim_start_matches('\\');
+    const BUILTINS: &[&str] = &[
+        "int", "float", "string", "bool", "array", "object", "mixed", "void", "null", "false",
+        "true", "iterable", "callable", "self", "static", "parent", "never",
+    ];
+    if BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(t)) {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 /// Extract every `view('name', data)` render site in `source`, resolving each

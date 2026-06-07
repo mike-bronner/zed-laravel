@@ -296,8 +296,15 @@ fn blade_var_resolves_via_view_index() {
     // `{{ $user->email }}` captured at line 3, col 15.
     let refs = vec![member_ref("$user", "email", 3, 15)];
     let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &p.index,
+        &mut cache,
+        &p.root,
+    );
 
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
@@ -317,8 +324,15 @@ fn blade_unknown_member_is_dropped() {
     // `nope` is not a column/accessor/relationship/property on User → dropped.
     let refs = vec![member_ref("$user", "nope", 1, 0)];
     let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &p.index,
+        &mut cache,
+        &p.root,
+    );
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -328,8 +342,15 @@ fn blade_var_with_no_inferred_type_is_dropped() {
     let idx = ViewVarIndex::new(); // empty — nothing rendered this view
     let refs = vec![member_ref("$user", "email", 1, 0)];
     let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &p.index,
+        &mut cache,
+        &p.root,
+    );
     assert!(entries.is_empty(), "got {entries:?}");
 }
 
@@ -344,8 +365,15 @@ fn blade_relationship_resolves() {
     // `{{ $user->posts }}` — relationship read as a property.
     let refs = vec![member_ref("$user", "posts", 2, 4)];
     let mut cache = ClassViewCache::new();
-    let entries =
-        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.show",
+        &idx,
+        &[],
+        &p.index,
+        &mut cache,
+        &p.root,
+    );
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "posts");
@@ -552,7 +580,7 @@ fn volt_resolves_this_property_access() {
     // `{{ $this->user->email }}` — receiver captured as `$this->user`.
     let refs = vec![member_ref("$this->user", "email", 5, 18)];
     let mut cache = ClassViewCache::new();
-    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
     assert_eq!(entries[0].member, "email");
@@ -567,7 +595,7 @@ fn volt_resolves_bare_public_property_access() {
     // Public properties are also readable bare in the template: `{{ $user->email }}`.
     let refs = vec![member_ref("$user", "email", 1, 0)];
     let mut cache = ClassViewCache::new();
-    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root);
     assert_eq!(entries.len(), 1, "got {entries:?}");
     assert_eq!(entries[0].fqcn, "App\\Models\\User");
 }
@@ -578,6 +606,104 @@ fn volt_unknown_property_is_dropped() {
     let types = HashMap::new(); // nothing inferred
     let refs = vec![member_ref("$this->user", "email", 1, 0)];
     let mut cache = ClassViewCache::new();
-    let entries = resolve_volt_member_accesses(&refs, &types, &p.index, &mut cache, &p.root);
+    let entries = resolve_volt_member_accesses(&refs, &types, &[], &p.index, &mut cache, &p.root);
+    assert!(entries.is_empty(), "got {entries:?}");
+}
+
+// ---- MFC / @foreach loop-variable typing ---------------------------------
+
+#[test]
+fn volt_computed_attribute_collection_body_inference() {
+    // `#[Computed] public function users(): Collection { return User::...->get(); }`
+    // — declared return type is a bare Collection, so the element type must come
+    // from the body's flow chain (→ App\Models\User).
+    let src = r#"<?php
+use App\Models\User;
+use Illuminate\Database\Eloquent\Collection;
+use Livewire\Volt\Component;
+new class extends Component {
+    #[Computed]
+    public function users(): Collection {
+        return User::with("roles")->orderBy("name")->get();
+    }
+};
+?>
+"#;
+    assert_eq!(
+        volt_types(src).get("users").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_foreach_loop_var_resolves_from_this_computed() {
+    let p = blade_project();
+    // `users` computed yields User elements.
+    let mut types = HashMap::new();
+    types.insert("users".to_string(), "App\\Models\\User".to_string());
+
+    // `@foreach($this->users as $user)` on line 5; `{{ $user->email }}` on line 7.
+    let loops = vec![crate::salsa_impl::BladeLoopVar {
+        item_var: "user".to_string(),
+        iterable: "$this->users".to_string(),
+        start_line: 5,
+        end_line: 20,
+    }];
+    let refs = vec![member_ref("$user", "email", 7, 40)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root);
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(entries[0].member, "email");
+}
+
+#[test]
+fn blade_foreach_loop_var_resolves_from_view_var() {
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    // Controller passed `users` (a User collection → element type User).
+    idx.insert_file(
+        p.root.join("C.php"),
+        &[render("users.index", &[("users", "App\\Models\\User")])],
+    );
+    // `@foreach($users as $user)` lines 2..10; `{{ $user->email }}` line 4.
+    let loops = vec![crate::salsa_impl::BladeLoopVar {
+        item_var: "user".to_string(),
+        iterable: "$users".to_string(),
+        start_line: 2,
+        end_line: 10,
+    }];
+    let refs = vec![member_ref("$user", "email", 4, 12)];
+    let mut cache = ClassViewCache::new();
+    let entries = resolve_blade_member_accesses(
+        &refs,
+        "users.index",
+        &idx,
+        &loops,
+        &p.index,
+        &mut cache,
+        &p.root,
+    );
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+}
+
+#[test]
+fn loop_var_outside_loop_range_is_dropped() {
+    let p = blade_project();
+    let mut types = HashMap::new();
+    types.insert("users".to_string(), "App\\Models\\User".to_string());
+    let loops = vec![crate::salsa_impl::BladeLoopVar {
+        item_var: "user".to_string(),
+        iterable: "$this->users".to_string(),
+        start_line: 5,
+        end_line: 20,
+    }];
+    // Access on line 30 — outside the loop body → no resolution.
+    let refs = vec![member_ref("$user", "email", 30, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_volt_member_accesses(&refs, &types, &loops, &p.index, &mut cache, &p.root);
     assert!(entries.is_empty(), "got {entries:?}");
 }

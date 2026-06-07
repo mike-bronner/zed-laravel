@@ -2322,6 +2322,43 @@ pub enum MagicMemberKind {
 /// `declaring_fqcn`/`kind` are `None` and `confidence` is
 /// [`Confidence::Unresolved`]. Wiring the index here once keeps M3 a pure
 /// "fill in resolution" diff with no structural churn.
+/// A Blade `@foreach`/`@forelse` loop's item variable + iterable, captured for
+/// magic-member loop-variable typing. `{{ $user->email }}` inside
+/// `@foreach($users as $user)` types `$user` from `$users`' element type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BladeLoopVar {
+    /// Loop value variable, without `$` (`user` from `… as $user`).
+    pub item_var: String,
+    /// Iterable expression, as written (`$users`, `$this->users`, `User::all()`).
+    pub iterable: String,
+    /// 0-based line of the `@foreach`/`@forelse` directive.
+    pub start_line: u32,
+    /// 0-based line of the matching `@endforeach`/`@endforelse`; `u32::MAX` if
+    /// the loop is unclosed (treat as extending to end of file).
+    pub end_line: u32,
+}
+
+/// Extract the `@foreach`/`@forelse` loops worth capturing for loop-variable
+/// typing: those with an iterable and a value variable. The value variable is
+/// the last of the parsed loop variables (`$key => $value` keeps `value`).
+pub fn blade_loop_vars(content: &str) -> Vec<BladeLoopVar> {
+    use crate::blade_loops::{find_loop_blocks, BladeLoopType};
+    find_loop_blocks(content)
+        .into_iter()
+        .filter(|b| matches!(b.loop_type, BladeLoopType::Foreach | BladeLoopType::Forelse))
+        .filter_map(|b| {
+            let iterable = b.iterable?;
+            let item_var = b.variables.last()?.0.clone();
+            Some(BladeLoopVar {
+                item_var,
+                iterable,
+                start_line: b.start_line as u32,
+                end_line: b.end_line.map(|e| e as u32).unwrap_or(u32::MAX),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemberAccessReferenceData {
     /// The accessed member name (`email`, `posts`, `profile`).
@@ -2894,6 +2931,13 @@ pub struct ParsedPatternsData {
     /// one just to check the Volt signature. Always `false` for `.php` files.
     #[serde(default)]
     pub is_volt: bool,
+    /// Blade `@foreach`/`@forelse` loops in this file — item variable, iterable
+    /// expression, and line range. Lets the magic-build type a loop variable
+    /// (`@foreach($users as $user) … {{ $user->email }}`) from its iterable's
+    /// element type without re-reading the file at build time. Captured at parse
+    /// (source in hand). Empty for `.php` files.
+    #[serde(default)]
+    pub blade_loops: Vec<BladeLoopVar>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -5754,6 +5798,11 @@ impl SalsaActor {
             // routes Volt vs. controller-rendered resolution without re-reading.
             is_volt: path_is_blade
                 && crate::livewire_resolver::source_contains_volt_signature(text),
+            blade_loops: if path_is_blade {
+                blade_loop_vars(text)
+            } else {
+                Vec::new()
+            },
             sorted_positions: Vec::new(),
         };
 

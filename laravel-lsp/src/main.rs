@@ -3027,27 +3027,47 @@ async fn build_magic_member_entries(
                 let _permit = permit_owner.acquire_owned().await.ok()?;
                 tokio::task::spawn_blocking(move || {
                     let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-                    // Volt pages declare their own template variables in a
-                    // front-matter `<?php … ?>` block (no external controller),
-                    // so they resolve against extracted component property types
-                    // instead of the view-var index. `is_volt` was captured at
-                    // parse time — only Volt files re-read source (for property
-                    // extraction); controller-rendered Blade (incl. large
-                    // published icon sets) resolves from refs + the view-var
-                    // index with no file read.
-                    let entries = if data.is_volt {
-                        let Ok(source) = std::fs::read_to_string(&path) else {
-                            return None;
-                        };
-                        let prop_types = laravel_lsp::view_var_index::volt_property_types(
-                            &source,
+                    // Establish Volt property context, if any:
+                    //  - SFC: the file's own front-matter (`is_volt`, captured
+                    //    at parse — re-read source to extract props).
+                    //  - MFC: a `$this->`-using template paired with an
+                    //    inline-class `.php` sibling (read the sibling).
+                    // Files with no `$this->` receiver or loop iterable (e.g.
+                    // the ~58k published icon templates) skip both — no read, no
+                    // sibling stat — and resolve via the view-var index.
+                    let volt_props = if data.is_volt {
+                        std::fs::read_to_string(&path).ok().map(|src| {
+                            laravel_lsp::view_var_index::volt_property_types(
+                                &src,
+                                &*class_files,
+                                &mut classviews,
+                                &root,
+                            )
+                        })
+                    } else if data
+                        .member_access_refs
+                        .iter()
+                        .any(|m| m.receiver.starts_with("$this->"))
+                        || data
+                            .blade_loops
+                            .iter()
+                            .any(|l| l.iterable.starts_with("$this->"))
+                    {
+                        laravel_lsp::view_var_index::mfc_volt_property_types(
+                            &path,
                             &*class_files,
                             &mut classviews,
                             &root,
-                        );
+                        )
+                    } else {
+                        None
+                    };
+
+                    let entries = if let Some(prop_types) = volt_props {
                         laravel_lsp::view_var_index::resolve_volt_member_accesses(
                             &data.member_access_refs,
                             &prop_types,
+                            &data.blade_loops,
                             &*class_files,
                             &mut classviews,
                             &root,
@@ -3059,6 +3079,7 @@ async fn build_magic_member_entries(
                             &data.member_access_refs,
                             &view_name,
                             &view_var_index,
+                            &data.blade_loops,
                             &*class_files,
                             &mut classviews,
                             &root,
@@ -5241,6 +5262,7 @@ impl LaravelLanguageServer {
             laravel_lsp::view_var_index::resolve_volt_member_accesses(
                 &patterns.member_access_refs,
                 &prop_types,
+                &patterns.blade_loops,
                 &*class_files,
                 &mut classviews,
                 &root,

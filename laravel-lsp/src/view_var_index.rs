@@ -24,7 +24,7 @@ use crate::member_resolver::{
 use crate::parser::parse_php;
 use crate::query_chain::flow;
 use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
-use crate::salsa_impl::{Confidence, MemberAccessReferenceData};
+use crate::salsa_impl::{BladeLoopVar, Confidence, MemberAccessReferenceData};
 use crate::symbol_index::MagicMemberEntry;
 
 /// One `view('name', …)` render site: the rendered view and the variable →
@@ -173,12 +173,31 @@ pub fn resolve_blade_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     view_name: &str,
     view_index: &ViewVarIndex,
+    blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Vec<MagicMemberEntry> {
     let mut out: Vec<MagicMemberEntry> = Vec::new();
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+
+    // Type a bare `$var` against the view-variable index, falling back to a
+    // `@foreach($collection as $var)` loop where the collection is a view var.
+    let var_types = |var: &str, line: u32| -> Vec<String> {
+        let direct = view_index.var_types(view_name, var);
+        if !direct.is_empty() {
+            return direct;
+        }
+        match enclosing_loop_iterable(blade_loops, var, line) {
+            // `@foreach($users as $user)` — element type is the iterable view
+            // var's type (the flow classifier already yields the model, not
+            // `Collection<T>`).
+            Some(iter) => bare_variable(iter)
+                .map(|iv| view_index.var_types(view_name, iv))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
 
     for m in member_refs {
         let receiver = m.receiver.trim();
@@ -187,8 +206,7 @@ pub fn resolve_blade_member_accesses(
         // can have multiple inferred types (union across render sites), so this
         // may yield more than one entry — each a valid find-references target.
         let declaring: Vec<String> = if let Some(var) = bare_variable(receiver) {
-            view_index
-                .var_types(view_name, var)
+            var_types(var, m.line)
                 .into_iter()
                 .filter_map(|fqcn| {
                     classify_fqcn_member(&fqcn, &m.member, resolver, classviews, project_root)
@@ -359,6 +377,40 @@ pub fn volt_property_types(
                 let temp =
                     render_method_vars(n, bytes, &aliases, resolver, classviews, project_root);
                 fold_or_insert(&mut out, temp);
+            }
+            // `#[Computed] public function users(): Collection { return User::…->get(); }`
+            // A computed property is read in the template as `$this->users`. The
+            // declared return type is often a bare `Collection`, so prefer the
+            // body's inferred type (the flow chain classifier returns the model
+            // for a collection-producing chain — exactly the element type a
+            // `@foreach($this->users as $user)` loop needs); fall back to a
+            // resolvable (non-collection) return type for scalar computeds.
+            "method_declaration" if method_has_attribute(n, bytes, "Computed") => {
+                if let Some(name) = n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(bytes).ok())
+                {
+                    let fqcn = function_return_expr(n)
+                        .and_then(|ret| {
+                            resolve_expression_type(
+                                ret,
+                                bytes,
+                                &aliases,
+                                resolver,
+                                classviews,
+                                project_root,
+                            )
+                            .map(|(f, _)| f)
+                        })
+                        .or_else(|| {
+                            n.child_by_field_name("return_type")
+                                .and_then(|rt| clean_type(rt.utf8_text(bytes).ok()?))
+                                .map(|t| resolve_class_name(&t, &aliases))
+                        });
+                    if let Some(fqcn) = fqcn {
+                        out.entry(name.to_string()).or_insert(fqcn);
+                    }
+                }
             }
             // Functional-API `mount(function (User $u) { $this->u = $u; });`.
             "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
@@ -534,6 +586,27 @@ fn function_return_expr(func: Node) -> Option<Node> {
     None
 }
 
+/// If `blade_path` is a multi-file Volt component — a `.blade.php` template with
+/// no own Volt front-matter but an inline-Livewire-class `.php` sibling (e.g.
+/// `users.blade.php` + `users.php`) — extract the sibling class's component
+/// property types so the template's `$this->prop` and loop variables resolve.
+/// `None` for plain Blade with no Volt sibling. Reads the sibling once.
+pub fn mfc_volt_property_types(
+    blade_path: &Path,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<HashMap<String, String>> {
+    let sibling = crate::livewire_resolver::mfc_sibling(blade_path)?;
+    let source = std::fs::read_to_string(&sibling).ok()?;
+    Some(volt_property_types(
+        &source,
+        resolver,
+        classviews,
+        project_root,
+    ))
+}
+
 /// Resolve a Volt file's captured member accesses against its inferred property
 /// types. Receivers `$this->prop` and bare `$prop` are typed from `prop_types`;
 /// other shapes (`auth()->user()->email`) fall back to standalone resolution.
@@ -541,6 +614,7 @@ fn function_return_expr(func: Node) -> Option<Node> {
 pub fn resolve_volt_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     prop_types: &HashMap<String, String>,
+    blade_loops: &[BladeLoopVar],
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
@@ -551,9 +625,22 @@ pub fn resolve_volt_member_accesses(
     for m in member_refs {
         let receiver = m.receiver.trim();
         let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
-            prop_types.get(prop).and_then(|fqcn| {
+            // Direct prop read (`$this->user`, or a bare public-prop/state read).
+            let direct = prop_types.get(prop).and_then(|fqcn| {
                 classify_fqcn_member(fqcn, &m.member, resolver, classviews, project_root)
                     .map(|c| c.declaring_fqcn)
+            });
+            // Loop fallback: a bare `$user` that isn't a prop but is the item of
+            // `@foreach($this->users as $user)` — type it from the iterable
+            // prop's element type (`users` computed → `User`).
+            direct.or_else(|| {
+                let var = bare_variable(receiver)?;
+                let iter = enclosing_loop_iterable(blade_loops, var, m.line)?;
+                let iter_prop = volt_base_prop(iter)?;
+                prop_types.get(iter_prop).and_then(|fqcn| {
+                    classify_fqcn_member(fqcn, &m.member, resolver, classviews, project_root)
+                        .map(|c| c.declaring_fqcn)
+                })
             })
         } else {
             resolve_chain_receiver(receiver, &m.member, resolver, classviews, project_root)
@@ -573,6 +660,17 @@ pub fn resolve_volt_member_accesses(
         }
     }
     out
+}
+
+/// The iterable expression of the innermost `@foreach` whose item variable is
+/// `var` and whose body contains `line`. Returns the iterable as written
+/// (`$users`, `$this->users`) for the caller to type.
+fn enclosing_loop_iterable<'a>(loops: &'a [BladeLoopVar], var: &str, line: u32) -> Option<&'a str> {
+    loops
+        .iter()
+        .filter(|l| l.item_var == var && line >= l.start_line && line <= l.end_line)
+        .max_by_key(|l| l.start_line) // innermost enclosing loop wins
+        .map(|l| l.iterable.as_str())
 }
 
 /// `$this->user` or bare `$user` → `Some("user")`; deeper chains
@@ -631,6 +729,22 @@ fn method_name_is(node: Node, bytes: &[u8], name: &str) -> bool {
     node.child_by_field_name("name")
         .and_then(|n| n.utf8_text(bytes).ok())
         == Some(name)
+}
+
+/// Whether a `method_declaration` carries an attribute whose name contains
+/// `name` (e.g. `#[Computed]`, `#[Computed(persist: true)]`,
+/// `#[\Livewire\Attributes\Computed]`). A substring check on the attribute list
+/// text is robust to the FQCN and argument variants.
+fn method_has_attribute(node: Node, bytes: &[u8], name: &str) -> bool {
+    let mut c = node.walk();
+    let found = node.children(&mut c).any(|ch| {
+        ch.kind() == "attribute_list"
+            && ch
+                .utf8_text(bytes)
+                .map(|t| t.contains(name))
+                .unwrap_or(false)
+    });
+    found
 }
 
 /// The first `function (...) { … }` / `fn (...) => …` argument of a call.

@@ -58,6 +58,9 @@ pub fn parse_owned_with_hierarchy(
         // Capture Volt-ness once, while the source is in hand, so the
         // magic-build Blade pass needn't re-read the file to check.
         data.is_volt = crate::livewire_resolver::source_contains_volt_signature(text);
+        // Capture `@foreach` loops so the magic build can type loop variables
+        // (`{{ $user->email }}` in `@foreach($users as $user)`) without a read.
+        data.blade_loops = crate::salsa_impl::blade_loop_vars(text);
         let lang = language_blade();
         if let Ok(tree) = parse_blade(text) {
             if let Ok(bp) = extract_all_blade_patterns(&tree, text, &lang) {

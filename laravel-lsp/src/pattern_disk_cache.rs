@@ -68,7 +68,12 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        schema-valid, are NOT re-parsed — so the magic-member index skips all
 ///        Blade/Volt/auth usages and find-references finds only PHP `$this->`
 ///        self-references. Bump forces a re-parse that captures them.
-const SCHEMA_VERSION: u32 = 5;
+///   v6 — Blade `@foreach` loop metadata (`blade_loops`) now captured so a
+///        loop variable (`@foreach($users as $user) … {{ $user->email }}`) can
+///        be typed from its iterable. Caches written before this deserialize it
+///        empty (serde default), so loop-variable usages wouldn't resolve on
+///        restored files; bump to force a re-parse that captures the loops.
+const SCHEMA_VERSION: u32 = 6;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

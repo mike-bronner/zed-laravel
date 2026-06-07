@@ -3233,6 +3233,13 @@ pub enum SalsaRequest {
     SnapshotClassFiles {
         reply: oneshot::Sender<std::collections::HashMap<String, PathBuf>>,
     },
+    /// Snapshot every indexed class grouped by file, so warming can persist
+    /// the hierarchy to the disk cache.
+    SnapshotHierarchyNodes {
+        reply: oneshot::Sender<
+            std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        >,
+    },
     /// Bulk-import resolved magic-member occurrences into the symbol index
     /// (M4). Appends to each path's existing (literal-symbol) entries.
     BulkImportMagicMembers {
@@ -3803,6 +3810,25 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot every indexed class grouped by declaring file, so warming can
+    /// persist the hierarchy to the disk cache (it survives a warm restart
+    /// only if persisted — fresh parses are the sole other populator).
+    pub async fn snapshot_hierarchy_nodes(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        &'static str,
+    > {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotHierarchyNodes { reply: reply_tx })
             .await
             .map_err(|_| "Salsa actor disconnected")?;
         reply_rx
@@ -4803,6 +4829,9 @@ impl SalsaActor {
                 }
                 SalsaRequest::SnapshotClassFiles { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.fqcn_file_map());
+                }
+                SalsaRequest::SnapshotHierarchyNodes { reply } => {
+                    let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
                 }
                 SalsaRequest::BulkImportMagicMembers { entries, reply } => {
                     // Append-only: `build_symbol_index` already inserted this

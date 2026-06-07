@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::class_hierarchy_index::ClassNode;
 use crate::salsa_impl::ParsedPatternsData;
 
 /// Bump this when the cache format changes — old caches are discarded
@@ -57,7 +58,10 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        the warming path. Old caches deserialize them empty (serde
 ///        default), so the magic-member index (M4) would build empty;
 ///        bump to force a re-parse that captures them.
-const SCHEMA_VERSION: u32 = 3;
+///   v4 — class-hierarchy nodes persisted per entry so the hierarchy index
+///        (and the magic-member index built from it) survive a warm restart
+///        instead of being empty until something re-parses.
+const SCHEMA_VERSION: u32 = 4;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 
@@ -80,6 +84,22 @@ struct CachedEntry {
     mtime_secs: u64,
     mtime_nanos: u32,
     patterns: ParsedPatternsData,
+    /// Class-hierarchy nodes declared in this file. Persisted so the
+    /// hierarchy index is restored on a warm start rather than left empty
+    /// until a fresh parse repopulates it. `#[serde(default)]` so a future
+    /// field addition doesn't have to bump the version for this one.
+    #[serde(default)]
+    nodes: Vec<ClassNode>,
+}
+
+/// Outcome of [`load_into`]: how many entries were restored vs dropped, plus
+/// the per-file class-hierarchy nodes of the restored entries (the caller
+/// re-imports these so the hierarchy index isn't empty on a warm start).
+#[derive(Default)]
+pub struct LoadResult {
+    pub restored: usize,
+    pub dropped: usize,
+    pub hierarchy: Vec<(PathBuf, Vec<ClassNode>)>,
 }
 
 /// Where the cache file for `project_root` lives on disk. Returns `None`
@@ -132,13 +152,13 @@ fn read_mtime(path: &Path) -> Option<(u64, u32)> {
 pub fn load_into(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
     project_root: &Path,
-) -> (usize, usize) {
+) -> LoadResult {
     let Some(path) = cache_file_path(project_root) else {
-        return (0, 0);
+        return LoadResult::default();
     };
     let Ok(bytes) = std::fs::read(&path) else {
         // No cache file yet — first-ever startup for this project.
-        return (0, 0);
+        return LoadResult::default();
     };
 
     let cache: CacheFile =
@@ -146,7 +166,7 @@ pub fn load_into(
             Ok((c, _)) => c,
             Err(e) => {
                 tracing::debug!("pattern_disk_cache: decode failed, ignoring: {}", e);
-                return (0, 0);
+                return LoadResult::default();
             }
         };
 
@@ -156,11 +176,10 @@ pub fn load_into(
             cache.schema_version,
             SCHEMA_VERSION
         );
-        return (0, 0);
+        return LoadResult::default();
     }
 
-    let mut restored = 0usize;
-    let mut dropped = 0usize;
+    let mut result = LoadResult::default();
     for (path, entry) in cache.entries {
         // Stat the file. If it's gone, or its mtime differs from the
         // cached value, drop the entry — warming will re-parse it.
@@ -170,15 +189,21 @@ pub fn load_into(
                 // it because it duplicates the Vec data) and insert.
                 let mut patterns = entry.patterns;
                 patterns.build_position_index();
+                // Surface the file's hierarchy nodes so the caller can
+                // re-import them — the index is otherwise empty on a warm
+                // start (no parse runs for disk-restored files).
+                if !entry.nodes.is_empty() {
+                    result.hierarchy.push((path.clone(), entry.nodes));
+                }
                 pattern_cache.insert(path, (0, Arc::new(patterns)));
-                restored += 1;
+                result.restored += 1;
             }
             _ => {
-                dropped += 1;
+                result.dropped += 1;
             }
         }
     }
-    (restored, dropped)
+    result
 }
 
 /// Persist every entry currently in `pattern_cache` to disk, stamped
@@ -190,6 +215,7 @@ pub fn load_into(
 /// failing to persist doesn't break the in-memory cache.
 pub fn save_from(
     pattern_cache: &Arc<DashMap<PathBuf, (i32, Arc<ParsedPatternsData>)>>,
+    hierarchy_by_file: &HashMap<PathBuf, Vec<ClassNode>>,
     project_root: &Path,
 ) -> Result<usize> {
     let cache_path =
@@ -219,6 +245,7 @@ pub fn save_from(
                 mtime_nanos: nanos,
                 // ParsedPatternsData: Clone is cheap (Arc bumps).
                 patterns: (**patterns).clone(),
+                nodes: hierarchy_by_file.get(path).cloned().unwrap_or_default(),
             },
         );
     }

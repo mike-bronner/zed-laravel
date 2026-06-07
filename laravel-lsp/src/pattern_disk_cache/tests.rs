@@ -42,12 +42,13 @@ fn save_then_load_restores_entries() {
     let file = touch(project.path(), "home.blade.php", "<x-foo/>");
     cache.insert(file.clone(), (0, Arc::new(fake_patterns("home"))));
 
-    let saved = save_from(&cache, project.path()).unwrap();
+    let saved = save_from(&cache, &Default::default(), project.path()).unwrap();
     assert_eq!(saved, 1, "save should report one entry written");
 
     // Fresh DashMap simulates a new LSP startup.
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 1);
     assert_eq!(dropped, 0);
 
@@ -62,7 +63,7 @@ fn entry_dropped_when_file_mtime_changes() {
 
     let file = touch(project.path(), "users.blade.php", "<x-bar/>");
     cache.insert(file.clone(), (0, Arc::new(fake_patterns("users"))));
-    save_from(&cache, project.path()).unwrap();
+    save_from(&cache, &Default::default(), project.path()).unwrap();
 
     // Sleep just long enough that the OS records a different mtime,
     // then rewrite the file. Different FSes have different resolutions;
@@ -71,7 +72,8 @@ fn entry_dropped_when_file_mtime_changes() {
     std::fs::write(&file, "<x-baz/>").unwrap();
 
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 0, "stale entry should not be restored");
     assert_eq!(dropped, 1, "stale entry should be counted as dropped");
 }
@@ -83,12 +85,13 @@ fn entry_dropped_when_file_is_deleted() {
 
     let file = touch(project.path(), "gone.blade.php", "<x-foo/>");
     cache.insert(file.clone(), (0, Arc::new(fake_patterns("gone"))));
-    save_from(&cache, project.path()).unwrap();
+    save_from(&cache, &Default::default(), project.path()).unwrap();
 
     std::fs::remove_file(&file).unwrap();
 
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 0);
     assert_eq!(dropped, 1);
 }
@@ -100,11 +103,12 @@ fn unchanged_file_is_restored_after_save() {
 
     let file = touch(project.path(), "kept.blade.php", "<x-foo/>");
     cache.insert(file.clone(), (0, Arc::new(fake_patterns("kept"))));
-    save_from(&cache, project.path()).unwrap();
+    save_from(&cache, &Default::default(), project.path()).unwrap();
 
     // No write between save and load — same mtime, so cache hits.
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 1);
     assert_eq!(dropped, 0);
 }
@@ -113,7 +117,8 @@ fn unchanged_file_is_restored_after_save() {
 fn missing_cache_file_loads_zero() {
     let project = TempDir::new().unwrap();
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 0);
     assert_eq!(dropped, 0);
     assert!(restored_cache.is_empty());
@@ -126,7 +131,7 @@ fn position_index_is_rebuilt_on_load() {
 
     let file = touch(project.path(), "indexed.blade.php", "<x-foo/>");
     cache.insert(file.clone(), (0, Arc::new(fake_patterns("indexed"))));
-    save_from(&cache, project.path()).unwrap();
+    save_from(&cache, &Default::default(), project.path()).unwrap();
 
     let restored_cache = Arc::new(DashMap::new());
     load_into(&restored_cache, project.path());
@@ -153,11 +158,43 @@ fn corrupted_cache_file_loads_zero() {
     std::fs::write(&cache_path, b"not a valid bincode payload at all").unwrap();
 
     let restored_cache = Arc::new(DashMap::new());
-    let (restored, dropped) = load_into(&restored_cache, project.path());
+    let lr = load_into(&restored_cache, project.path());
+    let (restored, dropped) = (lr.restored, lr.dropped);
     assert_eq!(restored, 0, "garbage cache should yield zero entries");
     assert_eq!(
         dropped, 0,
         "garbage isn't counted as dropped — it's not even decoded"
     );
     assert!(restored_cache.is_empty());
+}
+
+#[test]
+fn hierarchy_nodes_survive_save_and_load() {
+    // Regression: the class-hierarchy index must survive a warm restart.
+    // `load_into` should surface the restored files' nodes for re-import.
+    let project = TempDir::new().unwrap();
+    let cache = Arc::new(DashMap::new());
+    let src = "<?php\nnamespace App\\Models;\nclass User {}\n";
+    let file = touch(project.path(), "User.php", src);
+    cache.insert(file.clone(), (0, Arc::new(fake_patterns("x"))));
+
+    let mut hierarchy = std::collections::HashMap::new();
+    hierarchy.insert(
+        file.clone(),
+        crate::class_hierarchy_index::classes_in_file(&file, src),
+    );
+    save_from(&cache, &hierarchy, project.path()).unwrap();
+
+    let restored_cache = Arc::new(DashMap::new());
+    let lr = load_into(&restored_cache, project.path());
+    assert_eq!(lr.restored, 1);
+    let fqcns: Vec<String> = lr
+        .hierarchy
+        .iter()
+        .flat_map(|(_, nodes)| nodes.iter().map(|n| n.fqcn.clone()))
+        .collect();
+    assert!(
+        fqcns.contains(&"App\\Models\\User".to_string()),
+        "hierarchy node should round-trip through the disk cache, got {fqcns:?}"
+    );
 }

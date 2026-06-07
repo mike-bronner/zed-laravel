@@ -44,7 +44,7 @@ use crate::laravel_introspector::walker::{self, PhpMethodInfo, PhpPropertyInfo, 
 use crate::query_chain::use_aliases::{self, UseAliases};
 
 /// A single member (method or property) declaration with its source span.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberDecl {
     pub name: String,
     pub is_static: bool,
@@ -55,7 +55,7 @@ pub struct MemberDecl {
 }
 
 /// One class-like declaration, with inheritance edges resolved to FQCNs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassNode {
     pub fqcn: String,
     pub kind: PhpStructureKind,
@@ -191,6 +191,20 @@ impl ClassHierarchyIndex {
             .iter()
             .map(|(fqcn, node)| (fqcn.clone(), node.file_path.clone()))
             .collect()
+    }
+
+    /// Group every indexed class by its declaring file. Used to persist the
+    /// hierarchy alongside the pattern cache so it survives a warm restart
+    /// (the index is otherwise only populated by fresh parses).
+    pub fn nodes_by_file(&self) -> std::collections::HashMap<PathBuf, Vec<ClassNode>> {
+        let mut map: std::collections::HashMap<PathBuf, Vec<ClassNode>> =
+            std::collections::HashMap::new();
+        for node in self.classes.values() {
+            map.entry(node.file_path.clone())
+                .or_default()
+                .push(node.clone());
+        }
+        map
     }
 
     /// Classes that directly implement `fqcn` (an interface).

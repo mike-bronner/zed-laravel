@@ -50,7 +50,7 @@ pub struct PhpStructure {
     pub properties: Vec<PhpPropertyInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PhpStructureKind {
     Class,
     Interface,

@@ -3737,15 +3737,31 @@ impl LaravelLanguageServer {
         let pattern_cache = self.salsa.pattern_cache();
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
-        let (restored, dropped) = tokio::task::spawn_blocking(move || {
+        let load_result = tokio::task::spawn_blocking(move || {
             laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
         })
         .await
-        .unwrap_or((0, 0));
+        .unwrap_or_default();
+        let (restored, dropped) = (load_result.restored, load_result.dropped);
         if restored + dropped > 0 {
             info!(
                 "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
                 restored, dropped
+            );
+        }
+        // Re-import the restored files' class-hierarchy nodes. Without this the
+        // hierarchy index is empty on a warm start (no parse runs for
+        // disk-restored files), which would leave the magic-member index
+        // (and M5's structural lenses) with nothing to resolve against.
+        if !load_result.hierarchy.is_empty() {
+            let n = self
+                .salsa
+                .bulk_import_hierarchy(load_result.hierarchy)
+                .await
+                .unwrap_or(0);
+            info!(
+                "📐 Class-hierarchy index: {} classes restored from cache",
+                n
             );
         }
 
@@ -3989,8 +4005,16 @@ impl LaravelLanguageServer {
             // completion on it; the save just runs and logs its outcome.
             let cache_for_save = pattern_cache_for_warm.clone();
             let root_for_save_inner = root_for_save.clone();
+            // Snapshot the (now fully populated: restored + freshly parsed)
+            // hierarchy so it's persisted alongside the patterns and survives
+            // the next warm restart.
+            let hierarchy_for_save = salsa.snapshot_hierarchy_nodes().await.unwrap_or_default();
             let save_result = tokio::task::spawn_blocking(move || {
-                laravel_lsp::pattern_disk_cache::save_from(&cache_for_save, &root_for_save_inner)
+                laravel_lsp::pattern_disk_cache::save_from(
+                    &cache_for_save,
+                    &hierarchy_for_save,
+                    &root_for_save_inner,
+                )
             })
             .await;
             match save_result {

@@ -2696,7 +2696,7 @@ pub enum FileReferenceType {
 /// requested symbol when (a) the parser tagged the position as that pattern
 /// kind AND (b) the carried name matches. Random PHP strings that happen to
 /// share the shape are not returned.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolRefData {
     View(String),
     Route(String),
@@ -3306,6 +3306,14 @@ pub enum SalsaRequest {
         include_declaration: bool,
         reply: oneshot::Sender<Vec<ReferenceLocationData>>,
     },
+    /// Count references for a symbol straight from the inverted index — the
+    /// cheap, lazy primitive behind code-lens `resolve` (#59). Unlike
+    /// `FindReferences` it does no dirty-refresh / project walk; it's a direct
+    /// `symbol_index` lookup returning the occurrence count.
+    CountSymbolReferences {
+        symbol: SymbolRefData,
+        reply: oneshot::Sender<usize>,
+    },
     /// Return every project file path the actor currently has registered.
     /// Used by the warming task to compute which files to parse out-of-band.
     ListProjectFiles {
@@ -3840,6 +3848,25 @@ impl SalsaHandle {
             .send(SalsaRequest::FindReferences {
                 symbol,
                 include_declaration,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Count references for `symbol` directly from the inverted index (cheap;
+    /// no project walk). Backs code-lens `resolve`.
+    pub async fn count_symbol_references(
+        &self,
+        symbol: SymbolRefData,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::CountSymbolReferences {
+                symbol,
                 reply: reply_tx,
             })
             .await
@@ -4938,6 +4965,12 @@ impl SalsaActor {
                 } => {
                     let result = self.handle_find_references(&symbol, include_declaration);
                     let _ = reply.send(result);
+                }
+                SalsaRequest::CountSymbolReferences { symbol, reply } => {
+                    // Direct inverted-index lookup — no dirty-refresh or project
+                    // walk (code-lens resolve must stay cheap on large files).
+                    let count = self.symbol_index.find(&symbol).len();
+                    let _ = reply.send(count);
                 }
                 SalsaRequest::ListProjectFiles { reply } => {
                     // User code (the whole non-vendor source bucket, which

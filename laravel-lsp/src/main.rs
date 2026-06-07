@@ -16760,6 +16760,16 @@ impl LanguageServer for LaravelLanguageServer {
                 // pattern kind are returned.
                 references_provider: Some(OneOf::Left(true)),
 
+                // ✅ Code lens — reference-count indicators (#59). Lenses appear
+                // when the user sets `"code_lens": "on"`. Counts are computed
+                // lazily in `code_lens/resolve` to keep the initial response
+                // cheap on large files. Covers the Laravel symbols we index
+                // accurately: magic members, component members, and literal
+                // references (routes/views/…) — what a generic PHP LSP can't.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(true),
+                }),
+
                 // ✅ Rename provider — `textDocument/rename` /
                 // `textDocument/prepareRename`. Phase 2: route names, config
                 // keys, translation keys. Anything that resolves to (or may
@@ -16978,6 +16988,76 @@ impl LanguageServer for LaravelLanguageServer {
 
         info!("Laravel: Shutdown complete");
         Ok(())
+    }
+
+    /// Code lens (#59): emit a reference-count lens above each Laravel symbol we
+    /// count accurately — model magic members (relationships / scopes / public
+    /// properties) and Livewire/Volt component members (`#[Computed]` +
+    /// properties). Counts are deferred to `code_lens_resolve` to keep this
+    /// response cheap; each lens carries its index key in `data`.
+    async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        let Ok(path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        // Prefer the open buffer (reflects unsaved edits); fall back to disk.
+        let source = match self.documents.read().await.get(&uri) {
+            Some((text, _)) => text.clone(),
+            None => match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            },
+        };
+
+        let targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
+        let lenses = targets
+            .into_iter()
+            .map(|t| CodeLens {
+                range: Range {
+                    start: Position {
+                        line: t.line,
+                        character: t.column,
+                    },
+                    end: Position {
+                        line: t.line,
+                        character: t.end_column,
+                    },
+                },
+                command: None,
+                data: serde_json::to_value(&t.symbol).ok(),
+            })
+            .collect();
+        Ok(Some(lenses))
+    }
+
+    /// Fill in a lens's reference count from the inverted index (lazy). Unused
+    /// symbols (0 references) get a distinct marker; #59's warning-diagnostic
+    /// half is emitted separately during validation.
+    async fn code_lens_resolve(&self, mut lens: CodeLens) -> jsonrpc::Result<CodeLens> {
+        let Some(data) = lens.data.clone() else {
+            return Ok(lens);
+        };
+        let Ok(symbol) = serde_json::from_value::<laravel_lsp::salsa_impl::SymbolRefData>(data)
+        else {
+            return Ok(lens);
+        };
+        let count = self
+            .salsa
+            .count_symbol_references(symbol)
+            .await
+            .unwrap_or(0);
+        let title = match count {
+            0 => "⚠ 0 references".to_string(),
+            1 => "1 reference".to_string(),
+            n => format!("{n} references"),
+        };
+        // Display-only lens (no command) — the count is the signal.
+        lens.command = Some(Command {
+            title,
+            command: String::new(),
+            arguments: None,
+        });
+        Ok(lens)
     }
 
     async fn on_type_formatting(
@@ -17657,8 +17737,6 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
-
-    // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
 
     /// Document-symbol request — returns Laravel-aware structure for outline
     /// panels. Delegates the parsing to the Salsa actor which memoizes per file
@@ -20329,9 +20407,6 @@ impl LanguageServer for LaravelLanguageServer {
         })))
     }
 }
-
-// ❌ REMOVED: code_lens helper methods (extract_view_name_from_path, find_all_references_to_view)
-// Zed doesn't support custom LSP commands, so code lens was not functional.
 
 #[cfg(test)]
 mod tests;

@@ -3803,6 +3803,10 @@ impl LaravelLanguageServer {
 
         let salsa = self.salsa.clone();
         let root_for_save = root_path.to_path_buf();
+        // View roots for the warm Blade view-variable resolution (file →
+        // view-name mapping). Cloned here because `view_paths` was moved into
+        // `register_project_files` above.
+        let view_paths_for_warm = config.view_paths.clone();
         // pattern_cache already cloned above for the load step; clone
         // again here so the warming task can (a) skip files already in
         // cache from the load and (b) hand the same map to save_from.
@@ -4048,14 +4052,65 @@ impl LaravelLanguageServer {
             let class_files = salsa.snapshot_class_files().await.unwrap_or_default();
             if !class_files.is_empty() {
                 let class_files = Arc::new(class_files);
+
+                // ── Build the view-variable index (phase 4) ──────────────
+                // Scan non-vendor controllers (PHP files with `view()` calls)
+                // for render sites, resolving each passed variable's type so
+                // Blade member accesses can be typed below. Rebuilt every warm
+                // from re-read source + the just-built hierarchy — never
+                // persisted, so it can't go stale on a warm restart.
+                let view_targets: Vec<PathBuf> = pattern_cache_for_warm
+                    .iter()
+                    .filter(|e| {
+                        !e.key().components().any(|c| c.as_os_str() == "vendor")
+                            && !e.key().to_string_lossy().ends_with(".blade.php")
+                            && !e.value().1.views.is_empty()
+                    })
+                    .map(|e| e.key().clone())
+                    .collect();
+                let mut view_var_index = laravel_lsp::view_var_index::ViewVarIndex::new();
+                {
+                    let vv_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+                    let mut vv_handles = Vec::with_capacity(view_targets.len());
+                    for path in view_targets {
+                        let permit_owner = vv_sem.clone();
+                        let class_files = class_files.clone();
+                        let root = root_for_save.clone();
+                        vv_handles.push(tokio::spawn(async move {
+                            let _permit = permit_owner.acquire_owned().await.ok()?;
+                            tokio::task::spawn_blocking(move || {
+                                let source = std::fs::read_to_string(&path).ok()?;
+                                let mut classviews =
+                                    laravel_lsp::member_resolver::ClassViewCache::new();
+                                let renders = laravel_lsp::view_var_index::view_renders_in_file(
+                                    &source,
+                                    &*class_files,
+                                    &mut classviews,
+                                    &root,
+                                );
+                                (!renders.is_empty()).then_some((path, renders))
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }));
+                    }
+                    for h in vv_handles {
+                        if let Ok(Some((path, renders))) = h.await {
+                            view_var_index.insert_file(path, &renders);
+                        }
+                    }
+                }
+                let view_var_index = Arc::new(view_var_index);
+
+                // ── PHP magic targets ────────────────────────────────────
                 let targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
                     pattern_cache_for_warm
                         .iter()
                         .filter(|e| {
-                            // Blade files are captured but resolved via a
-                            // separate view-variable-inference path (not yet
-                            // wired) — skip them here so the PHP resolver never
-                            // tries to parse a `.blade.php` as PHP.
+                            // Blade is resolved in the dedicated pass below — skip
+                            // it here so the PHP resolver never parses a
+                            // `.blade.php` as PHP (pathologically slow).
                             !e.key().components().any(|c| c.as_os_str() == "vendor")
                                 && !e.key().to_string_lossy().ends_with(".blade.php")
                                 && !e.value().1.member_access_refs.is_empty()
@@ -4067,10 +4122,11 @@ impl LaravelLanguageServer {
                     .map(|(_, d)| d.member_access_refs.len())
                     .sum();
                 info!(
-                    "🪄 magic build inputs: {} classes in snapshot, {} non-vendor targets, {} member accesses",
+                    "🪄 magic build inputs: {} classes in snapshot, {} non-vendor targets, {} member accesses, {} views indexed",
                     class_files.len(),
                     targets.len(),
-                    total_member_accesses
+                    total_member_accesses,
+                    view_var_index.view_count(),
                 );
                 let magic_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
                 let mut magic_handles = Vec::with_capacity(targets.len());
@@ -4105,6 +4161,68 @@ impl LaravelLanguageServer {
                         magic_entries.push(pair);
                     }
                 }
+
+                // ── Blade magic targets (phase 4) ────────────────────────
+                // Resolve each Blade file's captured member accesses against the
+                // view-variable index (no file read or PHP parse needed — the
+                // refs already carry receiver text + outer-file positions). The
+                // resulting entries land in the same reverse index, so a
+                // find-references from PHP (`$this->email`) now surfaces Blade
+                // usages (`{{ $user->email }}`, `{{ auth()->user()->email }}`).
+                let blade_targets: Vec<(
+                    PathBuf,
+                    Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+                )> = pattern_cache_for_warm
+                    .iter()
+                    .filter(|e| {
+                        !e.key().components().any(|c| c.as_os_str() == "vendor")
+                            && e.key().to_string_lossy().ends_with(".blade.php")
+                            && !e.value().1.member_access_refs.is_empty()
+                    })
+                    .map(|e| (e.key().clone(), e.value().1.clone()))
+                    .collect();
+                if !blade_targets.is_empty() {
+                    let view_paths = Arc::new(view_paths_for_warm.clone());
+                    let blade_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+                    let mut blade_handles = Vec::with_capacity(blade_targets.len());
+                    for (path, data) in blade_targets {
+                        let permit_owner = blade_sem.clone();
+                        let class_files = class_files.clone();
+                        let view_var_index = view_var_index.clone();
+                        let view_paths = view_paths.clone();
+                        let root = root_for_save.clone();
+                        blade_handles.push(tokio::spawn(async move {
+                            let _permit = permit_owner.acquire_owned().await.ok()?;
+                            tokio::task::spawn_blocking(move || {
+                                let view_name = laravel_lsp::view_var_index::view_name_for_path(
+                                    &path,
+                                    &view_paths,
+                                )?;
+                                let mut classviews =
+                                    laravel_lsp::member_resolver::ClassViewCache::new();
+                                let entries =
+                                    laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                                        &data.member_access_refs,
+                                        &view_name,
+                                        &view_var_index,
+                                        &*class_files,
+                                        &mut classviews,
+                                        &root,
+                                    );
+                                (!entries.is_empty()).then_some((path, entries))
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }));
+                    }
+                    for h in blade_handles {
+                        if let Ok(Some(pair)) = h.await {
+                            magic_entries.push(pair);
+                        }
+                    }
+                }
+
                 match salsa.bulk_import_magic_members(magic_entries).await {
                     Ok(n) => info!("🪄 Magic-member index: {} entries", n),
                     Err(e) => debug!("Magic-member index build failed: {}", e),

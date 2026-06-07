@@ -3246,6 +3246,16 @@ pub enum SalsaRequest {
         entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
         reply: oneshot::Sender<usize>,
     },
+    /// Re-index a single file's symbols after an edit (instant per-file half of
+    /// the incremental refresh): drop the file's prior keys, re-insert its
+    /// literal symbols from the current pattern cache, then insert the freshly
+    /// resolved magic members. Keeps find-references on the edited file current
+    /// without a project-wide rebuild.
+    ReindexFileMagic {
+        path: PathBuf,
+        entries: Vec<crate::symbol_index::MagicMemberEntry>,
+        reply: oneshot::Sender<()>,
+    },
     /// find-references for the magic member under the cursor (M4): resolve the
     /// `member_access` site at `(line, column)` and return its indexed usages.
     FindMemberReferences {
@@ -3846,6 +3856,28 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::BulkImportMagicMembers {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Re-index a single edited file's symbols (instant per-file refresh):
+    /// evict its prior keys, re-add literals from the pattern cache, then insert
+    /// the freshly resolved magic members.
+    pub async fn reindex_file_magic(
+        &self,
+        path: PathBuf,
+        entries: Vec<crate::symbol_index::MagicMemberEntry>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ReindexFileMagic {
+                path,
                 entries,
                 reply: reply_tx,
             })
@@ -4844,6 +4876,23 @@ impl SalsaActor {
                         self.symbol_index.insert_magic_members(&path, &members);
                     }
                     let _ = reply.send(count);
+                }
+                SalsaRequest::ReindexFileMagic {
+                    path,
+                    entries,
+                    reply,
+                } => {
+                    // Evict the file's prior keys (literals + magic), then
+                    // rebuild: literals from the current pattern cache + the
+                    // freshly resolved magic members. `remove_file` clears both
+                    // kinds, so re-inserting literals here keeps them alive.
+                    self.symbol_index.remove_file(&path);
+                    if let Some(cached) = self.pattern_cache.get(&path) {
+                        let (_, ref patterns) = *cached;
+                        self.symbol_index.insert_file(&path, patterns);
+                    }
+                    self.symbol_index.insert_magic_members(&path, &entries);
+                    let _ = reply.send(());
                 }
                 SalsaRequest::FindMemberReferences {
                     path,

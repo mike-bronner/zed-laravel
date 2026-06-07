@@ -292,3 +292,51 @@ fn remove_file_evicts_magic_members_alongside_literals() {
         })
         .is_empty());
 }
+
+#[test]
+fn reindex_file_replaces_stale_magic_members() {
+    // Mirrors the actor's `ReindexFileMagic` sequence (the instant per-file
+    // incremental refresh): remove_file → re-insert literals → insert fresh
+    // magic. An edit that drops a member must not leave its stale usage behind.
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+
+    idx.insert_file(&path, &fixture("welcome", "home"));
+    idx.insert_magic_members(
+        &path,
+        &[
+            magic("App\\Models\\User", "email", 5),
+            magic("App\\Models\\User", "nickname", 6),
+        ],
+    );
+    assert_eq!(
+        idx.find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\User".into(),
+            member: "nickname".into()
+        })
+        .len(),
+        1
+    );
+
+    // Re-index: the file no longer references `nickname`, but still `email`.
+    idx.remove_file(&path);
+    idx.insert_file(&path, &fixture("welcome", "home"));
+    idx.insert_magic_members(&path, &[magic("App\\Models\\User", "email", 5)]);
+
+    // Stale `nickname` is gone; `email` survives; literals intact; no dupes.
+    assert!(idx
+        .find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\User".into(),
+            member: "nickname".into()
+        })
+        .is_empty());
+    assert_eq!(
+        idx.find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\User".into(),
+            member: "email".into()
+        })
+        .len(),
+        1
+    );
+    assert_eq!(idx.find(&SymbolRefData::View("welcome".into())).len(), 1);
+}

@@ -5586,6 +5586,39 @@ impl SalsaActor {
                     }));
                 }
 
+                // Property-form member accesses inside this Blade region
+                // (`{{ $user->email }}`). Positions are mapped to outer-file
+                // coords; byte ranges stay snippet-local (Blade resolution uses
+                // the receiver text + view-variable inference, not a whole-file
+                // PHP parse).
+                for m in snippet_patterns.member_accesses {
+                    let (line, col) = adjust_inner_position(
+                        m.row as u32,
+                        m.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        m.row as u32,
+                        m.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    member_access_refs.push(Arc::new(MemberAccessReferenceData {
+                        member: m.member.to_string(),
+                        receiver: m.receiver.to_string(),
+                        receiver_byte_start: m.receiver_byte_start,
+                        receiver_byte_end: m.receiver_byte_end,
+                        is_nullsafe: m.is_nullsafe,
+                        line,
+                        column: col,
+                        end_column: end_col,
+                        declaring_fqcn: None,
+                        kind: None,
+                        confidence: Confidence::Unresolved,
+                    }));
+                }
+
                 // Eloquent / DB query builder chains inside this Blade-
                 // embedded PHP region. Snippet-local byte ranges produced by
                 // the extractor reference the `<?php `-wrapped source; shift

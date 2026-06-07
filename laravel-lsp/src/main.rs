@@ -4052,7 +4052,12 @@ impl LaravelLanguageServer {
                     pattern_cache_for_warm
                         .iter()
                         .filter(|e| {
+                            // Blade files are captured but resolved via a
+                            // separate view-variable-inference path (not yet
+                            // wired) — skip them here so the PHP resolver never
+                            // tries to parse a `.blade.php` as PHP.
                             !e.key().components().any(|c| c.as_os_str() == "vendor")
+                                && !e.key().to_string_lossy().ends_with(".blade.php")
                                 && !e.value().1.member_access_refs.is_empty()
                         })
                         .map(|e| (e.key().clone(), e.value().1.clone()))

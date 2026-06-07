@@ -157,18 +157,19 @@ class User {
 }
 
 #[test]
-fn blade_embedded_member_access_is_not_captured() {
-    // M2 deferral: Blade-embedded member access carries snippet-local byte
-    // ranges that don't address the outer file, so it stays uncaptured.
+fn blade_embedded_member_access_is_captured_with_outer_positions() {
+    // Blade view-var inference (phase 1): `{{ $user->email }}` is now captured,
+    // with the member-name position mapped back into outer-file coordinates.
     let path = PathBuf::from("/fixture/resources/views/show.blade.php");
     let src = "<div>{{ $user->email }}</div>\n";
     let data = parse_owned(&path, src);
-    assert!(
-        data.member_access_refs.is_empty(),
-        "Blade-embedded member access is deferred (M2), got {:?}",
-        data.member_access_refs
-            .iter()
-            .map(|m| m.member.clone())
-            .collect::<Vec<_>>()
-    );
+    let email = data
+        .member_access_refs
+        .iter()
+        .find(|m| m.member == "email")
+        .expect("Blade-embedded $user->email should be captured");
+    assert_eq!(email.receiver, "$user");
+    // Outer-file row 0; `email` sits at column 15 in `<div>{{ $user->email }}`.
+    assert_eq!(email.line, 0);
+    assert_eq!(email.column, 15);
 }

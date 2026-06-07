@@ -857,3 +857,39 @@ fn member_access_resolution_fields_round_trip() {
     assert_eq!(back.kind, Some(MagicMemberKind::Scope));
     assert_eq!(back.confidence, Confidence::High);
 }
+
+// ─── Project source-file discovery (magic-member index breadth) ─────────
+
+#[test]
+fn collect_source_files_covers_app_and_views_skips_vendor() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "<?php\n").unwrap();
+        p
+    };
+
+    let model = write("app/Models/User.php");
+    let provider = write("app/Providers/HorizonServiceProvider.php");
+    let volt = write("resources/views/pages/users.php"); // Volt .php page
+    let blade = write("resources/views/welcome.blade.php");
+    let migration = write("database/migrations/2020_create_users.php");
+    let vendor = write("vendor/laravel/framework/User.php"); // excluded
+    let node = write("node_modules/pkg/x.php"); // excluded
+    write("public/app.js"); // non-php, ignored
+
+    let found = collect_source_files(root);
+
+    // Included: app source (all of it), Volt .php under views, Blade, database.
+    for p in [&model, &provider, &volt, &blade, &migration] {
+        assert!(found.contains(p), "expected {p:?} in {found:?}");
+    }
+    // Excluded: vendor + node_modules.
+    assert!(!found.contains(&vendor), "vendor must be skipped");
+    assert!(!found.contains(&node), "node_modules must be skipped");
+}

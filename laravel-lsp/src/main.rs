@@ -3030,12 +3030,15 @@ async fn build_magic_member_entries(
                     // Volt pages declare their own template variables in a
                     // front-matter `<?php … ?>` block (no external controller),
                     // so they resolve against extracted component property types
-                    // instead of the view-var index. One cheap read covers both
-                    // the Volt check and the property extraction.
-                    let source = std::fs::read_to_string(&path).ok()?;
-                    let entries = if laravel_lsp::livewire_resolver::source_contains_volt_signature(
-                        &source,
-                    ) {
+                    // instead of the view-var index. `is_volt` was captured at
+                    // parse time — only Volt files re-read source (for property
+                    // extraction); controller-rendered Blade (incl. large
+                    // published icon sets) resolves from refs + the view-var
+                    // index with no file read.
+                    let entries = if data.is_volt {
+                        let Ok(source) = std::fs::read_to_string(&path) else {
+                            return None;
+                        };
                         let prop_types = laravel_lsp::view_var_index::volt_property_types(
                             &source,
                             &*class_files,

@@ -2886,6 +2886,14 @@ pub struct ParsedPatternsData {
     /// extraction and repopulates.
     #[serde(default)]
     pub member_access_refs: Vec<Arc<MemberAccessReferenceData>>,
+    /// Whether this (Blade) file is a Volt component — captured once at parse
+    /// time (the source is already in hand) so the magic-build's Blade pass can
+    /// route Volt vs. controller-rendered resolution without re-reading the
+    /// file. Critical on projects with large published Blade sets (e.g. Flux's
+    /// ~58k FontAwesome icon templates): without it the pass would open every
+    /// one just to check the Volt signature. Always `false` for `.php` files.
+    #[serde(default)]
+    pub is_volt: bool,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -4563,6 +4571,15 @@ pub struct SalsaActor {
     /// the warming-stage filters (`.json.php` skip, 256KB size cap) to
     /// drop the auto-generated noise.
     vendor_files: Vec<PathBuf>,
+    /// Every non-vendor `*.php` / `*.blade.php` in the project (app/, database/,
+    /// tests/, config/, resources/, routes/, …). The categorized lists above
+    /// only cover controllers + Blade views + routes, which is enough for the
+    /// view/route/livewire navigation features but misses the broad source the
+    /// magic-member reverse index needs — a `$user->email` usage can live in any
+    /// model, service, job, action, or Volt `.php` page. This bucket feeds the
+    /// warm parse so those usages are indexed, not just files the user happens
+    /// to open. Excludes vendor (covered separately) and noise dirs.
+    source_files: Vec<PathBuf>,
 
     /// Root directories captured from the most recent
     /// `register_project_files` call. We retain them so the file-watcher
@@ -4663,6 +4680,7 @@ impl SalsaActor {
                 livewire_files: Vec::new(),
                 route_files: Vec::new(),
                 vendor_files: Vec::new(),
+                source_files: Vec::new(),
                 project_root_paths: ProjectRootPaths::default(),
                 symbol_index: crate::symbol_index::SymbolIndex::default(),
                 class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
@@ -4832,18 +4850,22 @@ impl SalsaActor {
                     let _ = reply.send(result);
                 }
                 SalsaRequest::ListProjectFiles { reply } => {
-                    // Vendor is chained in last so its paths are at the
-                    // tail of the warming spawn order — purely a
-                    // cosmetic choice. User-code paths get parsed first
-                    // when the semaphore frees up, so users see results
-                    // for their own code faster on cold start.
+                    // User code (the whole non-vendor source bucket, which
+                    // supersets the categorized controller/view/livewire/route
+                    // lists) is chained first so it parses first when the
+                    // semaphore frees up; vendor is tailed last. Deduplicated —
+                    // the categorized lists overlap `source_files`, and an
+                    // absolute view path could fall outside the project root.
+                    let mut seen = std::collections::HashSet::new();
                     let paths: Vec<PathBuf> = self
-                        .controller_files
+                        .source_files
                         .iter()
+                        .chain(self.controller_files.iter())
                         .chain(self.view_files.iter())
                         .chain(self.livewire_files.iter())
                         .chain(self.route_files.iter())
                         .chain(self.vendor_files.iter())
+                        .filter(|p| seen.insert((*p).clone()))
                         .cloned()
                         .collect();
                     let _ = reply.send(paths);
@@ -5728,6 +5750,10 @@ impl SalsaActor {
             feature_refs,
             chains,
             member_access_refs,
+            // Captured here (source in hand) so the magic-build Blade pass
+            // routes Volt vs. controller-rendered resolution without re-reading.
+            is_volt: path_is_blade
+                && crate::livewire_resolver::source_contains_volt_signature(text),
             sorted_positions: Vec::new(),
         };
 
@@ -5987,6 +6013,7 @@ impl SalsaActor {
         self.livewire_files.clear();
         self.route_files.clear();
         self.vendor_files.clear();
+        self.source_files.clear();
 
         // Capture the absolute roots we're about to walk so the file-
         // watcher handler can classify Created/Deleted events back into
@@ -6132,6 +6159,13 @@ impl SalsaActor {
                 // handle_get_patterns for the architectural why.
             }
         }
+
+        // Scan the whole project (minus vendor + noise dirs) for every
+        // `*.php` / `*.blade.php`. The categorized scans above cover the
+        // navigation features; this broad bucket feeds the magic-member reverse
+        // index, whose usages can live in any model / service / job / action /
+        // Volt page — not just controllers and Blade views.
+        self.source_files = collect_source_files(&root_path);
 
         // Create the ProjectFiles input
         self.project_files = Some(ProjectFiles::new(
@@ -7001,6 +7035,35 @@ fn extract_view_from_args(args: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Directories never worth walking for project source: dependency trees, VCS
+/// metadata, and runtime/cache output. `vendor` is excluded here because it's
+/// scanned separately (with its own size/noise filters at warm time).
+const SKIP_SCAN_DIRS: &[&str] = &["vendor", "node_modules", ".git", "storage", ".cache"];
+
+/// Collect every non-vendor `*.php` / `*.blade.php` under `root`, skipping
+/// dependency and runtime dirs. Feeds the magic-member reverse index, whose
+/// usages can live in any source file — not just controllers and Blade views.
+/// (`.blade.php` is included because it also ends with `.php`.)
+fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+    use walkdir::WalkDir;
+    let mut out = Vec::new();
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_name()
+                .to_str()
+                .map(|s| !SKIP_SCAN_DIRS.contains(&s))
+                .unwrap_or(true)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".php") {
+            out.push(entry.path().to_path_buf());
+        }
+    }
+    out
 }
 
 /// Append every parser-classified reference in `patterns` that matches `symbol`

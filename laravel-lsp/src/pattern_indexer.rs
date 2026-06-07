@@ -55,6 +55,9 @@ pub fn parse_owned_with_hierarchy(
     // Blade-specific pattern extraction (components, <livewire:…>, directives,
     // and the existing echo→translation special case).
     if is_blade {
+        // Capture Volt-ness once, while the source is in hand, so the
+        // magic-build Blade pass needn't re-read the file to check.
+        data.is_volt = crate::livewire_resolver::source_contains_volt_signature(text);
         let lang = language_blade();
         if let Ok(tree) = parse_blade(text) {
             if let Ok(bp) = extract_all_blade_patterns(&tree, text, &lang) {

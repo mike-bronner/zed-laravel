@@ -213,3 +213,140 @@ fn view_name_longest_root_wins() {
         Some("button".to_string())
     );
 }
+
+// ---- resolve_blade_member_accesses ---------------------------------------
+
+use crate::salsa_impl::{Confidence, MemberAccessReferenceData};
+use std::fs;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+const USER_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    protected $fillable = ['email'];
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+}
+"#;
+
+/// A temp project with `app/Models/User.php` indexed, plus a ready resolver.
+struct BladeProject {
+    _dir: TempDir,
+    index: ClassHierarchyIndex,
+    root: PathBuf,
+}
+
+fn blade_project() -> BladeProject {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    fs::write(&model_path, USER_MODEL).unwrap();
+    fs::write(
+        root.join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mut index = ClassHierarchyIndex::default();
+    index.insert_file(
+        &model_path,
+        crate::class_hierarchy_index::classes_in_file(&model_path, USER_MODEL),
+    );
+    BladeProject {
+        _dir: dir,
+        index,
+        root,
+    }
+}
+
+/// A property-form member-access ref as the capture pass would emit it
+/// (byte ranges unused for the Blade path — only receiver text + position).
+fn member_ref(
+    receiver: &str,
+    member: &str,
+    line: u32,
+    column: u32,
+) -> Arc<MemberAccessReferenceData> {
+    Arc::new(MemberAccessReferenceData {
+        member: member.to_string(),
+        receiver: receiver.to_string(),
+        receiver_byte_start: 0,
+        receiver_byte_end: 0,
+        is_nullsafe: false,
+        line,
+        column,
+        end_column: column + member.len() as u32,
+        declaring_fqcn: None,
+        kind: None,
+        confidence: Confidence::Unresolved,
+    })
+}
+
+#[test]
+fn blade_var_resolves_via_view_index() {
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        p.root.join("app/Http/Controllers/UserController.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+
+    // `{{ $user->email }}` captured at line 3, col 15.
+    let refs = vec![member_ref("$user", "email", 3, 15)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(entries[0].member, "email");
+    assert_eq!(entries[0].line, 3);
+    assert_eq!(entries[0].column, 15);
+}
+
+#[test]
+fn blade_unknown_member_is_dropped() {
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        p.root.join("C.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    // `nope` is not a column/accessor/relationship/property on User → dropped.
+    let refs = vec![member_ref("$user", "nope", 1, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    assert!(entries.is_empty(), "got {entries:?}");
+}
+
+#[test]
+fn blade_var_with_no_inferred_type_is_dropped() {
+    let p = blade_project();
+    let idx = ViewVarIndex::new(); // empty — nothing rendered this view
+    let refs = vec![member_ref("$user", "email", 1, 0)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    assert!(entries.is_empty(), "got {entries:?}");
+}
+
+#[test]
+fn blade_relationship_resolves() {
+    let p = blade_project();
+    let mut idx = ViewVarIndex::new();
+    idx.insert_file(
+        p.root.join("C.php"),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    // `{{ $user->posts }}` — relationship read as a property.
+    let refs = vec![member_ref("$user", "posts", 2, 4)];
+    let mut cache = ClassViewCache::new();
+    let entries =
+        resolve_blade_member_accesses(&refs, "users.show", &idx, &p.index, &mut cache, &p.root);
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(entries[0].member, "posts");
+}

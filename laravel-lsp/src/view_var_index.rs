@@ -13,13 +13,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tree_sitter::Node;
 
-use crate::member_resolver::{resolve_expression_type, ClassFileResolver, ClassViewCache};
+use crate::member_resolver::{
+    classify_member, resolve_expression_type, AccessForm, ClassFileResolver, ClassViewCache,
+    ClassifiedMember,
+};
 use crate::parser::parse_php;
 use crate::query_chain::flow;
 use crate::query_chain::use_aliases::extract_use_aliases;
+use crate::salsa_impl::{Confidence, MemberAccessReferenceData};
+use crate::symbol_index::MagicMemberEntry;
 
 /// One `view('name', …)` render site: the rendered view and the variable →
 /// FQCN types it passes in (only the variables whose type resolved).
@@ -144,6 +150,136 @@ pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String>
             return None;
         }
         return Some(stem.replace(['/', '\\'], "."));
+    }
+    None
+}
+
+/// Resolve the property-form member accesses captured in a Blade file into
+/// magic-member reference entries, using the project-wide view-variable index.
+///
+/// A Blade `{{ $user->email }}` can't be resolved from the `.blade.php` alone —
+/// `$user`'s type comes from whatever controller rendered the view. Given the
+/// file's `view_name`, each bare-`$var` receiver is typed via
+/// [`ViewVarIndex::var_types`] (the union of every render site's inferred type),
+/// then the member is classified against that class's surfaces. Receivers that
+/// aren't plain variables (`auth()->user()->email`, `Auth::user()->email`) are
+/// resolved standalone via the shared receiver resolver — those need no view
+/// context.
+///
+/// Positions come straight from the captured refs (already mapped to outer
+/// Blade-file coordinates by the capture pass), so entries point at the member
+/// name in the `.blade.php`. Sites that don't resolve are dropped.
+pub fn resolve_blade_member_accesses(
+    member_refs: &[Arc<MemberAccessReferenceData>],
+    view_name: &str,
+    view_index: &ViewVarIndex,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Vec<MagicMemberEntry> {
+    let mut out: Vec<MagicMemberEntry> = Vec::new();
+    let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+
+    for m in member_refs {
+        let receiver = m.receiver.trim();
+
+        // Collect every declaring FQCN this access resolves to. A bare `$var`
+        // can have multiple inferred types (union across render sites), so this
+        // may yield more than one entry — each a valid find-references target.
+        let declaring: Vec<String> = if let Some(var) = bare_variable(receiver) {
+            view_index
+                .var_types(view_name, var)
+                .into_iter()
+                .filter_map(|fqcn| {
+                    classify_fqcn_member(&fqcn, &m.member, resolver, classviews, project_root)
+                        .map(|c| c.declaring_fqcn)
+                })
+                .collect()
+        } else {
+            resolve_chain_receiver(receiver, &m.member, resolver, classviews, project_root)
+                .map(|c| vec![c.declaring_fqcn])
+                .unwrap_or_default()
+        };
+
+        for fqcn in declaring {
+            // A single site can map to the same declaring class twice (two
+            // inferred receiver types that share a base declaring the member);
+            // keep one entry per (class, position).
+            if seen.insert((fqcn.clone(), m.line, m.column)) {
+                out.push(MagicMemberEntry {
+                    fqcn,
+                    member: m.member.clone(),
+                    line: m.line,
+                    column: m.column,
+                    end_column: m.end_column,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `$user` → `Some("user")`; anything that isn't a single bare variable
+/// (`auth()->user()`, `$this->user`, …) → `None`.
+fn bare_variable(text: &str) -> Option<&str> {
+    let var = text.strip_prefix('$')?;
+    if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(var)
+    } else {
+        None
+    }
+}
+
+/// Classify `member` (property form) against `fqcn`'s resolved surfaces.
+fn classify_fqcn_member(
+    fqcn: &str,
+    member: &str,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<ClassifiedMember> {
+    let file = resolver.class_file(fqcn)?;
+    let view = classviews.get_or_build(fqcn, &file, project_root)?;
+    classify_member(&view, member, AccessForm::Property)
+}
+
+/// Resolve a non-variable receiver (`auth()->user()`, `Auth::user()`, a chain)
+/// by parsing it as a standalone PHP expression and running the shared receiver
+/// resolver, then classify `member`. Only HIGH/MEDIUM receiver confidence is
+/// accepted — the find-references gate.
+fn resolve_chain_receiver(
+    receiver_text: &str,
+    member: &str,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<ClassifiedMember> {
+    let snippet = format!("<?php {receiver_text};");
+    let tree = parse_php(&snippet).ok()?;
+    let bytes = snippet.as_bytes();
+    let aliases = extract_use_aliases(&tree, &snippet);
+    let expr = first_expression(&tree)?;
+    let (fqcn, confidence) =
+        resolve_expression_type(expr, bytes, &aliases, resolver, classviews, project_root)?;
+    if !matches!(confidence, Confidence::High | Confidence::Medium) {
+        return None;
+    }
+    classify_fqcn_member(&fqcn, member, resolver, classviews, project_root)
+}
+
+/// The expression of the first `expression_statement` in a parsed snippet
+/// (`<?php <expr>;` → the `<expr>` node).
+fn first_expression(tree: &tree_sitter::Tree) -> Option<Node<'_>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "expression_statement" {
+            let mut c = n.walk();
+            return n.named_children(&mut c).next();
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
     }
     None
 }

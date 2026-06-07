@@ -4205,7 +4205,12 @@ impl LaravelLanguageServer {
                                 let source = std::fs::read_to_string(&path).ok()?;
                                 let entries = if laravel_lsp::livewire_resolver::source_contains_volt_signature(&source) {
                                     let prop_types =
-                                        laravel_lsp::view_var_index::volt_property_types(&source);
+                                        laravel_lsp::view_var_index::volt_property_types(
+                                            &source,
+                                            &*class_files,
+                                            &mut classviews,
+                                            &root,
+                                        );
                                     laravel_lsp::view_var_index::resolve_volt_member_accesses(
                                         &data.member_access_refs,
                                         &prop_types,

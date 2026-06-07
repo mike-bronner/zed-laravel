@@ -353,6 +353,18 @@ fn blade_relationship_resolves() {
 
 // ---- Volt: volt_property_types -------------------------------------------
 
+/// Extract Volt prop types. Inline Eloquent values (`User::first()`) resolve via
+/// the flow chain classifier, which needs only the `use` aliases — no on-disk
+/// model — so a default resolver suffices here.
+fn volt_types(src: &str) -> HashMap<String, String> {
+    volt_property_types(
+        src,
+        &ClassHierarchyIndex::default(),
+        &mut ClassViewCache::new(),
+        Path::new("/proj"),
+    )
+}
+
 #[test]
 fn volt_typed_public_property() {
     let src = r#"<?php
@@ -367,7 +379,7 @@ new class extends Component {
 ?>
 <div>{{ $this->user->email }}</div>
 "#;
-    let types = volt_property_types(src);
+    let types = volt_types(src);
     assert_eq!(
         types.get("user").map(String::as_str),
         Some("App\\Models\\User")
@@ -395,7 +407,7 @@ mount(function (User $user) {
 ?>
 <div>{{ $this->user->email }}</div>
 "#;
-    let types = volt_property_types(src);
+    let types = volt_types(src);
     assert_eq!(
         types.get("user").map(String::as_str),
         Some("App\\Models\\User")
@@ -416,7 +428,7 @@ new class extends Component {
 };
 ?>
 "#;
-    let types = volt_property_types(src);
+    let types = volt_types(src);
     assert_eq!(
         types.get("user").map(String::as_str),
         Some("App\\Models\\User")
@@ -431,7 +443,102 @@ state(['count' => 0]);
 ?>
 <div>{{ $count }}</div>
 "#;
-    assert!(volt_property_types(src).is_empty());
+    assert!(volt_types(src).is_empty());
+}
+
+#[test]
+fn volt_state_typed_initial_value() {
+    let src = r#"<?php
+use App\Models\User;
+use function Livewire\Volt\{state};
+state(['user' => User::find(1)]);
+?>
+<div>{{ $user->email }}</div>
+"#;
+    assert_eq!(
+        volt_types(src).get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_computed_explicit_return_type() {
+    let src = r#"<?php
+use App\Models\User;
+use function Livewire\Volt\{computed};
+$user = computed(fn (): User => User::find(1));
+?>
+<div>{{ $this->user->email }}</div>
+"#;
+    assert_eq!(
+        volt_types(src).get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_computed_inferred_from_body() {
+    let src = r#"<?php
+use App\Models\User;
+use function Livewire\Volt\{computed};
+$user = computed(fn () => User::firstWhere('id', 1));
+?>
+<div>{{ $this->user->email }}</div>
+"#;
+    assert_eq!(
+        volt_types(src).get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_with_closure_array() {
+    let src = r#"<?php
+use App\Models\User;
+use function Livewire\Volt\{with};
+with(fn () => ['account' => User::first()]);
+?>
+<div>{{ $account->email }}</div>
+"#;
+    assert_eq!(
+        volt_types(src).get("account").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_class_render_view_data() {
+    let src = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+new class extends Component {
+    public function render() {
+        return view('livewire.users', ['account' => User::first()]);
+    }
+};
+?>
+"#;
+    assert_eq!(
+        volt_types(src).get("account").map(String::as_str),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn volt_typed_property_wins_over_state() {
+    // A typed public prop must not be downgraded by a same-named state entry.
+    let src = r#"<?php
+use App\Models\User;
+use Livewire\Volt\Component;
+new class extends Component {
+    public User $user;
+};
+?>
+"#;
+    assert_eq!(
+        volt_types(src).get("user").map(String::as_str),
+        Some("App\\Models\\User")
+    );
 }
 
 // ---- Volt: resolve_volt_member_accesses ----------------------------------

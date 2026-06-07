@@ -289,17 +289,27 @@ fn first_expression(tree: &tree_sitter::Tree) -> Option<Node<'_>> {
 // A Volt page (`resources/views/livewire/users.blade.php`) declares its own
 // template variables in a leading `<?php … ?>` front-matter block — there is no
 // external controller. The template reads them as `$this->prop` (and bare
-// `$prop` for public properties). We infer types from the two most reliable
-// shapes: typed public properties (`public User $user;`) and `mount()`
-// typed-parameter assignments (`mount(function (User $u) { $this->u = $u; })` /
-// the class-API `public function mount(User $u) { … }`). Untyped `state([…])`
-// and computed closures are out of scope for this pass.
+// `$prop` for public properties / state). We infer types from every reliable
+// shape:
+//   - typed public properties — `public User $user;` (authoritative)
+//   - `mount()` typed-param → `$this->prop` assignment (functional + class)
+//   - `state(['user' => User::first()])` initial-value types
+//   - `$user = computed(fn (): User => …)` / inferred-from-body return type
+//   - `with(fn () => ['posts' => …])` and the class-API `with(): array`
+//   - the class-API `render()` returning `view('…', ['extra' => …])`
+// Typed public properties win over everything inferred. Untyped `state(['x'])`
+// and unresolvable values are simply omitted.
 
 /// Extract a Volt component's typed view variables (prop name → FQCN) from its
-/// front-matter PHP block. Pure: parses the block + its `use` imports for
-/// qualification. The classify step that needs the class graph is separate
-/// ([`resolve_volt_member_accesses`]).
-pub fn volt_property_types(source: &str) -> HashMap<String, String> {
+/// front-matter PHP block. Resolver-aware: value expressions (`User::first()`,
+/// computed bodies, render data) are typed via [`resolve_expression_type`]; the
+/// block's own `use` imports qualify bare type names.
+pub fn volt_property_types(
+    source: &str,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> HashMap<String, String> {
     let Some(front) = volt_frontmatter(source) else {
         return HashMap::new();
     };
@@ -328,10 +338,76 @@ pub fn volt_property_types(source: &str) -> HashMap<String, String> {
             "method_declaration" if method_name_is(n, bytes, "mount") => {
                 collect_mount_assignments(n, bytes, &aliases, &mut out);
             }
+            // Class-API `public function with(): array { return [...]; }`.
+            "method_declaration" if method_name_is(n, bytes, "with") => {
+                if let Some(ret) = function_return_expr(n) {
+                    let mut temp = HashMap::new();
+                    collect_vars(
+                        ret,
+                        bytes,
+                        &aliases,
+                        resolver,
+                        classviews,
+                        project_root,
+                        &mut temp,
+                    );
+                    fold_or_insert(&mut out, temp);
+                }
+            }
+            // Class-API `public function render() { return view('…', [...]); }`.
+            "method_declaration" if method_name_is(n, bytes, "render") => {
+                let temp =
+                    render_method_vars(n, bytes, &aliases, resolver, classviews, project_root);
+                fold_or_insert(&mut out, temp);
+            }
             // Functional-API `mount(function (User $u) { $this->u = $u; });`.
             "function_call_expression" if call_function_name(n, bytes) == Some("mount") => {
                 if let Some(closure) = first_closure_arg(n) {
                     collect_mount_assignments(closure, bytes, &aliases, &mut out);
+                }
+            }
+            // Functional-API `state(['user' => User::first()]);`.
+            "function_call_expression" if call_function_name(n, bytes) == Some("state") => {
+                if let Some(args) = n.child_by_field_name("arguments") {
+                    if let Some(data) = positional_args(args).first() {
+                        let mut temp = HashMap::new();
+                        collect_vars(
+                            *data,
+                            bytes,
+                            &aliases,
+                            resolver,
+                            classviews,
+                            project_root,
+                            &mut temp,
+                        );
+                        fold_or_insert(&mut out, temp);
+                    }
+                }
+            }
+            // Functional-API `with(fn () => ['posts' => Post::all()]);`.
+            "function_call_expression" if call_function_name(n, bytes) == Some("with") => {
+                if let Some(closure) = first_closure_arg(n) {
+                    if let Some(ret) = function_return_expr(closure) {
+                        let mut temp = HashMap::new();
+                        collect_vars(
+                            ret,
+                            bytes,
+                            &aliases,
+                            resolver,
+                            classviews,
+                            project_root,
+                            &mut temp,
+                        );
+                        fold_or_insert(&mut out, temp);
+                    }
+                }
+            }
+            // Functional-API `$user = computed(fn (): User => …);`.
+            "assignment_expression" => {
+                if let Some((var, fqcn)) =
+                    computed_assignment(n, bytes, &aliases, resolver, classviews, project_root)
+                {
+                    out.entry(var).or_insert(fqcn);
                 }
             }
             _ => {}
@@ -342,6 +418,120 @@ pub fn volt_property_types(source: &str) -> HashMap<String, String> {
         }
     }
     out
+}
+
+/// Fold `temp` into `out` without overwriting — keeps authoritative typed
+/// properties ahead of inferred state/computed/with/render types.
+fn fold_or_insert(out: &mut HashMap<String, String>, temp: HashMap<String, String>) {
+    for (k, v) in temp {
+        out.entry(k).or_insert(v);
+    }
+}
+
+/// `$var = computed(fn (): T => …)` → `(var, FQCN)`. Prefers an explicit closure
+/// return type; otherwise infers from the body's returned expression.
+fn computed_assignment(
+    assign: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, String)> {
+    let var = plain_variable_name(assign.child_by_field_name("left")?, bytes)?;
+    let right = assign.child_by_field_name("right")?;
+    if right.kind() != "function_call_expression"
+        || call_function_name(right, bytes) != Some("computed")
+    {
+        return None;
+    }
+    let closure = first_closure_arg(right)?;
+    // Explicit return type wins.
+    if let Some(rt) = closure.child_by_field_name("return_type") {
+        if let Some(t) = rt.utf8_text(bytes).ok().and_then(clean_type) {
+            return Some((var, resolve_class_name(&t, aliases)));
+        }
+    }
+    // Otherwise infer from the returned expression.
+    let ret = function_return_expr(closure)?;
+    let (fqcn, _) =
+        resolve_expression_type(ret, bytes, aliases, resolver, classviews, project_root)?;
+    Some((var, fqcn))
+}
+
+/// The view-data variables of a class-API `render()` returning a `view('…', […])`
+/// call (also folding any chained `->with(...)`).
+fn render_method_vars(
+    method: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> HashMap<String, String> {
+    let Some(ret) = function_return_expr(method) else {
+        return HashMap::new();
+    };
+    let Some(view_call) = find_view_call(ret, bytes) else {
+        return HashMap::new();
+    };
+    render_from_view_call(
+        view_call,
+        bytes,
+        aliases,
+        resolver,
+        classviews,
+        project_root,
+    )
+    .map(|r| r.vars)
+    .unwrap_or_default()
+}
+
+/// The `view('…', …)` call within an expression subtree (the `render()` return),
+/// or `None`.
+fn find_view_call<'t>(node: Node<'t>, bytes: &[u8]) -> Option<Node<'t>> {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_call_expression" && call_function_name(n, bytes) == Some("view") {
+            return Some(n);
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+/// The expression returned by a closure/method `func`: the arrow body directly,
+/// or the first `return <expr>;` in a block body (not descending into nested
+/// functions).
+fn function_return_expr(func: Node) -> Option<Node> {
+    let body = func.child_by_field_name("body")?;
+    if body.kind() != "compound_statement" {
+        return Some(body); // arrow `fn () => <expr>`
+    }
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        // Don't leak into a nested closure's `return`.
+        if n.id() != body.id()
+            && matches!(
+                n.kind(),
+                "anonymous_function" | "arrow_function" | "method_declaration"
+            )
+        {
+            continue;
+        }
+        if n.kind() == "return_statement" {
+            let mut c = n.walk();
+            return n.named_children(&mut c).next();
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
 }
 
 /// Resolve a Volt file's captured member accesses against its inferred property

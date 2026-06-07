@@ -152,3 +152,55 @@ fn fqcn_file_map_maps_each_class_to_its_file() {
     assert_eq!(map.get("App\\Models\\User"), Some(&user_path));
     assert_eq!(map.get("App\\Models\\Post"), Some(&post_path));
 }
+
+// ── Snapshot-invalidation helpers (perf: cached class→file snapshot) ──────
+
+#[test]
+fn fqcns_changed_detects_class_set_changes() {
+    let mut idx = ClassHierarchyIndex::default();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+    let original = r#"<?php
+namespace App\Models;
+class User {
+    public function show() {}
+}
+"#;
+    idx.insert_file(&path, extract("/proj/app/Models/User.php", original));
+
+    // A method-body edit leaves the same class — no mapping change, so the
+    // cached snapshot can stay valid (the common edit stays O(1)).
+    let body_edit = r#"<?php
+namespace App\Models;
+class User {
+    public function show() { return 42; }
+}
+"#;
+    assert!(!idx.fqcns_changed(&path, &extract("/proj/app/Models/User.php", body_edit)));
+
+    // Adding a class to the file changes the set → invalidates.
+    let added_class = r#"<?php
+namespace App\Models;
+class User {}
+class Profile {}
+"#;
+    assert!(idx.fqcns_changed(&path, &extract("/proj/app/Models/User.php", added_class)));
+
+    // A brand-new (unindexed) path with classes is a change.
+    let other = PathBuf::from("/proj/app/Models/Post.php");
+    let post = "<?php\nnamespace App\\Models;\nclass Post {}\n";
+    assert!(idx.fqcns_changed(&other, &extract("/proj/app/Models/Post.php", post)));
+}
+
+#[test]
+fn contains_file_tracks_indexed_paths() {
+    let mut idx = ClassHierarchyIndex::default();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+    assert!(!idx.contains_file(&path));
+    idx.insert_file(
+        &path,
+        extract("/proj/app/Models/User.php", "<?php\nclass User {}\n"),
+    );
+    assert!(idx.contains_file(&path));
+    idx.remove_file(&path);
+    assert!(!idx.contains_file(&path));
+}

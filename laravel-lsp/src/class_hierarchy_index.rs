@@ -234,6 +234,28 @@ impl ClassHierarchyIndex {
         self.classes.len()
     }
 
+    /// Whether `path` currently contributes any indexed classes.
+    pub fn contains_file(&self, path: &Path) -> bool {
+        self.by_file.contains_key(path)
+    }
+
+    /// Whether re-indexing `path` with `nodes` would change its set of declared
+    /// FQCNs (vs. what's currently indexed for that path). The class→file map
+    /// only changes when this is true — a method-body edit that leaves the same
+    /// classes returns `false`, letting callers skip cache invalidation on the
+    /// common edit.
+    pub fn fqcns_changed(&self, path: &Path, nodes: &[ClassNode]) -> bool {
+        let old: HashSet<&str> = match self.by_file.get(path) {
+            Some(v) => v.iter().map(String::as_str).collect(),
+            None => HashSet::new(),
+        };
+        if old.len() != nodes.len() {
+            return true;
+        }
+        let new: HashSet<&str> = nodes.iter().map(|n| n.fqcn.as_str()).collect();
+        old != new
+    }
+
     pub fn indexed_file_count(&self) -> usize {
         self.by_file.len()
     }

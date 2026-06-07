@@ -2888,11 +2888,12 @@ async fn build_magic_member_entries(
     view_paths: &[PathBuf],
     max_concurrent: usize,
 ) -> Vec<(PathBuf, Vec<laravel_lsp::symbol_index::MagicMemberEntry>)> {
+    // `snapshot_class_files` already hands back a shared `Arc` (cached actor-
+    // side), so the per-rebuild full-map clone is gone — just reuse it.
     let class_files = salsa.snapshot_class_files().await.unwrap_or_default();
     if class_files.is_empty() {
         return Vec::new();
     }
-    let class_files = Arc::new(class_files);
     let root = root.to_path_buf();
 
     // ── Pass 1: build the view-variable index ────────────────────────────
@@ -5154,36 +5155,53 @@ impl LaravelLanguageServer {
             Ok(Some(p)) => p,
             _ => return,
         };
+
+        // No member accesses → nothing to resolve. Still re-index with an empty
+        // set so a *removed* last access clears its stale entry; this skips the
+        // class-files snapshot and the resolver entirely (the common edit on a
+        // file with no `->member` reads, e.g. a config or a plain function).
+        if patterns.member_access_refs.is_empty() {
+            let _ = self
+                .salsa
+                .reindex_file_magic(path.to_path_buf(), Vec::new())
+                .await;
+            return;
+        }
+
+        // Controller-rendered Blade needs the project-wide view-variable index —
+        // defer it to the debounced full rebuild. Self-contained Volt resolves
+        // locally below.
+        let is_volt =
+            is_blade && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
+        if is_blade && !is_volt {
+            return;
+        }
+
         let class_files = self.salsa.snapshot_class_files().await.unwrap_or_default();
         if class_files.is_empty() {
             return;
         }
 
         let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
-        let entries = if is_blade {
-            if laravel_lsp::livewire_resolver::source_contains_volt_signature(content) {
-                let prop_types = laravel_lsp::view_var_index::volt_property_types(
-                    content,
-                    &class_files,
-                    &mut classviews,
-                    &root,
-                );
-                laravel_lsp::view_var_index::resolve_volt_member_accesses(
-                    &patterns.member_access_refs,
-                    &prop_types,
-                    &class_files,
-                    &mut classviews,
-                    &root,
-                )
-            } else {
-                // Controller-rendered Blade — defer to the debounced full rebuild.
-                return;
-            }
+        let entries = if is_volt {
+            let prop_types = laravel_lsp::view_var_index::volt_property_types(
+                content,
+                &*class_files,
+                &mut classviews,
+                &root,
+            );
+            laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                &patterns.member_access_refs,
+                &prop_types,
+                &*class_files,
+                &mut classviews,
+                &root,
+            )
         } else {
             laravel_lsp::member_resolver::resolve_member_access_entries(
                 content,
                 &patterns.member_access_refs,
-                &class_files,
+                &*class_files,
                 &mut classviews,
                 &root,
             )
@@ -6548,7 +6566,14 @@ impl LaravelLanguageServer {
             // immediately (instant), then schedule a debounced project-wide
             // reconverge for cross-file ripples (controller→Blade, model→usages).
             self.refresh_file_magic(&path, content).await;
-            self.schedule_magic_rebuild().await;
+            // Volt pages are self-contained — the per-file refresh fully handles
+            // them and nothing else references their variables — so they don't
+            // need the heavier project-wide rebuild.
+            let is_volt_blade = filename.ends_with(".blade.php")
+                && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
+            if !is_volt_blade {
+                self.schedule_magic_rebuild().await;
+            }
         }
 
         // After Salsa update, re-run diagnostics for this file

@@ -3231,7 +3231,7 @@ pub enum SalsaRequest {
     /// Snapshot the `fqcn → declaring file` map for the out-of-actor
     /// magic-member index build (M4).
     SnapshotClassFiles {
-        reply: oneshot::Sender<std::collections::HashMap<String, PathBuf>>,
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, PathBuf>>>,
     },
     /// Snapshot every indexed class grouped by file, so warming can persist
     /// the hierarchy to the disk cache.
@@ -3816,7 +3816,7 @@ impl SalsaHandle {
     /// this owned copy to resolve receivers without borrowing the index.
     pub async fn snapshot_class_files(
         &self,
-    ) -> Result<std::collections::HashMap<String, PathBuf>, &'static str> {
+    ) -> Result<Arc<std::collections::HashMap<String, PathBuf>>, &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
@@ -4586,6 +4586,12 @@ pub struct SalsaActor {
     /// lenses (implementations / usages / overrides / parent) and cross-file
     /// inheritance resolution. See `class_hierarchy_index.rs`.
     class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex,
+    /// Cached class→file map handed to `snapshot_class_files`, shared by `Arc`
+    /// so the hot edit path and the debounced rebuild don't re-clone the whole
+    /// map every call. Set to `None` whenever the hierarchy's FQCN→file mapping
+    /// actually changes (see the invalidation at each mutation site); a typical
+    /// method-body edit leaves it intact so the next snapshot is O(1).
+    class_files_snapshot: Option<Arc<HashMap<String, PathBuf>>>,
 
     // === Service Provider Registry ===
     /// Cached middleware aliases from service provider analysis
@@ -4660,6 +4666,7 @@ impl SalsaActor {
                 project_root_paths: ProjectRootPaths::default(),
                 symbol_index: crate::symbol_index::SymbolIndex::default(),
                 class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
+                class_files_snapshot: None,
                 // Service provider registry
                 sp_middleware_aliases: HashMap::new(),
                 sp_bindings: HashMap::new(),
@@ -4740,7 +4747,10 @@ impl SalsaActor {
                     // correct: there's no future state to refresh
                     // to — the file is gone.
                     self.symbol_index.remove_file(&path);
-                    self.class_hierarchy_index.remove_file(&path);
+                    if self.class_hierarchy_index.contains_file(&path) {
+                        self.class_hierarchy_index.remove_file(&path);
+                        self.class_files_snapshot = None; // hierarchy changed
+                    }
                     let _ = reply.send(());
                 }
 
@@ -4857,10 +4867,19 @@ impl SalsaActor {
                         self.class_hierarchy_index.remove_file(&path);
                         self.class_hierarchy_index.insert_file(&path, nodes);
                     }
+                    // Bulk restore always changes the mapping — drop the cache.
+                    self.class_files_snapshot = None;
                     let _ = reply.send(self.class_hierarchy_index.class_count());
                 }
                 SalsaRequest::SnapshotClassFiles { reply } => {
-                    let _ = reply.send(self.class_hierarchy_index.fqcn_file_map());
+                    // Build once, then hand out cheap `Arc` clones until the
+                    // hierarchy's FQCN→file mapping changes (invalidated below).
+                    if self.class_files_snapshot.is_none() {
+                        let map = self.class_hierarchy_index.fqcn_file_map();
+                        self.class_files_snapshot = Some(Arc::new(map));
+                    }
+                    let snapshot = self.class_files_snapshot.clone().unwrap_or_default();
+                    let _ = reply.send(snapshot);
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
@@ -5527,9 +5546,16 @@ impl SalsaActor {
                 // class is absent from the hierarchy, so magic-member
                 // resolution (`$this->email` → its declaring class) fails.
                 let nodes = crate::class_hierarchy_index::classes_from_tree(path, &tree, text);
+                // Invalidate the cached class→file snapshot only when this
+                // file's set of declared FQCNs actually changed — a method-body
+                // edit leaves it intact, keeping the next snapshot O(1).
+                let mapping_changed = self.class_hierarchy_index.fqcns_changed(path, &nodes);
                 self.class_hierarchy_index.remove_file(path);
                 if !nodes.is_empty() {
                     self.class_hierarchy_index.insert_file(path, nodes);
+                }
+                if mapping_changed {
+                    self.class_files_snapshot = None;
                 }
             }
         } // end if !path_is_blade

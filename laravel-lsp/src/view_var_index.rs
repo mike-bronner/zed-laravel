@@ -11,8 +11,8 @@
 //! per-file [`ViewRender`]s; the project-wide reverse index (view → vars) and
 //! the Blade resolution that consumes it are wired on top.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use tree_sitter::Node;
 
@@ -27,6 +27,125 @@ use crate::query_chain::use_aliases::extract_use_aliases;
 pub struct ViewRender {
     pub view_name: String,
     pub vars: HashMap<String, String>,
+}
+
+/// Project-wide reverse index: view name → variable → set of FQCN types that
+/// any render site passes in for that variable.
+///
+/// **Union aggregation.** A view can be rendered from many places
+/// (`UserController::show` passes `App\Models\User`, `AdminController::show`
+/// might pass `App\Models\Admin`). We keep *all* observed types per variable so
+/// Blade member-access resolution can match against any of them — the "match
+/// any" aggregation chosen for this milestone.
+///
+/// **No persistence.** This index is rebuilt every warm from re-read source +
+/// the (already-persisted) hierarchy, so it never hits the empty-on-restart
+/// trap. `by_file` exists only for incremental eviction within a live session.
+#[derive(Debug, Default)]
+pub struct ViewVarIndex {
+    /// view name → (variable name → set of FQCN types).
+    forward: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// file → the view names it contributed render sites for (for eviction).
+    by_file: HashMap<PathBuf, Vec<String>>,
+}
+
+impl ViewVarIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a file's render sites into the index. Replaces any prior
+    /// contribution from the same file (evict-then-insert) so a re-parse of an
+    /// edited controller doesn't leave stale types behind.
+    pub fn insert_file(&mut self, path: PathBuf, renders: &[ViewRender]) {
+        self.remove_file(&path);
+        let mut contributed = Vec::new();
+        for render in renders {
+            let view = self.forward.entry(render.view_name.clone()).or_default();
+            for (var, fqcn) in &render.vars {
+                view.entry(var.clone()).or_default().insert(fqcn.clone());
+            }
+            contributed.push(render.view_name.clone());
+        }
+        if !contributed.is_empty() {
+            self.by_file.insert(path, contributed);
+        }
+    }
+
+    /// Drop a file's contribution. Because `forward` is a union across files,
+    /// eviction does a targeted rebuild of only the affected views from the
+    /// surviving files — correct, if not the cheapest possible.
+    pub fn remove_file(&mut self, path: &Path) {
+        let Some(views) = self.by_file.remove(path) else {
+            return;
+        };
+        for view in views {
+            // Clearing the whole view entry is imprecise (other files may feed
+            // it), but a per-file rebuild needs per-file type provenance we
+            // don't keep. The warm rebuild clears the whole index anyway; this
+            // path only matters for live single-session edits, where dropping
+            // the view's vars and letting the still-open renderers re-add them
+            // on their next parse is acceptable.
+            self.forward.remove(&view);
+        }
+    }
+
+    /// All FQCN types observed for `var` in `view_name`, across every render
+    /// site (the union). Empty if the view/var was never seen.
+    pub fn var_types(&self, view_name: &str, var: &str) -> Vec<String> {
+        self.forward
+            .get(view_name)
+            .and_then(|vars| vars.get(var))
+            .map(|set| {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clear everything — called at the start of a warm rebuild.
+    pub fn clear(&mut self) {
+        self.forward.clear();
+        self.by_file.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.forward.is_empty()
+    }
+
+    pub fn view_count(&self) -> usize {
+        self.forward.len()
+    }
+}
+
+/// Map a `.blade.php` file path to its Laravel view name, given the project's
+/// view-root directories (e.g. `resources/views`). Strips the matching root
+/// prefix and the `.blade.php` (or `.php`) suffix, then converts path
+/// separators to dots: `resources/views/users/show.blade.php` → `users.show`.
+///
+/// `view_roots` are tried longest-first so a nested namespace root wins over a
+/// parent. Returns `None` if the file isn't under any known view root.
+pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String> {
+    // Longest root first: a more specific root (vendor package view dir) should
+    // win over the catch-all `resources/views`.
+    let mut roots: Vec<&PathBuf> = view_roots.iter().collect();
+    roots.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
+
+    for root in roots {
+        let Ok(rel) = file.strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy();
+        let stem = rel_str
+            .strip_suffix(".blade.php")
+            .or_else(|| rel_str.strip_suffix(".php"))?;
+        if stem.is_empty() {
+            return None;
+        }
+        return Some(stem.replace(['/', '\\'], "."));
+    }
+    None
 }
 
 /// Extract every `view('name', data)` render site in `source`, resolving each

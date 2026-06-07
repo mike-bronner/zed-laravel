@@ -28,9 +28,10 @@ use crate::queries::{
 };
 use crate::salsa_impl::{
     ActionReferenceData, AssetHelperType, AssetReferenceData, BindingReferenceData,
-    ComponentReferenceData, ConfigReferenceData, DirectiveReferenceData, EnvReferenceData,
-    FeatureReferenceData, LivewireReferenceData, MiddlewareReferenceData, ParsedPatternsData,
-    RouteReferenceData, TranslationReferenceData, UrlReferenceData, ViewReferenceData,
+    ComponentReferenceData, Confidence, ConfigReferenceData, DirectiveReferenceData,
+    EnvReferenceData, FeatureReferenceData, LivewireReferenceData, MemberAccessReferenceData,
+    MiddlewareReferenceData, ParsedPatternsData, RouteReferenceData, TranslationReferenceData,
+    UrlReferenceData, ViewReferenceData,
 };
 
 /// Parse a file and return its `ParsedPatternsData` directly. Detects Blade
@@ -288,6 +289,31 @@ fn push_php_patterns(
             column: col,
             end_column: end_col,
         }));
+    }
+
+    // Property-form member accesses (M2 capture). Only for full-file PHP
+    // parses (`offset` is None): the recorded byte ranges must address the
+    // file the M4 resolver re-parses, and Blade-embedded member access is
+    // deferred — same scoping as `handle_get_patterns`. Without this, the
+    // warming path produced `ParsedPatternsData` with no member accesses, so
+    // the magic-member index built empty and find-references found nothing.
+    if offset.is_none() {
+        for m in &snippet.member_accesses {
+            data.member_access_refs
+                .push(Arc::new(MemberAccessReferenceData {
+                    member: m.member.to_string(),
+                    receiver: m.receiver.to_string(),
+                    receiver_byte_start: m.receiver_byte_start,
+                    receiver_byte_end: m.receiver_byte_end,
+                    is_nullsafe: m.is_nullsafe,
+                    line: m.row as u32,
+                    column: m.column as u32,
+                    end_column: m.end_column as u32,
+                    declaring_fqcn: None,
+                    kind: None,
+                    confidence: Confidence::Unresolved,
+                }));
+        }
     }
 }
 

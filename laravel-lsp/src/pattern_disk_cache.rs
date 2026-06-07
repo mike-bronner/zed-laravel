@@ -53,7 +53,11 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        so directive-form references are classified and indexed the
 ///        same as `<livewire:name>` tag form. Old caches lacked these
 ///        entries, breaking goto/hover/rename on the directive form.
-const SCHEMA_VERSION: u32 = 2;
+///   v3 — property-form member accesses (`$user->email`) now populated by
+///        the warming path. Old caches deserialize them empty (serde
+///        default), so the magic-member index (M4) would build empty;
+///        bump to force a re-parse that captures them.
+const SCHEMA_VERSION: u32 = 3;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

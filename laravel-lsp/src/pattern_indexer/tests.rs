@@ -128,3 +128,47 @@ fn returns_empty_for_unparseable_garbage() {
     assert!(data.route_refs.is_empty());
     assert!(data.config_refs.is_empty());
 }
+
+#[test]
+fn warming_path_populates_member_access_refs() {
+    // Regression: the warming path (`parse_owned`/`parse_owned_with_hierarchy`)
+    // must capture property-form member accesses, like the lazy
+    // `handle_get_patterns` path does. Without this, the magic-member index
+    // (M4) builds empty and find-references on `$this->email` finds nothing.
+    let path = PathBuf::from("/fixture/app/Models/User.php");
+    let src = r#"<?php
+namespace App\Models;
+class User {
+    public function gravatar(): string {
+        return md5($this->email);
+    }
+}
+"#;
+    let data = parse_owned(&path, src);
+    let members: Vec<&str> = data
+        .member_access_refs
+        .iter()
+        .map(|m| m.member.as_str())
+        .collect();
+    assert!(
+        members.contains(&"email"),
+        "warming path must capture `$this->email`, got {members:?}"
+    );
+}
+
+#[test]
+fn blade_embedded_member_access_is_not_captured() {
+    // M2 deferral: Blade-embedded member access carries snippet-local byte
+    // ranges that don't address the outer file, so it stays uncaptured.
+    let path = PathBuf::from("/fixture/resources/views/show.blade.php");
+    let src = "<div>{{ $user->email }}</div>\n";
+    let data = parse_owned(&path, src);
+    assert!(
+        data.member_access_refs.is_empty(),
+        "Blade-embedded member access is deferred (M2), got {:?}",
+        data.member_access_refs
+            .iter()
+            .map(|m| m.member.clone())
+            .collect::<Vec<_>>()
+    );
+}

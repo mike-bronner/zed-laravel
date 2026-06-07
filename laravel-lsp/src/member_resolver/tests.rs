@@ -1057,3 +1057,136 @@ class User extends Authenticatable {
         "warm-restart cycle should resolve $this->email; got {entries:?}"
     );
 }
+
+// ─── Auth-aware receiver resolution ──────────────────────────────────────
+
+#[test]
+fn parse_auth_model_resolves_via_use_alias() {
+    let content = r#"<?php
+use App\Models\User;
+return ['providers' => ['users' => ['driver' => 'eloquent', 'model' => User::class]]];
+"#;
+    assert_eq!(
+        parse_auth_model(content).as_deref(),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn parse_auth_model_handles_env_default() {
+    let content = r#"<?php
+use App\Models\User;
+return ['providers' => ['users' => ['model' => env('AUTH_MODEL', User::class)]]];
+"#;
+    assert_eq!(
+        parse_auth_model(content).as_deref(),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn parse_auth_model_handles_fully_qualified() {
+    let content = r#"<?php
+return ['providers' => ['users' => ['model' => \App\Models\Account::class]]];
+"#;
+    assert_eq!(
+        parse_auth_model(content).as_deref(),
+        Some("App\\Models\\Account")
+    );
+}
+
+#[test]
+fn parse_auth_model_ignores_commented_provider() {
+    let content = r#"<?php
+use App\Models\User;
+return ['providers' => [
+    'users' => ['model' => User::class],
+    // 'admins' => ['model' => Admin::class],
+]];
+"#;
+    assert_eq!(
+        parse_auth_model(content).as_deref(),
+        Some("App\\Models\\User")
+    );
+}
+
+#[test]
+fn parse_auth_model_none_when_absent() {
+    assert!(parse_auth_model("<?php return ['guards' => []];").is_none());
+}
+
+/// Temp project with config/auth.php + a User model, indexed. Returns the
+/// dir + index for auth-receiver resolution tests.
+fn auth_project(model_fqcn_class: &str) -> (TempDir, ClassHierarchyIndex) {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("config")).unwrap();
+    fs::write(
+        dir.path().join("config/auth.php"),
+        "<?php\nuse App\\Models\\User;\nreturn ['providers' => ['users' => ['model' => User::class]]];\n",
+    )
+    .unwrap();
+    let user_path = dir.path().join("app/Models/User.php");
+    fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+    let src = format!(
+        "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass {} extends Model {{ protected $fillable = ['email']; }}\n",
+        model_fqcn_class
+    );
+    fs::write(&user_path, &src).unwrap();
+    fs::write(
+        dir.path().join("composer.json"),
+        r#"{ "autoload": { "psr-4": { "App\\": "app/" } } }"#,
+    )
+    .unwrap();
+    let mut index = ClassHierarchyIndex::default();
+    index.insert_file(&user_path, classes_in_file(&user_path, &src));
+    (dir, index)
+}
+
+fn resolve_auth_caller(
+    dir: &TempDir,
+    index: &ClassHierarchyIndex,
+    caller: &str,
+) -> Vec<MagicMemberEntry> {
+    let refs = member_refs_of(caller);
+    resolve_member_access_entries(caller, &refs, index, &mut ClassViewCache::new(), dir.path())
+}
+
+#[test]
+fn resolves_auth_helper_chain() {
+    let (dir, index) = auth_project("User");
+    let entries = resolve_auth_caller(&dir, &index, "<?php\n$x = auth()->user()->email;\n");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "auth()->user()->email should resolve to the auth model; got {entries:?}"
+    );
+}
+
+#[test]
+fn resolves_auth_facade_chain() {
+    let (dir, index) = auth_project("User");
+    let caller = r#"<?php
+use Illuminate\Support\Facades\Auth;
+$x = Auth::user()->email;
+"#;
+    let entries = resolve_auth_caller(&dir, &index, caller);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "Auth::user()->email should resolve; got {entries:?}"
+    );
+}
+
+#[test]
+fn resolves_request_user_helper_chain() {
+    let (dir, index) = auth_project("User");
+    let entries = resolve_auth_caller(&dir, &index, "<?php\n$x = request()->user()->email;\n");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.member == "email" && e.fqcn == "App\\Models\\User"),
+        "request()->user()->email should resolve; got {entries:?}"
+    );
+}

@@ -320,6 +320,14 @@ fn resolve_receiver(
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<(String, Confidence)> {
+    // Auth-helper receivers (`auth()->user()`, `Auth::user()`, `request()->
+    // user()`) resolve to the configured auth user model — checked first
+    // because they're specific call shapes the generic branches below would
+    // otherwise mis-handle.
+    if let Some(resolved) = resolve_auth_user_receiver(receiver, bytes, project_root) {
+        return Some(resolved);
+    }
+
     match receiver.kind() {
         "variable_name" => {
             let raw = receiver.utf8_text(bytes).ok()?;
@@ -341,6 +349,63 @@ fn resolve_receiver(
         // `$obj->method()` — resolve via the method's return type.
         "member_call_expression" | "nullsafe_member_call_expression" => {
             resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve an auth-helper receiver to the configured auth user model:
+/// `auth()->user()`, `request()->user()` (member calls on the `auth()` /
+/// `request()` helpers) and `Auth::user()` (the facade). These are the
+/// dominant way authenticated-user attributes are reached in real code, and
+/// the user model is well-known, so they resolve at HIGH confidence.
+fn resolve_auth_user_receiver(
+    receiver: Node,
+    bytes: &[u8],
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    match receiver.kind() {
+        // `Auth::user()` / `\Illuminate\Support\Facades\Auth::user()`
+        "scoped_call_expression" => {
+            let name = receiver
+                .child_by_field_name("name")?
+                .utf8_text(bytes)
+                .ok()?;
+            if name != "user" {
+                return None;
+            }
+            let scope = receiver
+                .child_by_field_name("scope")?
+                .utf8_text(bytes)
+                .ok()?;
+            let base = scope.rsplit('\\').next().unwrap_or(scope);
+            if base != "Auth" {
+                return None;
+            }
+            auth_model_fqcn(project_root).map(|m| (m, Confidence::High))
+        }
+        // `auth()->user()` / `request()->user()`
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            let name = receiver
+                .child_by_field_name("name")?
+                .utf8_text(bytes)
+                .ok()?;
+            if name != "user" {
+                return None;
+            }
+            let object = receiver.child_by_field_name("object")?;
+            if object.kind() != "function_call_expression" {
+                return None;
+            }
+            let func = object
+                .child_by_field_name("function")?
+                .utf8_text(bytes)
+                .ok()?;
+            if func == "auth" || func == "request" {
+                auth_model_fqcn(project_root).map(|m| (m, Confidence::High))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -623,6 +688,87 @@ fn file_namespace(node: Node, bytes: &[u8]) -> Option<String> {
             if let Some(nn) = name_node {
                 return nn.utf8_text(bytes).ok().map(str::to_string);
             }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
+/// The configured auth user model FQCN for `project_root`, parsed from
+/// `config/auth.php`'s `providers.users.model`. Memoized per project root for
+/// the process lifetime — the auth model effectively never changes during a
+/// session, so we don't re-read the file on every receiver resolution.
+///
+/// (If `config/auth.php` is edited mid-session the cached value goes stale
+/// until restart — an acceptable tradeoff for a value this stable.)
+fn auth_model_fqcn(project_root: &Path) -> Option<String> {
+    static MEMO: once_cell::sync::Lazy<std::sync::Mutex<HashMap<PathBuf, Option<String>>>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    if let Ok(memo) = MEMO.lock() {
+        if let Some(cached) = memo.get(project_root) {
+            return cached.clone();
+        }
+    }
+    let resolved = std::fs::read_to_string(project_root.join("config/auth.php"))
+        .ok()
+        .and_then(|content| parse_auth_model(&content));
+    if let Ok(mut memo) = MEMO.lock() {
+        memo.insert(project_root.to_path_buf(), resolved.clone());
+    }
+    resolved
+}
+
+/// Extract `providers.users.model` from `config/auth.php` source. Resolves the
+/// class reference (`User::class`, `env('AUTH_MODEL', User::class)`, or a
+/// fully-qualified `\App\Models\User::class`) through the file's `use` aliases.
+/// Tree-sitter parsing means commented-out providers are ignored. Returns the
+/// first `'model'` entry in source order — the default user provider.
+fn parse_auth_model(content: &str) -> Option<String> {
+    let tree = parse_php(content).ok()?;
+    let bytes = content.as_bytes();
+    let aliases = extract_use_aliases(&tree, content);
+
+    let mut best: Option<(usize, String)> = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "array_element_initializer" {
+            let mut c = n.walk();
+            let kids: Vec<_> = n.named_children(&mut c).collect();
+            if kids.len() == 2 {
+                let key = kids[0].utf8_text(bytes).ok()?.trim_matches(['\'', '"']);
+                if key == "model" {
+                    if let Some(class_ref) = first_class_const(kids[1], bytes) {
+                        let fqcn = resolve_class_name(&class_ref, &aliases)
+                            .trim_start_matches('\\')
+                            .to_string();
+                        let pos = n.start_byte();
+                        if best.as_ref().is_none_or(|(p, _)| pos < *p) {
+                            best = Some((pos, fqcn));
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    best.map(|(_, fqcn)| fqcn)
+}
+
+/// First `X::class` class reference in `node`'s subtree → the class name `X`
+/// (handles both a bare `User::class` and one wrapped in `env(..., User::class)`).
+fn first_class_const(node: Node, bytes: &[u8]) -> Option<String> {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "class_constant_access_expression" {
+            let scope = n.named_child(0)?;
+            return scope.utf8_text(bytes).ok().map(str::to_string);
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {

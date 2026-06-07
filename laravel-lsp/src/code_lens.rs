@@ -2,15 +2,15 @@
 //!
 //! Given an open PHP/Blade file, enumerate the *declaration* sites of symbols
 //! whose references this server counts accurately — model magic members
-//! (relationships, scopes, public properties) and Livewire/Volt component
-//! members (`#[Computed]` methods + public properties). Each target carries the
-//! [`SymbolRefData`] key the reverse index counts by; the LSP `code_lens`
-//! handler turns these into lenses and `code_lens/resolve` fills in the count.
+//! (relationships, scopes, accessors, public properties) and Livewire/Volt
+//! component members (`#[Computed]` methods + public properties). Each target
+//! carries the [`SymbolRefData`] key the reverse index counts by; the LSP
+//! `code_lens` handler turns these into lenses and `code_lens/resolve` fills in
+//! the count.
 //!
 //! Deliberately scoped to accurately-counted symbols: plain method *calls* and
 //! class references aren't indexed, so they get no lens (a generic PHP LSP
-//! covers those). Accessors and Laravel literal definitions (routes/views/…)
-//! are follow-ups.
+//! covers those). Laravel literal definitions (routes/views/…) are a follow-up.
 
 use std::path::Path;
 
@@ -132,6 +132,8 @@ fn model_targets(source: &str) -> Vec<CodeLensTarget> {
                 if let Some((name, line, col, end)) = name_position(n, bytes) {
                     if let Some(usage) = scope_usage_name(&name) {
                         out.push(target(&fqcn, &usage, line, col, end));
+                    } else if let Some(usage) = accessor_usage_name(n, &name, bytes) {
+                        out.push(target(&fqcn, &usage, line, col, end));
                     } else if method_is_relationship(n, bytes) {
                         out.push(target(&fqcn, &name, line, col, end));
                     }
@@ -173,6 +175,37 @@ fn scope_usage_name(method: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}{}", first.to_ascii_lowercase(), chars.as_str()))
+}
+
+/// The attribute name an accessor method exposes, matching the reverse index's
+/// keying (`getFullNameAttribute` / `fullName(): Attribute` → `full_name`), or
+/// `None` if the method isn't an accessor. Mirrors `chain::compute_accessors`.
+fn accessor_usage_name(method: Node, name: &str, bytes: &[u8]) -> Option<String> {
+    use crate::laravel_introspector::model_metadata::pascal_to_snake;
+    // Old-style: `get{Middle}Attribute`.
+    if let Some(middle) = name
+        .strip_prefix("get")
+        .and_then(|s| s.strip_suffix("Attribute"))
+    {
+        if !middle.is_empty() {
+            return Some(pascal_to_snake(middle));
+        }
+    }
+    // New-style: any method returning `Attribute` (possibly namespaced/nullable).
+    let returns_attribute = method
+        .child_by_field_name("return_type")
+        .and_then(|rt| rt.utf8_text(bytes).ok())
+        .map(|t| {
+            t.trim()
+                .trim_start_matches('?')
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
+                .trim()
+                == "Attribute"
+        })
+        .unwrap_or(false);
+    returns_attribute.then(|| pascal_to_snake(name))
 }
 
 /// True if a method body calls an Eloquent relationship factory

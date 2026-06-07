@@ -111,3 +111,36 @@ class UserController {
     // No relationships/scopes/public-props → no lenses (plain method skipped).
     assert!(targets.is_empty(), "got {targets:?}");
 }
+
+#[test]
+fn model_accessors_old_and_new_style() {
+    let src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+class User extends \Illuminate\Database\Eloquent\Model {
+    public function getFullNameAttribute() { return $this->first.' '.$this->last; }
+    public function displayName(): Attribute { return Attribute::make(fn () => $this->name); }
+}
+"#;
+    let targets = code_lens_targets(Path::new("/proj/app/Models/User.php"), src);
+    let k = keys(&targets);
+    // Old-style getFullNameAttribute → `full_name`; new-style displayName(): Attribute → `display_name`.
+    assert!(
+        k.contains(&("App\\Models\\User", "full_name")),
+        "old-style accessor, got {k:?}"
+    );
+    assert!(
+        k.contains(&("App\\Models\\User", "display_name")),
+        "new-style accessor, got {k:?}"
+    );
+    // The lens anchors on the method name, not the derived attribute.
+    let acc = targets
+        .iter()
+        .find(|t| matches!(&t.symbol, SymbolRefData::MagicMember { member, .. } if member == "full_name"))
+        .unwrap();
+    let line = src.lines().nth(acc.line as usize).unwrap();
+    assert_eq!(
+        acc.column,
+        line.find("getFullNameAttribute").unwrap() as u32
+    );
+}

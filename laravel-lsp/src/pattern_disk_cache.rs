@@ -61,7 +61,14 @@ use crate::salsa_impl::ParsedPatternsData;
 ///   v4 — class-hierarchy nodes persisted per entry so the hierarchy index
 ///        (and the magic-member index built from it) survive a warm restart
 ///        instead of being empty until something re-parses.
-const SCHEMA_VERSION: u32 = 4;
+///   v5 — Blade-embedded member accesses (`{{ $user->email }}`,
+///        `{{ auth()->user()->email }}`) are now captured into
+///        `member_access_refs` for `.blade.php` files. Caches written before
+///        this restore Blade entries with empty refs (serde default) and, being
+///        schema-valid, are NOT re-parsed — so the magic-member index skips all
+///        Blade/Volt/auth usages and find-references finds only PHP `$this->`
+///        self-references. Bump forces a re-parse that captures them.
+const SCHEMA_VERSION: u32 = 5;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

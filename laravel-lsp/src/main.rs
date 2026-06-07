@@ -12133,6 +12133,30 @@ return [
     // ========================================================================
 
     /// Create LocationLink for a view reference from Salsa data
+    /// find-references for a magic member under the cursor. Asks the actor to
+    /// resolve the cursor's `member_access` site to its declaring class +
+    /// member, then return every indexed usage of that key. `None` when the
+    /// cursor isn't on a resolvable magic member or it has no usages.
+    async fn magic_member_references(
+        &self,
+        file_path: &std::path::Path,
+        position: Position,
+    ) -> Option<Vec<Location>> {
+        let locs = self
+            .salsa
+            .find_member_references(file_path.to_path_buf(), position.line, position.character)
+            .await
+            .ok()?;
+        if locs.is_empty() {
+            return None;
+        }
+        Some(
+            locs.into_iter()
+                .filter_map(|l| reference_location_to_lsp(&l))
+                .collect(),
+        )
+    }
+
     async fn create_view_location_from_salsa(
         &self,
         view: &ViewReferenceData,
@@ -17272,7 +17296,9 @@ impl LanguageServer for LaravelLanguageServer {
         .await
         {
             Some(s) => s,
-            None => return Ok(None),
+            // Not a literal-symbol site — try a magic member (`$user->email`),
+            // resolved via the M3 engine + reverse index (M4).
+            None => return Ok(self.magic_member_references(&file_path, position).await),
         };
 
         let include_declaration = params.context.include_declaration;

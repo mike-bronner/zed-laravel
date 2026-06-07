@@ -3239,6 +3239,14 @@ pub enum SalsaRequest {
         entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
         reply: oneshot::Sender<usize>,
     },
+    /// find-references for the magic member under the cursor (M4): resolve the
+    /// `member_access` site at `(line, column)` and return its indexed usages.
+    FindMemberReferences {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Vec<ReferenceLocationData>>,
+    },
 
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
@@ -3813,6 +3821,31 @@ impl SalsaHandle {
         self.sender
             .send(SalsaRequest::BulkImportMagicMembers {
                 entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// find-references for the magic member under the cursor (M4). The actor
+    /// resolves the `member_access` site at `(line, column)` to its declaring
+    /// class + member, then returns every indexed usage of that key. Empty
+    /// when the cursor isn't on a resolvable magic member.
+    pub async fn find_member_references(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Vec<ReferenceLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FindMemberReferences {
+                path,
+                line,
+                column,
                 reply: reply_tx,
             })
             .await
@@ -4782,6 +4815,15 @@ impl SalsaActor {
                         self.symbol_index.insert_magic_members(&path, &members);
                     }
                     let _ = reply.send(count);
+                }
+                SalsaRequest::FindMemberReferences {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_find_member_references(&path, line, column);
+                    let _ = reply.send(result);
                 }
 
                 // === Service Provider Handlers ===
@@ -6104,6 +6146,68 @@ impl SalsaActor {
     /// freezes the actor long enough that Zed times out the LSP and
     /// resets the connection — a stale-but-live answer beats a dead
     /// server every time.
+    /// Resolve the magic member under the cursor and return its indexed usages
+    /// (M4). The cursor-side resolution runs here, not in
+    /// `classify_pattern_at_cursor`, because it needs the live parse tree plus
+    /// the actor-owned class-hierarchy index.
+    fn handle_find_member_references(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Vec<ReferenceLocationData> {
+        let Some(patterns) = self.handle_get_patterns(path) else {
+            return Vec::new();
+        };
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return Vec::new(),
+        };
+        let Some(project_root) = self.config_root.clone() else {
+            return Vec::new();
+        };
+
+        // In-memory source for the cursor file (reflects unsaved edits).
+        self.ensure_file_registered(path);
+        let Some(file) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let text = file.text(&self.db).clone();
+
+        let Ok(tree) = crate::parser::parse_php(&text) else {
+            return Vec::new();
+        };
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+        let Some(receiver) = tree.root_node().descendant_for_byte_range(
+            member_ref.receiver_byte_start,
+            member_ref.receiver_byte_end,
+        ) else {
+            return Vec::new();
+        };
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let Some(resolved) = crate::member_resolver::resolve_and_classify(
+            receiver,
+            &member_ref.member,
+            crate::member_resolver::AccessForm::Property,
+            bytes,
+            &aliases,
+            &self.class_hierarchy_index,
+            &mut classviews,
+            &project_root,
+        ) else {
+            return Vec::new();
+        };
+        // find-references threshold: HIGH + MEDIUM.
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            return Vec::new();
+        }
+        self.symbol_index.find(&SymbolRefData::MagicMember {
+            fqcn: resolved.declaring_fqcn,
+            member: member_ref.member.clone(),
+        })
+    }
+
     fn handle_find_references(
         &mut self,
         symbol: &SymbolRefData,

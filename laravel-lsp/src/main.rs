@@ -1842,6 +1842,10 @@ struct LaravelLanguageServer {
     pending_rescans: Arc<RwLock<HashSet<RescanType>>>,
     /// Handle for the rescan debounce timer
     rescan_debounce_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the debounced full magic-member index rebuild. Coalesces
+    /// rapid edits into one project-wide reconverge (the "full" half of the
+    /// hybrid incremental refresh; the per-file refresh is the "instant" half).
+    magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// File existence cache with TTL (path -> (exists, cached_at))
     /// This avoids blocking I/O in async context for file_exists checks
     file_exists_cache: Arc<RwLock<HashMap<PathBuf, (bool, Instant)>>>,
@@ -2856,6 +2860,15 @@ use laravel_lsp::livewire_resolver::{
     blade_contains_inline_class, extract_blade_variable_at_cursor, mfc_sibling,
 };
 
+/// Debounce window for the project-wide magic-member reconverge (the "full"
+/// half of the hybrid incremental refresh). Long enough that a burst of
+/// keystrokes coalesces into one rebuild after the user pauses.
+const MAGIC_REBUILD_DEBOUNCE_MS: u64 = 1500;
+
+/// Parallelism cap for the magic-member resolution passes when rebuilding
+/// incrementally (mirrors the warm build's `MAX_CONCURRENT_PARSES`).
+const MAX_CONCURRENT_MAGIC_PARSES: usize = 8;
+
 /// Resolve the magic-member reference entries for the whole project from the
 /// current pattern cache. Runs the three resolution passes — controller
 /// view-variable index, PHP member accesses, Blade/Volt member accesses — in
@@ -3723,6 +3736,7 @@ impl LaravelLanguageServer {
             cache: Arc::new(RwLock::new(None)),
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
+            magic_rebuild_handle: Arc::new(RwLock::new(None)),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
             cached_livewire: Arc::new(RwLock::new(None)),
@@ -5114,6 +5128,137 @@ impl LaravelLanguageServer {
         *self.rescan_debounce_handle.write().await = Some(handle);
     }
 
+    /// Instant per-file magic-member refresh after an edit (the "instant" half
+    /// of the hybrid incremental refresh). Re-resolves just the edited file's
+    /// member accesses against the current hierarchy and replaces its entries in
+    /// the reverse index, so find-references on that file is current
+    /// immediately — without waiting for the debounced project-wide rebuild.
+    ///
+    /// Handles PHP files and self-contained Volt pages. Controller-rendered
+    /// Blade needs the project-wide view-variable index (it must know which
+    /// controllers feed this view), so it is left to the debounced full rebuild.
+    async fn refresh_file_magic(&self, path: &Path, content: &str) {
+        let path_str = path.to_string_lossy();
+        // `.blade.php` also ends with `.php`, so this covers both.
+        if !path_str.ends_with(".php") {
+            return;
+        }
+        let is_blade = path_str.ends_with(".blade.php");
+        let Some(root) = self.root_path.read().await.clone() else {
+            return;
+        };
+
+        // Fresh parsed patterns for the edited file. `get_patterns` also updates
+        // the class hierarchy for this file, so its own class is resolvable.
+        let patterns = match self.salsa.get_patterns(path.to_path_buf()).await {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+        let class_files = self.salsa.snapshot_class_files().await.unwrap_or_default();
+        if class_files.is_empty() {
+            return;
+        }
+
+        let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+        let entries = if is_blade {
+            if laravel_lsp::livewire_resolver::source_contains_volt_signature(content) {
+                let prop_types = laravel_lsp::view_var_index::volt_property_types(
+                    content,
+                    &class_files,
+                    &mut classviews,
+                    &root,
+                );
+                laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                    &patterns.member_access_refs,
+                    &prop_types,
+                    &class_files,
+                    &mut classviews,
+                    &root,
+                )
+            } else {
+                // Controller-rendered Blade — defer to the debounced full rebuild.
+                return;
+            }
+        } else {
+            laravel_lsp::member_resolver::resolve_member_access_entries(
+                content,
+                &patterns.member_access_refs,
+                &class_files,
+                &mut classviews,
+                &root,
+            )
+        };
+
+        if let Err(e) = self
+            .salsa
+            .reindex_file_magic(path.to_path_buf(), entries)
+            .await
+        {
+            debug!("Per-file magic refresh failed for {}: {}", path_str, e);
+        }
+    }
+
+    /// Schedule the debounced project-wide magic-member reconverge (the "full"
+    /// half of the hybrid refresh). Coalesces rapid edits: each call cancels the
+    /// previous pending rebuild and starts a fresh timer, so cross-file ripples
+    /// (controller→Blade, model→usages) reconverge once the user pauses.
+    async fn schedule_magic_rebuild(&self) {
+        if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
+            handle.abort();
+        }
+        let server = self.clone_for_spawn();
+        let handle = tokio::spawn(async move {
+            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+            server.rebuild_magic_index_full().await;
+        });
+        *self.magic_rebuild_handle.write().await = Some(handle);
+    }
+
+    /// Re-resolve the whole project's magic-member reverse index from the
+    /// current pattern cache. Reuses the exact warm-build passes via
+    /// [`build_magic_member_entries`]; `build_symbol_index` clears the index
+    /// first (literals + magic) so the append below can't duplicate.
+    ///
+    /// Gated on project size: on very large projects the full reconverge is too
+    /// heavy to run per edit-settle, so it is skipped and the per-file refresh
+    /// remains the only incremental path there.
+    async fn rebuild_magic_index_full(&self) {
+        let Some(root) = self.root_path.read().await.clone() else {
+            return;
+        };
+        let view_paths = match self.cached_config.read().await.as_ref() {
+            Some(c) => c.view_paths.clone(),
+            None => return,
+        };
+        let pattern_cache = self.salsa.pattern_cache();
+
+        const MAX_FULL_REBUILD_FILES: usize = 15_000;
+        if pattern_cache.len() > MAX_FULL_REBUILD_FILES {
+            debug!(
+                "🪄 Project too large ({} files) — skipping debounced full magic rebuild; per-file refresh only",
+                pattern_cache.len()
+            );
+            return;
+        }
+
+        if let Err(e) = self.salsa.build_symbol_index().await {
+            debug!("Symbol index rebuild failed: {}", e);
+            return;
+        }
+        let entries = build_magic_member_entries(
+            &self.salsa,
+            &pattern_cache,
+            &root,
+            &view_paths,
+            MAX_CONCURRENT_MAGIC_PARSES,
+        )
+        .await;
+        match self.salsa.bulk_import_magic_members(entries).await {
+            Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
+            Err(e) => debug!("Magic reconverge failed: {}", e),
+        }
+    }
+
     /// Execute all pending rescans
     async fn execute_pending_rescans(&self) {
         let pending: Vec<RescanType> = self.pending_rescans.write().await.drain().collect();
@@ -6398,6 +6543,12 @@ impl LaravelLanguageServer {
             {
                 debug!("Failed to update source file in Salsa: {}", e);
             }
+
+            // Hybrid incremental magic-member refresh: re-resolve this file
+            // immediately (instant), then schedule a debounced project-wide
+            // reconverge for cross-file ripples (controller→Blade, model→usages).
+            self.refresh_file_magic(&path, content).await;
+            self.schedule_magic_rebuild().await;
         }
 
         // After Salsa update, re-run diagnostics for this file
@@ -13864,6 +14015,7 @@ return [
             cache: self.cache.clone(),
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
+            magic_rebuild_handle: self.magic_rebuild_handle.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
             cached_livewire: self.cached_livewire.clone(),

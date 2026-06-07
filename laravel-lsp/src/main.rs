@@ -4057,6 +4057,16 @@ impl LaravelLanguageServer {
                         })
                         .map(|e| (e.key().clone(), e.value().1.clone()))
                         .collect();
+                let total_member_accesses: usize = targets
+                    .iter()
+                    .map(|(_, d)| d.member_access_refs.len())
+                    .sum();
+                info!(
+                    "🪄 magic build inputs: {} classes in snapshot, {} non-vendor targets, {} member accesses",
+                    class_files.len(),
+                    targets.len(),
+                    total_member_accesses
+                );
                 let magic_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
                 let mut magic_handles = Vec::with_capacity(targets.len());
                 for (path, data) in targets {

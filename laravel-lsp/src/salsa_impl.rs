@@ -5470,6 +5470,18 @@ impl SalsaActor {
                 for chain in crate::query_chain::extract_chains(&tree, text) {
                     chains.push(Arc::new(chain));
                 }
+
+                // Keep the class-hierarchy index current for this file. The
+                // on-demand parse path (did_open / edits / cache misses) is the
+                // ONLY populator for files warming skipped because they were
+                // already cached — without this, an open/edited model's own
+                // class is absent from the hierarchy, so magic-member
+                // resolution (`$this->email` → its declaring class) fails.
+                let nodes = crate::class_hierarchy_index::classes_from_tree(path, &tree, text);
+                self.class_hierarchy_index.remove_file(path);
+                if !nodes.is_empty() {
+                    self.class_hierarchy_index.insert_file(path, nodes);
+                }
             }
         } // end if !path_is_blade
 

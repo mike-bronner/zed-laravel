@@ -4014,6 +4014,64 @@ impl LaravelLanguageServer {
                 hierarchy_classes
             );
 
+            // Build the magic-member reverse index (M4): resolve each
+            // non-vendor file's captured property-form member accesses against
+            // the now-complete class hierarchy and ingest the results. Runs in
+            // a throttled parallel pass — like the parse above — then
+            // bulk-imports, so the actor is never blocked. Vendor files are
+            // skipped: a magic member's *usages* live in app code + Blade, not
+            // in framework/package source.
+            let class_files = salsa.snapshot_class_files().await.unwrap_or_default();
+            if !class_files.is_empty() {
+                let class_files = Arc::new(class_files);
+                let targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+                    pattern_cache_for_warm
+                        .iter()
+                        .filter(|e| {
+                            !e.key().components().any(|c| c.as_os_str() == "vendor")
+                                && !e.value().1.member_access_refs.is_empty()
+                        })
+                        .map(|e| (e.key().clone(), e.value().1.clone()))
+                        .collect();
+                let magic_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+                let mut magic_handles = Vec::with_capacity(targets.len());
+                for (path, data) in targets {
+                    let permit_owner = magic_sem.clone();
+                    let class_files = class_files.clone();
+                    let root = root_for_save.clone();
+                    magic_handles.push(tokio::spawn(async move {
+                        let _permit = permit_owner.acquire_owned().await.ok()?;
+                        tokio::task::spawn_blocking(move || {
+                            let source = std::fs::read_to_string(&path).ok()?;
+                            let mut classviews =
+                                laravel_lsp::member_resolver::ClassViewCache::new();
+                            let entries =
+                                laravel_lsp::member_resolver::resolve_member_access_entries(
+                                    &source,
+                                    &data.member_access_refs,
+                                    &*class_files,
+                                    &mut classviews,
+                                    &root,
+                                );
+                            (!entries.is_empty()).then_some((path, entries))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }));
+                }
+                let mut magic_entries = Vec::with_capacity(magic_handles.len());
+                for h in magic_handles {
+                    if let Ok(Some(pair)) = h.await {
+                        magic_entries.push(pair);
+                    }
+                }
+                match salsa.bulk_import_magic_members(magic_entries).await {
+                    Ok(n) => info!("🪄 Magic-member index: {} entries", n),
+                    Err(e) => debug!("Magic-member index build failed: {}", e),
+                }
+            }
+
             let elapsed = started_at.elapsed();
             info!(
                 "🔥 Laravel: pattern cache warmed ({} newly parsed, {} from disk, total {}, in {:?})",

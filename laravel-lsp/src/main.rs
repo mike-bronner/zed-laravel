@@ -12920,11 +12920,48 @@ return [
     /// for `Command` subclasses. Mirrors `rebuild_migration_index` — the
     /// (blocking) walk runs off the async runtime, then the index is swapped in.
     async fn rebuild_command_index(&self, root: &Path) {
-        let root = root.to_path_buf();
-        let index = tokio::task::spawn_blocking(move || build_command_index(&root)).await;
+        // Cold start: restore the disk-cached index immediately so
+        // goto-definition/hover on command strings work without waiting for
+        // the full project+vendor walk below. Only on a cold index (None) —
+        // file-watcher rebuilds already have a live index and skip this. The
+        // full build that follows corrects any drift (added/removed commands
+        // while the LSP was off) and re-saves the cache.
+        if self.command_index.read().await.is_none() {
+            let root_for_load = root.to_path_buf();
+            if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
+                laravel_lsp::command_disk_cache::load_index(&root_for_load)
+            })
+            .await
+            {
+                info!(
+                    "🗄️  Command index: restored {} commands from disk cache",
+                    cached.len()
+                );
+                *self.command_index.write().await = Some(cached);
+            }
+        }
+
+        let root_buf = root.to_path_buf();
+        let index = tokio::task::spawn_blocking(move || build_command_index(&root_buf)).await;
         match index {
             Ok(index) => {
                 info!("🎛️  Command index built: {} commands", index.len());
+
+                // Persist the freshly built index so the next cold start can
+                // skip the walk. Advisory — a save failure doesn't affect the
+                // live in-memory index.
+                let to_save = index.clone();
+                let root_for_save = root.to_path_buf();
+                let saved = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::command_disk_cache::save_index(&to_save, &root_for_save)
+                })
+                .await;
+                match saved {
+                    Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} commands", n),
+                    Ok(Err(e)) => debug!("Command disk cache save failed: {}", e),
+                    Err(e) => debug!("Command disk cache save task panicked: {}", e),
+                }
+
                 *self.command_index.write().await = Some(index);
             }
             Err(e) => {

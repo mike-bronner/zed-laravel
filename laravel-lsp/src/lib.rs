@@ -19,6 +19,7 @@ pub mod cache_manager;
 pub mod class_locator;
 pub mod class_rename;
 pub mod command_call_locator;
+pub mod command_disk_cache;
 pub mod command_index;
 pub mod command_signature;
 pub mod completion_format;

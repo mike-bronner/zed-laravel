@@ -10,7 +10,9 @@
 //! Built once at init and refreshed when a relevant `Command` file changes
 //! (mirrors [`crate::migration_index`]). The walk is regex-gated — a file is
 //! only fully parsed when it actually `extends ...Command`, so the cost of
-//! scanning a large `vendor/` tree stays bounded to real command classes.
+//! scanning a large `vendor/` tree stays bounded to real command classes. The
+//! built index is persisted by [`crate::command_disk_cache`] so a cold restart
+//! can restore it instantly instead of re-walking the whole tree.
 //!
 //! ## Priority (AC: app overrides framework/package)
 //!
@@ -40,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::command_signature::{extends_console_command, extract_command_signature};
@@ -47,7 +50,7 @@ use crate::command_signature::{extends_console_command, extract_command_signatur
 /// Source tier of a command declaration. Higher wins when two classes declare
 /// the same command name (`App` overrides a `Package` which overrides the
 /// `Framework`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CommandPriority {
     /// Shipped by `laravel/framework` itself (`vendor/laravel/framework/`).
     Framework = 0,
@@ -60,7 +63,7 @@ pub enum CommandPriority {
 /// One Artisan command discovered on a `Command` subclass, resolved to its
 /// declaration site. `class_name` powers the hover summary; the position fields
 /// point at the `$signature` string content so goto lands on the declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandEntry {
     /// The resolvable command name (`emails:send`).
     pub name: String,
@@ -100,6 +103,27 @@ impl CommandIndex {
 
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
+    }
+
+    /// Every resolved command declaration, in arbitrary order. Used by the
+    /// on-disk cache to persist the index.
+    pub fn entries(&self) -> impl Iterator<Item = &CommandEntry> {
+        self.commands.values()
+    }
+
+    /// Insert one resolved command declaration, applying the priority merge:
+    /// the new entry replaces an existing one for the same command name only
+    /// when it ranks strictly higher (App > Package > Framework). A same-tier
+    /// duplicate leaves the first-inserted winner in place. This is the single
+    /// place the override rule lives — both the project walk and the disk-cache
+    /// restore funnel through here.
+    pub fn insert_entry(&mut self, entry: CommandEntry) {
+        match self.commands.get(&entry.name) {
+            Some(existing) if existing.priority >= entry.priority => {}
+            _ => {
+                self.commands.insert(entry.name.clone(), entry);
+            }
+        }
     }
 }
 
@@ -179,8 +203,8 @@ pub fn index_command_file(index: &mut CommandIndex, path: &Path, content: &str) 
     };
 
     let priority = classify_priority(path);
-    let entry = CommandEntry {
-        name: sig.name.clone(),
+    index.insert_entry(CommandEntry {
+        name: sig.name,
         class_name,
         raw_signature: sig.raw_signature,
         file: path.to_path_buf(),
@@ -188,14 +212,7 @@ pub fn index_command_file(index: &mut CommandIndex, path: &Path, content: &str) 
         start_column: sig.start_column,
         end_column: sig.end_column,
         priority,
-    };
-
-    match index.commands.get(&sig.name) {
-        Some(existing) if existing.priority >= entry.priority => {}
-        _ => {
-            index.commands.insert(sig.name, entry);
-        }
-    }
+    });
 }
 
 #[cfg(test)]

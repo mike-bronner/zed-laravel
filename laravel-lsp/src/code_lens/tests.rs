@@ -144,3 +144,61 @@ class User extends \Illuminate\Database\Eloquent\Model {
         line.find("getFullNameAttribute").unwrap() as u32
     );
 }
+
+// ── Route-name declaration lenses ─────────────────────────────────────────
+
+use crate::route_name_locator::RouteNameDeclaration;
+
+fn decl(full_name: &str, line: u32, start: u32, end: u32) -> RouteNameDeclaration {
+    RouteNameDeclaration {
+        full_name: full_name.to_string(),
+        local_segment: full_name.rsplit('.').next().unwrap_or(full_name).to_string(),
+        line,
+        start_column: start,
+        end_column: end,
+    }
+}
+
+fn route_names(targets: &[CodeLensTarget]) -> Vec<&str> {
+    targets
+        .iter()
+        .filter_map(|t| match &t.symbol {
+            SymbolRefData::Route(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn route_lens_no_external_prefix_uses_bare_full_name() {
+    let decls = [decl("users.index", 10, 42, 53), decl("users.show", 11, 42, 52)];
+    let targets = route_lens_targets(&decls, &[]);
+
+    assert_eq!(route_names(&targets), vec!["users.index", "users.show"]);
+    // Anchors on the name string content, on the declaration line.
+    assert_eq!((targets[0].line, targets[0].column, targets[0].end_column), (10, 42, 53));
+}
+
+#[test]
+fn route_lens_applies_external_prefix() {
+    let decls = [decl("dashboard", 3, 30, 39)];
+    let targets = route_lens_targets(&decls, &["admin.".to_string()]);
+
+    assert_eq!(route_names(&targets), vec!["admin.dashboard"]);
+    assert_eq!(targets[0].line, 3);
+}
+
+#[test]
+fn route_lens_emits_one_target_per_external_prefix() {
+    // A file loaded under two prefixes counts each resulting route separately.
+    let decls = [decl("index", 5, 20, 25)];
+    let targets = route_lens_targets(&decls, &["admin.".to_string(), "staff.".to_string()]);
+
+    assert_eq!(route_names(&targets), vec!["admin.index", "staff.index"]);
+    assert!(targets.iter().all(|t| t.line == 5 && t.column == 20 && t.end_column == 25));
+}
+
+#[test]
+fn route_lens_empty_decls_is_empty() {
+    assert!(route_lens_targets(&[], &["admin.".to_string()]).is_empty());
+}

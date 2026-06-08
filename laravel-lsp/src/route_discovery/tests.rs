@@ -1135,3 +1135,32 @@ fn closure_group_behavior_unchanged_regression() {
         "in-file closure group should not also emit the bare leaf"
     );
 }
+
+#[test]
+fn external_prefixes_for_defaults_to_empty_prefix() {
+    // An index with no cached prefixes still yields the always-applicable "".
+    let index = RouteIndex::new();
+    assert_eq!(
+        index.external_prefixes_for(&PathBuf::from("/fake/routes/web.php")),
+        vec![String::new()]
+    );
+}
+
+#[test]
+fn external_prefixes_for_returns_cached_prefixes() {
+    let mut index = RouteIndex::new();
+    let path = PathBuf::from("/fake/routes/admin.php");
+    index.external_prefixes.insert(
+        normalize_path(&path),
+        vec![String::new(), "admin.".to_string()],
+    );
+    assert_eq!(
+        index.external_prefixes_for(&path),
+        vec![String::new(), "admin.".to_string()]
+    );
+    // Lookup is normalized-path based, so a non-canonical spelling still hits.
+    assert_eq!(
+        index.external_prefixes_for(&PathBuf::from("/fake/routes/../routes/admin.php")),
+        vec![String::new(), "admin.".to_string()]
+    );
+}

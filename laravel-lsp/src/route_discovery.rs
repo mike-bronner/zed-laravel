@@ -96,6 +96,24 @@ pub struct RouteIndex {
     /// (issue #43). Used by `did_save` to decide whether a saved file should
     /// trigger a route-index rebuild.
     pub source_files: std::collections::HashSet<PathBuf>,
+    /// Inherited external-load name prefixes per route file (issue #43),
+    /// keyed by normalized path and always including `""`. Computed during
+    /// [`build_route_index`] from the same load-graph pass that builds the
+    /// routes, so consumers (e.g. the code-lens handler) resolve a file's
+    /// fully-qualified route names without re-parsing every route file. Use
+    /// [`RouteIndex::external_prefixes_for`], which defaults to `[""]`.
+    pub external_prefixes: HashMap<PathBuf, Vec<String>>,
+}
+
+impl RouteIndex {
+    /// The inherited external-load name prefixes that apply to `path` (always
+    /// includes `""`). Reads the map cached at build time — no I/O.
+    pub fn external_prefixes_for(&self, path: &Path) -> Vec<String> {
+        self.external_prefixes
+            .get(&normalize_path(path))
+            .cloned()
+            .unwrap_or_else(|| vec![String::new()])
+    }
 }
 
 impl RouteIndex {
@@ -235,7 +253,28 @@ pub fn build_route_index(root: &Path, files: &[RouteFile]) -> RouteIndex {
             }
         }
     }
+    // Cache the per-file prefix map from the same `effective` data, so the
+    // code-lens handler can resolve fully-qualified route names without
+    // re-running this whole load-graph pass per request.
+    for (key, prefixes) in effective {
+        index
+            .external_prefixes
+            .insert(key, dedup_prefixes(&prefixes));
+    }
     index
+}
+
+/// Normalize a raw inherited-prefix list into the `[""]`-prefixed, deduplicated
+/// form callers expect: the empty prefix always applies (a file is scanned
+/// directly), plus each distinct non-empty inherited prefix once.
+fn dedup_prefixes(prefixes: &[String]) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for p in prefixes {
+        if !p.is_empty() && !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// Return the inherited external-file name prefixes that apply to `file`
@@ -283,13 +322,7 @@ pub fn external_prefixes_map(root: &Path) -> HashMap<PathBuf, Vec<String>> {
 
     let mut map: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for (key, prefixes) in effective {
-        let mut out = vec![String::new()];
-        for p in prefixes {
-            if !p.is_empty() && !out.contains(&p) {
-                out.push(p);
-            }
-        }
-        map.insert(key, out);
+        map.insert(key, dedup_prefixes(&prefixes));
     }
     map
 }

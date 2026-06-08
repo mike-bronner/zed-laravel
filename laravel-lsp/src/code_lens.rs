@@ -17,6 +17,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use crate::parser::parse_php;
+use crate::route_name_locator::RouteNameDeclaration;
 use crate::salsa_impl::SymbolRefData;
 
 /// One code-lens anchor: the symbol-name position (0-based) and the index key
@@ -66,6 +67,44 @@ pub fn code_lens_targets(path: &Path, source: &str) -> Vec<CodeLensTarget> {
     }
 
     model_targets(source)
+}
+
+/// Code-lens targets for the route-name declarations in an open routes file.
+///
+/// Each `->name('x')` / `->as('x')` gets a lens whose count is the number of
+/// `route('x')` usages. The lens anchors on the name *string content* (so it
+/// sits on the declaration line) and is keyed by the route's fully-qualified
+/// name — the declaration's `full_name` already folds in-file group prefixes,
+/// and `external_prefixes` carries any prefix the file inherits from how it's
+/// loaded (`Route::as('admin.')->group(base_path('routes/admin.php'))`, #43).
+/// One target per (declaration, external prefix) so a file loaded under
+/// several prefixes counts each resulting route independently; a file with no
+/// external prefix is passed `[""]` and keeps its bare `full_name`.
+pub fn route_lens_targets(
+    decls: &[RouteNameDeclaration],
+    external_prefixes: &[String],
+) -> Vec<CodeLensTarget> {
+    // A file with no external prefix still needs one pass with an empty prefix
+    // so its bare `full_name` is emitted. `default_prefix` outlives the borrow.
+    let default_prefix;
+    let prefixes: &[String] = if external_prefixes.is_empty() {
+        default_prefix = [String::new()];
+        &default_prefix
+    } else {
+        external_prefixes
+    };
+    let mut out = Vec::with_capacity(decls.len());
+    for d in decls {
+        for ext in prefixes {
+            out.push(CodeLensTarget {
+                line: d.line,
+                column: d.start_column,
+                end_column: d.end_column,
+                symbol: SymbolRefData::Route(format!("{ext}{}", d.full_name)),
+            });
+        }
+    }
+    out
 }
 
 /// The leading `<?php … ?>` front-matter and the 0-based line it starts on.

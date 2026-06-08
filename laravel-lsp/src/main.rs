@@ -17018,7 +17018,32 @@ impl LanguageServer for LaravelLanguageServer {
             },
         };
 
-        let targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
+        let mut targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
+
+        // Literal-symbol lenses: route-name declarations in an open routes
+        // file. Each `->name('x')` gets a lens counting `route('x')` usages.
+        // Declarations come from the live buffer (accurate mid-edit); the
+        // fully-qualified name's external-load prefixes (#43) come from the
+        // map cached on the warm-built route index — so this stays O(decls)
+        // with no per-request route-file re-parsing.
+        {
+            let guard = self.route_index.read().await;
+            if let Some(index) = guard.as_ref() {
+                if index
+                    .source_files
+                    .contains(&laravel_lsp::route_discovery::normalize_path(&path))
+                {
+                    let decls =
+                        laravel_lsp::route_name_locator::extract_route_name_declarations(&source);
+                    if !decls.is_empty() {
+                        let ext = index.external_prefixes_for(&path);
+                        targets
+                            .extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
+                    }
+                }
+            }
+        }
+
         let lenses = targets
             .into_iter()
             .map(|t| CodeLens {

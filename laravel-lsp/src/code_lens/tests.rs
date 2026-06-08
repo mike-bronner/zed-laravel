@@ -202,3 +202,29 @@ fn route_lens_emits_one_target_per_external_prefix() {
 fn route_lens_empty_decls_is_empty() {
     assert!(route_lens_targets(&[], &["admin.".to_string()]).is_empty());
 }
+
+// ── Env-var declaration lenses ────────────────────────────────────────────
+
+fn env_keys(targets: &[CodeLensTarget]) -> Vec<&str> {
+    targets
+        .iter()
+        .filter_map(|t| match &t.symbol {
+            SymbolRefData::Env(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn env_lens_targets_one_per_key_with_positions() {
+    let src = "# config\nAPP_NAME=Laravel\nDB_HOST=127.0.0.1\n";
+    let targets = env_lens_targets(src);
+    assert_eq!(env_keys(&targets), vec!["APP_NAME", "DB_HOST"]);
+    // Anchors on the key text.
+    assert_eq!((targets[0].line, targets[0].column, targets[0].end_column), (1, 0, 8));
+}
+
+#[test]
+fn env_lens_targets_empty_for_no_declarations() {
+    assert!(env_lens_targets("# only comments\n\nJUST_TEXT\n").is_empty());
+}

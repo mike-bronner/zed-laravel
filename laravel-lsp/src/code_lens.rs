@@ -107,6 +107,24 @@ pub fn route_lens_targets(
     out
 }
 
+/// Code-lens targets for the key declarations in an open `.env*` file.
+///
+/// Each `KEY=value` line gets a lens whose count is the number of `env('KEY')`
+/// usages. The lens anchors on the key text and is keyed by the bare key —
+/// matching how `env()` usages are indexed — so the existing resolve path
+/// turns it into a count + `showReferences`.
+pub fn env_lens_targets(source: &str) -> Vec<CodeLensTarget> {
+    crate::env_key_locator::enumerate_keys_in_source(source)
+        .into_iter()
+        .map(|(key, pos)| CodeLensTarget {
+            line: pos.line,
+            column: pos.start_column,
+            end_column: pos.end_column,
+            symbol: SymbolRefData::Env(key),
+        })
+        .collect()
+}
+
 /// The leading `<?php … ?>` front-matter and the 0-based line it starts on.
 fn front_matter(source: &str) -> Option<(&str, u32)> {
     let start = source.find("<?php")?;

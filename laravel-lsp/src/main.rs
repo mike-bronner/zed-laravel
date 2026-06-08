@@ -2888,6 +2888,12 @@ async fn build_magic_member_entries(
     root: &Path,
     view_paths: &[PathBuf],
     max_concurrent: usize,
+    // First-load progress handle. Drives the "Building semantic index N of M…"
+    // status while PHP member accesses resolve — the slow phase on big projects
+    // that previously ran silently (the file-parse loop has nothing to report
+    // on a cache-warm start, so the bar otherwise sits frozen). `None` on the
+    // incremental save-refresh path, which has no progress UI.
+    mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
 ) -> Vec<(PathBuf, Vec<laravel_lsp::symbol_index::MagicMemberEntry>)> {
     // `snapshot_class_files` already hands back a shared `Arc` (cached actor-
     // side), so the per-rebuild full-map clone is gone — just reuse it.
@@ -3001,10 +3007,22 @@ async fn build_magic_member_entries(
             .flatten()
         }));
     }
-    let mut magic_entries = Vec::with_capacity(magic_handles.len());
+    let magic_total = magic_handles.len();
+    let mut magic_done = 0usize;
+    let mut magic_entries = Vec::with_capacity(magic_total);
     for h in magic_handles {
         if let Ok(Some(pair)) = h.await {
             magic_entries.push(pair);
+        }
+        magic_done += 1;
+        if let Some(p) = progress.as_deref_mut() {
+            let pct = ((magic_done.saturating_mul(100) / magic_total.max(1)) as u32).min(100);
+            p.report(
+                format!("Indexing {magic_done} of {magic_total} files…"),
+                Some(pct),
+                false,
+            )
+            .await;
         }
     }
 
@@ -4076,6 +4094,8 @@ impl LaravelLanguageServer {
         // Cloned into the warm task so it can ask the client to re-resolve code
         // lenses once the magic-member index is populated (lenses requested
         // during warming would otherwise show stale/zero counts forever).
+        // Cloned for the post-warm `code_lens_refresh` (re-request lenses that
+        // resolved against an empty index during warming).
         let client_for_warm = self.client.clone();
         let root_for_save = root_path.to_path_buf();
         // View roots for the warm Blade view-variable resolution (file →
@@ -4317,28 +4337,85 @@ impl LaravelLanguageServer {
                 hierarchy_classes
             );
 
-            // Build the magic-member reverse index (M4 + phases 4–5): resolve
-            // each non-vendor file's captured member accesses (PHP, Blade, Volt)
-            // against the now-complete hierarchy + view-variable index, then
-            // bulk-import. Extracted into `build_magic_member_entries` so the
-            // debounced incremental refresh reuses the exact same passes.
-            let magic_entries = build_magic_member_entries(
-                &salsa,
-                &pattern_cache_for_warm,
-                &root_for_save,
-                &view_paths_for_warm,
-                MAX_CONCURRENT_PARSES,
-            )
-            .await;
-            if !magic_entries.is_empty() {
-                match salsa.bulk_import_magic_members(magic_entries).await {
-                    Ok(n) => info!("🪄 Magic-member index: {} entries", n),
-                    Err(e) => debug!("Magic-member index build failed: {}", e),
+            // Magic-member reverse index (M4 + phases 4–5): the resolution of
+            // every captured member access (PHP/Blade/Volt) against the class
+            // hierarchy + view-variable index — the dominant warm cost.
+            //
+            // Restore it from disk when the project is UNCHANGED since the last
+            // save (`to_parse == 0` → the pattern cache validated every file).
+            // Because resolution is cross-file, this all-or-nothing guard keeps
+            // the restored index correct: if even one file changed, the cached
+            // resolution could be stale, so we resolve fresh. The common
+            // reload-without-edits case becomes instant instead of ~30s.
+            // Disk read on the blocking pool so it never stalls the async
+            // runtime (the file can be large on a big project).
+            let restored = if to_parse == 0 {
+                let root_for_load = root_for_save.clone();
+                tokio::task::spawn_blocking(move || {
+                    laravel_lsp::magic_disk_cache::load(&root_for_load)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            if let Some(entries) = restored {
+                match salsa.bulk_import_magic_members(entries).await {
+                    Ok(n) => info!("🪄 Magic-member index: {} entries (restored from disk)", n),
+                    Err(e) => debug!("Magic-member restore import failed: {}", e),
                 }
-                // The index is now populated — re-resolve any code lenses the
-                // client requested while warming was still in progress.
-                let _ = client_for_warm.code_lens_refresh().await;
+            } else {
+                // Resolve fresh, drive progress (the file-parse loop had nothing
+                // to report on a cache-warm start), persist for next time, then
+                // import. `build_magic_member_entries` is shared with the
+                // incremental save-refresh path.
+                let magic_entries = build_magic_member_entries(
+                    &salsa,
+                    &pattern_cache_for_warm,
+                    &root_for_save,
+                    &view_paths_for_warm,
+                    MAX_CONCURRENT_PARSES,
+                    progress.as_mut(),
+                )
+                .await;
+                if !magic_entries.is_empty() {
+                    // Persist on the blocking pool (sync I/O), handing the
+                    // entries back so the import below still owns them — no clone.
+                    let root_for_msave = root_for_save.clone();
+                    let magic_entries = match tokio::task::spawn_blocking(move || {
+                        let res = laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_entries);
+                        (res, magic_entries)
+                    })
+                    .await
+                    {
+                        Ok((Ok(n), entries)) => {
+                            info!("🗄️  Magic-member index: saved {} files to disk", n);
+                            entries
+                        }
+                        Ok((Err(e), entries)) => {
+                            debug!("Magic-member disk save failed: {}", e);
+                            entries
+                        }
+                        Err(e) => {
+                            debug!("Magic-member disk save task panicked: {}", e);
+                            Vec::new()
+                        }
+                    };
+                    match salsa.bulk_import_magic_members(magic_entries).await {
+                        Ok(n) => info!("🪄 Magic-member index: {} entries", n),
+                        Err(e) => debug!("Magic-member index build failed: {}", e),
+                    }
+                }
             }
+            // The reference indexes are built — ask the client to refresh code
+            // lenses requested while warming was still in progress (those
+            // resolved against an empty index and read 0). Fire-and-forget, so
+            // it never blocks. NOTE: Zed currently doesn't re-query already-open
+            // documents on this refresh (upstream bug, filed) — a reopen/edit
+            // refreshes them — but files opened after warm resolve correctly,
+            // and the disk cache keeps warm short.
+            let _ = client_for_warm.code_lens_refresh().await;
 
             let elapsed = started_at.elapsed();
             info!(
@@ -5379,6 +5456,7 @@ impl LaravelLanguageServer {
             &root,
             &view_paths,
             MAX_CONCURRENT_MAGIC_PARSES,
+            None, // save-refresh path has no first-load progress UI
         )
         .await;
         match self.salsa.bulk_import_magic_members(entries).await {
@@ -16770,11 +16848,18 @@ impl LanguageServer for LaravelLanguageServer {
                 references_provider: Some(OneOf::Left(true)),
 
                 // ✅ Code lens — reference-count indicators (#59). Lenses appear
-                // when the user sets `"code_lens": "on"`. Counts are computed
-                // lazily in `code_lens/resolve` to keep the initial response
-                // cheap on large files. Covers the Laravel symbols we index
-                // accurately: magic members, component members, and literal
-                // references (routes/views/…) — what a generic PHP LSP can't.
+                // when the user sets `"code_lens": "on"`. Covers the Laravel
+                // symbols we index accurately: magic members, component members,
+                // and literal references (routes/views/…) — what a generic PHP
+                // LSP can't.
+                //
+                // A lens resolved while first-load warming is still in progress
+                // shows an honest "indexing references…" placeholder instead of
+                // a misleading "0" — Zed never re-queries an already-open
+                // document (neither `codeLens/refresh` nor dynamic registration
+                // triggers a re-request), so a wrong 0 would otherwise stick
+                // until the file is reopened. See `code_lens_resolve` +
+                // `magic_index_ready`.
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
@@ -17018,15 +17103,23 @@ impl LanguageServer for LaravelLanguageServer {
             },
         };
 
-        let mut targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_env = file_name == ".env" || file_name.starts_with(".env.");
 
-        // Literal-symbol lenses: route-name declarations in an open routes
-        // file. Each `->name('x')` gets a lens counting `route('x')` usages.
-        // Declarations come from the live buffer (accurate mid-edit); the
-        // fully-qualified name's external-load prefixes (#43) come from the
-        // map cached on the warm-built route index — so this stays O(decls)
-        // with no per-request route-file re-parsing.
-        {
+        let targets = if is_env {
+            // Env-var lenses: each `KEY=` in an open `.env*` file counts
+            // `env('KEY')` usages. (`.env` is the only non-PHP file type we
+            // lens; Zed routes it to our LSP as Shell Script.)
+            laravel_lsp::code_lens::env_lens_targets(&source)
+        } else {
+            let mut targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
+
+            // Literal-symbol lenses: route-name declarations in an open routes
+            // file. Each `->name('x')` gets a lens counting `route('x')` usages.
+            // Declarations come from the live buffer (accurate mid-edit); the
+            // fully-qualified name's external-load prefixes (#43) come from the
+            // map cached on the warm-built route index — so this stays O(decls)
+            // with no per-request route-file re-parsing.
             let guard = self.route_index.read().await;
             if let Some(index) = guard.as_ref() {
                 if index
@@ -17042,7 +17135,8 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                 }
             }
-        }
+            targets
+        };
 
         let lenses = targets
             .into_iter()
@@ -17092,7 +17186,11 @@ impl LanguageServer for LaravelLanguageServer {
             .and_then(|s| Url::parse(s).ok());
 
         // Reference locations — fast for magic members (the index lookup skips
-        // the literal dirty-refresh).
+        // the literal dirty-refresh). A lens resolved before warming finishes
+        // reads 0 (empty index); the post-warm `code_lens_refresh` re-requests
+        // so the count fills in. (Zed currently doesn't re-query already-open
+        // docs on that refresh — a reopen/edit refreshes them — see the upstream
+        // bug; the disk cache keeps warm fast so the window is short.)
         let locations: Vec<Location> = self
             .salsa
             .find_references(symbol, false)

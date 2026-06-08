@@ -63,7 +63,10 @@ pub enum SymbolKind {
 /// A resolved magic-member occurrence ready to ingest: the inheritance-
 /// resolved declaring class, the member name, and the usage site's position.
 /// Built by the actor from a file's `member_access_refs` after M3 resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Serialize`/`Deserialize` so the resolved index can be persisted to disk
+/// (the resolution pass is the dominant warm cost; caching it makes a clean
+/// reload near-instant — see `magic_disk_cache`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MagicMemberEntry {
     pub fqcn: String,
     pub member: String,

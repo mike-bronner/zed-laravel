@@ -17160,6 +17160,24 @@ impl LanguageServer for LaravelLanguageServer {
                     }
                 }
             }
+            drop(guard);
+
+            // File-level lens (Phase 4): a plain view/component blade gets one
+            // lens at the top counting its usages (`view()`/`@include` or
+            // `<x-…>`). Skip Volt SFCs — those are Livewire components (their
+            // member lenses come from `code_lens_targets`; file-level Livewire
+            // is a follow-up).
+            if file_name.ends_with(".blade.php")
+                && !laravel_lsp::livewire_resolver::source_contains_volt_signature(&source)
+            {
+                if let Some(config) = self.get_cached_config().await {
+                    if let Some(t) =
+                        laravel_lsp::code_lens::file_level_lens_target(&path, &config)
+                    {
+                        targets.push(t);
+                    }
+                }
+            }
             targets
         };
 

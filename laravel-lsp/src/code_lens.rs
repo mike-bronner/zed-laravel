@@ -18,7 +18,7 @@ use tree_sitter::Node;
 
 use crate::parser::parse_php;
 use crate::route_name_locator::RouteNameDeclaration;
-use crate::salsa_impl::SymbolRefData;
+use crate::salsa_impl::{LaravelConfigData, SymbolRefData};
 
 /// One code-lens anchor: the symbol-name position (0-based) and the index key
 /// its reference count is looked up under.
@@ -158,6 +158,45 @@ pub fn config_lens_targets(file_stem: &str, source: &str) -> Vec<CodeLensTarget>
 /// locale's file lenses the same keys.
 pub fn translation_lens_targets(file_stem: &str, source: &str) -> Vec<CodeLensTarget> {
     dotted_key_lens_targets(file_stem, source, SymbolRefData::Translation)
+}
+
+/// File-level lens for a view or component `.blade.php`: one lens at the top of
+/// the file counting how many times the file is referenced.
+///
+/// A component file (under a `components/` dir) counts `<x-name>` tags; a plain
+/// view file counts `view('name')` / `@include` / `@extends` references.
+/// Component is checked first because `components/` lives under a view root, so
+/// a component would otherwise also resolve as a view — we prefer the component
+/// identity. Returns `None` for non-blade files and blades that resolve to
+/// neither name.
+///
+/// Volt SFCs are NOT excluded here (this function has no source) — the caller
+/// skips them, since they're Livewire components (file-level Livewire lenses
+/// are a follow-up; their member lenses come from [`code_lens_targets`]).
+pub fn file_level_lens_target(path: &Path, config: &LaravelConfigData) -> Option<CodeLensTarget> {
+    if !path.to_string_lossy().ends_with(".blade.php") {
+        return None;
+    }
+    if let Some(name) =
+        crate::component_declaration_locator::component_name_for_blade_path(path, config)
+    {
+        return Some(file_top_lens(SymbolRefData::Component(name)));
+    }
+    if let Some(name) = crate::view_var_index::view_name_for_path(path, &config.view_paths) {
+        return Some(file_top_lens(SymbolRefData::View(name)));
+    }
+    None
+}
+
+/// A lens anchored at the very top of the file (line 0), for whole-file symbols
+/// (view / component) that don't correspond to a single in-file position.
+fn file_top_lens(symbol: SymbolRefData) -> CodeLensTarget {
+    CodeLensTarget {
+        line: 0,
+        column: 0,
+        end_column: 0,
+        symbol,
+    }
 }
 
 /// The leading `<?php … ?>` front-matter and the 0-based line it starts on.

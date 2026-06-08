@@ -291,3 +291,51 @@ fn dotted_key_lens_targets_empty_for_non_array() {
     assert!(config_lens_targets("app", "<?php // nothing").is_empty());
     assert!(translation_lens_targets("auth", "<?php // nothing").is_empty());
 }
+
+// ── File-level view / component lenses ────────────────────────────────────
+
+use crate::salsa_impl::LaravelConfigData;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn lens_config(root: &Path) -> LaravelConfigData {
+    LaravelConfigData {
+        root: root.to_path_buf(),
+        view_paths: vec![root.join("resources/views")],
+        component_paths: vec![(String::new(), root.join("resources/views/components"))],
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+    }
+}
+
+#[test]
+fn file_level_lens_component_under_components_dir() {
+    let root = PathBuf::from("/proj");
+    let config = lens_config(&root);
+    let path = root.join("resources/views/components/forms/input.blade.php");
+    let t = file_level_lens_target(&path, &config).expect("component lens");
+    assert!(matches!(&t.symbol, SymbolRefData::Component(n) if n == "forms.input"));
+    assert_eq!((t.line, t.column, t.end_column), (0, 0, 0));
+}
+
+#[test]
+fn file_level_lens_plain_view() {
+    let root = PathBuf::from("/proj");
+    let config = lens_config(&root);
+    let path = root.join("resources/views/users/index.blade.php");
+    let t = file_level_lens_target(&path, &config).expect("view lens");
+    assert!(matches!(&t.symbol, SymbolRefData::View(n) if n == "users.index"));
+}
+
+#[test]
+fn file_level_lens_none_for_non_blade() {
+    let root = PathBuf::from("/proj");
+    let config = lens_config(&root);
+    assert!(file_level_lens_target(&root.join("app/Models/User.php"), &config).is_none());
+}

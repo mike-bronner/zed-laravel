@@ -18,6 +18,7 @@ pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod class_rename;
+pub mod command_signature;
 pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;

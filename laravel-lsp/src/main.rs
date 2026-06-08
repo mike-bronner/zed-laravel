@@ -17161,27 +17161,10 @@ impl LanguageServer for LaravelLanguageServer {
                 }
             }
             drop(guard);
-
-            // File-level lens (Phase 4): a plain view/component blade gets one
-            // lens at the top counting its usages (`view()`/`@include` or
-            // `<x-…>`). Skip Volt SFCs — those are Livewire components (their
-            // member lenses come from `code_lens_targets`; file-level Livewire
-            // is a follow-up).
-            if file_name.ends_with(".blade.php")
-                && !laravel_lsp::livewire_resolver::source_contains_volt_signature(&source)
-            {
-                if let Some(config) = self.get_cached_config().await {
-                    if let Some(t) =
-                        laravel_lsp::code_lens::file_level_lens_target(&path, &config)
-                    {
-                        targets.push(t);
-                    }
-                }
-            }
             targets
         };
 
-        let lenses = targets
+        let mut lenses: Vec<CodeLens> = targets
             .into_iter()
             .map(|t| CodeLens {
                 range: Range {
@@ -17204,6 +17187,52 @@ impl LanguageServer for LaravelLanguageServer {
                 })),
             })
             .collect();
+
+        // Compound file-level lens (Phase 4 / 4b): ONE top-of-file lens whose
+        // count is the SUM across every identity the file is referenced under —
+        // Livewire (`<livewire:…>`), component (`<x-…>`), and view (`view()` /
+        // `@include`). A file can have several (a component blade is also a
+        // view; a Livewire companion view is also a view), so we collect them
+        // all and `resolve` combines their reference sites. Skipped for
+        // env/config/translation files (handled above).
+        if !is_env && !is_config && !is_translation && file_name.ends_with(".php") {
+            let mut file_symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = Vec::new();
+            if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+                if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
+                    &path, &lw_config, lw_version,
+                ) {
+                    file_symbols.push(laravel_lsp::salsa_impl::SymbolRefData::Livewire(name));
+                }
+            }
+            if file_name.ends_with(".blade.php") {
+                if let Some(config) = self.get_cached_config().await {
+                    file_symbols
+                        .extend(laravel_lsp::code_lens::file_level_symbols(&path, &config));
+                }
+            }
+            if !file_symbols.is_empty() {
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    command: None,
+                    // `symbols` (plural) — `resolve` sums references across all
+                    // of them. Single-symbol lenses above use `symbol`.
+                    data: Some(serde_json::json!({
+                        "symbols": &file_symbols,
+                        "uri": uri.as_str(),
+                    })),
+                });
+            }
+        }
+
         Ok(Some(lenses))
     }
 
@@ -17216,32 +17245,55 @@ impl LanguageServer for LaravelLanguageServer {
         let Some(data) = lens.data.clone() else {
             return Ok(lens);
         };
-        let symbol =
-            match data.get("symbol").cloned().and_then(|s| {
+        // A lens carries either a single `symbol` (position lenses) or a
+        // `symbols` list (the compound file-level lens, which sums references
+        // across the file's view/component/livewire identities).
+        let symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = match data.get("symbols") {
+            Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
+            None => match data.get("symbol").cloned().and_then(|s| {
                 serde_json::from_value::<laravel_lsp::salsa_impl::SymbolRefData>(s).ok()
             }) {
-                Some(s) => s,
+                Some(s) => vec![s],
                 None => return Ok(lens),
-            };
+            },
+        };
+        if symbols.is_empty() {
+            return Ok(lens);
+        }
         let uri = data
             .get("uri")
             .and_then(|u| u.as_str())
             .and_then(|s| Url::parse(s).ok());
 
-        // Reference locations — fast for magic members (the index lookup skips
+        // Reference locations, combined across every symbol and de-duplicated by
+        // (file, line, column). Fast for magic members (the index lookup skips
         // the literal dirty-refresh). A lens resolved before warming finishes
         // reads 0 (empty index); the post-warm `code_lens_refresh` re-requests
         // so the count fills in. (Zed currently doesn't re-query already-open
         // docs on that refresh — a reopen/edit refreshes them — see the upstream
         // bug; the disk cache keeps warm fast so the window is short.)
-        let locations: Vec<Location> = self
-            .salsa
-            .find_references(symbol, false)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter_map(reference_location_to_lsp)
-            .collect();
+        let mut locations: Vec<Location> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, u32, u32)> =
+            std::collections::HashSet::new();
+        for symbol in symbols {
+            for loc in self
+                .salsa
+                .find_references(symbol, false)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(reference_location_to_lsp)
+            {
+                let key = (
+                    loc.uri.to_string(),
+                    loc.range.start.line,
+                    loc.range.start.character,
+                );
+                if seen.insert(key) {
+                    locations.push(loc);
+                }
+            }
+        }
 
         let count = locations.len();
         let title = match count {

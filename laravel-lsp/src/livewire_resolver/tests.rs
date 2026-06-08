@@ -299,3 +299,103 @@ fn unknown_version_tries_v4_first() {
     let component = resolve_component("counter", &cfg, LivewireVersion::Unknown).expect("resolves");
     assert_eq!(component.kind, LivewireComponentKind::V4Sfc);
 }
+
+// ---------- livewire_name_for_path (reverse, guess-verify) ----------
+
+#[test]
+fn reverse_v4_sfc_top_level() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join(format!(
+        "resources/views/livewire/{}counter.blade.php",
+        naming::LIVEWIRE_EMOJI
+    ));
+    write(&path, "<?php new class extends Component {}; ?><div></div>");
+
+    assert_eq!(
+        livewire_name_for_path(&path, &cfg, LivewireVersion::V4).as_deref(),
+        Some("counter")
+    );
+}
+
+#[test]
+fn reverse_v4_sfc_nested() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join(format!(
+        "resources/views/components/admin/{}user-list.blade.php",
+        naming::LIVEWIRE_EMOJI
+    ));
+    write(&path, "<?php new class extends Component {}; ?><div></div>");
+
+    assert_eq!(
+        livewire_name_for_path(&path, &cfg, LivewireVersion::V4).as_deref(),
+        Some("admin.user-list")
+    );
+}
+
+#[test]
+fn reverse_v4_mfc_class_and_blade_both_resolve() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let dir = root.join(format!(
+        "resources/views/components/{}counter",
+        naming::LIVEWIRE_EMOJI
+    ));
+    write(&dir.join("counter.php"), "<?php new class {}; ?>");
+    write(&dir.join("counter.blade.php"), "<div></div>");
+
+    assert_eq!(
+        livewire_name_for_path(&dir.join("counter.php"), &cfg, LivewireVersion::V4).as_deref(),
+        Some("counter")
+    );
+    assert_eq!(
+        livewire_name_for_path(&dir.join("counter.blade.php"), &cfg, LivewireVersion::V4).as_deref(),
+        Some("counter")
+    );
+}
+
+#[test]
+fn reverse_v3_class_nested() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("app/Livewire/Admin/UserList.php");
+    write(&path, "<?php namespace App\\Livewire\\Admin; class UserList {}");
+
+    assert_eq!(
+        livewire_name_for_path(&path, &cfg, LivewireVersion::V4).as_deref(),
+        Some("admin.user-list")
+    );
+}
+
+#[test]
+fn reverse_volt_sfc() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("resources/views/livewire/counter.blade.php");
+    write(
+        &path,
+        "<?php use Livewire\\Volt\\Component; new class extends Component {}; ?><div></div>",
+    );
+
+    assert_eq!(
+        livewire_name_for_path(&path, &cfg, LivewireVersion::V4).as_deref(),
+        Some("counter")
+    );
+}
+
+#[test]
+fn reverse_none_for_non_livewire_file() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cfg = config_for(root);
+    let path = root.join("app/Models/User.php");
+    write(&path, "<?php namespace App\\Models; class User {}");
+
+    assert!(livewire_name_for_path(&path, &cfg, LivewireVersion::V4).is_none());
+}

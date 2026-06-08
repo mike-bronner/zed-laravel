@@ -243,6 +243,112 @@ pub fn resolve_component(
     None
 }
 
+/// Reverse of [`resolve_component`]: given a component file path, return the
+/// Livewire component name it backs (`counter`, `admin.user-list`,
+/// `pages::dashboard`), or `None` if the path isn't a Livewire component.
+///
+/// Works by *guess and verify*: derive candidate names from the path under the
+/// configured roots (class path, component locations, namespace dirs), then
+/// confirm each by running [`resolve_component`] forward and checking it points
+/// back at this file. Every shape/convention nuance (v3 class, v4 SFC/MFC,
+/// Volt, `⚡` prefixes, kebab-casing) stays in the forward resolver — a wrong
+/// guess simply fails verification, so this never returns a bogus name (at
+/// worst it returns `None` and the caller shows no lens).
+pub fn livewire_name_for_path(
+    path: &Path,
+    config: &LivewireConfig,
+    version: LivewireVersion,
+) -> Option<String> {
+    let target = crate::route_discovery::normalize_path(path);
+    for name in candidate_livewire_names(path, config) {
+        if let Some(component) = resolve_component(&name, config, version) {
+            if component
+                .paths
+                .iter()
+                .any(|p| crate::route_discovery::normalize_path(p) == target)
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Candidate component names for `path`, one per configured root it falls
+/// under. Over-generation is safe — [`livewire_name_for_path`] verifies each.
+fn candidate_livewire_names(path: &Path, config: &LivewireConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    let is_blade = path.to_string_lossy().ends_with(".blade.php");
+    let is_php = !is_blade && path.extension().and_then(|e| e.to_str()) == Some("php");
+
+    // V3 class: a non-blade `.php` under the class path → kebab-dotted class
+    // path relative to the root.
+    if is_php {
+        if let Ok(rel) = path.strip_prefix(&config.class_path) {
+            if let Some(stem) = rel.to_str().and_then(|s| s.strip_suffix(".php")) {
+                if let Some(name) = kebab_dotted(stem.split(['/', '\\']), "") {
+                    out.push(name);
+                }
+            }
+        }
+    }
+
+    // V4 SFC / MFC / Volt under a component location (+ namespaced variants).
+    for loc in &config.component_locations {
+        if let Ok(rel) = path.strip_prefix(loc) {
+            if let Some(name) = name_from_component_rel(rel, is_blade) {
+                out.push(name);
+            }
+        }
+    }
+    for (ns, dir) in &config.component_namespaces {
+        if let Ok(rel) = path.strip_prefix(dir) {
+            if let Some(name) = name_from_component_rel(rel, is_blade) {
+                out.push(format!("{ns}::{name}"));
+            }
+        }
+    }
+    out
+}
+
+/// Derive a component name from a path relative to a component location.
+///   - file inside a `⚡leaf/` dir (MFC, `.php` or `.blade.php`) → the `⚡leaf`
+///     dir supplies the leaf, the trailing file is dropped.
+///   - `[⚡]leaf.blade.php` (SFC or Volt) → dir segments + emoji-stripped leaf.
+fn name_from_component_rel(rel: &Path, is_blade: bool) -> Option<String> {
+    let s = rel.to_str()?;
+    let segs: Vec<&str> = s.split(['/', '\\']).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    // MFC: the file lives inside a `⚡leaf/` directory.
+    if segs.len() >= 2 && naming::has_emoji(segs[segs.len() - 2]) {
+        let leaf_dir = segs[segs.len() - 2];
+        return kebab_dotted(segs[..segs.len() - 2].iter().copied(), leaf_dir);
+    }
+    // SFC / Volt: a `.blade.php` file directly under the location tree.
+    if is_blade {
+        let (last, parents) = segs.split_last()?;
+        let leaf = last.strip_suffix(".blade.php").unwrap_or(last);
+        return kebab_dotted(parents.iter().copied(), leaf);
+    }
+    None
+}
+
+/// Kebab-case each segment (PascalCase or emoji-prefixed) and dot-join. When
+/// `leaf` is empty the last `parents` segment is treated as the leaf (used for
+/// the class-path form where the whole relative path is segments).
+fn kebab_dotted<'a>(parents: impl Iterator<Item = &'a str>, leaf: &str) -> Option<String> {
+    let mut parts: Vec<String> = parents
+        .map(|p| naming::pascal_to_kebab(naming::strip_emoji(p)))
+        .collect();
+    if !leaf.is_empty() {
+        parts.push(naming::pascal_to_kebab(naming::strip_emoji(leaf)));
+    }
+    parts.retain(|p| !p.is_empty());
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
 // ---------- format-specific lookups ----------
 
 fn try_v4_sfc(parent_dir: &Path, leaf: &str) -> Option<LivewireComponent> {

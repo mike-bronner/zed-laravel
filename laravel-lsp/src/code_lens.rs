@@ -160,43 +160,28 @@ pub fn translation_lens_targets(file_stem: &str, source: &str) -> Vec<CodeLensTa
     dotted_key_lens_targets(file_stem, source, SymbolRefData::Translation)
 }
 
-/// File-level lens for a view or component `.blade.php`: one lens at the top of
-/// the file counting how many times the file is referenced.
-///
-/// A component file (under a `components/` dir) counts `<x-name>` tags; a plain
-/// view file counts `view('name')` / `@include` / `@extends` references.
-/// Component is checked first because `components/` lives under a view root, so
-/// a component would otherwise also resolve as a view — we prefer the component
-/// identity. Returns `None` for non-blade files and blades that resolve to
+/// The view/component identities a `.blade.php` file is referenced under, for
+/// the compound file-level lens. A file can have BOTH — a blade under
+/// `components/` resolves as a component (`<x-name>`) *and* as a view
+/// (`view('components.name')`) — and the caller sums their reference counts (a
+/// file genuinely usable both ways shouldn't lose either's references). The
+/// Livewire identity is added separately by the caller (it needs the livewire
+/// config + resolver). Empty for non-blade files or blades that resolve to
 /// neither name.
-///
-/// Volt SFCs are NOT excluded here (this function has no source) — the caller
-/// skips them, since they're Livewire components (file-level Livewire lenses
-/// are a follow-up; their member lenses come from [`code_lens_targets`]).
-pub fn file_level_lens_target(path: &Path, config: &LaravelConfigData) -> Option<CodeLensTarget> {
+pub fn file_level_symbols(path: &Path, config: &LaravelConfigData) -> Vec<SymbolRefData> {
     if !path.to_string_lossy().ends_with(".blade.php") {
-        return None;
+        return Vec::new();
     }
+    let mut out = Vec::new();
     if let Some(name) =
         crate::component_declaration_locator::component_name_for_blade_path(path, config)
     {
-        return Some(file_top_lens(SymbolRefData::Component(name)));
+        out.push(SymbolRefData::Component(name));
     }
     if let Some(name) = crate::view_var_index::view_name_for_path(path, &config.view_paths) {
-        return Some(file_top_lens(SymbolRefData::View(name)));
+        out.push(SymbolRefData::View(name));
     }
-    None
-}
-
-/// A lens anchored at the very top of the file (line 0), for whole-file symbols
-/// (view / component) that don't correspond to a single in-file position.
-fn file_top_lens(symbol: SymbolRefData) -> CodeLensTarget {
-    CodeLensTarget {
-        line: 0,
-        column: 0,
-        end_column: 0,
-        symbol,
-    }
+    out
 }
 
 /// The leading `<?php … ?>` front-matter and the 0-based line it starts on.

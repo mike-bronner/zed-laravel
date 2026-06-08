@@ -315,27 +315,34 @@ fn lens_config(root: &Path) -> LaravelConfigData {
 }
 
 #[test]
-fn file_level_lens_component_under_components_dir() {
+fn file_level_symbols_component_resolves_both_component_and_view() {
     let root = PathBuf::from("/proj");
     let config = lens_config(&root);
+    // A component blade lives under a view root, so it has BOTH identities —
+    // both are returned and the caller compounds their reference counts.
     let path = root.join("resources/views/components/forms/input.blade.php");
-    let t = file_level_lens_target(&path, &config).expect("component lens");
-    assert!(matches!(&t.symbol, SymbolRefData::Component(n) if n == "forms.input"));
-    assert_eq!((t.line, t.column, t.end_column), (0, 0, 0));
+    let syms = file_level_symbols(&path, &config);
+    assert!(syms
+        .iter()
+        .any(|s| matches!(s, SymbolRefData::Component(n) if n == "forms.input")));
+    assert!(syms
+        .iter()
+        .any(|s| matches!(s, SymbolRefData::View(n) if n == "components.forms.input")));
 }
 
 #[test]
-fn file_level_lens_plain_view() {
+fn file_level_symbols_plain_view_is_view_only() {
     let root = PathBuf::from("/proj");
     let config = lens_config(&root);
     let path = root.join("resources/views/users/index.blade.php");
-    let t = file_level_lens_target(&path, &config).expect("view lens");
-    assert!(matches!(&t.symbol, SymbolRefData::View(n) if n == "users.index"));
+    let syms = file_level_symbols(&path, &config);
+    assert_eq!(syms.len(), 1);
+    assert!(matches!(&syms[0], SymbolRefData::View(n) if n == "users.index"));
 }
 
 #[test]
-fn file_level_lens_none_for_non_blade() {
+fn file_level_symbols_empty_for_non_blade() {
     let root = PathBuf::from("/proj");
     let config = lens_config(&root);
-    assert!(file_level_lens_target(&root.join("app/Models/User.php"), &config).is_none());
+    assert!(file_level_symbols(&root.join("app/Models/User.php"), &config).is_empty());
 }

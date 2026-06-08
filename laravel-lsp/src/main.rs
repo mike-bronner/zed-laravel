@@ -4073,6 +4073,10 @@ impl LaravelLanguageServer {
         const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
 
         let salsa = self.salsa.clone();
+        // Cloned into the warm task so it can ask the client to re-resolve code
+        // lenses once the magic-member index is populated (lenses requested
+        // during warming would otherwise show stale/zero counts forever).
+        let client_for_warm = self.client.clone();
         let root_for_save = root_path.to_path_buf();
         // View roots for the warm Blade view-variable resolution (file →
         // view-name mapping). Cloned here because `view_paths` was moved into
@@ -4331,6 +4335,9 @@ impl LaravelLanguageServer {
                     Ok(n) => info!("🪄 Magic-member index: {} entries", n),
                     Err(e) => debug!("Magic-member index build failed: {}", e),
                 }
+                // The index is now populated — re-resolve any code lenses the
+                // client requested while warming was still in progress.
+                let _ = client_for_warm.code_lens_refresh().await;
             }
 
             let elapsed = started_at.elapsed();
@@ -5378,6 +5385,8 @@ impl LaravelLanguageServer {
             Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
             Err(e) => debug!("Magic reconverge failed: {}", e),
         }
+        // Counts changed — ask the client to re-resolve code lenses.
+        let _ = self.client.code_lens_refresh().await;
     }
 
     /// Execute all pending rescans

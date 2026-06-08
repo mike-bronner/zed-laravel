@@ -125,6 +125,41 @@ pub fn env_lens_targets(source: &str) -> Vec<CodeLensTarget> {
         .collect()
 }
 
+/// Code-lens targets for the keys in an open config/lang `.php` file. Each
+/// `'key' =>` entry gets a lens; `make_symbol` turns the fully-qualified dotted
+/// key (`<file_stem>.<path>`) into the index key the count is looked up under
+/// (`Config` vs `Translation`). The enumeration emits leaf and intermediate
+/// keys alike, since each is a referenceable `config()` / `__()` key.
+fn dotted_key_lens_targets(
+    file_stem: &str,
+    source: &str,
+    make_symbol: impl Fn(String) -> SymbolRefData,
+) -> Vec<CodeLensTarget> {
+    crate::config_key_locator::enumerate_keys_in_source(source)
+        .into_iter()
+        .map(|(path, pos)| CodeLensTarget {
+            line: pos.line,
+            column: pos.start_column,
+            end_column: pos.end_column,
+            symbol: make_symbol(format!("{file_stem}.{path}")),
+        })
+        .collect()
+}
+
+/// Config-key lenses for an open `config/<file_stem>.php` — each key's count is
+/// its `config('<file_stem>.<path>')` usages.
+pub fn config_lens_targets(file_stem: &str, source: &str) -> Vec<CodeLensTarget> {
+    dotted_key_lens_targets(file_stem, source, SymbolRefData::Config)
+}
+
+/// Translation-key lenses for an open `lang/<locale>/<file_stem>.php` — each
+/// key's count is its `__()` / `trans('<file_stem>.<path>')` usages. The locale
+/// is irrelevant to the key (`auth.failed` is identical across locales), so any
+/// locale's file lenses the same keys.
+pub fn translation_lens_targets(file_stem: &str, source: &str) -> Vec<CodeLensTarget> {
+    dotted_key_lens_targets(file_stem, source, SymbolRefData::Translation)
+}
+
 /// The leading `<?php … ?>` front-matter and the 0-based line it starts on.
 fn front_matter(source: &str) -> Option<(&str, u32)> {
     let start = source.find("<?php")?;

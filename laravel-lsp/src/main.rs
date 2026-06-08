@@ -17104,13 +17104,38 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
         let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let root = self.root_path.read().await.clone();
+        // A `config/<file>.php` (direct child of the project's config dir).
+        let is_config = file_name.ends_with(".php")
+            && root
+                .as_ref()
+                .is_some_and(|r| path.parent() == Some(r.join("config").as_path()));
+        // A `lang/<locale>/<file>.php` (or legacy `resources/lang/<locale>/…`).
+        let is_translation = file_name.ends_with(".php")
+            && root.as_ref().is_some_and(|r| {
+                path.parent()
+                    .and_then(|locale| locale.parent())
+                    .is_some_and(|lang| {
+                        lang == r.join("lang") || lang == r.join("resources").join("lang")
+                    })
+            });
 
         let targets = if is_env {
             // Env-var lenses: each `KEY=` in an open `.env*` file counts
             // `env('KEY')` usages. (`.env` is the only non-PHP file type we
             // lens; Zed routes it to our LSP as Shell Script.)
             laravel_lsp::code_lens::env_lens_targets(&source)
+        } else if is_config {
+            // Config-key lenses: each key in `config/<stem>.php` counts
+            // `config('<stem>.<dotted-key>')` usages.
+            laravel_lsp::code_lens::config_lens_targets(file_stem, &source)
+        } else if is_translation {
+            // Translation-key lenses: each key in `lang/<locale>/<stem>.php`
+            // counts `__()` / `trans('<stem>.<dotted-key>')` usages. JSON lang
+            // files are not yet covered (PHP-array walker only).
+            laravel_lsp::code_lens::translation_lens_targets(file_stem, &source)
         } else {
             let mut targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
 

@@ -228,3 +228,66 @@ fn env_lens_targets_one_per_key_with_positions() {
 fn env_lens_targets_empty_for_no_declarations() {
     assert!(env_lens_targets("# only comments\n\nJUST_TEXT\n").is_empty());
 }
+
+// ── Config / translation key lenses ───────────────────────────────────────
+
+fn config_keys(targets: &[CodeLensTarget]) -> Vec<&str> {
+    targets
+        .iter()
+        .filter_map(|t| match &t.symbol {
+            SymbolRefData::Config(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn translation_keys(targets: &[CodeLensTarget]) -> Vec<&str> {
+    targets
+        .iter()
+        .filter_map(|t| match &t.symbol {
+            SymbolRefData::Translation(k) => Some(k.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn config_lens_targets_prefix_file_stem_and_nest() {
+    let src = r#"<?php
+return [
+    'default' => 'mysql',
+    'connections' => [
+        'mysql' => ['host' => '127.0.0.1'],
+    ],
+];
+"#;
+    let targets = config_lens_targets("database", src);
+    assert_eq!(
+        config_keys(&targets),
+        vec![
+            "database.default",
+            "database.connections",
+            "database.connections.mysql",
+            "database.connections.mysql.host",
+        ]
+    );
+}
+
+#[test]
+fn translation_lens_targets_prefix_file_stem() {
+    let src = r#"<?php
+return [
+    'failed' => 'These credentials do not match our records.',
+    'throttle' => 'Too many login attempts.',
+];
+"#;
+    let targets = translation_lens_targets("auth", src);
+    assert_eq!(translation_keys(&targets), vec!["auth.failed", "auth.throttle"]);
+    assert_eq!((targets[0].line, targets[0].column > 0), (2, true));
+}
+
+#[test]
+fn dotted_key_lens_targets_empty_for_non_array() {
+    assert!(config_lens_targets("app", "<?php // nothing").is_empty());
+    assert!(translation_lens_targets("auth", "<?php // nothing").is_empty());
+}

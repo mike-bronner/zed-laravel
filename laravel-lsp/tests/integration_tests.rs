@@ -1468,3 +1468,62 @@ mod debounce_behavior {
         assert_eq!(pending_updates.len(), 2);
     }
 }
+
+/// End-to-end resolution for Artisan command-string call sites (issue #62):
+/// a cursor on a command string resolves through the call-site locator and the
+/// project-wide command index to the declaring Command class. Covers two call
+/// patterns and both app- and vendor-side commands.
+#[cfg(test)]
+mod command_resolution {
+    use laravel_lsp::command_call_locator::command_call_at_position;
+    use laravel_lsp::command_index::{build_command_index, CommandPriority};
+    use std::fs;
+
+    fn command_class(class: &str, signature: &str) -> String {
+        format!(
+            "<?php\n\nnamespace App\\Console\\Commands;\n\nuse Illuminate\\Console\\Command;\n\nclass {class} extends Command\n{{\n    protected $signature = '{signature}';\n\n    public function handle()\n    {{\n    }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn resolves_two_call_patterns_across_app_and_vendor() {
+        let dir = std::env::temp_dir().join(format!("cmd-e2e-{}", std::process::id()));
+        let app = dir.join("app/Console/Commands");
+        let vendor = dir.join("vendor/acme/pkg/src/Commands");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(
+            app.join("SendEmails.php"),
+            command_class("SendEmails", "emails:send {user}"),
+        )
+        .unwrap();
+        fs::write(
+            vendor.join("BackupRun.php"),
+            command_class("BackupRun", "backup:run"),
+        )
+        .unwrap();
+
+        let index = build_command_index(&dir);
+
+        // Pattern 1 — direct dispatch, app-side command.
+        let call = "<?php\nArtisan::call('emails:send');\n";
+        let site = command_call_at_position(call, 1, 16).expect("cursor on app call site");
+        let entry = index
+            .resolve(site.command_name())
+            .expect("app command resolves");
+        assert_eq!(entry.class_name, "SendEmails");
+        assert_eq!(entry.priority, CommandPriority::App);
+        assert!(entry.file.ends_with("app/Console/Commands/SendEmails.php"));
+
+        // Pattern 2 — scheduler `->command`, vendor-side command.
+        let sched = "<?php\n$schedule->command('backup:run')->daily();\n";
+        let site = command_call_at_position(sched, 1, 22).expect("cursor on vendor call site");
+        let entry = index
+            .resolve(site.command_name())
+            .expect("vendor command resolves");
+        assert_eq!(entry.class_name, "BackupRun");
+        assert_eq!(entry.priority, CommandPriority::Package);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}

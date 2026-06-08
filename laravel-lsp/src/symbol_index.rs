@@ -201,6 +201,39 @@ impl SymbolIndex {
         }
     }
 
+    /// Evict only this file's *literal-symbol* keys (views, routes, config,
+    /// …), leaving its magic-member entries untouched.
+    ///
+    /// The lazy dirty-drain re-parses a file and re-inserts its literals on
+    /// demand via [`insert_file`], but magic members are resolved only by the
+    /// warm/save passes ([`insert_magic_members`]). So a plain [`remove_file`]
+    /// here would drop the file's magic entries with nothing to restore them
+    /// until the next save — which silently zeroes magic-member find-references
+    /// and code-lens counts the moment an indexed file is edited or reopened.
+    /// The drain uses this instead so magic survives. Real file *deletes* still
+    /// use [`remove_file`] to drop everything.
+    pub fn remove_literal_entries(&mut self, path: &Path) {
+        let Some(keys) = self.by_file.remove(path) else {
+            return;
+        };
+        let mut retained: Vec<SymbolKey> = Vec::new();
+        for key in keys {
+            if key.kind == SymbolKind::MagicMember {
+                retained.push(key);
+                continue;
+            }
+            if let Some(entries) = self.forward.get_mut(&key) {
+                entries.retain(|loc| loc.file_path.as_path() != path);
+                if entries.is_empty() {
+                    self.forward.remove(&key);
+                }
+            }
+        }
+        if !retained.is_empty() {
+            self.by_file.insert(path.to_path_buf(), retained);
+        }
+    }
+
     /// Mark a path as needing refresh. Cheap (just a HashSet insert);
     /// the actual re-parse work happens later in `take_dirty()`.
     pub fn mark_dirty(&mut self, path: &Path) {
@@ -248,6 +281,56 @@ impl SymbolIndex {
             None => return Vec::new(),
         };
         self.forward.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Reverse lookup: every reference sharing the magic-member symbol whose
+    /// occurrence covers `(line, column)` in `path`.
+    ///
+    /// The index is already a position→symbol map — each resolved member access
+    /// was stored with its usage position. So find-references invoked *at a
+    /// usage site* (`$post->status`, `$this->status`, …) doesn't need to
+    /// re-resolve the receiver: we just find which symbol owns the clicked
+    /// position and return its whole bucket. This is the only path that works
+    /// for Blade, where re-parsing the template as PHP can't locate the node.
+    ///
+    /// A union-typed receiver (`$post` inferred as two classes) can produce two
+    /// symbols at the same position; we return the union of their references,
+    /// de-duplicated by `(file, line, column)`.
+    pub fn references_at(
+        &self,
+        path: &Path,
+        line: u32,
+        column: u32,
+    ) -> Vec<ReferenceLocationData> {
+        let Some(keys) = self.by_file.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ReferenceLocationData> = Vec::new();
+        let mut seen_keys: HashSet<&SymbolKey> = HashSet::new();
+        let mut seen_locs: HashSet<(PathBuf, u32, u32)> = HashSet::new();
+        for key in keys {
+            if key.kind != SymbolKind::MagicMember || !seen_keys.insert(key) {
+                continue;
+            }
+            let Some(locs) = self.forward.get(key) else {
+                continue;
+            };
+            let covers = locs.iter().any(|l| {
+                l.file_path.as_path() == path
+                    && l.line == line
+                    && column >= l.column
+                    && column <= l.end_column
+            });
+            if !covers {
+                continue;
+            }
+            for l in locs {
+                if seen_locs.insert((l.file_path.clone(), l.line, l.column)) {
+                    out.push(l.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Total entry count across all symbols. Useful for logging.

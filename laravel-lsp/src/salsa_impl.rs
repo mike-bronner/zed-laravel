@@ -6475,6 +6475,20 @@ impl SalsaActor {
         line: u32,
         column: u32,
     ) -> Vec<ReferenceLocationData> {
+        // Primary: the reverse index is already a position→symbol map. If the
+        // click lands on a resolved usage (PHP `$this->status`, Blade
+        // `$post->status`, Volt `$this->entities`, …) the index knows which
+        // symbol that position belongs to — return its references directly. No
+        // receiver re-resolution, and (unlike the fallback below) this works in
+        // Blade, where re-parsing the whole template as PHP can't locate nodes.
+        let indexed = self.symbol_index.references_at(path, line, column);
+        if !indexed.is_empty() {
+            return indexed;
+        }
+
+        // Fallback: live resolution for usages not yet in the index — e.g. a
+        // usage typed since the last save-time magic refresh. Resolves the
+        // receiver from the cursor file's own PHP AST.
         let Some(patterns) = self.handle_get_patterns(path) else {
             return Vec::new();
         };
@@ -6606,7 +6620,13 @@ impl SalsaActor {
                 symbol
             );
             for path in dirty {
-                self.symbol_index.remove_file(&path);
+                // Literal-only eviction: re-parsing restores literals via
+                // `insert_file`, but magic members are resolved only by the
+                // warm/save passes. A full `remove_file` here would drop this
+                // file's magic entries with nothing to restore them until the
+                // next save — silently zeroing magic-member counts. Preserve
+                // them.
+                self.symbol_index.remove_literal_entries(&path);
                 if let Some(patterns) = self.handle_get_patterns(&path) {
                     self.symbol_index.insert_file(&path, &patterns);
                 }

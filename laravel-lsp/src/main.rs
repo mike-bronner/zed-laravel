@@ -17319,12 +17319,16 @@ impl LanguageServer for LaravelLanguageServer {
         // Clear diagnostics from our cache
         self.diagnostics.write().await.remove(&uri);
 
-        // Remove from Salsa database
-        if let Ok(file_path) = uri.to_file_path() {
-            if let Err(e) = self.salsa.remove_file(file_path).await {
-                debug!("Failed to remove from Salsa database: {}", e);
-            }
-        }
+        // Deliberately DO NOT drop the file from Salsa / the symbol index here.
+        // A closed buffer's file still exists on disk and its references are
+        // still valid — project-wide find-references (and code lenses) must
+        // keep finding them. Worse, `RemoveFile` evicts the file's resolved
+        // magic-member entries, which only the warm/save passes rebuild — so
+        // evicting on close silently zeroed magic-member counts the moment you
+        // navigated away (e.g. opening the references multibuffer closes the
+        // model buffer, dropping its `$this->status` entry). External edits to
+        // a closed file are still picked up via `did_change_watched_files`,
+        // and a real delete still goes through `RemoveFile`.
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;

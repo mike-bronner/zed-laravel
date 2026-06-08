@@ -340,3 +340,142 @@ fn reindex_file_replaces_stale_magic_members() {
     );
     assert_eq!(idx.find(&SymbolRefData::View("welcome".into())).len(), 1);
 }
+
+/// A magic-member entry with explicit column span (the shared `magic` helper
+/// fixes columns at 4..12; position tests need control over the span).
+fn magic_at(fqcn: &str, member: &str, line: u32, column: u32, end_column: u32) -> MagicMemberEntry {
+    MagicMemberEntry {
+        fqcn: fqcn.to_string(),
+        member: member.to_string(),
+        line,
+        column,
+        end_column,
+    }
+}
+
+#[test]
+fn references_at_returns_full_bucket_for_clicked_usage() {
+    let mut idx = SymbolIndex::default();
+    let model = PathBuf::from("/proj/app/Models/Post.php");
+    let blade = PathBuf::from("/proj/resources/views/blog/index.blade.php");
+    // One PHP self-reference + two Blade usages of Post#status.
+    idx.insert_magic_members(&model, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+    idx.insert_magic_members(
+        &blade,
+        &[
+            magic_at("App\\Models\\Post", "status", 78, 43, 49),
+            magic_at("App\\Models\\Post", "status", 81, 38, 44),
+        ],
+    );
+
+    // Click inside the member name in the Blade file (col 45 ∈ 43..49).
+    let hits = idx.references_at(&blade, 78, 45);
+    assert_eq!(hits.len(), 3, "should return every reference, not just the click");
+    assert!(hits.iter().any(|l| l.file_path == model && l.line == 65));
+    assert_eq!(hits.iter().filter(|l| l.file_path == blade).count(), 2);
+}
+
+#[test]
+fn references_at_matches_span_boundaries_and_misses_outside() {
+    let mut idx = SymbolIndex::default();
+    let blade = PathBuf::from("/proj/resources/views/x.blade.php");
+    idx.insert_magic_members(&blade, &[magic_at("App\\Models\\Post", "status", 10, 43, 49)]);
+
+    assert_eq!(idx.references_at(&blade, 10, 43).len(), 1, "start col inclusive");
+    assert_eq!(idx.references_at(&blade, 10, 49).len(), 1, "end col inclusive");
+    assert!(idx.references_at(&blade, 10, 42).is_empty(), "before span");
+    assert!(idx.references_at(&blade, 10, 50).is_empty(), "after span");
+    assert!(idx.references_at(&blade, 11, 45).is_empty(), "wrong line");
+}
+
+#[test]
+fn references_at_unknown_file_is_empty() {
+    let idx = SymbolIndex::default();
+    assert!(idx
+        .references_at(&PathBuf::from("/proj/nope.php"), 1, 1)
+        .is_empty());
+}
+
+#[test]
+fn references_at_unions_overlapping_symbols_deduped() {
+    let mut idx = SymbolIndex::default();
+    let blade = PathBuf::from("/proj/resources/views/u.blade.php");
+    let a = PathBuf::from("/proj/app/Models/Post.php");
+    let b = PathBuf::from("/proj/app/Models/Draft.php");
+    // A union-typed `$item->status`: same position resolves to two classes.
+    idx.insert_magic_members(
+        &blade,
+        &[
+            magic_at("App\\Models\\Post", "status", 5, 10, 16),
+            magic_at("App\\Models\\Draft", "status", 5, 10, 16),
+        ],
+    );
+    idx.insert_magic_members(&a, &[magic_at("App\\Models\\Post", "status", 1, 0, 6)]);
+    idx.insert_magic_members(&b, &[magic_at("App\\Models\\Draft", "status", 2, 0, 6)]);
+
+    let hits = idx.references_at(&blade, 5, 12);
+    // Post: blade@5 + a@1 ; Draft: blade@5 + b@2 ; blade@5 deduped once.
+    assert_eq!(hits.len(), 3, "union of both symbols, blade site deduped");
+    assert!(hits.iter().any(|l| l.file_path == a));
+    assert!(hits.iter().any(|l| l.file_path == b));
+    assert_eq!(hits.iter().filter(|l| l.file_path == blade).count(), 1);
+}
+
+#[test]
+fn remove_literal_entries_preserves_magic_members() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Models/Post.php");
+    // Literals (view + route) and a magic member, all from one file.
+    idx.insert_file(&path, &fixture("welcome", "home"));
+    idx.insert_magic_members(&path, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+
+    idx.remove_literal_entries(&path);
+
+    // Literals dropped…
+    assert!(idx.find(&SymbolRefData::View("welcome".into())).is_empty());
+    assert!(idx.find(&SymbolRefData::Route("home".into())).is_empty());
+    // …magic member survives.
+    let magic_hits = idx.find(&SymbolRefData::MagicMember {
+        fqcn: "App\\Models\\Post".into(),
+        member: "status".into(),
+    });
+    assert_eq!(magic_hits.len(), 1, "magic member must survive a literal-only eviction");
+    // And the position lookup still resolves (by_file retained the magic key).
+    assert_eq!(idx.references_at(&path, 65, 24).len(), 1);
+}
+
+#[test]
+fn remove_literal_entries_then_reinsert_has_no_duplicates() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Models/Post.php");
+    idx.insert_file(&path, &fixture("welcome", "home"));
+    idx.insert_magic_members(&path, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+
+    // Simulate the dirty-drain: evict literals, re-parse, re-insert literals.
+    idx.remove_literal_entries(&path);
+    idx.insert_file(&path, &fixture("welcome", "home"));
+
+    assert_eq!(idx.find(&SymbolRefData::View("welcome".into())).len(), 1, "no literal dupes");
+    assert_eq!(
+        idx.find(&SymbolRefData::MagicMember {
+            fqcn: "App\\Models\\Post".into(),
+            member: "status".into()
+        })
+        .len(),
+        1,
+        "magic member still present and not duplicated"
+    );
+}
+
+#[test]
+fn remove_literal_entries_drops_by_file_when_no_magic_remains() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Http/Controllers/Home.php");
+    idx.insert_file(&path, &fixture("welcome", "home"));
+
+    idx.remove_literal_entries(&path);
+
+    // Pure-literal file: everything gone, no lingering by_file bucket.
+    assert_eq!(idx.indexed_file_count(), 0);
+    assert!(idx.find(&SymbolRefData::View("welcome".into())).is_empty());
+}

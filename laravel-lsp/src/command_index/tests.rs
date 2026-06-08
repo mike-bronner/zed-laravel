@@ -26,7 +26,9 @@ fn priority_classifies_by_path() {
         CommandPriority::App
     );
     assert_eq!(
-        classify_priority(Path::new("/app/vendor/spatie/backup/src/Commands/Backup.php")),
+        classify_priority(Path::new(
+            "/app/vendor/spatie/backup/src/Commands/Backup.php"
+        )),
         CommandPriority::Package
     );
     assert_eq!(
@@ -47,7 +49,9 @@ fn indexes_a_command_and_resolves_it() {
         &src,
     );
 
-    let entry = index.resolve("emails:send").expect("command should resolve");
+    let entry = index
+        .resolve("emails:send")
+        .expect("command should resolve");
     assert_eq!(entry.name, "emails:send");
     assert_eq!(entry.class_name, "SendEmails");
     assert_eq!(entry.raw_signature, "emails:send {user} {--force}");

@@ -120,8 +120,7 @@ pub fn classify_priority(path: &Path) -> CommandPriority {
 /// is found (the caller then skips the file — no class, no goto target).
 pub fn class_name_from_content(content: &str) -> Option<String> {
     lazy_static! {
-        static ref CLASS_RE: Regex =
-            Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        static ref CLASS_RE: Regex = Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
     }
     CLASS_RE
         .captures(content)

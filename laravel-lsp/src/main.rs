@@ -22,6 +22,7 @@ use laravel_lsp::cache_manager::{
     BindingEntry, CacheManager, CachedEnvVars, CachedLaravelConfig, MiddlewareEntry, RescanType,
     ScanResult,
 };
+use laravel_lsp::command_index::{build_command_index, CommandIndex};
 use laravel_lsp::completion_format::CompletionDoc;
 use laravel_lsp::config::find_project_root;
 use laravel_lsp::middleware_parser::{middleware_base_alias, resolve_class_to_file};
@@ -1928,6 +1929,14 @@ struct LaravelLanguageServer {
     /// (column → migration line, table → create-table migration). Built at init
     /// and refreshed when migration files change.
     migration_index: Arc<RwLock<Option<MigrationIndex>>>,
+
+    /// Project-wide index of Artisan commands (classes extending
+    /// `Illuminate\Console\Command`) keyed by command name, with app-over-
+    /// package-over-framework priority. Powers goto-definition and hover on
+    /// command-string call sites (`Artisan::call('emails:send')`). Built at
+    /// init and refreshed when a `Command` file changes. See
+    /// [`laravel_lsp::command_index`].
+    command_index: Arc<RwLock<Option<CommandIndex>>>,
 
     /// Cached map of translation `namespace → absolute lang directory` for
     /// unpublished vendor packages. Lazily populated on the first translation
@@ -3862,6 +3871,7 @@ impl LaravelLanguageServer {
             route_index: Arc::new(RwLock::new(None)),
             warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
+            command_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -5034,6 +5044,7 @@ impl LaravelLanguageServer {
             tokio::spawn(async move {
                 server.rebuild_route_index(&route_root).await;
                 server.rebuild_migration_index(&route_root).await;
+                server.rebuild_command_index(&route_root).await;
             });
         }
 
@@ -5609,6 +5620,7 @@ impl LaravelLanguageServer {
         // renamed, removed) are reflected on the next goto-definition request.
         self.rebuild_route_index(&root).await;
         self.rebuild_migration_index(&root).await;
+        self.rebuild_command_index(&root).await;
 
         // Populate cache with ALL parsed middleware/bindings AFTER all rescans complete
         // This ensures we capture middleware from both vendor and app sources
@@ -5874,6 +5886,7 @@ impl LaravelLanguageServer {
         info!("========================================");
         self.rebuild_route_index(&discovered_root).await;
         self.rebuild_migration_index(&discovered_root).await;
+        self.rebuild_command_index(&discovered_root).await;
 
         // Initialize environment variables with Salsa
         info!("========================================");
@@ -13685,6 +13698,146 @@ return [
         }
     }
 
+    /// Rebuild the Artisan command index by scanning the project and `vendor/`
+    /// for `Command` subclasses. Mirrors `rebuild_migration_index` — the
+    /// (blocking) walk runs off the async runtime, then the index is swapped in.
+    async fn rebuild_command_index(&self, root: &Path) {
+        // Cold start: restore the disk-cached index immediately so
+        // goto-definition/hover on command strings work without waiting for
+        // the full project+vendor walk below. Only on a cold index (None) —
+        // file-watcher rebuilds already have a live index and skip this. The
+        // full build that follows corrects any drift (added/removed commands
+        // while the LSP was off) and re-saves the cache.
+        if self.command_index.read().await.is_none() {
+            let root_for_load = root.to_path_buf();
+            if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
+                laravel_lsp::command_disk_cache::load_index(&root_for_load)
+            })
+            .await
+            {
+                info!(
+                    "🗄️  Command index: restored {} commands from disk cache",
+                    cached.len()
+                );
+                *self.command_index.write().await = Some(cached);
+            }
+        }
+
+        let root_buf = root.to_path_buf();
+        let index = tokio::task::spawn_blocking(move || build_command_index(&root_buf)).await;
+        match index {
+            Ok(index) => {
+                info!("🎛️  Command index built: {} commands", index.len());
+
+                // Persist the freshly built index so the next cold start can
+                // skip the walk. Advisory — a save failure doesn't affect the
+                // live in-memory index.
+                let to_save = index.clone();
+                let root_for_save = root.to_path_buf();
+                let saved = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::command_disk_cache::save_index(&to_save, &root_for_save)
+                })
+                .await;
+                match saved {
+                    Ok(Ok(n)) => info!("🗄️  Command disk cache: saved {} commands", n),
+                    Ok(Err(e)) => debug!("Command disk cache save failed: {}", e),
+                    Err(e) => debug!("Command disk cache save task panicked: {}", e),
+                }
+
+                *self.command_index.write().await = Some(index);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build command index: {}", e);
+            }
+        }
+    }
+
+    /// Goto-definition for an Artisan command-string call site under the cursor
+    /// (`Artisan::call('emails:send')`, `->command('emails:send')`, …). Resolves
+    /// the cursor to a command name via [`laravel_lsp::command_call_locator`],
+    /// looks it up in the command index, and lands on the matching class's
+    /// `$signature` declaration. Returns `None` when the cursor isn't on a call
+    /// site or the command isn't indexed — goto then no-ops.
+    async fn command_goto_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<GotoDefinitionResponse> {
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let site = laravel_lsp::command_call_locator::command_call_at_position(
+            &content,
+            position.line,
+            position.character,
+        )?;
+
+        let guard = self.command_index.read().await;
+        let entry = guard.as_ref()?.resolve(site.command_name())?;
+
+        let target_uri = Url::from_file_path(&entry.file).ok()?;
+        let range = Range {
+            start: Position {
+                line: entry.line,
+                character: entry.start_column,
+            },
+            end: Position {
+                line: entry.line,
+                character: entry.end_column,
+            },
+        };
+        let caret = Range {
+            start: range.start,
+            end: range.start,
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri,
+            target_range: range,
+            target_selection_range: caret,
+        }]))
+    }
+
+    /// Hover markdown for an Artisan command-string call site under the cursor:
+    /// the declaring class name and the command's `$signature`. Returns `None`
+    /// when the cursor isn't on a call site or the command isn't indexed.
+    async fn command_hover(&self, uri: &Url, position: Position) -> Option<String> {
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let site = laravel_lsp::command_call_locator::command_call_at_position(
+            &content,
+            position.line,
+            position.character,
+        )?;
+
+        let guard = self.command_index.read().await;
+        let entry = guard.as_ref()?.resolve(site.command_name())?;
+        Some(format!(
+            "**Artisan command** `{}`\n\n`{}`\n\n```php\nprotected $signature = '{}';\n```",
+            entry.name, entry.class_name, entry.raw_signature
+        ))
+    }
+
+    /// Wrap [`command_hover`](Self::command_hover) markdown into a hover
+    /// response, or `None` when the cursor isn't on a resolvable command string.
+    async fn command_hover_response(&self, uri: &Url, position: Position) -> Option<Hover> {
+        let value = self.command_hover(uri, position).await?;
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        })
+    }
+
     /// Goto-definition for a query-chain literal under the cursor. Re-extracts
     /// chains from the LIVE document (Salsa's cached chains can lag, and we need
     /// byte offsets that match `content`), resolves the literal, and routes it:
@@ -14356,6 +14509,7 @@ return [
             route_index: self.route_index.clone(),
             warm_complete: self.warm_complete.clone(),
             migration_index: self.migration_index.clone(),
+            command_index: self.command_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
@@ -18467,6 +18621,7 @@ impl LanguageServer for LaravelLanguageServer {
         let mut deleted = 0usize;
         let mut skipped_open = 0usize;
         let mut migrations_changed = false;
+        let mut commands_changed = false;
 
         for change in params.changes {
             if open_docs.contains(&change.uri) {
@@ -18476,6 +18631,15 @@ impl LanguageServer for LaravelLanguageServer {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
             };
+            // A Command class can live anywhere, but conventionally sits under a
+            // `Commands/` directory (app or package). That heuristic keeps the
+            // index fresh without rebuilding on every unrelated `.php` save.
+            if !commands_changed {
+                let p = path.to_string_lossy();
+                if p.ends_with(".php") && p.contains("/Commands/") {
+                    commands_changed = true;
+                }
+            }
             if !migrations_changed && path.to_string_lossy().contains("database/migrations") {
                 migrations_changed = true;
             }
@@ -18564,6 +18728,14 @@ impl LanguageServer for LaravelLanguageServer {
         if migrations_changed {
             if let Some(root) = self.initialized_root.read().await.clone() {
                 self.rebuild_migration_index(&root).await;
+            }
+        }
+
+        // A Command class changed on disk — rebuild the Artisan command index so
+        // goto-definition/hover on command strings stay accurate. One per batch.
+        if commands_changed {
+            if let Some(root) = self.initialized_root.read().await.clone() {
+                self.rebuild_command_index(&root).await;
             }
         }
     }
@@ -18689,6 +18861,14 @@ impl LanguageServer for LaravelLanguageServer {
                 // migration). Chains aren't position-indexed, so this lives in
                 // the no-pattern branch.
                 if let Some(loc) = self.chain_goto_definition(&uri, position).await {
+                    return Ok(Some(loc));
+                }
+
+                // Artisan command-string fallback: cmd-click on a command name
+                // in `Artisan::call('emails:send')`, `->command('emails:send')`,
+                // etc. jumps to the declaring Command class's `$signature`.
+                // Call sites aren't position-indexed, so this lives here too.
+                if let Some(loc) = self.command_goto_definition(&uri, position).await {
                     return Ok(Some(loc));
                 }
 
@@ -18867,12 +19047,14 @@ impl LanguageServer for LaravelLanguageServer {
             is_blade,
         ) {
             Some(t) => t,
-            None => return Ok(None),
+            // No Salsa-indexed hover target — try the Artisan command-string
+            // fallback (call sites aren't position-indexed) before giving up.
+            None => return Ok(self.command_hover_response(uri, position).await),
         };
 
         let value = match self.build_hover_markdown(target, uri).await {
             Some(v) => v,
-            None => return Ok(None),
+            None => return Ok(self.command_hover_response(uri, position).await),
         };
 
         Ok(Some(Hover {

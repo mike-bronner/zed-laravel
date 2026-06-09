@@ -768,3 +768,180 @@ fn collect_returns_empty_for_no_matches() {
         "a view name must not satisfy a route reference query"
     );
 }
+
+// ─── Shared component resolution (issue #69) ────────────────────────────
+//
+// `component_candidate_paths` is the single source of truth shared by
+// goto-definition and the "component not found" diagnostic. These tests pin
+// the class-based `Blade::componentNamespace` (PSR-4) resolution that the
+// naive guesses in `resolve_component_path` missed — the Filament / mail
+// failure case from the issue — plus the false-negative guarantee.
+
+use crate::composer_autoload::ComposerAutoload;
+use tempfile::TempDir;
+
+/// Build a Laravel-shaped tempdir with the given (relative path, body) pairs.
+fn project_with_files(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    for (relpath, body) in files {
+        let full = dir.path().join(relpath);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, body).unwrap();
+    }
+    let root = dir.path().to_path_buf();
+    (dir, root)
+}
+
+/// Config whose only interesting field is a set of `Blade::componentNamespace`
+/// registrations (`prefix => PHP namespace`), rooted at `root`.
+fn config_with_component_namespaces(root: &Path, ns: &[(&str, &str)]) -> LaravelConfigData {
+    let mut component_namespaces = HashMap::new();
+    for (prefix, php_ns) in ns {
+        component_namespaces.insert(prefix.to_string(), php_ns.to_string());
+    }
+    LaravelConfigData {
+        root: root.to_path_buf(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces,
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+    }
+}
+
+/// Mirror of the live resolver's existence check: a component "resolves" when
+/// any candidate path exists on disk.
+fn resolves(name: &str, config: &LaravelConfigData, autoload: &ComposerAutoload) -> bool {
+    component_candidate_paths(name, config, autoload)
+        .iter()
+        .any(|p| p.exists())
+}
+
+#[test]
+fn psr4_class_namespace_component_resolves_across_two_namespaces() {
+    // Two separate package namespaces registered via componentNamespace, each
+    // shipped under a PSR-4 vendor layout that the naive
+    // `vendor/<Namespace>/...` guess in resolve_component_path can't find.
+    // Both `<x-filament::badge>` and `<x-nightshade::alert-banner>` must
+    // resolve through the autoload map (issue #69 — at least two namespaces).
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/support",
+                "autoload": { "psr-4": { "Filament\\Support\\": "src/" } },
+                "install-path": "../filament/support"
+            },
+            {
+                "name": "nightshade/ui",
+                "autoload": { "psr-4": { "Nightshade\\Ui\\": "src/" } },
+                "install-path": "../nightshade/ui"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/support/src/View/Components/Badge.php",
+            "<?php namespace Filament\\Support\\View\\Components; class Badge {}",
+        ),
+        (
+            "vendor/nightshade/ui/src/View/Components/AlertBanner.php",
+            "<?php namespace Nightshade\\Ui\\View\\Components; class AlertBanner {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[
+            ("filament", "Filament\\Support\\View\\Components"),
+            ("nightshade", "Nightshade\\Ui\\View\\Components"),
+        ],
+    );
+
+    assert!(
+        resolves("filament::badge", &config, &autoload),
+        "filament::badge must resolve via PSR-4 autoload: {:#?}",
+        component_candidate_paths("filament::badge", &config, &autoload),
+    );
+    // kebab tag → PascalCase class file under the same namespace.
+    assert!(
+        resolves("nightshade::alert-banner", &config, &autoload),
+        "nightshade::alert-banner must resolve via PSR-4 autoload: {:#?}",
+        component_candidate_paths("nightshade::alert-banner", &config, &autoload),
+    );
+}
+
+#[test]
+fn psr4_class_namespace_resolves_dotted_subnamespace() {
+    // `<x-filament::forms.text-input>` → Forms/TextInput.php under the
+    // registered namespace.
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/forms",
+                "autoload": { "psr-4": { "Filament\\Forms\\": "src/" } },
+                "install-path": "../filament/forms"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/forms/src/View/Components/Forms/TextInput.php",
+            "<?php namespace Filament\\Forms\\View\\Components\\Forms; class TextInput {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[("filament", "Filament\\Forms\\View\\Components")],
+    );
+
+    assert!(
+        resolves("filament::forms.text-input", &config, &autoload),
+        "dotted namespaced component must map to a sub-namespaced class: {:#?}",
+        component_candidate_paths("filament::forms.text-input", &config, &autoload),
+    );
+}
+
+#[test]
+fn missing_namespaced_component_still_reports_not_found() {
+    // A registered namespace whose class file does NOT exist must NOT resolve —
+    // diagnostics still fire (issue #69, no false negatives).
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/support",
+                "autoload": { "psr-4": { "Filament\\Support\\": "src/" } },
+                "install-path": "../filament/support"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/support/src/View/Components/Badge.php",
+            "<?php class Badge {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[("filament", "Filament\\Support\\View\\Components")],
+    );
+
+    assert!(
+        !resolves("filament::does-not-exist", &config, &autoload),
+        "a namespaced component with no backing file must not resolve",
+    );
+    // An entirely unregistered namespace must not resolve either.
+    assert!(
+        !resolves("unknown::widget", &config, &autoload),
+        "an unregistered namespace must not resolve",
+    );
+}

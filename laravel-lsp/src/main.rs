@@ -12090,37 +12090,50 @@ return [
         None
     }
 
+    /// Resolve a Blade component tag name to the file backing it on disk.
+    ///
+    /// The single shared entry point for goto-definition and the
+    /// "component not found" diagnostic (issue #69): both walk the exact same
+    /// candidate list from [`laravel_lsp::salsa_impl::component_candidate_paths`]
+    /// with the same cached existence check, so they can never disagree about
+    /// whether a component resolves. Returns the first existing candidate, or
+    /// `None` when nothing matches.
+    async fn resolve_component_existing_file(&self, name: &str) -> Option<PathBuf> {
+        let config = self.get_cached_config().await?;
+        let root = self.root_path.read().await.clone()?;
+        let autoload = laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root);
+
+        for path in laravel_lsp::salsa_impl::component_candidate_paths(name, &config, autoload) {
+            if self.file_exists_cached(&path).await {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     /// Create LocationLink for a component reference from Salsa data
     async fn create_component_location_from_salsa(
         &self,
         comp: &ComponentReferenceData,
     ) -> Option<GotoDefinitionResponse> {
-        let config = self.get_cached_config().await?;
-        let possible_paths = config.resolve_component_path(&comp.name);
-
-        for path in possible_paths {
-            if self.file_exists_cached(&path).await {
-                if let Ok(target_uri) = Url::from_file_path(&path) {
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: comp.line,
-                            character: comp.column,
-                        },
-                        end: Position {
-                            line: comp.line,
-                            character: comp.end_column,
-                        },
-                    };
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: Range::default(),
-                        target_selection_range: Range::default(),
-                    }]));
-                }
-            }
-        }
-        None
+        let path = self.resolve_component_existing_file(&comp.name).await?;
+        let target_uri = Url::from_file_path(&path).ok()?;
+        let origin_selection_range = Range {
+            start: Position {
+                line: comp.line,
+                character: comp.column,
+            },
+            end: Position {
+                line: comp.line,
+                character: comp.end_column,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(origin_selection_range),
+            target_uri,
+            target_range: Range::default(),
+            target_selection_range: Range::default(),
+        }]))
     }
 
     /// Create LocationLink for an `<x-slot:name>` tag.
@@ -14741,61 +14754,56 @@ return [
         }
 
         // Check Blade components (<x-button>) using Salsa patterns. A
-        // component is considered to exist if EITHER a conventional view
-        // file (`resources/views/components/{name}.blade.php`) OR a class
-        // file (`app/View/Components/{Pascal}.php`) is on disk. The class-
-        // only case covers components like `<x-app-layout>` whose
-        // `render()` method returns a view at a non-conventional path
-        // (`view('layouts.app')`) — common in Laravel Breeze/Jetstream
-        // starter kits.
-        let root_for_components = self.root_path.read().await;
+        // component is considered to exist when the SAME resolver the
+        // goto-definition handler uses finds a backing file — conventional
+        // view, anonymous-path/namespace, package view, vendor-published,
+        // a conventional class file (`app/View/Components/{Pascal}.php`), or
+        // a PSR-4 class-based `Blade::componentNamespace` component such as
+        // `<x-filament::badge>` / `<x-mail::message>` (issue #69). Sharing
+        // `resolve_component_existing_file` guarantees diagnostics and
+        // goto-definition can never disagree about whether a component exists.
         for comp_ref in &patterns.components {
-            let possible_paths = config.resolve_component_path(&comp_ref.name);
-            let view_exists = possible_paths.iter().any(|p| p.exists());
-
-            let class_path =
-                laravel_lsp::component_declaration_locator::conventional_class_file_path(
-                    &comp_ref.name,
-                    &config,
-                );
-            let class_exists = class_path.is_file();
-
-            if !view_exists && !class_exists {
-                // Neither view nor class exists — surface as "not found"
-                // so the user gets a Create Missing View / Create Missing
-                // Component code action.
-                let expected_path = possible_paths
-                    .first()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let diagnostic = Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: comp_ref.line,
-                            character: comp_ref.column,
-                        },
-                        end: Position {
-                            line: comp_ref.line,
-                            character: comp_ref.end_column,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: None,
-                    source: Some("laravel".to_string()),
-                    message: format!(
-                        "Blade component not found: '{}'\nExpected at: {}",
-                        comp_ref.name, expected_path
-                    ),
-                    related_information: None,
-                    tags: None,
-                    code_description: None,
-                    data: None,
-                };
-                diagnostics.push(diagnostic);
+            if self
+                .resolve_component_existing_file(&comp_ref.name)
+                .await
+                .is_some()
+            {
+                continue;
             }
+
+            // Nothing resolved — surface as "not found" so the user gets a
+            // Create Missing View / Create Missing Component code action.
+            let possible_paths = config.resolve_component_path(&comp_ref.name);
+            let expected_path = possible_paths
+                .first()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let diagnostic = Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: comp_ref.line,
+                        character: comp_ref.column,
+                    },
+                    end: Position {
+                        line: comp_ref.line,
+                        character: comp_ref.end_column,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: None,
+                source: Some("laravel".to_string()),
+                message: format!(
+                    "Blade component not found: '{}'\nExpected at: {}",
+                    comp_ref.name, expected_path
+                ),
+                related_information: None,
+                tags: None,
+                code_description: None,
+                data: None,
+            };
+            diagnostics.push(diagnostic);
         }
-        drop(root_for_components);
 
         // Check Livewire components using Salsa patterns. The resolver
         // routes through three layers in order:

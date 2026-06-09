@@ -2514,6 +2514,60 @@ impl LaravelConfigData {
     }
 }
 
+/// All candidate file paths that could back a Blade component tag, in
+/// priority order. This is the **single source of truth** shared by
+/// goto-definition and the "component not found" diagnostic, so the two can
+/// never disagree about whether a component resolves (issue #69).
+///
+/// Layers, in order:
+///   1. [`LaravelConfigData::resolve_component_path`] — conventional,
+///      aliased, icon, anonymous-path/namespace, package-view, vendor-publish,
+///      and the *naive* class-namespace guesses.
+///   2. The conventional class-backed component file
+///      (`app/View/Components/<Pascal>.php`).
+///   3. **PSR-4 class-based `Blade::componentNamespace` components.** Layer 1
+///      only emits a guessed `vendor/<Namespace>/...` path that ignores how
+///      Composer actually lays packages out on disk, so namespaced class
+///      components (`<x-filament::badge>`, `<x-mail::message>`) never matched.
+///      Here we walk the registered PHP namespace to its real source
+///      directory via the autoload map and append the class file path.
+///
+/// `autoload` supplies the project's PSR-4 prefix map (see
+/// [`crate::composer_autoload::ComposerAutoload`]). The function does **not**
+/// touch the filesystem itself — callers decide existence (cached async check
+/// for the live server, direct `Path::exists` in tests).
+pub fn component_candidate_paths(
+    name: &str,
+    config: &LaravelConfigData,
+    autoload: &crate::composer_autoload::ComposerAutoload,
+) -> Vec<PathBuf> {
+    let mut candidates = config.resolve_component_path(name);
+
+    // Conventional class-backed component (non-namespaced names).
+    candidates
+        .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+
+    // PSR-4 class-based componentNamespace resolution.
+    if let Some((namespace, component)) = name.split_once("::") {
+        if let Some(php_namespace) = config.component_namespaces.get(namespace) {
+            // `forms.input-text` → relative class path `Forms/InputText.php`,
+            // matching the FQCN `<php_namespace>\Forms\InputText`.
+            let class_name = kebab_to_pascal_case(&component.replace('.', "\\"));
+            let mut rel = PathBuf::new();
+            for segment in class_name.split('\\') {
+                rel.push(segment);
+            }
+            rel.set_extension("php");
+
+            for dir in autoload.resolve_namespace_dirs(php_namespace) {
+                candidates.push(dir.join(&rel));
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Type of file that contains a view reference
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum FileReferenceType {

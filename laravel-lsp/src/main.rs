@@ -15770,14 +15770,9 @@ return [
             Ok(Some(d)) => d,
             _ => return String::new(),
         };
-        // `decl_line` is 0-based (repo convention); source links are 1-based.
-        let link = match &data.decl_file {
-            Some(f) => Some(self.source_link(f, data.decl_line.map(|l| l + 1)).await),
-            None => None,
-        };
-        // For a method-backed member, read the *declaring* file (usually a
-        // different file — the model, not the cursor file) off the async side
-        // (not the Salsa actor) and slice its source for the hover snippet.
+        // Method-backed member (relationship / scope / accessor): read the
+        // declaring file (usually a different file — the model) off the async
+        // side and slice its source for the hover snippet.
         let definition = match (&data.decl_file, data.decl_line, data.decl_end_line) {
             (Some(f), Some(start), Some(end)) => tokio::fs::read_to_string(f)
                 .await
@@ -15786,14 +15781,94 @@ return [
                 .filter(|s| !s.is_empty()),
             _ => None,
         };
+
+        // Columns (M6.2): confirm + type via migrations-first, DB fallback. A
+        // *tentative* column (the resolver couldn't classify it — a plain,
+        // non-`$casts` DB column) renders only when migrations or the DB confirm
+        // it, so a typo'd member never produces a spurious card.
+        let mut type_hint = None;
+        let mut column_link = None;
+        if matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+            let (confirmed, php_type, mig_link) = self
+                .resolve_column_hover(&data.declaring_fqcn, &data.member)
+                .await;
+            if data.tentative && !confirmed {
+                return String::new();
+            }
+            type_hint = php_type;
+            column_link = mig_link;
+        }
+
+        // Link: prefer the migration site for a column (the column's actual
+        // definition), else the declaration site. `decl_line` is 0-based; the
+        // source link is 1-based.
+        let decl_link = match &data.decl_file {
+            Some(f) => Some(self.source_link(f, data.decl_line.map(|l| l + 1)).await),
+            None => None,
+        };
+        let link = column_link.or(decl_link);
+
         hover::magic_member_card(
             data.kind,
             &data.member,
             &data.declaring_fqcn,
             data.confidence,
             definition.as_deref(),
+            type_hint.as_deref(),
             link.as_deref(),
         )
+    }
+
+    /// Confirm a column on `model_fqcn` and resolve its type + a goto link.
+    /// **Migrations first** (already indexed, O(1) lookup, no DB connection
+    /// required): they confirm the column exists and give a definition link.
+    /// The **DB schema** supplies the cast-aware PHP type — migrations don't
+    /// store it. Returns `(confirmed, php_type, migration_link)`. Async + off
+    /// the Salsa actor (migration-index + DB-schema reads only).
+    async fn resolve_column_hover(
+        &self,
+        model_fqcn: &str,
+        column: &str,
+    ) -> (bool, Option<String>, Option<String>) {
+        use laravel_lsp::query_chain::eloquent_completion;
+        let Some(root) = self.root_path.read().await.clone() else {
+            return (false, None, None);
+        };
+        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
+            .await
+            .unwrap_or_else(|| {
+                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
+                eloquent_completion::snake_pluralize(basename)
+            });
+
+        // Migrations first: existence + a definition link (offline-capable).
+        let mig_site = {
+            let guard = self.migration_index.read().await;
+            guard
+                .as_ref()
+                .and_then(|mi| mi.column(&table, column).map(|s| (s.file.clone(), s.line)))
+        };
+        let mig_link = match &mig_site {
+            Some((file, line)) => Some(self.source_link(file, Some(line + 1)).await),
+            None => None,
+        };
+
+        // DB for the cast-aware PHP type — migrations don't carry types.
+        let php_type = {
+            let guard = self.database_schema.read().await;
+            match guard.as_ref() {
+                Some(db) => db
+                    .get_columns_with_types(&table)
+                    .await
+                    .into_iter()
+                    .find(|(name, _)| name == column)
+                    .map(|(_, php_type)| php_type),
+                None => None,
+            }
+        };
+
+        let confirmed = mig_site.is_some() || php_type.is_some();
+        (confirmed, php_type, mig_link)
     }
 
     /// Blade component — distinguishes class-backed components (Laravel

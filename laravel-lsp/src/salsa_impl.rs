@@ -2451,6 +2451,11 @@ pub struct MagicMemberHoverData {
     /// 0-based end line — present only for a *method* declaration, so the async
     /// hover builder knows to read the declaring file and extract a snippet.
     pub decl_end_line: Option<u32>,
+    /// True when the resolver couldn't classify the member but the receiver
+    /// resolved to a model — a likely *plain DB column* (not `$casts`-declared,
+    /// so invisible to the source-only `ClassView`). The main side must confirm
+    /// it against migrations/DB before rendering, and skip the card otherwise.
+    pub tentative: bool,
 }
 
 /// Laravel configuration data for transfer across async boundaries
@@ -6649,21 +6654,41 @@ impl SalsaActor {
             member_ref.receiver_byte_start,
             member_ref.receiver_byte_end,
         )?;
-        let resolved = crate::member_resolver::resolve_and_classify(
-            receiver,
-            &member_ref.member,
-            crate::member_resolver::AccessForm::Property,
-            bytes,
-            &aliases,
-            &self.class_hierarchy_index,
-            &mut classviews,
-            &project_root,
-        )?;
-
-        // Hover threshold mirrors find-references: HIGH + MEDIUM only.
-        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
-            return None;
-        }
+        // Classify the member; HIGH/MEDIUM only (mirrors find-references). If the
+        // member doesn't classify but the receiver still resolves to a model, it
+        // may be a plain DB column the source-only ClassView can't see (not in
+        // `$casts`) — mark it tentative and let the main side confirm it against
+        // migrations/DB.
+        let (declaring_fqcn, kind, confidence, tentative) =
+            match crate::member_resolver::resolve_and_classify(
+                receiver,
+                &member_ref.member,
+                crate::member_resolver::AccessForm::Property,
+                bytes,
+                &aliases,
+                &self.class_hierarchy_index,
+                &mut classviews,
+                &project_root,
+            ) {
+                Some(r) if matches!(r.confidence, Confidence::High | Confidence::Medium) => {
+                    (r.declaring_fqcn, r.kind, r.confidence, false)
+                }
+                Some(_) => return None,
+                None => {
+                    let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
+                        receiver,
+                        bytes,
+                        &aliases,
+                        &self.class_hierarchy_index,
+                        &mut classviews,
+                        &project_root,
+                    )?;
+                    if !matches!(confidence, Confidence::High | Confidence::Medium) {
+                        return None;
+                    }
+                    (fqcn, MagicMemberKind::Column, confidence, true)
+                }
+            };
 
         // Locate the declaration in the declaring class. A method-backed member
         // (relationship / scope / accessor / finder) yields both start+end lines
@@ -6671,10 +6696,9 @@ impl SalsaActor {
         // just the start line for the link; otherwise fall back to the class's
         // own start line.
         let (decl_file, decl_line, decl_end_line) =
-            match self.class_hierarchy_index.get(&resolved.declaring_fqcn) {
+            match self.class_hierarchy_index.get(&declaring_fqcn) {
                 Some(node) => {
-                    let candidates =
-                        crate::hover::candidate_method_names(resolved.kind, &member_ref.member);
+                    let candidates = crate::hover::candidate_method_names(kind, &member_ref.member);
                     if let Some(m) = node
                         .methods
                         .iter()
@@ -6693,13 +6717,14 @@ impl SalsaActor {
             };
 
         Some(MagicMemberHoverData {
-            declaring_fqcn: resolved.declaring_fqcn,
+            declaring_fqcn,
             member: member_ref.member.clone(),
-            kind: resolved.kind,
-            confidence: resolved.confidence,
+            kind,
+            confidence,
             decl_file,
             decl_line,
             decl_end_line,
+            tentative,
         })
     }
 

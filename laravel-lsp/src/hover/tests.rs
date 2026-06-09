@@ -211,6 +211,7 @@ fn magic_member_card_relationship_high_confidence() {
         "App\\Models\\User",
         Confidence::High,
         None,
+        None,
         Some("[app/Models/User.php:12](file:///p/app/Models/User.php#L12)"),
     );
     assert_eq!(
@@ -228,6 +229,7 @@ fn magic_member_card_with_definition_renders_php_code_block() {
         Confidence::High,
         Some("public function account()\n{\n    return $this->belongsTo(Account::class);\n}"),
         None,
+        None,
     );
     // Definition renders as a php fence (render prepends the <?php opener) and
     // sits between the detail line and any source link.
@@ -238,7 +240,7 @@ fn magic_member_card_with_definition_renders_php_code_block() {
 #[test]
 fn magic_member_card_labels_each_kind() {
     let label = |k| {
-        magic_member_card(k, "x", "App\\Models\\User", Confidence::High, None, None)
+        magic_member_card(k, "x", "App\\Models\\User", Confidence::High, None, None, None)
             .lines()
             .next()
             .unwrap()
@@ -260,6 +262,7 @@ fn magic_member_card_plain_member_is_empty() {
         Confidence::High,
         None,
         None,
+        None,
     );
     assert_eq!(out, "");
 }
@@ -273,6 +276,7 @@ fn magic_member_card_medium_confidence_adds_inferred_trailer() {
         Confidence::Medium,
         None,
         None,
+        None,
     );
     assert!(out.ends_with("*receiver type inferred*"), "got: {out}");
 }
@@ -284,6 +288,7 @@ fn magic_member_card_high_confidence_has_no_trailer() {
         "active",
         "App\\Models\\User",
         Confidence::High,
+        None,
         None,
         None,
     );
@@ -343,6 +348,22 @@ fn magic_member_card_without_link_omits_source_section() {
         Confidence::High,
         None,
         None,
+        None,
     );
     assert_eq!(out, "**Database column**\n\n`email` on `App\\Models\\User`");
+
+    // With a resolved type (M6.2), a "Type" line appears under the detail.
+    let typed = magic_member_card(
+        MagicMemberKind::Column,
+        "email",
+        "App\\Models\\User",
+        Confidence::High,
+        None,
+        Some("string"),
+        None,
+    );
+    assert_eq!(
+        typed,
+        "**Database column**\n\n`email` on `App\\Models\\User`\n\nType `string`"
+    );
 }

@@ -171,6 +171,7 @@ pub fn magic_member_card(
     declaring_fqcn: &str,
     confidence: crate::salsa_impl::Confidence,
     definition: Option<&str>,
+    type_hint: Option<&str>,
     source_link: Option<&str>,
 ) -> String {
     use crate::salsa_impl::{Confidence, MagicMemberKind};
@@ -184,6 +185,8 @@ pub fn magic_member_card(
         MagicMemberKind::PlainMember => return String::new(),
     };
     let detail = format!("`{member}` on `{declaring_fqcn}`");
+    // For a column, the resolved PHP type (cast-aware) from the DB schema.
+    let type_desc = type_hint.map(|t| format!("Type `{t}`"));
     // A MEDIUM-confidence resolution leaned on an inferred receiver type — flag
     // it so the reader knows it's a best-effort, not a static guarantee.
     let trailer = match confidence {
@@ -193,6 +196,7 @@ pub fn magic_member_card(
     render(&HoverContent {
         header: Some(kind_label),
         detail: Some(&detail),
+        description: type_desc.as_deref(),
         // The declaring method's source — for a relationship this reveals the
         // target model (`$this->belongsTo(Account::class)`), for a scope its
         // query body, for an accessor what it computes.

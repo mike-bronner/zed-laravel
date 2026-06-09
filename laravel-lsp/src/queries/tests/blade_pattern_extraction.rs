@@ -255,3 +255,80 @@ fn blade_translation_patterns() {
         "Echo should contain __() call"
     );
 }
+
+// ─── Dynamic-name guard (runtime-interpolated component / Livewire names) ─
+
+#[test]
+fn name_is_runtime_constructed_detects_interpolation() {
+    assert!(name_is_runtime_constructed("edit-{$type}-flow"));
+    assert!(name_is_runtime_constructed("{{ $name }}"));
+    assert!(name_is_runtime_constructed("alert-$kind"));
+    assert!(!name_is_runtime_constructed("button"));
+    assert!(!name_is_runtime_constructed("forms.input"));
+    // `dynamic-component` is a static literal — handled by registration
+    // resolution, NOT skipped as dynamic.
+    assert!(!name_is_runtime_constructed("dynamic-component"));
+}
+
+#[test]
+fn livewire_directive_skips_interpolated_name() {
+    // `@livewire("...{$x}...")` builds the component name at runtime — it must
+    // not surface as a static Livewire reference (which would false-flag as
+    // "Livewire component not found"). The bare-`$var` form is already skipped;
+    // this covers the interpolated double-quoted form (the live decisioncloud
+    // case).
+    let blade_code = r#"
+    <div>
+        @livewire("decision-cloud.edit-{$campaign->type}-lead-flow", ['k' => $v])
+        @livewire('static-counter')
+    </div>
+    "#;
+    let tree = parse_blade(blade_code).expect("Should parse Blade");
+    let lang = language_blade();
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
+
+    let names: Vec<&str> = patterns.livewire.iter().map(|m| m.component_name).collect();
+    assert!(
+        names.contains(&"static-counter"),
+        "the static @livewire name must still be extracted, got {names:?}"
+    );
+    assert!(
+        names.iter().all(|n| !n.contains('{') && !n.contains('$')),
+        "an interpolated @livewire name must be skipped, not extracted verbatim: {names:?}"
+    );
+}
+
+#[test]
+fn static_component_and_livewire_tags_survive_the_guard() {
+    // Regression: the guard must not over-skip. Static tag names — including
+    // `dynamic-component`, which is a literal name resolved via registration —
+    // are still extracted.
+    let blade_code = r#"
+    <div>
+        <x-button />
+        <x-dynamic-component :component="$view" />
+        <livewire:user-profile />
+    </div>
+    "#;
+    let tree = parse_blade(blade_code).expect("Should parse Blade");
+    let lang = language_blade();
+    let patterns =
+        extract_all_blade_patterns(&tree, blade_code, &lang).expect("Should extract patterns");
+
+    let comp: Vec<&str> = patterns
+        .components
+        .iter()
+        .map(|m| m.component_name)
+        .collect();
+    assert!(comp.contains(&"button"), "static <x-button> kept: {comp:?}");
+    assert!(
+        comp.contains(&"dynamic-component"),
+        "<x-dynamic-component> is a static name, kept for registration resolution: {comp:?}"
+    );
+    let lw: Vec<&str> = patterns.livewire.iter().map(|m| m.component_name).collect();
+    assert!(
+        lw.contains(&"user-profile"),
+        "static <livewire:user-profile> kept: {lw:?}"
+    );
+}

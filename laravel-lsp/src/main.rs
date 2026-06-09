@@ -262,6 +262,17 @@ struct ValidationRuleInfo {
     source: String,
 }
 
+/// One code-lens item: where the lens sits and the symbol(s) whose references
+/// it counts. Position lenses (magic members, routes, env, config, translation)
+/// carry a single symbol; the compound file-level lens carries the file's
+/// view/component/livewire identities. Shared by the `code_lens` handler (which
+/// renders the reference-count lens) and the unused-symbol diagnostic (which
+/// flags items with zero non-test references).
+struct LensItem {
+    range: Range,
+    symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData>,
+}
+
 /// Context for validation rule parameter completion (e.g., "exists:█" or "after:█")
 struct ValidationParamContext {
     /// The rule name (e.g., "exists", "after", "dimensions")
@@ -1843,6 +1854,10 @@ struct LaravelLanguageServer {
     pending_rescans: Arc<RwLock<HashSet<RescanType>>>,
     /// Handle for the rescan debounce timer
     rescan_debounce_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the debounced full magic-member index rebuild. Coalesces
+    /// rapid edits into one project-wide reconverge (the "full" half of the
+    /// hybrid incremental refresh; the per-file refresh is the "instant" half).
+    magic_rebuild_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// File existence cache with TTL (path -> (exists, cached_at))
     /// This avoids blocking I/O in async context for file_exists checks
     file_exists_cache: Arc<RwLock<HashMap<PathBuf, (bool, Instant)>>>,
@@ -1880,6 +1895,11 @@ struct LaravelLanguageServer {
     /// `None` disables them; defaults to `WARNING`. Set via the
     /// `diagnostics.severity` LSP setting.
     chain_diagnostic_severity: Arc<RwLock<Option<DiagnosticSeverity>>>,
+    /// Master opt-in for the code-lens feature (#59): reference-count lenses AND
+    /// the unused-symbol diagnostic. Default `false` — the feature is still
+    /// maturing, so users opt in via `codeLens.enabled`. Gates both surfaces so
+    /// nothing from #59 appears unless explicitly enabled.
+    code_lens_enabled: Arc<RwLock<bool>>,
     /// Whether we've shown the vendor missing diagnostic this session
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
@@ -1897,6 +1917,12 @@ struct LaravelLanguageServer {
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
+
+    /// `true` once first-load warming has built the reference indexes. The
+    /// unused-symbol diagnostic gates on this — running it mid-warm (empty
+    /// index) would flag every lensed symbol with a false "no references"
+    /// warning, flooding the Problems panel.
+    warm_complete: Arc<std::sync::atomic::AtomicBool>,
 
     /// Project-wide index of column/table definitions parsed from
     /// `database/migrations/*.php`. Powers goto-definition on chain literals
@@ -2011,6 +2037,21 @@ fn default_auto_complete_debounce() -> u64 {
     DEFAULT_SALSA_DEBOUNCE_MS
 }
 
+/// Code-lens feature settings (#59). Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "codeLens": { "enabled": true } } } } }`
+///
+/// A single master switch covering both the reference-count lenses and the
+/// unused-symbol diagnostic. Default `false` (opt-in) while the feature matures.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CodeLensSettings {
+    /// Turn on reference-count lenses + the unused-symbol diagnostic. Note this
+    /// is *in addition* to Zed's global `"code_lens": "on"`, which controls
+    /// whether the editor requests lenses at all.
+    #[serde(default)]
+    enabled: bool,
+}
+
 /// LSP settings object from Zed
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { ... } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2025,6 +2066,8 @@ struct LspSettings {
     blade: BladeSettings,
     #[serde(default)]
     diagnostics: DiagnosticsSettings,
+    #[serde(default)]
+    code_lens: CodeLensSettings,
 }
 
 // ============================================================================
@@ -2865,6 +2908,290 @@ use laravel_lsp::livewire_resolver::{
     blade_contains_inline_class, extract_blade_variable_at_cursor, mfc_sibling,
 };
 
+/// Debounce window for the project-wide magic-member reconverge. Triggered on
+/// save (not on typing), so it can be short — long enough to coalesce a
+/// save-all / format-on-save burst into one rebuild, short enough that
+/// find-references is correct soon after a single save.
+const MAGIC_REBUILD_DEBOUNCE_MS: u64 = 750;
+
+/// Parallelism cap for the magic-member resolution passes when rebuilding
+/// incrementally (mirrors the warm build's `MAX_CONCURRENT_PARSES`).
+const MAX_CONCURRENT_MAGIC_PARSES: usize = 8;
+
+/// Resolve the magic-member reference entries for the whole project from the
+/// current pattern cache. Runs the three resolution passes — controller
+/// view-variable index, PHP member accesses, Blade/Volt member accesses — in
+/// throttled parallel and returns `(file, entries)` pairs ready for
+/// `bulk_import_magic_members`. Does **not** import: the caller decides whether
+/// to append (warm) or clear-then-append (debounced rebuild).
+///
+/// Shared by the warm build and the debounced incremental rebuild so both run
+/// byte-for-byte the same resolution. Returns empty when the class hierarchy
+/// snapshot is empty (nothing to resolve against).
+async fn build_magic_member_entries(
+    salsa: &SalsaHandle,
+    pattern_cache: &Arc<
+        dashmap::DashMap<PathBuf, (i32, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)>,
+    >,
+    root: &Path,
+    view_paths: &[PathBuf],
+    max_concurrent: usize,
+    // First-load progress handle. Drives the "Building semantic index N of M…"
+    // status while PHP member accesses resolve — the slow phase on big projects
+    // that previously ran silently (the file-parse loop has nothing to report
+    // on a cache-warm start, so the bar otherwise sits frozen). `None` on the
+    // incremental save-refresh path, which has no progress UI.
+    mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
+) -> Vec<(PathBuf, Vec<laravel_lsp::symbol_index::MagicMemberEntry>)> {
+    // `snapshot_class_files` already hands back a shared `Arc` (cached actor-
+    // side), so the per-rebuild full-map clone is gone — just reuse it.
+    let class_files = salsa.snapshot_class_files().await.unwrap_or_default();
+    if class_files.is_empty() {
+        return Vec::new();
+    }
+    let root = root.to_path_buf();
+
+    // ── Pass 1: build the view-variable index ────────────────────────────
+    // Scan non-vendor controllers (PHP with `view()` calls) for render sites,
+    // resolving each passed variable's type so Blade accesses can be typed.
+    let view_targets: Vec<PathBuf> = pattern_cache
+        .iter()
+        .filter(|e| {
+            !e.key().components().any(|c| c.as_os_str() == "vendor")
+                && !e.key().to_string_lossy().ends_with(".blade.php")
+                && !e.value().1.views.is_empty()
+        })
+        .map(|e| e.key().clone())
+        .collect();
+    let mut view_var_index = laravel_lsp::view_var_index::ViewVarIndex::new();
+    {
+        let vv_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut vv_handles = Vec::with_capacity(view_targets.len());
+        for path in view_targets {
+            let permit_owner = vv_sem.clone();
+            let class_files = class_files.clone();
+            let root = root.clone();
+            vv_handles.push(tokio::spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                tokio::task::spawn_blocking(move || {
+                    let source = std::fs::read_to_string(&path).ok()?;
+                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                    let renders = laravel_lsp::view_var_index::view_renders_in_file(
+                        &source,
+                        &*class_files,
+                        &mut classviews,
+                        &root,
+                    );
+                    (!renders.is_empty()).then_some((path, renders))
+                })
+                .await
+                .ok()
+                .flatten()
+            }));
+        }
+        for h in vv_handles {
+            if let Ok(Some((path, renders))) = h.await {
+                view_var_index.insert_file(path, &renders);
+            }
+        }
+    }
+    let view_var_index = Arc::new(view_var_index);
+
+    // ── Pass 2: PHP member accesses ──────────────────────────────────────
+    let targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> = pattern_cache
+        .iter()
+        .filter(|e| {
+            // Blade is resolved in the dedicated pass below — skip here so the
+            // PHP resolver never parses a `.blade.php` as PHP (pathologically
+            // slow).
+            !e.key().components().any(|c| c.as_os_str() == "vendor")
+                && !e.key().to_string_lossy().ends_with(".blade.php")
+                && !e.value().1.member_access_refs.is_empty()
+        })
+        .map(|e| (e.key().clone(), e.value().1.clone()))
+        .collect();
+    let total_member_accesses: usize = targets
+        .iter()
+        .map(|(_, d)| d.member_access_refs.len())
+        .sum();
+    info!(
+        "🪄 magic build inputs: {} classes in snapshot, {} non-vendor targets, {} member accesses, {} views indexed",
+        class_files.len(),
+        targets.len(),
+        total_member_accesses,
+        view_var_index.view_count(),
+    );
+    let magic_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let mut magic_handles = Vec::with_capacity(targets.len());
+    for (path, data) in targets {
+        let permit_owner = magic_sem.clone();
+        let class_files = class_files.clone();
+        let root = root.clone();
+        magic_handles.push(tokio::spawn(async move {
+            let _permit = permit_owner.acquire_owned().await.ok()?;
+            tokio::task::spawn_blocking(move || {
+                let source = std::fs::read_to_string(&path).ok()?;
+                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
+                    &source,
+                    &data.member_access_refs,
+                    &*class_files,
+                    &mut classviews,
+                    &root,
+                );
+                // Volt SFC `.php` components: index `$this->member` reads under
+                // the component's synthetic key (no-op for plain/model .php).
+                entries.extend(
+                    laravel_lsp::view_var_index::resolve_component_member_accesses(
+                        &path,
+                        &source,
+                        &data.member_access_refs,
+                    ),
+                );
+                (!entries.is_empty()).then_some((path, entries))
+            })
+            .await
+            .ok()
+            .flatten()
+        }));
+    }
+    let magic_total = magic_handles.len();
+    let mut magic_done = 0usize;
+    let mut magic_entries = Vec::with_capacity(magic_total);
+    for h in magic_handles {
+        if let Ok(Some(pair)) = h.await {
+            magic_entries.push(pair);
+        }
+        magic_done += 1;
+        if let Some(p) = progress.as_deref_mut() {
+            let pct = ((magic_done.saturating_mul(100) / magic_total.max(1)) as u32).min(100);
+            p.report(
+                format!("Indexing {magic_done} of {magic_total} files…"),
+                Some(pct),
+                false,
+            )
+            .await;
+        }
+    }
+
+    // ── Pass 3: Blade/Volt member accesses ───────────────────────────────
+    // Resolve each Blade file's captured accesses against the view-variable
+    // index (controller-rendered) or extracted Volt props. Entries land in the
+    // same reverse index, so find-references from PHP surfaces Blade usages.
+    let blade_targets: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
+        pattern_cache
+            .iter()
+            .filter(|e| {
+                !e.key().components().any(|c| c.as_os_str() == "vendor")
+                    && e.key().to_string_lossy().ends_with(".blade.php")
+                    && !e.value().1.member_access_refs.is_empty()
+            })
+            .map(|e| (e.key().clone(), e.value().1.clone()))
+            .collect();
+    if !blade_targets.is_empty() {
+        let view_paths = Arc::new(view_paths.to_vec());
+        let blade_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut blade_handles = Vec::with_capacity(blade_targets.len());
+        for (path, data) in blade_targets {
+            let permit_owner = blade_sem.clone();
+            let class_files = class_files.clone();
+            let view_var_index = view_var_index.clone();
+            let view_paths = view_paths.clone();
+            let root = root.clone();
+            blade_handles.push(tokio::spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                tokio::task::spawn_blocking(move || {
+                    let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                    // A Volt component (own front-matter, or an MFC template
+                    // referencing `$this->`) needs the file source — for property
+                    // typing AND for keying `$this->member` component references.
+                    // Files with no `$this->` (e.g. the ~58k published icon
+                    // templates) read nothing and resolve via the view-var index.
+                    let uses_this = data
+                        .member_access_refs
+                        .iter()
+                        .any(|m| m.receiver.trim() == "$this")
+                        || data
+                            .blade_loops
+                            .iter()
+                            .any(|l| l.iterable.starts_with("$this->"));
+                    let source = if data.is_volt || uses_this {
+                        std::fs::read_to_string(&path).ok()
+                    } else {
+                        None
+                    };
+
+                    let volt_props = if data.is_volt {
+                        source.as_deref().map(|src| {
+                            laravel_lsp::view_var_index::volt_property_types(
+                                src,
+                                &*class_files,
+                                &mut classviews,
+                                &root,
+                            )
+                        })
+                    } else if uses_this {
+                        laravel_lsp::view_var_index::mfc_volt_property_types(
+                            &path,
+                            &*class_files,
+                            &mut classviews,
+                            &root,
+                        )
+                    } else {
+                        None
+                    };
+
+                    let mut entries = if let Some(prop_types) = volt_props {
+                        laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                            &data.member_access_refs,
+                            &prop_types,
+                            &data.blade_loops,
+                            &*class_files,
+                            &mut classviews,
+                            &root,
+                        )
+                    } else {
+                        let view_name =
+                            laravel_lsp::view_var_index::view_name_for_path(&path, &view_paths)?;
+                        laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                            &data.member_access_refs,
+                            &view_name,
+                            &view_var_index,
+                            &data.blade_loops,
+                            &*class_files,
+                            &mut classviews,
+                            &root,
+                        )
+                    };
+                    // Component `$this->member` references (SFC own class, or MFC
+                    // sibling). Additive — these are component-self refs, not
+                    // model/view-var resolutions.
+                    if let Some(src) = &source {
+                        entries.extend(
+                            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                                &path,
+                                src,
+                                &data.member_access_refs,
+                            ),
+                        );
+                    }
+                    (!entries.is_empty()).then_some((path, entries))
+                })
+                .await
+                .ok()
+                .flatten()
+            }));
+        }
+        for h in blade_handles {
+            if let Ok(Some(pair)) = h.await {
+                magic_entries.push(pair);
+            }
+        }
+    }
+
+    magic_entries
+}
+
 impl LaravelLanguageServer {
     /// Eloquent / DB query builder chain completion entry point.
     ///
@@ -3525,6 +3852,7 @@ impl LaravelLanguageServer {
             cache: Arc::new(RwLock::new(None)),
             pending_rescans: Arc::new(RwLock::new(HashSet::new())),
             rescan_debounce_handle: Arc::new(RwLock::new(None)),
+            magic_rebuild_handle: Arc::new(RwLock::new(None)),
             file_exists_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_config: Arc::new(RwLock::new(None)),
             cached_livewire: Arc::new(RwLock::new(None)),
@@ -3534,12 +3862,14 @@ impl LaravelLanguageServer {
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
+            code_lens_enabled: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             cached_directive_names: Arc::new(RwLock::new(None)),
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
+            warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             command_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
@@ -3584,6 +3914,73 @@ impl LaravelLanguageServer {
             );
             *self.chain_diagnostic_severity.write().await = new_severity;
         }
+
+        // Code-lens feature master switch (lenses + unused diagnostic, #59)
+        let new_code_lens = settings.code_lens.enabled;
+        let old_code_lens = *self.code_lens_enabled.read().await;
+        if new_code_lens != old_code_lens {
+            info!(
+                "⚙️  Updating code-lens feature: {} → {}",
+                old_code_lens, new_code_lens
+            );
+            *self.code_lens_enabled.write().await = new_code_lens;
+        }
+    }
+
+    /// Pull `lsp.laravel-lsp.settings` from the client via
+    /// `workspace/configuration` and apply it. Zed (and most editors) deliver
+    /// per-server `settings` through this PULL request — the
+    /// `didChangeConfiguration` push arrives as an empty `{}`, so relying on it
+    /// alone silently kept every setting at its default. We request the whole
+    /// settings object (`section: None`) and, as a fallback for editors that
+    /// namespace by server id, also `section: "laravel-lsp"`. The first
+    /// non-empty, parseable response wins; empties are skipped so we never reset
+    /// live settings to defaults.
+    async fn pull_and_apply_settings(&self) {
+        let items = vec![
+            ConfigurationItem {
+                scope_uri: None,
+                section: None,
+            },
+            ConfigurationItem {
+                scope_uri: None,
+                section: Some("laravel-lsp".to_string()),
+            },
+        ];
+        let values = match self.client.configuration(items).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("⚠️  workspace/configuration request failed: {e}");
+                return;
+            }
+        };
+        debug!(
+            "📥 workspace/configuration returned {} item(s): {:?}",
+            values.len(),
+            values
+        );
+        for value in values {
+            // Null or `{}` would reset everything to defaults — skip them.
+            if value.is_null() || value.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                continue;
+            }
+            match serde_json::from_value::<LspSettings>(value.clone()) {
+                Ok(settings) => {
+                    info!(
+                        "⚙️  Pulled settings: codeLens.enabled={}, blade.directiveSpacing={}, autoCompleteDebounce={}ms",
+                        settings.code_lens.enabled,
+                        settings.blade.directive_spacing,
+                        settings.auto_complete_debounce
+                    );
+                    self.update_settings(&settings).await;
+                    return;
+                }
+                Err(e) => {
+                    warn!("⚠️  Could not parse pulled configuration: {e} (value: {value:?})")
+                }
+            }
+        }
+        info!("⚙️  workspace/configuration carried no usable settings (kept current values)");
     }
 
     /// The set of Blade directive names to highlight — standard directives plus
@@ -3747,15 +4144,31 @@ impl LaravelLanguageServer {
         let pattern_cache = self.salsa.pattern_cache();
         let root_for_load = root_path.to_path_buf();
         let cache_for_load = pattern_cache.clone();
-        let (restored, dropped) = tokio::task::spawn_blocking(move || {
+        let load_result = tokio::task::spawn_blocking(move || {
             laravel_lsp::pattern_disk_cache::load_into(&cache_for_load, &root_for_load)
         })
         .await
-        .unwrap_or((0, 0));
+        .unwrap_or_default();
+        let (restored, dropped) = (load_result.restored, load_result.dropped);
         if restored + dropped > 0 {
             info!(
                 "🗄️  Disk cache: restored {} fresh entries, dropped {} stale",
                 restored, dropped
+            );
+        }
+        // Re-import the restored files' class-hierarchy nodes. Without this the
+        // hierarchy index is empty on a warm start (no parse runs for
+        // disk-restored files), which would leave the magic-member index
+        // (and M5's structural lenses) with nothing to resolve against.
+        if !load_result.hierarchy.is_empty() {
+            let n = self
+                .salsa
+                .bulk_import_hierarchy(load_result.hierarchy)
+                .await
+                .unwrap_or(0);
+            info!(
+                "📐 Class-hierarchy index: {} classes restored from cache",
+                n
             );
         }
 
@@ -3796,7 +4209,18 @@ impl LaravelLanguageServer {
         const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
 
         let salsa = self.salsa.clone();
+        // Cloned into the warm task so it can ask the client to re-resolve code
+        // lenses once the magic-member index is populated (lenses requested
+        // during warming would otherwise show stale/zero counts forever).
+        // Cloned for the post-warm `code_lens_refresh` (re-request lenses that
+        // resolved against an empty index during warming).
+        let client_for_warm = self.client.clone();
+        let warm_complete_for_warm = self.warm_complete.clone();
         let root_for_save = root_path.to_path_buf();
+        // View roots for the warm Blade view-variable resolution (file →
+        // view-name mapping). Cloned here because `view_paths` was moved into
+        // `register_project_files` above.
+        let view_paths_for_warm = config.view_paths.clone();
         // pattern_cache already cloned above for the load step; clone
         // again here so the warming task can (a) skip files already in
         // cache from the load and (b) hand the same map to save_from.
@@ -3890,6 +4314,7 @@ impl LaravelLanguageServer {
                         return Some((
                             path,
                             Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                            Vec::new(),
                         ));
                     }
 
@@ -3907,24 +4332,28 @@ impl LaravelLanguageServer {
                         return Some((
                             path,
                             Arc::new(laravel_lsp::salsa_impl::ParsedPatternsData::default()),
+                            Vec::new(),
                         ));
                     }
                     // Actual parse on the blocking pool — tree-sitter is
                     // CPU-bound and would block the async runtime if run
                     // directly in a tokio task.
                     let path_for_task = path.clone();
-                    let parsed: Option<Arc<laravel_lsp::salsa_impl::ParsedPatternsData>> =
-                        tokio::task::spawn_blocking(move || {
-                            let text = std::fs::read_to_string(&path_for_task).ok()?;
-                            Some(laravel_lsp::pattern_indexer::parse_owned(
-                                &path_for_task,
-                                &text,
-                            ))
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                    parsed.map(|data| (path, data))
+                    type ParsePair = (
+                        Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+                        Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+                    );
+                    let parsed: Option<ParsePair> = tokio::task::spawn_blocking(move || {
+                        let text = std::fs::read_to_string(&path_for_task).ok()?;
+                        Some(laravel_lsp::pattern_indexer::parse_owned_with_hierarchy(
+                            &path_for_task,
+                            &text,
+                        ))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    parsed.map(|(data, nodes)| (path, data, nodes))
                 }));
             }
 
@@ -3939,8 +4368,11 @@ impl LaravelLanguageServer {
             // Progress reports are emitted as each handle completes. The
             // IndexingProgress helper throttles internally so we don't
             // need to be careful about emitting every iteration.
-            let mut buffer: Vec<(PathBuf, Arc<laravel_lsp::salsa_impl::ParsedPatternsData>)> =
-                Vec::with_capacity(to_parse);
+            let mut buffer: Vec<(
+                PathBuf,
+                Arc<laravel_lsp::salsa_impl::ParsedPatternsData>,
+                Vec<laravel_lsp::class_hierarchy_index::ClassNode>,
+            )> = Vec::with_capacity(to_parse);
             let mut completed = 0usize;
             for h in handles {
                 if let Ok(Some(pair)) = h.await {
@@ -3964,7 +4396,25 @@ impl LaravelLanguageServer {
                     .await;
                 }
             }
-            let imported = salsa.bulk_import_patterns(buffer).await.unwrap_or(0);
+            // Split the combined parse results: patterns go to the shared
+            // cache, class-hierarchy nodes to the actor-owned index. Files
+            // with no class declarations contribute no hierarchy entry.
+            let mut pattern_entries = Vec::with_capacity(buffer.len());
+            let mut hierarchy_entries = Vec::with_capacity(buffer.len());
+            for (path, data, nodes) in buffer {
+                pattern_entries.push((path.clone(), data));
+                if !nodes.is_empty() {
+                    hierarchy_entries.push((path, nodes));
+                }
+            }
+            let imported = salsa
+                .bulk_import_patterns(pattern_entries)
+                .await
+                .unwrap_or(0);
+            let hierarchy_classes = salsa
+                .bulk_import_hierarchy(hierarchy_entries)
+                .await
+                .unwrap_or(0);
 
             // Persist the entire live pattern_cache (cached restores +
             // freshly parsed entries) so the next LSP startup can skip
@@ -3973,8 +4423,16 @@ impl LaravelLanguageServer {
             // completion on it; the save just runs and logs its outcome.
             let cache_for_save = pattern_cache_for_warm.clone();
             let root_for_save_inner = root_for_save.clone();
+            // Snapshot the (now fully populated: restored + freshly parsed)
+            // hierarchy so it's persisted alongside the patterns and survives
+            // the next warm restart.
+            let hierarchy_for_save = salsa.snapshot_hierarchy_nodes().await.unwrap_or_default();
             let save_result = tokio::task::spawn_blocking(move || {
-                laravel_lsp::pattern_disk_cache::save_from(&cache_for_save, &root_for_save_inner)
+                laravel_lsp::pattern_disk_cache::save_from(
+                    &cache_for_save,
+                    &hierarchy_for_save,
+                    &root_for_save_inner,
+                )
             })
             .await;
             match save_result {
@@ -3993,6 +4451,95 @@ impl LaravelLanguageServer {
                 Ok(count) => info!("🔍 Symbol index built: {} symbol entries", count),
                 Err(e) => debug!("Symbol index build failed: {}", e),
             }
+            info!(
+                "📐 Class-hierarchy index: {} classes indexed",
+                hierarchy_classes
+            );
+
+            // Magic-member reverse index (M4 + phases 4–5): the resolution of
+            // every captured member access (PHP/Blade/Volt) against the class
+            // hierarchy + view-variable index — the dominant warm cost.
+            //
+            // Restore it from disk when the project is UNCHANGED since the last
+            // save (`to_parse == 0` → the pattern cache validated every file).
+            // Because resolution is cross-file, this all-or-nothing guard keeps
+            // the restored index correct: if even one file changed, the cached
+            // resolution could be stale, so we resolve fresh. The common
+            // reload-without-edits case becomes instant instead of ~30s.
+            // Disk read on the blocking pool so it never stalls the async
+            // runtime (the file can be large on a big project).
+            let restored = if to_parse == 0 {
+                let root_for_load = root_for_save.clone();
+                tokio::task::spawn_blocking(move || {
+                    laravel_lsp::magic_disk_cache::load(&root_for_load)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            if let Some(entries) = restored {
+                match salsa.bulk_import_magic_members(entries).await {
+                    Ok(n) => info!("🪄 Magic-member index: {} entries (restored from disk)", n),
+                    Err(e) => debug!("Magic-member restore import failed: {}", e),
+                }
+            } else {
+                // Resolve fresh, drive progress (the file-parse loop had nothing
+                // to report on a cache-warm start), persist for next time, then
+                // import. `build_magic_member_entries` is shared with the
+                // incremental save-refresh path.
+                let magic_entries = build_magic_member_entries(
+                    &salsa,
+                    &pattern_cache_for_warm,
+                    &root_for_save,
+                    &view_paths_for_warm,
+                    MAX_CONCURRENT_PARSES,
+                    progress.as_mut(),
+                )
+                .await;
+                if !magic_entries.is_empty() {
+                    // Persist on the blocking pool (sync I/O), handing the
+                    // entries back so the import below still owns them — no clone.
+                    let root_for_msave = root_for_save.clone();
+                    let magic_entries = match tokio::task::spawn_blocking(move || {
+                        let res =
+                            laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_entries);
+                        (res, magic_entries)
+                    })
+                    .await
+                    {
+                        Ok((Ok(n), entries)) => {
+                            info!("🗄️  Magic-member index: saved {} files to disk", n);
+                            entries
+                        }
+                        Ok((Err(e), entries)) => {
+                            debug!("Magic-member disk save failed: {}", e);
+                            entries
+                        }
+                        Err(e) => {
+                            debug!("Magic-member disk save task panicked: {}", e);
+                            Vec::new()
+                        }
+                    };
+                    match salsa.bulk_import_magic_members(magic_entries).await {
+                        Ok(n) => info!("🪄 Magic-member index: {} entries", n),
+                        Err(e) => debug!("Magic-member index build failed: {}", e),
+                    }
+                }
+            }
+            // The reference indexes are built — ask the client to refresh code
+            // lenses requested while warming was still in progress (those
+            // resolved against an empty index and read 0). Fire-and-forget, so
+            // it never blocks. NOTE: Zed currently doesn't re-query already-open
+            // documents on this refresh (upstream bug, filed) — a reopen/edit
+            // refreshes them — but files opened after warm resolve correctly,
+            // and the disk cache keeps warm short.
+            let _ = client_for_warm.code_lens_refresh().await;
+            // Reference indexes are ready — the unused-symbol diagnostic may now
+            // run (it's suppressed mid-warm to avoid flagging everything while
+            // the index is empty). It surfaces on the next open/edit of a file.
+            warm_complete_for_warm.store(true, std::sync::atomic::Ordering::Relaxed);
 
             let elapsed = started_at.elapsed();
             info!(
@@ -4838,6 +5385,211 @@ impl LaravelLanguageServer {
         });
 
         *self.rescan_debounce_handle.write().await = Some(handle);
+    }
+
+    /// Refresh the magic-member index when a source file is saved — the single
+    /// entry point for incremental updates (typing-pause edits deliberately do
+    /// no magic work). Pushes the saved buffer into Salsa so resolution sees
+    /// current content, runs the instant per-file refresh (which also covers
+    /// very large projects where the full rebuild is gated off), then schedules
+    /// the debounced project-wide reconverge for cross-file ripples. Volt pages
+    /// are self-contained, so they skip the project-wide pass.
+    async fn refresh_magic_on_save(&self, uri: &Url, text: &str) {
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        // `.blade.php` also ends with `.php`, so this covers both.
+        if !path_str.ends_with(".php") {
+            return;
+        }
+
+        // Ensure Salsa reflects the saved buffer before resolving — a pending
+        // did_change debounce may not have fired yet. Use the buffer's version
+        // so this doesn't regress against a newer in-flight update.
+        let version = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        if let Err(e) = self
+            .salsa
+            .update_file(path.clone(), version, text.to_string())
+            .await
+        {
+            debug!("Failed to update Salsa on save for {}: {}", path_str, e);
+        }
+
+        self.refresh_file_magic(&path, text).await;
+
+        let is_volt_blade = path_str.ends_with(".blade.php")
+            && laravel_lsp::livewire_resolver::source_contains_volt_signature(text);
+        if !is_volt_blade {
+            self.schedule_magic_rebuild().await;
+        }
+    }
+
+    /// Instant per-file magic-member refresh (the "instant" half of the
+    /// save-time refresh). Re-resolves just the saved file's member accesses
+    /// against the current hierarchy and replaces its entries in the reverse
+    /// index, so find-references on that file is current the moment the
+    /// project-wide reconverge is gated off (large projects) or still pending.
+    ///
+    /// Handles PHP files and self-contained Volt pages. Controller-rendered
+    /// Blade needs the project-wide view-variable index (it must know which
+    /// controllers feed this view), so it is left to the debounced full rebuild.
+    async fn refresh_file_magic(&self, path: &Path, content: &str) {
+        let path_str = path.to_string_lossy();
+        // `.blade.php` also ends with `.php`, so this covers both.
+        if !path_str.ends_with(".php") {
+            return;
+        }
+        let is_blade = path_str.ends_with(".blade.php");
+        let Some(root) = self.root_path.read().await.clone() else {
+            return;
+        };
+
+        // Fresh parsed patterns for the edited file. `get_patterns` also updates
+        // the class hierarchy for this file, so its own class is resolvable.
+        let patterns = match self.salsa.get_patterns(path.to_path_buf()).await {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+
+        // No member accesses → nothing to resolve. Still re-index with an empty
+        // set so a *removed* last access clears its stale entry; this skips the
+        // class-files snapshot and the resolver entirely (the common edit on a
+        // file with no `->member` reads, e.g. a config or a plain function).
+        if patterns.member_access_refs.is_empty() {
+            let _ = self
+                .salsa
+                .reindex_file_magic(path.to_path_buf(), Vec::new())
+                .await;
+            return;
+        }
+
+        // Controller-rendered Blade needs the project-wide view-variable index —
+        // defer it to the debounced full rebuild. Self-contained Volt resolves
+        // locally below.
+        let is_volt =
+            is_blade && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
+        if is_blade && !is_volt {
+            return;
+        }
+
+        let class_files = self.salsa.snapshot_class_files().await.unwrap_or_default();
+        if class_files.is_empty() {
+            return;
+        }
+
+        let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+        let mut entries = if is_volt {
+            let prop_types = laravel_lsp::view_var_index::volt_property_types(
+                content,
+                &*class_files,
+                &mut classviews,
+                &root,
+            );
+            laravel_lsp::view_var_index::resolve_volt_member_accesses(
+                &patterns.member_access_refs,
+                &prop_types,
+                &patterns.blade_loops,
+                &*class_files,
+                &mut classviews,
+                &root,
+            )
+        } else {
+            laravel_lsp::member_resolver::resolve_member_access_entries(
+                content,
+                &patterns.member_access_refs,
+                &*class_files,
+                &mut classviews,
+                &root,
+            )
+        };
+        // Component `$this->member` references (Volt SFC `.php` or Blade SFC).
+        entries.extend(
+            laravel_lsp::view_var_index::resolve_component_member_accesses(
+                path,
+                content,
+                &patterns.member_access_refs,
+            ),
+        );
+
+        if let Err(e) = self
+            .salsa
+            .reindex_file_magic(path.to_path_buf(), entries)
+            .await
+        {
+            debug!("Per-file magic refresh failed for {}: {}", path_str, e);
+        }
+    }
+
+    /// Schedule the debounced project-wide magic-member reconverge (the "full"
+    /// half of the save-time refresh). Coalesces rapid saves (save-all, format-
+    /// on-save bursts): each call cancels the previous pending rebuild and
+    /// starts a fresh timer, so cross-file ripples (controller→Blade,
+    /// model→usages) reconverge shortly after the save settles.
+    async fn schedule_magic_rebuild(&self) {
+        if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
+            handle.abort();
+        }
+        let server = self.clone_for_spawn();
+        let handle = tokio::spawn(async move {
+            sleep(Duration::from_millis(MAGIC_REBUILD_DEBOUNCE_MS)).await;
+            server.rebuild_magic_index_full().await;
+        });
+        *self.magic_rebuild_handle.write().await = Some(handle);
+    }
+
+    /// Re-resolve the whole project's magic-member reverse index from the
+    /// current pattern cache. Reuses the exact warm-build passes via
+    /// [`build_magic_member_entries`]; `build_symbol_index` clears the index
+    /// first (literals + magic) so the append below can't duplicate.
+    ///
+    /// Gated on project size: on very large projects the full reconverge is too
+    /// heavy to run per edit-settle, so it is skipped and the per-file refresh
+    /// remains the only incremental path there.
+    async fn rebuild_magic_index_full(&self) {
+        let Some(root) = self.root_path.read().await.clone() else {
+            return;
+        };
+        let view_paths = match self.cached_config.read().await.as_ref() {
+            Some(c) => c.view_paths.clone(),
+            None => return,
+        };
+        let pattern_cache = self.salsa.pattern_cache();
+
+        const MAX_FULL_REBUILD_FILES: usize = 15_000;
+        if pattern_cache.len() > MAX_FULL_REBUILD_FILES {
+            debug!(
+                "🪄 Project too large ({} files) — skipping debounced full magic rebuild; per-file refresh only",
+                pattern_cache.len()
+            );
+            return;
+        }
+
+        if let Err(e) = self.salsa.build_symbol_index().await {
+            debug!("Symbol index rebuild failed: {}", e);
+            return;
+        }
+        let entries = build_magic_member_entries(
+            &self.salsa,
+            &pattern_cache,
+            &root,
+            &view_paths,
+            MAX_CONCURRENT_MAGIC_PARSES,
+            None, // save-refresh path has no first-load progress UI
+        )
+        .await;
+        match self.salsa.bulk_import_magic_members(entries).await {
+            Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
+            Err(e) => debug!("Magic reconverge failed: {}", e),
+        }
+        // Counts changed — ask the client to re-resolve code lenses.
+        let _ = self.client.code_lens_refresh().await;
     }
 
     /// Execute all pending rescans
@@ -6126,6 +6878,12 @@ impl LaravelLanguageServer {
             {
                 debug!("Failed to update source file in Salsa: {}", e);
             }
+
+            // NOTE: magic-member refresh deliberately does NOT run here. Doing
+            // it on every typing-pause is wasted work — find-references is a
+            // deliberate action, not something queried mid-keystroke. The
+            // refresh (instant per-file + debounced project reconverge) runs on
+            // `did_save` instead. See `refresh_magic_on_save`.
         }
 
         // After Salsa update, re-run diagnostics for this file
@@ -12058,6 +12816,30 @@ return [
     // ========================================================================
 
     /// Create LocationLink for a view reference from Salsa data
+    /// find-references for a magic member under the cursor. Asks the actor to
+    /// resolve the cursor's `member_access` site to its declaring class +
+    /// member, then return every indexed usage of that key. `None` when the
+    /// cursor isn't on a resolvable magic member or it has no usages.
+    async fn magic_member_references(
+        &self,
+        file_path: &std::path::Path,
+        position: Position,
+    ) -> Option<Vec<Location>> {
+        let locs = self
+            .salsa
+            .find_member_references(file_path.to_path_buf(), position.line, position.character)
+            .await
+            .ok()?;
+        if locs.is_empty() {
+            return None;
+        }
+        Some(
+            locs.into_iter()
+                .filter_map(|l| reference_location_to_lsp(&l))
+                .collect(),
+        )
+    }
+
     async fn create_view_location_from_salsa(
         &self,
         view: &ViewReferenceData,
@@ -13721,6 +14503,7 @@ return [
             cache: self.cache.clone(),
             pending_rescans: self.pending_rescans.clone(),
             rescan_debounce_handle: self.rescan_debounce_handle.clone(),
+            magic_rebuild_handle: self.magic_rebuild_handle.clone(),
             file_exists_cache: self.file_exists_cache.clone(),
             cached_config: self.cached_config.clone(),
             cached_livewire: self.cached_livewire.clone(),
@@ -13730,12 +14513,14 @@ return [
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
+            code_lens_enabled: self.code_lens_enabled.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             cached_directive_names: self.cached_directive_names.clone(),
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
+            warm_complete: self.warm_complete.clone(),
             migration_index: self.migration_index.clone(),
             command_index: self.command_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
@@ -14668,6 +15453,11 @@ return [
                 ));
             }
 
+            // Unused-symbol diagnostics (#59): lensed symbols (model magic
+            // members, routes, config/translation keys, …) with zero non-test
+            // references.
+            diagnostics.extend(self.unused_symbol_diagnostics(&file_path, source).await);
+
             // Store and publish diagnostics for PHP files
             self.diagnostics
                 .write()
@@ -15007,6 +15797,10 @@ return [
             ));
         }
 
+        // Unused-symbol diagnostics (#59): Blade-addressed symbols (views,
+        // components, Livewire) with zero non-test references.
+        diagnostics.extend(self.unused_symbol_diagnostics(&file_path, source).await);
+
         self.diagnostics
             .write()
             .await
@@ -15072,6 +15866,10 @@ return [
             PatternAtPosition::Binding(binding) => self.hover_for_binding(&binding.name).await,
             PatternAtPosition::Asset(asset) => self.hover_for_asset(&asset).await,
             PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
+            // M6 — semantic hover card for a resolved Eloquent magic member.
+            PatternAtPosition::MemberAccess(member_ref) => {
+                self.hover_for_magic_member(&member_ref, uri).await
+            }
             // Patterns we don't yet surface in hover — silently drop.
             PatternAtPosition::Directive(_)
             | PatternAtPosition::Action(_)
@@ -15110,6 +15908,616 @@ return [
             trailer,
             ..Default::default()
         })
+    }
+
+    /// M6 — semantic hover for an Eloquent magic member: a scope (`->active()`),
+    /// relationship (`$user->posts`), accessor (`$model->full_name`), or column
+    /// (`$user->email`) — the sites Intelephense can't see through. Resolves the
+    /// member at its position via the Salsa actor, then renders a classification
+    /// card linking to the declaring class. Returns `""` (→ no hover) for
+    /// unresolvable members, plain properties, and component `$this->` members.
+    async fn hover_for_magic_member(
+        &self,
+        member_ref: &laravel_lsp::salsa_impl::MemberAccessReferenceData,
+        uri: &Url,
+    ) -> String {
+        use laravel_lsp::hover;
+        let Ok(path) = uri.to_file_path() else {
+            return String::new();
+        };
+        let data = match self
+            .salsa
+            .resolve_magic_member_at(path, member_ref.line, member_ref.column)
+            .await
+        {
+            Ok(Some(d)) => d,
+            _ => return String::new(),
+        };
+        // Method-backed member (relationship / scope / accessor): read the
+        // declaring file (usually a different file — the model) off the async
+        // side and slice its source for the hover snippet.
+        let definition = match (&data.decl_file, data.decl_line, data.decl_end_line) {
+            (Some(f), Some(start), Some(end)) => tokio::fs::read_to_string(f)
+                .await
+                .ok()
+                .map(|src| hover::extract_member_snippet(&src, start, end))
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        };
+
+        // Columns (M6.2): confirm + type via migrations-first, DB fallback. A
+        // *tentative* column (the resolver couldn't classify it — a plain,
+        // non-`$casts` DB column) renders only when migrations or the DB confirm
+        // it, so a typo'd member never produces a spurious card.
+        let mut type_hint = None;
+        let mut column_link = None;
+        if matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+            let (confirmed, php_type, mig_link) = self
+                .resolve_column_hover(&data.declaring_fqcn, &data.member)
+                .await;
+            if data.tentative && !confirmed {
+                return String::new();
+            }
+            type_hint = php_type;
+            column_link = mig_link;
+        }
+
+        // Link: prefer the migration site for a column (the column's actual
+        // definition), else the declaration site. `decl_line` is 0-based; the
+        // source link is 1-based.
+        let decl_link = match &data.decl_file {
+            Some(f) => Some(self.source_link(f, data.decl_line.map(|l| l + 1)).await),
+            None => None,
+        };
+        let link = column_link.or(decl_link);
+
+        hover::magic_member_card(
+            data.kind,
+            &data.member,
+            &data.declaring_fqcn,
+            data.confidence,
+            definition.as_deref(),
+            type_hint.as_deref(),
+            link.as_deref(),
+        )
+    }
+
+    /// Confirm a column on `model_fqcn` and resolve its type + a goto link.
+    /// **Migrations first** (already indexed, O(1) lookup, no DB connection
+    /// required): they confirm the column exists and give a definition link.
+    /// The **DB schema** supplies the cast-aware PHP type — migrations don't
+    /// store it. Returns `(confirmed, php_type, migration_link)`. Async + off
+    /// the Salsa actor (migration-index + DB-schema reads only).
+    async fn resolve_column_hover(
+        &self,
+        model_fqcn: &str,
+        column: &str,
+    ) -> (bool, Option<String>, Option<String>) {
+        use laravel_lsp::query_chain::eloquent_completion;
+        let Some(root) = self.root_path.read().await.clone() else {
+            return (false, None, None);
+        };
+        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
+            .await
+            .unwrap_or_else(|| {
+                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
+                eloquent_completion::snake_pluralize(basename)
+            });
+
+        // Migrations first: existence + a definition link (offline-capable).
+        let mig_site = {
+            let guard = self.migration_index.read().await;
+            guard
+                .as_ref()
+                .and_then(|mi| mi.column(&table, column).map(|s| (s.file.clone(), s.line)))
+        };
+        let mig_link = match &mig_site {
+            Some((file, line)) => Some(self.source_link(file, Some(line + 1)).await),
+            None => None,
+        };
+
+        // DB for the cast-aware PHP type — migrations don't carry types.
+        let php_type = {
+            let guard = self.database_schema.read().await;
+            match guard.as_ref() {
+                Some(db) => db
+                    .get_columns_with_types(&table)
+                    .await
+                    .into_iter()
+                    .find(|(name, _)| name == column)
+                    .map(|(_, php_type)| php_type),
+                None => None,
+            }
+        };
+
+        let confirmed = mig_site.is_some() || php_type.is_some();
+        (confirmed, php_type, mig_link)
+    }
+
+    /// Column rename (M8): rename a DB column project-wide. Fires when the
+    /// cursor resolves to a `MagicMemberKind::Column` (`$user->email`,
+    /// `where('email', …)`). `None` when the cursor isn't a column, so the
+    /// caller falls through to the method-based magic-member rename and then
+    /// the literal-symbol flow.
+    ///
+    /// The resulting `WorkspaceEdit` rewrites:
+    /// 1. property-form usages (`$user->email`, `{{ $user->email }}`) — from
+    ///    the magic-member inverted index;
+    /// 2. string-literal column args in query chains — only in chains whose
+    ///    table resolves to the column's table (qualified literals must also
+    ///    have a matching qualifier);
+    /// 3. the declaring model's `$fillable` / `$casts` / `$hidden` / `$guarded`
+    ///    / `$dates` array entries.
+    ///
+    /// It also emits a reversible `renameColumn` migration as a `CreateFile`.
+    async fn column_rename_edit(
+        &self,
+        file_path: &Path,
+        position: Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        // 1. Identify the column under the cursor: model FQCN + column name.
+        let data = self
+            .salsa
+            .resolve_magic_member_at(file_path.to_path_buf(), position.line, position.character)
+            .await
+            .ok()
+            .flatten()?;
+        if !matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+            return None;
+        }
+        let model_fqcn = data.declaring_fqcn.clone();
+        let old_column = data.member.clone();
+
+        let root = self.root_path.read().await.clone()?;
+
+        // The column's table: model→table with the snake_pluralize fallback.
+        let table = laravel_lsp::query_chain::eloquent_completion::resolve_table_for_model(
+            &model_fqcn,
+            &root,
+        )
+        .await
+        .unwrap_or_else(|| {
+            let basename = model_fqcn.rsplit('\\').next().unwrap_or(&model_fqcn);
+            laravel_lsp::query_chain::eloquent_completion::snake_pluralize(basename)
+        });
+
+        // Confirm the column actually exists (migrations first, then DB) before
+        // doing anything destructive. `resolve_magic_member_at` classifies a
+        // *tentative* column for any unresolved member on a model — including a
+        // typo like `$user->emial` — which would otherwise still generate a
+        // bogus `renameColumn` migration. No confirmation → no rename.
+        let confirmed = {
+            let in_migration = self
+                .migration_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|mi| mi.column(&table, &old_column).is_some());
+            if in_migration {
+                true
+            } else {
+                let guard = self.database_schema.read().await;
+                match guard.as_ref() {
+                    Some(db) => db
+                        .get_columns_with_types(&table)
+                        .await
+                        .iter()
+                        .any(|(name, _)| name == &old_column),
+                    None => false,
+                }
+            }
+        };
+        if !confirmed {
+            return None;
+        }
+
+        // The target model's own file. Used twice: to rewrite its `$fillable`/…
+        // arrays, and as the enclosing-model fallback for the chain scan — a
+        // local scope (`scopeActive($query) { $query->where('email') }`) has no
+        // model on the chain, so an unresolved bare-column chain *inside this
+        // file* is taken to operate on this model's table.
+        let model_decl_file = laravel_lsp::class_locator::find_php_class_file(&model_fqcn, &root);
+
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = Vec::new();
+
+        // 2. Property-form usages from the magic-member index ($user->email,
+        //    {{ $user->email }}). Rewritten to the new name verbatim.
+        if let Ok(refs) = self
+            .salsa
+            .find_references(
+                laravel_lsp::salsa_impl::SymbolRefData::MagicMember {
+                    fqcn: model_fqcn.clone(),
+                    member: old_column.clone(),
+                },
+                false,
+            )
+            .await
+        {
+            targets.extend(refs.into_iter().map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+                new_text: new_name.to_string(),
+            }));
+        }
+
+        // 3. Model array entries in the declaring model file.
+        if let Some(decl_file) = model_decl_file.clone() {
+            if let Ok(src) = tokio::fs::read_to_string(&decl_file).await {
+                let old = old_column.clone();
+                let sites = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::column_rename::model_array_sites(&src, &old)
+                })
+                .await
+                .unwrap_or_default();
+                targets.extend(sites.into_iter().map(|s| laravel_lsp::rename::EditTarget {
+                    file_path: decl_file.clone(),
+                    line: s.line,
+                    start_column: s.start_column,
+                    end_column: s.end_column,
+                    new_text: new_name.to_string(),
+                }));
+            }
+        }
+
+        // 4. Project-wide query-chain literal scan. Heavy work runs entirely on
+        //    the blocking pool: a fast `source.contains(old_column)` byte check
+        //    skips files that can't mention the column before any parse, and a
+        //    semaphore bounds concurrent parses so a large project can't
+        //    saturate threads/RAM (see the warming path for the same caps).
+        let chain_targets = self
+            .column_chain_targets(
+                &root,
+                &old_column,
+                &table,
+                new_name,
+                model_decl_file.as_deref(),
+            )
+            .await;
+        targets.extend(chain_targets);
+
+        // 5. The migration: a reversible renameColumn, emitted as CreateFile +
+        //    content. Built from the current wall-clock as the filename prefix.
+        let migration = self.build_rename_migration(&root, &table, &old_column, new_name);
+
+        Self::build_column_rename_workspace_edit(targets, migration)
+    }
+
+    /// Scan the project for query-chain column-arg literals that name
+    /// `old_column` and belong to a chain resolving to `table`, returning the
+    /// rewrite targets. Bounded + off the async runtime per the throttling
+    /// rules: byte pre-filter, per-file size cap, semaphore-gated blocking
+    /// parses, chain table resolution done async only for files with hits.
+    async fn column_chain_targets(
+        &self,
+        root: &Path,
+        old_column: &str,
+        table: &str,
+        new_name: &str,
+        model_decl_file: Option<&Path>,
+    ) -> Vec<laravel_lsp::rename::EditTarget> {
+        use std::sync::Arc;
+        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
+        const MAX_CONCURRENT_PARSES: usize = 8;
+
+        let root_owned = root.to_path_buf();
+        let files = tokio::task::spawn_blocking(move || {
+            laravel_lsp::salsa_impl::collect_source_files(&root_owned)
+        })
+        .await
+        .unwrap_or_default();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+        let mut handles = Vec::new();
+        for path in files {
+            let permit_owner = semaphore.clone();
+            let old = old_column.to_string();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                // Per-file size cap — skip oversized files (data dumps).
+                let metadata = std::fs::metadata(&path).ok()?;
+                if metadata.len() > MAX_FILE_SIZE_BYTES {
+                    return None;
+                }
+                let path_for_task = path.clone();
+                // Parse + extract literals on the blocking pool. The cheap
+                // `contains` check happens FIRST so files that can't mention
+                // the column are never parsed.
+                let result = tokio::task::spawn_blocking(move || {
+                    let source = std::fs::read_to_string(&path_for_task).ok()?;
+                    if !source.contains(&old) {
+                        return None;
+                    }
+                    let lits = laravel_lsp::column_rename::chain_column_literals(&source, &old);
+                    if lits.is_empty() {
+                        return None;
+                    }
+                    // Re-extract chains so the table resolver can read receivers.
+                    let tree = laravel_lsp::parser::parse_php(&source).ok()?;
+                    let chains = laravel_lsp::query_chain::extract_chains(&tree, &source);
+                    Some((chains, lits))
+                })
+                .await
+                .ok()
+                .flatten()?;
+                Some((path, result))
+            }));
+        }
+
+        let mut targets = Vec::new();
+        for handle in handles {
+            let Ok(Some((path, (chains, lits)))) = handle.await else {
+                continue;
+            };
+            // Resolve each chain's table once (async model→table), then keep
+            // only the literal sites whose chain matches the target table.
+            let chains_arc: Vec<Arc<laravel_lsp::query_chain::BuilderChain>> =
+                chains.into_iter().map(Arc::new).collect();
+            // Cache per-chain accessible-table sets so a chain with multiple
+            // matching literals resolves its model→table only once.
+            let mut resolved: std::collections::HashMap<
+                usize,
+                Vec<laravel_lsp::query_chain::AccessibleTable>,
+            > = std::collections::HashMap::new();
+            for lit in lits {
+                let tables = match resolved.get(&lit.chain_index) {
+                    Some(t) => t,
+                    None => {
+                        let t = self
+                            .accessible_tables_for_chain(&chains_arc, lit.chain_index, root)
+                            .await;
+                        resolved.entry(lit.chain_index).or_insert(t)
+                    }
+                };
+                // Enclosing-model fallback: when the chain's table can't be
+                // resolved (an untyped `$query` in a local scope), a *bare*
+                // (unqualified) column inside the target model's own file is
+                // taken to operate on that model's table. A qualified
+                // `other.email` is excluded — it names a different table
+                // explicitly.
+                let enclosing_match = tables.is_empty()
+                    && lit.qualifier.is_none()
+                    && model_decl_file.is_some_and(|f| f == path.as_path());
+                if enclosing_match
+                    || Self::chain_matches_table(tables, table, lit.qualifier.as_deref())
+                {
+                    targets.push(laravel_lsp::rename::EditTarget {
+                        file_path: path.clone(),
+                        line: lit.site.line,
+                        start_column: lit.site.start_column,
+                        end_column: lit.site.end_column,
+                        new_text: new_name.to_string(),
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// Resolve the accessible tables for the chain at `chain_index`, reusing the
+    /// cursor resolver + the same `accessible_tables_for_goto` pipeline goto-def
+    /// uses. Anchors the cursor at the chain's own span so `detect_chain_context_at`
+    /// finds it. Returns an empty `Vec` when the chain's receiver can't be
+    /// resolved (unknown var type, etc.) — an unresolved chain matches nothing,
+    /// which is the safe default for a rename.
+    async fn accessible_tables_for_chain(
+        &self,
+        chains: &[std::sync::Arc<laravel_lsp::query_chain::BuilderChain>],
+        chain_index: usize,
+        root: &Path,
+    ) -> Vec<laravel_lsp::query_chain::AccessibleTable> {
+        let Some(chain) = chains.get(chain_index) else {
+            return Vec::new();
+        };
+        // Anchor inside the chain's span so the resolver picks this chain. The
+        // start byte sits on the receiver, which is always within the chain.
+        let anchor = chain.span_byte_range.0;
+        let Some(ctx) = laravel_lsp::query_chain::detect_chain_context_at(chains, anchor) else {
+            return Vec::new();
+        };
+        Self::accessible_tables_for_goto(&ctx, root).await
+    }
+
+    /// True when a column literal in a chain refers to `target_table`:
+    /// - **qualified** (`users.email`) → some accessible table's qualifier
+    ///   matches the literal's qualifier AND its real table is `target_table`;
+    /// - **bare** (`email`) → `target_table` is among the chain's accessible
+    ///   tables (by real name or qualifier).
+    fn chain_matches_table(
+        tables: &[laravel_lsp::query_chain::AccessibleTable],
+        target_table: &str,
+        qualifier: Option<&str>,
+    ) -> bool {
+        match qualifier {
+            Some(q) => tables
+                .iter()
+                .any(|t| t.qualifier() == q && t.table == target_table),
+            None => tables
+                .iter()
+                .any(|t| t.table == target_table || t.qualifier() == target_table),
+        }
+    }
+
+    /// Build the `(uri, content)` for the column-rename migration. The filename
+    /// uses the current wall-clock as Laravel's `YYYY_MM_DD_HHMMSS` prefix.
+    /// `None` if the URI can't be formed.
+    fn build_rename_migration(
+        &self,
+        root: &Path,
+        table: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Option<(Url, String)> {
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let timestamp =
+            laravel_lsp::query_chain::code_actions::format_migration_timestamp(unix_secs);
+        let filename = laravel_lsp::column_rename::rename_migration_filename(
+            &timestamp, old_column, new_column, table,
+        );
+        let path = root.join("database").join("migrations").join(&filename);
+        let uri = Url::from_file_path(&path).ok()?;
+        let content =
+            laravel_lsp::column_rename::rename_migration_content(table, old_column, new_column);
+        Some((uri, content))
+    }
+
+    /// Assemble the column-rename `WorkspaceEdit`: the migration `CreateFile`
+    /// (+ its content insert at 0:0) followed by every text-rewrite target,
+    /// grouped per file into `TextDocumentEdit`s. Uses `DocumentChanges::
+    /// Operations` so the resource op and edits ride in one workspace edit.
+    /// `None` when there's nothing to do (no targets and no migration).
+    fn build_column_rename_workspace_edit(
+        targets: Vec<laravel_lsp::rename::EditTarget>,
+        migration: Option<(Url, String)>,
+    ) -> Option<WorkspaceEdit> {
+        if targets.is_empty() && migration.is_none() {
+            return None;
+        }
+
+        let mut ops: Vec<DocumentChangeOperation> = Vec::new();
+
+        // Migration first: create the file, then write its content.
+        if let Some((uri, content)) = migration {
+            ops.push(DocumentChangeOperation::Op(ResourceOp::Create(
+                CreateFile {
+                    uri: uri.clone(),
+                    options: Some(CreateFileOptions {
+                        overwrite: Some(false),
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                },
+            )));
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: vec![OneOf::Left(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    new_text: content,
+                })],
+            }));
+        }
+
+        // Group text targets per file into one TextDocumentEdit each.
+        let mut grouped: std::collections::HashMap<Url, Vec<TextEdit>> =
+            std::collections::HashMap::new();
+        for t in targets {
+            let Ok(uri) = Url::from_file_path(&t.file_path) else {
+                continue;
+            };
+            grouped.entry(uri).or_default().push(TextEdit {
+                range: Range {
+                    start: Position {
+                        line: t.line,
+                        character: t.start_column,
+                    },
+                    end: Position {
+                        line: t.line,
+                        character: t.end_column,
+                    },
+                },
+                new_text: t.new_text,
+            });
+        }
+        for (uri, edits) in grouped {
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }));
+        }
+
+        if ops.is_empty() {
+            return None;
+        }
+
+        Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            change_annotations: None,
+        })
+    }
+
+    /// Magic-member rename (M7): rewrite a method-backed magic member's
+    /// declaration (transformed: `active`→`scopeActive`, `full_name`→
+    /// `getFullNameAttribute`, `posts`→`posts`) plus every cached usage site
+    /// (the new usage name verbatim). `None` when the cursor isn't a renameable
+    /// magic member, so the caller falls through to the literal-symbol flow.
+    /// The declaring file is read off the async side (not the Salsa actor).
+    async fn magic_member_rename_edit(
+        &self,
+        file_path: &Path,
+        position: Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        let data = self
+            .salsa
+            .resolve_magic_member_rename_at(
+                file_path.to_path_buf(),
+                position.line,
+                position.character,
+            )
+            .await
+            .ok()
+            .flatten()?;
+
+        // Every cached usage site → the new usage name verbatim.
+        let call_sites = self
+            .salsa
+            .find_references(
+                laravel_lsp::salsa_impl::SymbolRefData::MagicMember {
+                    fqcn: data.fqcn.clone(),
+                    member: data.member.clone(),
+                },
+                false,
+            )
+            .await
+            .ok()?;
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = call_sites
+            .into_iter()
+            .map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+                new_text: new_name.to_string(),
+            })
+            .collect();
+
+        // Declaration: rewrite just the method-name token, transformed for the
+        // kind (scope/accessor affixes preserved). Read from the declaring file.
+        if let Ok(src) = tokio::fs::read_to_string(&data.decl_file).await {
+            if let Some((line, start_column, end_column)) =
+                laravel_lsp::rename::locate_method_name(&src, &data.method_name)
+            {
+                let new_method = laravel_lsp::rename::magic_member_decl_name(
+                    data.kind,
+                    &data.method_name,
+                    new_name,
+                );
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: data.decl_file.clone(),
+                    line,
+                    start_column,
+                    end_column,
+                    new_text: new_method,
+                });
+            }
+        }
+
+        laravel_lsp::rename::build_rename_edit(&targets)
     }
 
     /// Blade component — distinguishes class-backed components (Laravel
@@ -15862,6 +17270,9 @@ fn pattern_range_at(
         laravel_lsp::salsa_impl::PatternAtPosition::Url(u) => (u.line, u.column, u.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Action(a) => (a.line, a.column, a.end_column),
         laravel_lsp::salsa_impl::PatternAtPosition::Feature(f) => (f.line, f.column, f.end_column),
+        laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m) => {
+            (m.line, m.column, m.end_column)
+        }
     };
     Some(Range {
         start: Position {
@@ -16227,6 +17638,235 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
     }
 }
 
+impl LaravelLanguageServer {
+    /// Collect every code-lens item for a file — each a `(range, symbols)` pair.
+    /// Position lenses (magic members, routes, env, config, translation) carry
+    /// one symbol; the compound file-level lens carries the file's
+    /// view/component/livewire identities. Shared by `code_lens` (renders the
+    /// count) and `unused_symbol_diagnostics` (flags zero-reference items).
+    async fn collect_lens_items(&self, path: &Path, source: &str) -> Vec<LensItem> {
+        use laravel_lsp::salsa_impl::SymbolRefData;
+
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let root = self.root_path.read().await.clone();
+        // A `config/<file>.php` (direct child of the project's config dir).
+        let is_config = file_name.ends_with(".php")
+            && root
+                .as_ref()
+                .is_some_and(|r| path.parent() == Some(r.join("config").as_path()));
+        // A `lang/<locale>/<file>.php` (or legacy `resources/lang/<locale>/…`).
+        let is_translation = file_name.ends_with(".php")
+            && root.as_ref().is_some_and(|r| {
+                path.parent()
+                    .and_then(|locale| locale.parent())
+                    .is_some_and(|lang| {
+                        lang == r.join("lang") || lang == r.join("resources").join("lang")
+                    })
+            });
+
+        // Position (single-symbol) lenses by file type.
+        let position_targets = if is_env {
+            laravel_lsp::code_lens::env_lens_targets(source)
+        } else if is_config {
+            laravel_lsp::code_lens::config_lens_targets(file_stem, source)
+        } else if is_translation {
+            laravel_lsp::code_lens::translation_lens_targets(file_stem, source)
+        } else {
+            let mut targets = laravel_lsp::code_lens::code_lens_targets(path, source);
+            // Route-name declarations in an open routes file: declarations come
+            // from the live buffer, external-load prefixes (#43) from the cached
+            // warm-built route index (no per-request route-file re-parsing).
+            let guard = self.route_index.read().await;
+            if let Some(index) = guard.as_ref() {
+                if index
+                    .source_files
+                    .contains(&laravel_lsp::route_discovery::normalize_path(path))
+                {
+                    let decls =
+                        laravel_lsp::route_name_locator::extract_route_name_declarations(source);
+                    if !decls.is_empty() {
+                        let ext = index.external_prefixes_for(path);
+                        targets.extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
+                    }
+                }
+            }
+            drop(guard);
+            targets
+        };
+
+        let mut items: Vec<LensItem> = position_targets
+            .into_iter()
+            .map(|t| LensItem {
+                range: Range {
+                    start: Position {
+                        line: t.line,
+                        character: t.column,
+                    },
+                    end: Position {
+                        line: t.line,
+                        character: t.end_column,
+                    },
+                },
+                symbols: vec![t.symbol],
+            })
+            .collect();
+
+        // Compound file-level item: ONE lens whose count is the SUM across every
+        // identity the file is referenced under — Livewire (`<livewire:…>`),
+        // component (`<x-…>`), and view (`view()` / `@include`). A file can have
+        // several (a component blade is also a view; a Livewire companion view
+        // is also a view). Skipped for env/config/translation files.
+        if !is_env && !is_config && !is_translation && file_name.ends_with(".php") {
+            let mut file_symbols: Vec<SymbolRefData> = Vec::new();
+            if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+                if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
+                    path, &lw_config, lw_version,
+                ) {
+                    file_symbols.push(SymbolRefData::Livewire(name));
+                }
+            }
+            if file_name.ends_with(".blade.php") {
+                if let Some(config) = self.get_cached_config().await {
+                    file_symbols.extend(laravel_lsp::code_lens::file_level_symbols(path, &config));
+                }
+            }
+            if !file_symbols.is_empty() {
+                items.push(LensItem {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    symbols: file_symbols,
+                });
+            }
+        }
+        items
+    }
+
+    /// Diagnostics for lensed symbols with zero NON-test references — the
+    /// "unused / referenced-only-in-tests" warnings (#59). Reuses the same
+    /// item collection as the code lenses, so coverage matches exactly.
+    ///
+    /// Gated on warm completion: running mid-warm (empty index) would flag
+    /// every symbol with a false "no references" warning. A reference whose
+    /// file lives under `<root>/tests` is counted as a test reference. Worded
+    /// factually (not "dead code") and WARNING-level, because a zero count can
+    /// also mean dynamic / by-convention usage we can't see statically (a
+    /// URL-hit route, `config()`-read env, `$model->$dynamic` access).
+    async fn unused_symbol_diagnostics(&self, path: &Path, source: &str) -> Vec<Diagnostic> {
+        // Opt-in (#59): suppressed unless the user enables `codeLens.enabled`.
+        if !*self.code_lens_enabled.read().await {
+            return Vec::new();
+        }
+        if !self
+            .warm_complete
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let Some(root) = self.root_path.read().await.clone() else {
+            return Vec::new();
+        };
+        let tests_dir = root.join("tests");
+        let first_line_len = source
+            .lines()
+            .next()
+            .map(|l| l.chars().count() as u32)
+            .unwrap_or(0);
+
+        let mut out = Vec::new();
+        for item in self.collect_lens_items(path, source).await {
+            let mut non_test = 0usize;
+            let mut test = 0usize;
+            for symbol in &item.symbols {
+                for loc in self
+                    .salsa
+                    .find_references(symbol.clone(), false)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if loc.file_path.starts_with(&tests_dir) {
+                        test += 1;
+                    } else {
+                        non_test += 1;
+                    }
+                }
+            }
+            if non_test > 0 {
+                continue;
+            }
+            // A member with zero project references may still be read by the
+            // framework through inheritance — a model's `$timestamps` is read by
+            // `HasTimestamps`, never by app code. Prove that across the chain
+            // (parents + traits, including vendor) before flagging it. Runs only
+            // for the already-zero-reference case (a handful of members per
+            // file) and off the async worker, since the walk does FS IO +
+            // parsing.
+            if self.any_member_framework_read(&root, &item.symbols).await {
+                continue;
+            }
+            let message = if test > 0 {
+                "Referenced only in tests — possibly dead code?".to_string()
+            } else {
+                "No references found — possibly dead code?".to_string()
+            };
+            // Widen a zero-width (file-level) range to the first line so the
+            // squiggle is visible.
+            let mut range = item.range;
+            if range.start == range.end {
+                range.end = Position {
+                    line: range.start.line,
+                    character: first_line_len.max(1),
+                };
+            }
+            out.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("laravel-lsp".to_string()),
+                message,
+                ..Default::default()
+            });
+        }
+        out
+    }
+
+    /// Whether any `MagicMember` in `symbols` is read across its inheritance
+    /// chain (parents + traits, including vendor) — i.e. framework-read rather
+    /// than dead. Spares configuration properties like a model's `$timestamps`
+    /// from the unused-symbol warning. Each check runs on a blocking thread so
+    /// the filesystem IO + parsing never stalls the async worker or other
+    /// in-flight requests.
+    async fn any_member_framework_read(
+        &self,
+        root: &Path,
+        symbols: &[laravel_lsp::salsa_impl::SymbolRefData],
+    ) -> bool {
+        for symbol in symbols {
+            if let laravel_lsp::salsa_impl::SymbolRefData::MagicMember { fqcn, member } = symbol {
+                let root = root.to_path_buf();
+                let fqcn = fqcn.clone();
+                let member = member.clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::vendor_member_prover::member_read_in_chain(&root, &fqcn, &member)
+                })
+                .await
+                .unwrap_or(false);
+                if read {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
@@ -16238,14 +17878,16 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(init_options) = params.initialization_options {
             match serde_json::from_value::<LspSettings>(init_options) {
                 Ok(settings) => {
-                    info!("⚙️  Initial settings: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
-                        settings.auto_complete_debounce, settings.blade.directive_spacing);
+                    info!("⚙️  Initial settings: autoCompleteDebounce={}ms, blade.directiveSpacing={}, codeLens.enabled={}",
+                        settings.auto_complete_debounce, settings.blade.directive_spacing, settings.code_lens.enabled);
                     self.update_settings(&settings).await;
                 }
                 Err(e) => {
-                    debug!("Could not parse initialization_options: {}", e);
+                    warn!("⚠️  Could not parse initialization_options: {}", e);
                 }
             }
+        } else {
+            info!("⚙️  No initialization_options sent (laravel-lsp config lives under `settings` → expect workspace/didChangeConfiguration instead)");
         }
 
         // Store the root path - lightweight operation
@@ -16335,6 +17977,26 @@ impl LanguageServer for LaravelLanguageServer {
                 // pattern kind are returned.
                 references_provider: Some(OneOf::Left(true)),
 
+                // ✅ Code lens — reference-count indicators (#59). Opt-in while
+                // the feature matures: the capability is always advertised, but
+                // the handler returns nothing unless the user enables our
+                // `codeLens.enabled` setting (which also gates the unused-symbol
+                // diagnostic). Lenses additionally require Zed's global
+                // `"code_lens": "on"`. Covers the Laravel symbols we index
+                // accurately: magic members, component members, and literal
+                // references (routes/views/…) — what a generic PHP LSP can't.
+                //
+                // A lens resolved while first-load warming is still in progress
+                // shows an honest "indexing references…" placeholder instead of
+                // a misleading "0" — Zed never re-queries an already-open
+                // document (neither `codeLens/refresh` nor dynamic registration
+                // triggers a re-request), so a wrong 0 would otherwise stick
+                // until the file is reopened. See `code_lens_resolve` +
+                // `magic_index_ready`.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(true),
+                }),
+
                 // ✅ Rename provider — `textDocument/rename` /
                 // `textDocument/prepareRename`. Phase 2: route names, config
                 // keys, translation keys. Anything that resolves to (or may
@@ -16409,6 +18071,12 @@ impl LanguageServer for LaravelLanguageServer {
         info!("========================================");
         info!("🚀 Laravel ({}) initialized", env!("LARAVEL_LSP_GIT_HASH"));
         info!("========================================");
+
+        // Pull `lsp.laravel-lsp.settings` now — Zed delivers per-server settings
+        // via the workspace/configuration PULL, not the didChangeConfiguration
+        // push (which arrives as `{}`). Without this, `codeLens.enabled` and
+        // every other setting stayed at its default.
+        self.pull_and_apply_settings().await;
 
         // Get root path
         let root = match self.root_path.read().await.clone() {
@@ -16553,6 +18221,136 @@ impl LanguageServer for LaravelLanguageServer {
 
         info!("Laravel: Shutdown complete");
         Ok(())
+    }
+
+    /// Code lens (#59): emit a reference-count lens above each Laravel symbol we
+    /// count accurately — model magic members (relationships / scopes / public
+    /// properties) and Livewire/Volt component members (`#[Computed]` +
+    /// properties). Counts are deferred to `code_lens_resolve` to keep this
+    /// response cheap; each lens carries its index key in `data`.
+    async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
+        // Opt-in (#59): no lenses unless the user enables `codeLens.enabled`.
+        let enabled = *self.code_lens_enabled.read().await;
+        debug!(
+            "🔎 code_lens requested for {} (codeLens.enabled={})",
+            params.text_document.uri, enabled
+        );
+        if !enabled {
+            return Ok(Some(Vec::new()));
+        }
+        let uri = params.text_document.uri;
+        let Ok(path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        // Prefer the open buffer (reflects unsaved edits); fall back to disk.
+        let source = match self.documents.read().await.get(&uri) {
+            Some((text, _)) => text.clone(),
+            None => match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            },
+        };
+
+        let lenses = self
+            .collect_lens_items(&path, &source)
+            .await
+            .into_iter()
+            .map(|item| CodeLens {
+                range: item.range,
+                command: None,
+                // `symbols` (a list) + the document URI so `resolve` can sum
+                // references across them and build the `showReferences` command
+                // (resolve doesn't receive the document URI otherwise).
+                data: Some(serde_json::json!({
+                    "symbols": item.symbols,
+                    "uri": uri.as_str(),
+                })),
+            })
+            .collect();
+        Ok(Some(lenses))
+    }
+
+    /// Fill in a lens's reference count + make it open the references when
+    /// clicked. Resolves the symbol's reference locations from the index, sets
+    /// the title to the count, and wires `editor.action.showReferences` so the
+    /// client opens a multi-file references view (the vtsls `referencesCodeLens`
+    /// pattern Zed supports) rather than going to the definition.
+    async fn code_lens_resolve(&self, mut lens: CodeLens) -> jsonrpc::Result<CodeLens> {
+        let Some(data) = lens.data.clone() else {
+            return Ok(lens);
+        };
+        // Every lens carries a `symbols` list (usually one; the compound
+        // file-level lens carries the file's view/component/livewire
+        // identities). `resolve` sums references across them.
+        let symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = data
+            .get("symbols")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if symbols.is_empty() {
+            return Ok(lens);
+        }
+        let uri = data
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|s| Url::parse(s).ok());
+
+        // Reference locations, combined across every symbol and de-duplicated by
+        // (file, line, column). Fast for magic members (the index lookup skips
+        // the literal dirty-refresh). A lens resolved before warming finishes
+        // reads 0 (empty index); the post-warm `code_lens_refresh` re-requests
+        // so the count fills in. (Zed currently doesn't re-query already-open
+        // docs on that refresh — a reopen/edit refreshes them — see the upstream
+        // bug; the disk cache keeps warm fast so the window is short.)
+        let mut locations: Vec<Location> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, u32, u32)> =
+            std::collections::HashSet::new();
+        for symbol in symbols {
+            for loc in self
+                .salsa
+                .find_references(symbol, false)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(reference_location_to_lsp)
+            {
+                let key = (
+                    loc.uri.to_string(),
+                    loc.range.start.line,
+                    loc.range.start.character,
+                );
+                if seen.insert(key) {
+                    locations.push(loc);
+                }
+            }
+        }
+
+        let count = locations.len();
+        let title = match count {
+            0 => "0 references".to_string(),
+            1 => "1 reference".to_string(),
+            n => format!("{n} references"),
+        };
+
+        // `editor.action.showReferences` opens the references peek/multibuffer
+        // with `[uri, anchor position, locations]`. Fall back to display-only
+        // (count text, no navigation) if the URI didn't round-trip.
+        lens.command = Some(match uri {
+            Some(uri) => Command {
+                title,
+                command: "editor.action.showReferences".to_string(),
+                arguments: Some(vec![
+                    serde_json::to_value(uri).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(lens.range.start).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&locations).unwrap_or(serde_json::Value::Null),
+                ]),
+            },
+            None => Command {
+                title,
+                command: String::new(),
+                arguments: None,
+            },
+        });
+        Ok(lens)
     }
 
     async fn on_type_formatting(
@@ -16738,7 +18536,11 @@ impl LanguageServer for LaravelLanguageServer {
             let is_php = uri.path().ends_with(".php");
 
             if is_blade || is_php {
-                // Removed: parse_and_cache_patterns - performance_cache handles this automatically
+                // Refresh the magic-member index on save (not on typing-pause):
+                // instant per-file + a debounced project-wide reconverge for
+                // cross-file ripples. Saves are deliberate and infrequent, so
+                // this keeps typing free of resolution work.
+                self.refresh_magic_on_save(&uri, &text).await;
             }
 
             // Run diagnostics immediately on save
@@ -16764,12 +18566,16 @@ impl LanguageServer for LaravelLanguageServer {
         // Clear diagnostics from our cache
         self.diagnostics.write().await.remove(&uri);
 
-        // Remove from Salsa database
-        if let Ok(file_path) = uri.to_file_path() {
-            if let Err(e) = self.salsa.remove_file(file_path).await {
-                debug!("Failed to remove from Salsa database: {}", e);
-            }
-        }
+        // Deliberately DO NOT drop the file from Salsa / the symbol index here.
+        // A closed buffer's file still exists on disk and its references are
+        // still valid — project-wide find-references (and code lenses) must
+        // keep finding them. Worse, `RemoveFile` evicts the file's resolved
+        // magic-member entries, which only the warm/save passes rebuild — so
+        // evicting on close silently zeroed magic-member counts the moment you
+        // navigated away (e.g. opening the references multibuffer closes the
+        // model buffer, dropping its `$this->status` entry). External edits to
+        // a closed file are still picked up via `did_change_watched_files`,
+        // and a real delete still goes through `RemoveFile`.
 
         // Publish empty diagnostics to clear them from the client
         self.client.publish_diagnostics(uri, vec![], None).await;
@@ -16944,19 +18750,32 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Handle runtime configuration changes without requiring LSP restart
-        // Settings are configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
-        debug!("🔧 Configuration changed: {:?}", params.settings);
+        // Settings live under `lsp.laravel-lsp.settings`. Zed sends `{}` here and
+        // delivers the real values via the workspace/configuration PULL, so
+        // applying this payload directly would reset everything to defaults.
+        debug!("🔧 did_change_configuration received: {}", params.settings);
 
-        match serde_json::from_value::<LspSettings>(params.settings) {
-            Ok(settings) => {
-                info!("⚙️  Configuration updated: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
-                    settings.auto_complete_debounce, settings.blade.directive_spacing);
-                self.update_settings(&settings).await;
-            }
-            Err(e) => {
-                debug!("Could not parse configuration settings: {}", e);
+        // Honor a non-empty push (editors that send settings inline), otherwise
+        // re-pull (Zed's path).
+        let has_push = params
+            .settings
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        if has_push {
+            match serde_json::from_value::<LspSettings>(params.settings) {
+                Ok(settings) => {
+                    info!("⚙️  Applying pushed configuration: autoCompleteDebounce={}ms, blade.directiveSpacing={}, codeLens.enabled={}",
+                        settings.auto_complete_debounce, settings.blade.directive_spacing, settings.code_lens.enabled);
+                    self.update_settings(&settings).await;
+                    return;
+                }
+                Err(e) => {
+                    warn!("⚠️  Could not parse pushed configuration: {e} — falling back to pull");
+                }
             }
         }
+        self.pull_and_apply_settings().await;
     }
 
     async fn goto_definition(
@@ -17150,6 +18969,11 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
             }
+            PatternAtPosition::MemberAccess(_) => {
+                // Goto-definition for magic members (the inheritance-resolved
+                // declaration locator) lands in M4.
+                None
+            }
         };
 
         if location.is_none() {
@@ -17251,8 +19075,6 @@ impl LanguageServer for LaravelLanguageServer {
     }
 
     // NOTE: completion handler removed - capability not advertised in ServerCapabilities
-
-    // NOTE: code_lens handler removed - Zed doesn't support custom LSP commands
 
     /// Document-symbol request — returns Laravel-aware structure for outline
     /// panels. Delegates the parsing to the Salsa actor which memoizes per file
@@ -17364,7 +19186,9 @@ impl LanguageServer for LaravelLanguageServer {
         .await
         {
             Some(s) => s,
-            None => return Ok(None),
+            // Not a literal-symbol site — try a magic member (`$user->email`),
+            // resolved via the M3 engine + reverse index (M4).
+            None => return Ok(self.magic_member_references(&file_path, position).await),
         };
 
         let include_declaration = params.context.include_declaration;
@@ -17431,6 +19255,60 @@ impl LanguageServer for LaravelLanguageServer {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
+
+        // Magic member (M7): a method-backed magic member under the cursor
+        // (relationship / scope / accessor) renames over its member-name token.
+        // Checked before the literal-symbol classifier, which doesn't know
+        // magic members and would fall through to the class-rename path.
+        if let Ok(Some(_)) = self
+            .salsa
+            .resolve_magic_member_rename_at(file_path.clone(), position.line, position.character)
+            .await
+        {
+            if let Some(laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m)) =
+                patterns.find_at_position(position.line, position.character)
+            {
+                return Ok(Some(PrepareRenameResponse::Range(Range {
+                    start: Position {
+                        line: m.line,
+                        character: m.column,
+                    },
+                    end: Position {
+                        line: m.line,
+                        character: m.end_column,
+                    },
+                })));
+            }
+        }
+
+        // Column (M8): a DB column under the cursor (`$user->email`, or a
+        // `where('email', …)` literal) renames over the column-name token.
+        // `resolve_magic_member_at` classifies property-form columns; for a
+        // chain literal the classifier below returns the string range. Handle
+        // the property-form case here so F2 on `$user->email` highlights just
+        // `email`.
+        if let Ok(Some(data)) = self
+            .salsa
+            .resolve_magic_member_at(file_path.clone(), position.line, position.character)
+            .await
+        {
+            if matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+                if let Some(laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m)) =
+                    patterns.find_at_position(position.line, position.character)
+                {
+                    return Ok(Some(PrepareRenameResponse::Range(Range {
+                        start: Position {
+                            line: m.line,
+                            character: m.column,
+                        },
+                        end: Position {
+                            line: m.line,
+                            character: m.end_column,
+                        },
+                    })));
+                }
+            }
+        }
 
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(
@@ -17517,6 +19395,29 @@ impl LanguageServer for LaravelLanguageServer {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
+
+        // Column (M8): renaming a DB column (cursor on `email` in `$user->email`
+        // or `where('email', …)`) rewrites column literals project-wide, the
+        // model's array entries, the property-form usages, and generates a
+        // `renameColumn` migration. Checked first — a Column routes here; the
+        // method-backed magic members route to `magic_member_rename_edit`.
+        if let Some(edit) = self
+            .column_rename_edit(&file_path, position, &new_name)
+            .await
+        {
+            return Ok(Some(edit));
+        }
+
+        // Magic member (M7): rename a method-backed magic member (relationship /
+        // scope / accessor) across its declaration + every cached usage site.
+        // Checked before the literal-symbol classifier (which doesn't know magic
+        // members) and the class-rename fallback.
+        if let Some(edit) = self
+            .magic_member_rename_edit(&file_path, position, &new_name)
+            .await
+        {
+            return Ok(Some(edit));
+        }
 
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(
@@ -19921,9 +21822,6 @@ impl LanguageServer for LaravelLanguageServer {
         })))
     }
 }
-
-// ❌ REMOVED: code_lens helper methods (extract_view_name_from_path, find_all_references_to_view)
-// Zed doesn't support custom LSP commands, so code lens was not functional.
 
 #[cfg(test)]
 mod tests;

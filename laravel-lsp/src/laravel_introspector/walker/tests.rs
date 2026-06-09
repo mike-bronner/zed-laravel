@@ -65,6 +65,38 @@ class Counter extends \Livewire\Component {
 }
 
 #[test]
+fn extracts_implements_clause() {
+    let content = r#"<?php
+class User extends Model implements \Illuminate\Contracts\Auth\Authenticatable, Arrayable {
+    public int $id;
+}
+"#;
+    let s = extract_php_structure(content);
+    assert_eq!(s.structures.len(), 1);
+    // Raw names preserved in source order, namespace separators intact.
+    assert_eq!(
+        s.structures[0].implements_raw,
+        vec![
+            "\\Illuminate\\Contracts\\Auth\\Authenticatable".to_string(),
+            "Arrayable".to_string(),
+        ]
+    );
+    // extends is parsed independently of implements.
+    assert_eq!(s.structures[0].extends.as_deref(), Some("Model"));
+}
+
+#[test]
+fn no_implements_clause_is_empty() {
+    let content = r#"<?php
+class Plain {
+    public int $id;
+}
+"#;
+    let s = extract_php_structure(content);
+    assert!(s.structures[0].implements_raw.is_empty());
+}
+
+#[test]
 fn extracts_return_types_with_namespace_stripped() {
     let content = r#"<?php
 class Post {

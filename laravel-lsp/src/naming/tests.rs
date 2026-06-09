@@ -6,6 +6,16 @@ fn pascal_to_kebab_single_word() {
 }
 
 #[test]
+fn snake_to_pascal_cases() {
+    assert_eq!(snake_to_pascal("active"), "Active");
+    assert_eq!(snake_to_pascal("full_name"), "FullName");
+    assert_eq!(snake_to_pascal("created_at_date"), "CreatedAtDate");
+    // Defensive: leading/empty segments don't produce empty chunks.
+    assert_eq!(snake_to_pascal("_foo"), "Foo");
+    assert_eq!(snake_to_pascal(""), "");
+}
+
+#[test]
 fn pascal_to_kebab_two_words() {
     assert_eq!(pascal_to_kebab("UserProfile"), "user-profile");
 }

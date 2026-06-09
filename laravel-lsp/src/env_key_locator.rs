@@ -83,30 +83,13 @@ pub fn locate_keys_across_env_files(root: &Path, key: &str) -> Vec<EnvKeyLocatio
 /// warns on duplicates).
 pub fn locate_in_source(source: &str, key: &str) -> Option<KeyPosition> {
     for (line_idx, line) in source.lines().enumerate() {
-        // Blank line or comment? Skip — neither can declare a key.
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // No `=`? Not a declaration. Laravel's env parser ignores
-        // lines without `=` so we do too.
-        let Some(eq_pos) = line.find('=') else {
+        let Some((found, start_col, end_col)) = parse_key_declaration(line) else {
             continue;
         };
-        // Pull out the key text (everything before `=`, whitespace-
-        // trimmed) and compare. Exact match only — `APP_NAM` must NOT
-        // match `APP_NAME`.
-        let key_part = &line[..eq_pos];
-        let key_trimmed = key_part.trim();
-        if key_trimmed != key {
+        // Exact match only — `APP_NAM` must NOT match `APP_NAME`.
+        if found != key {
             continue;
         }
-        // Column accounting: where in the line does the trimmed key
-        // actually start? Subtract trailing-trim length from the
-        // pre-`=` slice length to find any leading whitespace offset.
-        let leading_ws = key_part.len() - key_part.trim_start().len();
-        let start_col = leading_ws as u32;
-        let end_col = (leading_ws + key_trimmed.len()) as u32;
         return Some(KeyPosition {
             line: line_idx as u32,
             start_column: start_col,
@@ -114,6 +97,55 @@ pub fn locate_in_source(source: &str, key: &str) -> Option<KeyPosition> {
         });
     }
     None
+}
+
+/// Enumerate every key declaration in a `.env`-format source, in file order,
+/// with column-accurate positions. First declaration wins per key (matching
+/// [`locate_in_source`]'s first-match-wins), so a malformed file with a
+/// duplicated key yields a single entry. Used to build env-var code lenses for
+/// an open `.env*` file.
+pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (line_idx, line) in source.lines().enumerate() {
+        let Some((key, start_col, end_col)) = parse_key_declaration(line) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push((
+            key.to_string(),
+            KeyPosition {
+                line: line_idx as u32,
+                start_column: start_col,
+                end_column: end_col,
+            },
+        ));
+    }
+    out
+}
+
+/// Parse one `.env` line into `(key, start_column, end_column)` — the key text
+/// (everything before the first `=`, whitespace-trimmed) and its column span.
+/// Returns `None` for blank lines, `#` comments, lines without `=`, and lines
+/// whose key is empty. Shared by [`locate_in_source`] and
+/// [`enumerate_keys_in_source`] so both classify lines identically.
+fn parse_key_declaration(line: &str) -> Option<(&str, u32, u32)> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let eq_pos = line.find('=')?;
+    let key_part = &line[..eq_pos];
+    let key = key_part.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let leading_ws = key_part.len() - key_part.trim_start().len();
+    let start_col = leading_ws as u32;
+    let end_col = (leading_ws + key.len()) as u32;
+    Some((key, start_col, end_col))
 }
 
 #[cfg(test)]

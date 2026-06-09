@@ -191,3 +191,48 @@ fn nonexistent_root_returns_empty() {
     let locs = locate_keys_across_env_files(Path::new("/totally/made/up/path"), "APP_NAME");
     assert!(locs.is_empty());
 }
+
+// ── enumerate_keys_in_source ──────────────────────────────────────────────
+
+#[test]
+fn enumerate_returns_all_keys_in_order_with_positions() {
+    let src = "APP_NAME=Laravel\nAPP_ENV=local\nDB_HOST=127.0.0.1\n";
+    let keys = enumerate_keys_in_source(src);
+    assert_eq!(
+        keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["APP_NAME", "APP_ENV", "DB_HOST"]
+    );
+    assert_eq!(
+        (keys[0].1.line, keys[0].1.start_column, keys[0].1.end_column),
+        (0, 0, 8)
+    );
+    assert_eq!(keys[2].1.line, 2);
+}
+
+#[test]
+fn enumerate_skips_comments_blanks_and_no_equals_lines() {
+    let src = "# a comment\n\nAPP_NAME=Laravel\nJUST_TEXT\n  # indented comment\nDB_HOST=db\n";
+    let entries = enumerate_keys_in_source(src);
+    let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["APP_NAME", "DB_HOST"]);
+}
+
+#[test]
+fn enumerate_dedups_keeping_first_occurrence() {
+    let src = "APP_NAME=first\nAPP_NAME=second\n";
+    let keys = enumerate_keys_in_source(src);
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, "APP_NAME");
+    assert_eq!(keys[0].1.line, 0, "first occurrence wins");
+}
+
+#[test]
+fn enumerate_handles_empty_value_and_leading_whitespace() {
+    let src = "EMPTY=\n  SPACED=value\n";
+    let keys = enumerate_keys_in_source(src);
+    assert_eq!(keys[0].0, "EMPTY");
+    assert_eq!((keys[0].1.start_column, keys[0].1.end_column), (0, 5));
+    assert_eq!(keys[1].0, "SPACED");
+    // Leading whitespace is reflected in the start column.
+    assert_eq!((keys[1].1.start_column, keys[1].1.end_column), (2, 8));
+}

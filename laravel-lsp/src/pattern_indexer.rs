@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::blade_embedded_php::{adjust_inner_position, extract_php_regions};
+use crate::class_hierarchy_index::{classes_from_tree, ClassNode};
 use crate::parser::{language_blade, language_php, parse_blade, parse_php};
 use crate::queries::{
     extract_all_blade_patterns, extract_all_php_patterns, AssetHelperType as QAssetHelperType,
@@ -27,21 +28,44 @@ use crate::queries::{
 };
 use crate::salsa_impl::{
     ActionReferenceData, AssetHelperType, AssetReferenceData, BindingReferenceData,
-    ComponentReferenceData, ConfigReferenceData, DirectiveReferenceData, EnvReferenceData,
-    FeatureReferenceData, LivewireReferenceData, MiddlewareReferenceData, ParsedPatternsData,
-    RouteReferenceData, TranslationReferenceData, UrlReferenceData, ViewReferenceData,
+    ComponentReferenceData, Confidence, ConfigReferenceData, DirectiveReferenceData,
+    EnvReferenceData, FeatureReferenceData, LivewireReferenceData, MemberAccessReferenceData,
+    MiddlewareReferenceData, ParsedPatternsData, RouteReferenceData, TranslationReferenceData,
+    UrlReferenceData, ViewReferenceData,
 };
 
 /// Parse a file and return its `ParsedPatternsData` directly. Detects Blade
 /// vs plain PHP from the path extension. Errors during parsing yield empty
 /// data for the affected pass; never panics.
 pub fn parse_owned(path: &Path, text: &str) -> Arc<ParsedPatternsData> {
+    parse_owned_with_hierarchy(path, text).0
+}
+
+/// Like [`parse_owned`], but also returns the file's class-hierarchy nodes,
+/// extracted from the SAME PHP parse (no second tree-sitter pass). Blade
+/// files yield no class nodes — PHP class declarations only live in `.php`.
+pub fn parse_owned_with_hierarchy(
+    path: &Path,
+    text: &str,
+) -> (Arc<ParsedPatternsData>, Vec<ClassNode>) {
     let is_blade = path.to_string_lossy().ends_with(".blade.php");
     let mut data = ParsedPatternsData::default();
+    let mut nodes: Vec<ClassNode> = Vec::new();
 
     // Blade-specific pattern extraction (components, <livewire:…>, directives,
     // and the existing echo→translation special case).
     if is_blade {
+        // Capture Volt-ness once, while the source is in hand, so the
+        // magic-build Blade pass needn't re-read the file to check.
+        data.is_volt = crate::livewire_resolver::source_contains_volt_signature(text);
+        // Capture `@foreach` loops so the magic build can type loop variables
+        // (`{{ $user->email }}` in `@foreach($users as $user)`) without a read.
+        data.blade_loops = crate::salsa_impl::blade_loop_vars(text);
+        // Capture member accesses inside `@foreach` iterables (`$this->entities`)
+        // — directive args the `{{ }}`/PHP capture below would otherwise miss.
+        for m in crate::salsa_impl::blade_loop_iterable_accesses(text) {
+            data.member_access_refs.push(std::sync::Arc::new(m));
+        }
         let lang = language_blade();
         if let Ok(tree) = parse_blade(text) {
             if let Ok(bp) = extract_all_blade_patterns(&tree, text, &lang) {
@@ -129,11 +153,13 @@ pub fn parse_owned(path: &Path, text: &str) -> Arc<ParsedPatternsData> {
             if let Ok(patterns) = extract_all_php_patterns(&tree, text, &lang_php) {
                 push_php_patterns(&patterns, &mut data, None);
             }
+            // Class-hierarchy nodes share this same PHP parse.
+            nodes = classes_from_tree(path, &tree, text);
         }
     }
 
     data.build_position_index();
-    Arc::new(data)
+    (Arc::new(data), nodes)
 }
 
 /// Append every PHP-side pattern from `snippet` into `data`. When `offset`
@@ -274,6 +300,32 @@ fn push_php_patterns(
             column: col,
             end_column: end_col,
         }));
+    }
+
+    // Property-form member accesses. For full-file PHP (offset None) the byte
+    // ranges are file-absolute (the PHP resolver re-parses the file and locates
+    // the receiver node by them). For Blade-embedded regions (offset Some) the
+    // positions are mapped to outer-file coords via `xform`; the byte ranges
+    // stay snippet-local and are unused — Blade receiver resolution works off
+    // the receiver text + controller/Volt view-variable inference, never a
+    // whole-file PHP parse (parsing a `.blade.php` as PHP is pathologically
+    // slow, see the note above).
+    for m in &snippet.member_accesses {
+        let (line, col, end_col) = xform(m.row, m.column, m.end_column);
+        data.member_access_refs
+            .push(Arc::new(MemberAccessReferenceData {
+                member: m.member.to_string(),
+                receiver: m.receiver.to_string(),
+                receiver_byte_start: m.receiver_byte_start,
+                receiver_byte_end: m.receiver_byte_end,
+                is_nullsafe: m.is_nullsafe,
+                line,
+                column: col,
+                end_column: end_col,
+                declaring_fqcn: None,
+                kind: None,
+                confidence: Confidence::Unresolved,
+            }));
     }
 }
 

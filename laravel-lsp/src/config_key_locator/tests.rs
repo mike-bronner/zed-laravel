@@ -116,3 +116,79 @@ return [
         "env"
     );
 }
+
+// ── enumerate_keys_in_source ──────────────────────────────────────────────
+
+fn enum_keys(src: &str) -> Vec<String> {
+    enumerate_keys_in_source(src)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+#[test]
+fn enumerate_top_level_keys_with_positions() {
+    let src = r#"<?php
+return [
+    'name' => env('APP_NAME', 'Laravel'),
+    'env' => env('APP_ENV', 'production'),
+];
+"#;
+    let entries = enumerate_keys_in_source(src);
+    assert_eq!(
+        entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["name", "env"]
+    );
+    // Position is the key string content (matches locate_in_source).
+    assert_eq!(entries[0].1, locate_in_source(src, &["name"]).unwrap());
+}
+
+#[test]
+fn enumerate_emits_nested_paths_leaf_and_intermediate() {
+    let src = r#"<?php
+return [
+    'default' => 'mysql',
+    'connections' => [
+        'mysql' => [
+            'host' => '127.0.0.1',
+            'port' => 3306,
+        ],
+    ],
+];
+"#;
+    let keys = enum_keys(src);
+    assert_eq!(
+        keys,
+        vec![
+            "default",
+            "connections",
+            "connections.mysql",
+            "connections.mysql.host",
+            "connections.mysql.port",
+        ]
+    );
+}
+
+#[test]
+fn enumerate_skips_numeric_list_entries() {
+    let src = r#"<?php
+return [
+    'providers' => [
+        App\Providers\AppServiceProvider::class,
+        App\Providers\AuthServiceProvider::class,
+    ],
+    'aliases' => [
+        'Route' => Illuminate\Support\Facades\Route::class,
+    ],
+];
+"#;
+    let keys = enum_keys(src);
+    // `providers` is keyed; its list items are numeric → skipped. `aliases`
+    // and its string-keyed child are emitted.
+    assert_eq!(keys, vec!["providers", "aliases", "aliases.Route"]);
+}
+
+#[test]
+fn enumerate_empty_for_non_array_php() {
+    assert!(enum_keys("<?php echo 'hi';").is_empty());
+}

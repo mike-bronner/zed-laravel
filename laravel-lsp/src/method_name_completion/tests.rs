@@ -385,6 +385,7 @@ fn empty_view() -> ClassView {
             extends: None,
             extends_raw: None,
             trait_uses: Vec::new(),
+            implements_raw: Vec::new(),
             start_line: 0,
             start_column: 0,
             end_line: 0,

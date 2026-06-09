@@ -8,5 +8,6 @@ mod call_site_variants;
 mod column_positions;
 mod extraction_performance;
 mod feature_pattern_extraction;
+mod member_access_extraction;
 mod middleware_extraction;
 mod php_pattern_extraction;

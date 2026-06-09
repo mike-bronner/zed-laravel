@@ -34,9 +34,34 @@ impl zed::Extension for LaravelExtension {
     fn language_server_initialization_options(
         &mut self,
         _language_server_id: &zed::LanguageServerId,
-        _worktree: &zed::Worktree,
+        worktree: &zed::Worktree,
     ) -> Result<Option<zed::serde_json::Value>> {
-        Ok(None)
+        // Forward `lsp.laravel-lsp.initialization_options` to the server's
+        // `initialize` params. Without this Zed sends `None`, and any settings
+        // a user places under `initialization_options` are silently dropped.
+        Ok(
+            zed::settings::LspSettings::for_worktree("laravel-lsp", worktree)
+                .ok()
+                .and_then(|s| s.initialization_options),
+        )
+    }
+
+    fn language_server_workspace_configuration(
+        &mut self,
+        _language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<Option<zed::serde_json::Value>> {
+        // Forward `lsp.laravel-lsp.settings` so the server's
+        // `workspace/configuration` pull (and `didChangeConfiguration`) actually
+        // carries the user's settings. Zed does NOT do this automatically for
+        // extension-provided servers — without this hook it answers the pull
+        // with `{}`, so every setting (codeLens.enabled, blade.directiveSpacing,
+        // diagnostics.severity, …) stays at its default.
+        Ok(
+            zed::settings::LspSettings::for_worktree("laravel-lsp", worktree)
+                .ok()
+                .and_then(|s| s.settings),
+        )
     }
 }
 

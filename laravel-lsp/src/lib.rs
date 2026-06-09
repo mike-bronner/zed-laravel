@@ -18,6 +18,8 @@ pub mod blade_props;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod class_rename;
+pub mod code_lens;
+pub mod column_rename;
 pub mod command_call_locator;
 pub mod command_disk_cache;
 pub mod command_index;
@@ -46,6 +48,7 @@ pub mod middleware_parser;
 pub mod migration_index;
 // model_analyzer was consolidated into `laravel_introspector::model_metadata`.
 // Public API is re-exported as `laravel_introspector::ModelMetadata`.
+pub mod magic_disk_cache;
 pub mod naming;
 pub mod parser;
 pub mod pattern_disk_cache;
@@ -73,6 +76,19 @@ pub mod salsa_impl;
 
 // Inverted symbol index for O(1) find-references
 pub mod symbol_index;
+
+// Project-wide class-hierarchy + member index (structural code lenses)
+pub mod class_hierarchy_index;
+
+// Prove a member is read across the inheritance chain (incl. vendor) — used to
+// avoid flagging framework-read config properties (e.g. $timestamps) as unused
+pub mod vendor_member_prover;
+
+// Magic-member resolve + classify engine (find-references / lens / hover)
+pub mod member_resolver;
+
+// Controller/Volt → Blade view-variable type inference (magic members in Blade)
+pub mod view_var_index;
 
 // Re-export commonly used types
 pub use config::find_project_root;

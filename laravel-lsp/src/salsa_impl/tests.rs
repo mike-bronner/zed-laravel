@@ -945,3 +945,152 @@ fn missing_namespaced_component_still_reports_not_found() {
         "an unregistered namespace must not resolve",
     );
 }
+
+// ─── Member-access capture data model (M2) ──────────────────────────────
+
+/// A captured property-form access with the capture-time defaults (the
+/// resolution scaffold left unfilled, as M2 leaves it).
+fn unresolved_member_access(member: &str, line: u32, col: u32) -> MemberAccessReferenceData {
+    MemberAccessReferenceData {
+        member: member.into(),
+        receiver: "$user".into(),
+        receiver_byte_start: 0,
+        receiver_byte_end: 5,
+        is_nullsafe: false,
+        line,
+        column: col,
+        end_column: col + member.len() as u32,
+        declaring_fqcn: None,
+        kind: None,
+        confidence: Confidence::Unresolved,
+    }
+}
+
+#[test]
+fn member_access_is_indexed_and_found_at_position() {
+    let mut p = ParsedPatternsData::default();
+    // `$user->email` — member name spans cols 12..17 on row 1.
+    p.member_access_refs
+        .push(Arc::new(unresolved_member_access("email", 1, 12)));
+    p.build_position_index();
+
+    let found = p
+        .find_at_position(1, 14)
+        .expect("cursor inside the member name should hit the access");
+    match found {
+        PatternAtPosition::MemberAccess(m) => assert_eq!(m.member, "email"),
+        other => panic!("expected MemberAccess, got {other:?}"),
+    }
+
+    // Cursor before the member name (on the receiver) must not match —
+    // the access is indexed at the member span, not the whole expression.
+    assert!(p.find_at_position(1, 2).is_none());
+}
+
+#[test]
+fn member_access_capture_defaults_are_unresolved() {
+    let m = unresolved_member_access("email", 1, 12);
+    assert!(m.declaring_fqcn.is_none());
+    assert!(m.kind.is_none());
+    assert_eq!(m.confidence, Confidence::Unresolved);
+    assert_eq!(Confidence::default(), Confidence::Unresolved);
+}
+
+#[test]
+fn member_access_deserializes_without_resolution_fields() {
+    // A disk-cache entry written before the resolution scaffold existed:
+    // only the capture fields are present. `#[serde(default)]` must fill the
+    // rest rather than failing the whole entry.
+    let json = r#"{
+        "member": "email",
+        "receiver": "$user",
+        "receiver_byte_start": 0,
+        "receiver_byte_end": 5,
+        "is_nullsafe": false,
+        "line": 1,
+        "column": 12,
+        "end_column": 17
+    }"#;
+    let m: MemberAccessReferenceData =
+        serde_json::from_str(json).expect("legacy entry should deserialize");
+    assert_eq!(m.member, "email");
+    assert!(m.declaring_fqcn.is_none());
+    assert!(m.kind.is_none());
+    assert_eq!(m.confidence, Confidence::Unresolved);
+}
+
+#[test]
+fn member_access_resolution_fields_round_trip() {
+    // Once M3 fills the scaffold, it must survive (de)serialization.
+    let mut m = unresolved_member_access("active", 3, 8);
+    m.declaring_fqcn = Some("App\\Models\\User".into());
+    m.kind = Some(MagicMemberKind::Scope);
+    m.confidence = Confidence::High;
+
+    let json = serde_json::to_string(&m).expect("serialize");
+    let back: MemberAccessReferenceData = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(back.declaring_fqcn.as_deref(), Some("App\\Models\\User"));
+    assert_eq!(back.kind, Some(MagicMemberKind::Scope));
+    assert_eq!(back.confidence, Confidence::High);
+}
+
+// ─── Project source-file discovery (magic-member index breadth) ─────────
+
+#[test]
+fn collect_source_files_covers_app_and_views_skips_vendor() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let write = |rel: &str| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "<?php\n").unwrap();
+        p
+    };
+
+    let model = write("app/Models/User.php");
+    let provider = write("app/Providers/HorizonServiceProvider.php");
+    let volt = write("resources/views/pages/users.php"); // Volt .php page
+    let blade = write("resources/views/welcome.blade.php");
+    let migration = write("database/migrations/2020_create_users.php");
+    let vendor = write("vendor/laravel/framework/User.php"); // excluded
+    let node = write("node_modules/pkg/x.php"); // excluded
+    write("public/app.js"); // non-php, ignored
+
+    let found = collect_source_files(root);
+
+    // Included: app source (all of it), Volt .php under views, Blade, database.
+    for p in [&model, &provider, &volt, &blade, &migration] {
+        assert!(found.contains(p), "expected {p:?} in {found:?}");
+    }
+    // Excluded: vendor + node_modules.
+    assert!(!found.contains(&vendor), "vendor must be skipped");
+    assert!(!found.contains(&node), "node_modules must be skipped");
+}
+
+// ─── Blade @foreach iterable member-access capture ──────────────────────
+
+#[test]
+fn blade_loop_iterable_captures_this_member_access() {
+    let content =
+        "<div>\n    @foreach ($this->entities as $entity)\n        {{ $entity->name }}\n    @endforeach\n</div>\n";
+    let accesses = blade_loop_iterable_accesses(content);
+    assert_eq!(accesses.len(), 1, "got {accesses:?}");
+    let a = &accesses[0];
+    assert_eq!(a.member, "entities");
+    assert_eq!(a.receiver, "$this");
+    assert_eq!(a.line, 1); // 0-based; @foreach is the 2nd line
+    let line = content.lines().nth(1).unwrap();
+    assert_eq!(a.column, line.find("entities").unwrap() as u32);
+    assert_eq!(a.end_column, a.column + "entities".len() as u32);
+}
+
+#[test]
+fn blade_loop_iterable_bare_var_has_no_member_access() {
+    // `@foreach($users as $user)` — a bare collection var, no `->member`.
+    let content = "@foreach ($users as $user)\n{{ $user->x }}\n@endforeach\n";
+    assert!(blade_loop_iterable_accesses(content).is_empty());
+}

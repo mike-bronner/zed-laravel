@@ -468,3 +468,87 @@ function show() {
     // back to User (the original seed) or return None safely.
     let _ = resolve(node, bytes, "a", &aliases);
 }
+
+// ---- Confidence tiers (M3) ---------------------------------------------
+
+use crate::query_chain::flow::resolve_with_confidence;
+use crate::salsa_impl::Confidence;
+
+/// Like `resolve_at`, but reports the confidence tier alongside the FQCN.
+fn resolve_conf_at(src: &str, var: &str, n: usize) -> Option<(String, Confidence)> {
+    let wrapped = format!("<?php\n{src}");
+    let tree = parse_php(&wrapped).expect("parse");
+    let bytes = wrapped.as_bytes();
+    let aliases = extract_use_aliases(&tree, &wrapped);
+    let node = find_nth_var(&tree, bytes, var, n)?;
+    resolve_with_confidence(node, bytes, var, &aliases)
+}
+
+#[test]
+fn confidence_typed_param_is_high() {
+    let src = r#"
+function show(User $user) {
+    $user->where('id', 1);
+}
+"#;
+    let (fqcn, conf) = resolve_conf_at(src, "user", 1).expect("typed param resolves");
+    assert_eq!(fqcn, "User");
+    assert_eq!(conf, Confidence::High);
+}
+
+#[test]
+fn confidence_direct_static_assignment_is_high() {
+    let src = r#"
+function search() {
+    $q = User::query();
+    $q->where('email', 'a@b.c');
+}
+"#;
+    let (_, conf) = resolve_conf_at(src, "q", 1).expect("direct assignment resolves");
+    assert_eq!(conf, Confidence::High);
+}
+
+#[test]
+fn confidence_paren_new_is_high() {
+    let src = r#"
+function make() {
+    $u = (new User)->newQuery();
+    $u->where('id', 1);
+}
+"#;
+    let (_, conf) = resolve_conf_at(src, "u", 1).expect("(new X) resolves");
+    assert_eq!(conf, Confidence::High);
+}
+
+#[test]
+fn confidence_docblock_var_is_high() {
+    let src = r#"
+function show() {
+    /** @var User $user */
+    $user = resolve_it();
+    $user->where('id', 1);
+}
+"#;
+    let (_, conf) = resolve_conf_at(src, "user", 1).expect("@var resolves");
+    assert_eq!(conf, Confidence::High);
+}
+
+#[test]
+fn confidence_multi_hop_is_medium() {
+    // `$a` is seeded from `$b`'s chain, and `$b` from a static call.
+    // Resolving `$a` requires an extra assignment hop → indirect flow.
+    let src = r#"
+function search() {
+    $b = User::query();
+    $a = $b->where('active', 1);
+    $a->orderBy('name');
+}
+"#;
+    let (fqcn, conf) = resolve_conf_at(src, "a", 1).expect("multi-hop resolves");
+    assert_eq!(fqcn, "User");
+    assert_eq!(
+        conf,
+        Confidence::Medium,
+        "an extra flow hop lowers confidence"
+    );
+}

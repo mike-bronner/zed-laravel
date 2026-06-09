@@ -1609,14 +1609,46 @@ pub fn parse_service_provider_source<'db>(
             r#"\$this->loadViewsFrom\s*\(\s*__DIR__\s*\.\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
-        /// Matches Blade::component('tag-name', Class::class)
+        /// Matches a class-backed component registration with the tag first:
+        /// `Blade::component('tag-name', Class::class)` — facade form — or
+        /// `$blade->component('tag-name', Class::class)` — the instance form
+        /// the framework itself uses (ViewServiceProvider registers
+        /// `dynamic-component` on the compiler instance inside a tap() closure).
         static ref BLADE_COMPONENT_RE: Regex = Regex::new(
-            r#"Blade::component\s*\(\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class\s*\)"#
+            r#"(?:Blade::|\$\w+->)component\s*\(\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class\s*\)"#
+        ).unwrap();
+
+        /// Same registration with the canonical argument order:
+        /// `component(Class::class, 'tag-name')`. `BladeCompiler::component`
+        /// accepts both orders and swaps internally; statically the `::class`
+        /// suffix marks which argument is the class, so we match each order
+        /// with its own pattern.
+        static ref BLADE_COMPONENT_CLASS_FIRST_RE: Regex = Regex::new(
+            r#"(?:Blade::|\$\w+->)component\s*\(\s*\\?([A-Za-z0-9_\\]+)::class\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
         /// Matches Blade::componentNamespace('Namespace\\Path', 'prefix')
         static ref COMPONENT_NAMESPACE_RE: Regex = Regex::new(
             r#"Blade::componentNamespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+
+        /// Matches a fluent package-builder name declaration: `->name('package')`.
+        /// The literal `loadViewsFrom`/`loadTranslationsFrom` patterns above only
+        /// see Laravel-native registration. Builder-convention providers (the
+        /// dominant one being laravel-package-tools, but this is form-based, not
+        /// vendor-tied) declare capabilities fluently — `->name('x')->hasViews()`
+        /// — and the real `loadViewsFrom($computedDir, $name)` runs in a base
+        /// class with runtime args the literal patterns can't see. This pair of
+        /// patterns reconstructs that registration form.
+        static ref BUILDER_NAME_RE: Regex = Regex::new(
+            r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+
+        /// Matches the builder view capability: `->hasViews()` or
+        /// `->hasViews('explicit-namespace')`. The optional capture is the
+        /// namespace override; absent, the namespace is the package short-name.
+        static ref BUILDER_HAS_VIEWS_RE: Regex = Regex::new(
+            r#"->hasViews\s*\(\s*(?:['"]([^'"]+)['"])?\s*\)"#
         ).unwrap();
     }
 
@@ -1848,26 +1880,93 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
-    // Parse Blade::component() registrations
-    // Example: Blade::component('package-alert', AlertComponent::class)
-    for cap in BLADE_COMPONENT_RE.captures_iter(text) {
-        if let (Some(tag_name), Some(class)) = (cap.get(1), cap.get(2)) {
-            let tag_name_str = tag_name.as_str();
-            let class_str = class.as_str().trim_start_matches('\\');
+    // Parse the fluent package-builder view registration form:
+    //   $package->name('filament')->hasViews();
+    // Builder-convention providers register views from a base class
+    // (`loadViewsFrom($computedDir, $name)`) with runtime-computed arguments, so
+    // the literal LOAD_VIEWS_RE above never sees them. Reconstruct the
+    // (namespace, directory) pair from the convention: the namespace is the
+    // explicit `->hasViews('ns')` argument or the package short-name (a leading
+    // `laravel-` stripped, matching the builder's own `shortName()` rule), and
+    // the directory is the package's `resources/views` — one level up from the
+    // provider's `src/` dir, which is where these builders resolve their base
+    // path. The capability (`->hasViews(`) gates this: without it the provider
+    // isn't registering views, so a stray `->name(` elsewhere can't misfire.
+    if let Some(has_views) = BUILDER_HAS_VIEWS_RE.captures(text) {
+        if let Some(name_cap) = BUILDER_NAME_RE.captures(text) {
+            let package_name = name_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let namespace = has_views
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| builder_short_name(package_name));
 
-            let line = text[..tag_name.start()].lines().count() as u32;
-            let file_path = resolve_class_to_file_internal(class_str, &root);
+            if !namespace.is_empty() {
+                let line = text[..name_cap.get(0).map(|m| m.start()).unwrap_or(0)]
+                    .lines()
+                    .count() as u32;
+
+                // Convention: provider in `<pkg>/src`, views at `<pkg>/resources/views`.
+                let provider_dir = path.parent().unwrap_or(path.as_path());
+                let view_path = provider_dir.join("../resources/views");
+                let resolved_path = if view_path.exists() {
+                    Some(view_path.canonicalize().unwrap_or(view_path))
+                } else {
+                    Some(normalize_path(&view_path))
+                };
+
+                let pkg_namespace = PackageNamespace::new(db, namespace);
+                view_namespaces.push(ParsedViewNamespaceReg::new(
+                    db,
+                    pkg_namespace,
+                    resolved_path,
+                    line,
+                    priority,
+                    path.clone(),
+                ));
+            }
+        }
+    }
+
+    // Parse class-backed component registrations, both argument orders and
+    // both receivers (Blade:: facade and $instance->):
+    //   Blade::component('package-alert', AlertComponent::class)
+    //   $blade->component('dynamic-component', DynamicComponent::class)
+    //   Blade::component(AlertComponent::class, 'alert')
+    // A bare class name (`DynamicComponent::class`) is expanded to its FQN via
+    // the file's `use` statements before file resolution, mirroring how PHP
+    // itself resolves the reference.
+    {
+        let mut push_blade_component = |tag_match: regex::Match, class_match: regex::Match| {
+            let tag_name_str = tag_match.as_str();
+            let class_str = expand_class_via_use_statements(
+                class_match.as_str().trim_start_matches('\\'),
+                text,
+            );
+
+            let line = text[..tag_match.start()].lines().count() as u32;
+            let file_path = resolve_class_to_file_internal(&class_str, &root);
 
             let component_name = ComponentName::new(db, tag_name_str.to_string());
             blade_components.push(ParsedBladeComponentReg::new(
                 db,
                 component_name,
-                class_str.to_string(),
+                class_str,
                 file_path,
                 line,
                 priority,
                 path.clone(),
             ));
+        };
+
+        for cap in BLADE_COMPONENT_RE.captures_iter(text) {
+            if let (Some(tag_name), Some(class)) = (cap.get(1), cap.get(2)) {
+                push_blade_component(tag_name, class);
+            }
+        }
+        for cap in BLADE_COMPONENT_CLASS_FIRST_RE.captures_iter(text) {
+            if let (Some(class), Some(tag_name)) = (cap.get(1), cap.get(2)) {
+                push_blade_component(tag_name, class);
+            }
         }
     }
 
@@ -2078,6 +2177,63 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+/// The namespace a fluent package-builder derives from a package name when
+/// `->hasViews()` is called without an explicit argument: everything after a
+/// leading `laravel-`. Mirrors the builder's own `shortName()`
+/// (`Str::after($name, 'laravel-')`) so discovery matches runtime resolution.
+///
+/// `filament` → `filament`; `laravel-foo` → `foo`; `my-laravel-bar` → `bar`.
+pub(crate) fn builder_short_name(package_name: &str) -> String {
+    package_name
+        .split_once("laravel-")
+        .map(|(_, after)| after.to_string())
+        .unwrap_or_else(|| package_name.to_string())
+}
+
+/// Expand a bare class name from a registration argument to its FQN using the
+/// source file's `use` statements, the same way PHP resolves the reference.
+/// `DynamicComponent` + `use Illuminate\View\DynamicComponent;` →
+/// `Illuminate\View\DynamicComponent`. Aliased imports (`use Foo\Bar as Baz;`)
+/// match on the alias. Names already carrying a `\` are returned unchanged;
+/// so is a name with no matching import (group-use bodies are not expanded —
+/// resolution then simply fails downstream, same as before).
+fn expand_class_via_use_statements(class_name: &str, source: &str) -> String {
+    if class_name.contains('\\') {
+        return class_name.to_string();
+    }
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(import) = trimmed.strip_prefix("use ") else {
+            continue;
+        };
+        // `use function`/`use const` imports and trait-`use` inside class
+        // bodies (no namespace separator, e.g. `use HasFactory;`) are not
+        // class imports we can expand from.
+        if import.starts_with("function ") || import.starts_with("const ") {
+            continue;
+        }
+        let Some(import) = import.strip_suffix(';') else {
+            continue;
+        };
+
+        let (fqn, visible_name) = match import.split_once(" as ") {
+            Some((fqn, alias)) => (fqn.trim(), alias.trim()),
+            None => {
+                let fqn = import.trim();
+                let basename = fqn.rsplit('\\').next().unwrap_or(fqn);
+                (fqn, basename)
+            }
+        };
+
+        if visible_name == class_name && fqn.contains('\\') {
+            return fqn.trim_start_matches('\\').to_string();
+        }
+    }
+
+    class_name.to_string()
 }
 
 /// Resolve a class name to a file path using PSR-4 conventions
@@ -2509,6 +2665,14 @@ pub struct LaravelConfigData {
     /// file path. Built by walking vendor packages with `resources/svg/` +
     /// `config/blade-*.php` shape and combining the prefix with each SVG file.
     pub icon_aliases: HashMap<String, String>,
+    /// Class-backed component registrations from
+    /// `Blade::component('tag', Class::class)` (facade or instance form,
+    /// either argument order). Maps the `<x-{tag}>` tag to the registered
+    /// class's resolved file. Laravel core registers `dynamic-component` →
+    /// `Illuminate\View\DynamicComponent` this way. `serde(default)` keeps
+    /// disk-cached configs written before this field deserializable.
+    #[serde(default)]
+    pub class_component_files: HashMap<String, PathBuf>,
 }
 
 impl LaravelConfigData {
@@ -2717,6 +2881,78 @@ impl LaravelConfigData {
 
         Some(path)
     }
+}
+
+/// All candidate file paths that could back a Blade component tag, in
+/// priority order. This is the **single source of truth** shared by
+/// goto-definition and the "component not found" diagnostic, so the two can
+/// never disagree about whether a component resolves (issue #69).
+///
+/// Layers, in order:
+///   1. [`LaravelConfigData::resolve_component_path`] — conventional,
+///      aliased, icon, anonymous-path/namespace, package-view, vendor-publish,
+///      and the *naive* class-namespace guesses.
+///   2. The conventional class-backed component file
+///      (`app/View/Components/<Pascal>.php`).
+///   3. **PSR-4 class-based `Blade::componentNamespace` components.** Layer 1
+///      only emits a guessed `vendor/<Namespace>/...` path that ignores how
+///      Composer actually lays packages out on disk, so namespaced class
+///      components (`<x-filament::badge>`, `<x-mail::message>`) never matched.
+///      Here we walk the registered PHP namespace to its real source
+///      directory via the autoload map and append the class file path.
+///   4. **Explicit class-backed registrations** —
+///      `Blade::component('tag', Class::class)` in any provider, facade or
+///      instance form (Laravel core registers `dynamic-component` this way).
+///      The tag maps straight to the registered class's resolved file.
+///
+/// `autoload` supplies the project's PSR-4 prefix map (see
+/// [`crate::composer_autoload::ComposerAutoload`]). The function does **not**
+/// touch the filesystem itself — callers decide existence (cached async check
+/// for the live server, direct `Path::exists` in tests).
+pub fn component_candidate_paths(
+    name: &str,
+    config: &LaravelConfigData,
+    autoload: &crate::composer_autoload::ComposerAutoload,
+) -> Vec<PathBuf> {
+    let mut candidates = config.resolve_component_path(name);
+
+    // Conventional class-backed component (non-namespaced names).
+    candidates
+        .push(crate::component_declaration_locator::conventional_class_file_path(name, config));
+
+    // Explicit class-backed registration: Blade::component('tag', Class::class)
+    // in any provider (facade or instance form). Laravel core registers
+    // `dynamic-component` → Illuminate\View\DynamicComponent this way.
+    if let Some(class_file) = config.class_component_files.get(name) {
+        candidates.push(class_file.clone());
+    }
+
+    // PSR-4 class-based componentNamespace resolution.
+    if let Some((namespace, component)) = name.split_once("::") {
+        if let Some(php_namespace) = config.component_namespaces.get(namespace) {
+            // `forms.text-input` → relative class path `Forms/TextInput.php`,
+            // matching the FQCN `<php_namespace>\Forms\TextInput`. Each
+            // `\`-delimited segment must be PascalCased independently, since
+            // `kebab_to_pascal_case` only splits on `-`.
+            let class_name = component
+                .replace('.', "\\")
+                .split('\\')
+                .map(kebab_to_pascal_case)
+                .collect::<Vec<_>>()
+                .join("\\");
+            let mut rel = PathBuf::new();
+            for segment in class_name.split('\\') {
+                rel.push(segment);
+            }
+            rel.set_extension("php");
+
+            for dir in autoload.resolve_namespace_dirs(php_namespace) {
+                candidates.push(dir.join(&rel));
+            }
+        }
+    }
+
+    candidates
 }
 
 /// Type of file that contains a view reference
@@ -6125,6 +6361,9 @@ impl SalsaActor {
         let mut component_namespaces: HashMap<String, String> = HashMap::new();
         let mut anonymous_component_paths: HashMap<String, PathBuf> = HashMap::new();
         let mut anonymous_component_namespaces: HashMap<String, String> = HashMap::new();
+        // tag → (priority, class file); higher priority (app > package >
+        // framework) wins since sp-file iteration order is arbitrary.
+        let mut class_component_files: HashMap<String, (u8, PathBuf)> = HashMap::new();
 
         if let Some(sp_root) = self.salsa_sp_root.as_ref() {
             for sp_file in self.salsa_sp_files.values() {
@@ -6171,6 +6410,22 @@ impl SalsaActor {
                         .entry(prefix)
                         .or_insert(directory);
                 }
+
+                // Collect class-backed component registrations
+                // (Blade::component('tag', Class::class), either form/order)
+                for bc in parsed.blade_components(&self.db) {
+                    let Some(file) = bc.file_path(&self.db).clone() else {
+                        continue;
+                    };
+                    let tag = bc.tag_name(&self.db).name(&self.db).clone();
+                    let prio = bc.priority(&self.db);
+                    match class_component_files.get(&tag) {
+                        Some((existing_prio, _)) if *existing_prio >= prio => {}
+                        _ => {
+                            class_component_files.insert(tag, (prio, file));
+                        }
+                    }
+                }
             }
         }
 
@@ -6186,6 +6441,13 @@ impl SalsaActor {
             component_namespaces
                 .entry(prefix.clone())
                 .or_insert_with(|| data.php_namespace.clone());
+        }
+        for (tag, data) in &self.sp_blade_components {
+            if let Some(file) = &data.file_path {
+                class_component_files
+                    .entry(tag.clone())
+                    .or_insert_with(|| (data.priority, file.clone()));
+            }
         }
 
         // Convert to data transfer type
@@ -6204,6 +6466,10 @@ impl SalsaActor {
             anonymous_component_namespaces,
             component_aliases,
             icon_aliases,
+            class_component_files: class_component_files
+                .into_iter()
+                .map(|(tag, (_prio, file))| (tag, file))
+                .collect(),
         };
 
         // Cache the result

@@ -874,6 +874,19 @@ pub fn extract_all_php_patterns<'a>(
     Ok(result)
 }
 
+/// Whether an extracted component / Livewire name is constructed at runtime
+/// rather than being a static literal.
+///
+/// Component, Livewire, and view names are kebab/dotted/colon-cased — they
+/// never legitimately contain `{` or `$`. So either marker means the name
+/// carries an interpolated part (`<x-alert-{{ $type }}>`,
+/// `@livewire("edit-{$type}-flow")`, `${x}`) and the real target isn't known
+/// until runtime. Such references can't be resolved or validated statically, so
+/// callers skip them instead of emitting a phantom "not found" diagnostic.
+fn name_is_runtime_constructed(name: &str) -> bool {
+    name.contains('{') || name.contains('$')
+}
+
 /// Extract all Blade patterns in a single tree traversal
 pub fn extract_all_blade_patterns<'a>(
     tree: &Tree,
@@ -912,28 +925,34 @@ pub fn extract_all_blade_patterns<'a>(
                 if text == "x-slot" || text.starts_with("x-slot:") {
                     // intentionally skipped
                 } else if let Some(component_name) = text.strip_prefix("x-") {
-                    // Blade component
-                    result.components.push(ComponentMatch {
-                        component_name,
-                        tag_name: text,
-                        byte_start: node.start_byte(),
-                        byte_end: node.end_byte(),
-                        row: start_pos.row,
-                        column: start_pos.column,
-                        end_column: end_pos.column,
-                        resolved_path: None,
-                    });
+                    // Blade component. A runtime-interpolated tag name
+                    // (`<x-alert-{{ $type }}>`) names no single component, so
+                    // skip it rather than emit a phantom "not found".
+                    if !name_is_runtime_constructed(component_name) {
+                        result.components.push(ComponentMatch {
+                            component_name,
+                            tag_name: text,
+                            byte_start: node.start_byte(),
+                            byte_end: node.end_byte(),
+                            row: start_pos.row,
+                            column: start_pos.column,
+                            end_column: end_pos.column,
+                            resolved_path: None,
+                        });
+                    }
                 } else if let Some(component_name) = text.strip_prefix("livewire:") {
-                    // Livewire component tag syntax
-                    // Remove "livewire:" prefix
-                    result.livewire.push(LivewireMatch {
-                        component_name,
-                        byte_start: node.start_byte(),
-                        byte_end: node.end_byte(),
-                        row: start_pos.row,
-                        column: start_pos.column,
-                        end_column: end_pos.column,
-                    });
+                    // Livewire component tag syntax (prefix stripped). Same
+                    // dynamic-name guard as Blade components above.
+                    if !name_is_runtime_constructed(component_name) {
+                        result.livewire.push(LivewireMatch {
+                            component_name,
+                            byte_start: node.start_byte(),
+                            byte_end: node.end_byte(),
+                            row: start_pos.row,
+                            column: start_pos.column,
+                            end_column: end_pos.column,
+                        });
+                    }
                 }
             }
 
@@ -1012,40 +1031,44 @@ pub fn extract_all_blade_patterns<'a>(
                             //     the kebab name from the class basename)
                             //   - `@livewire($var)` — dynamic; can't be
                             //     resolved statically, skip entirely
-                            let component_name: Option<&str> =
-                                if first_arg.starts_with('\'') || first_arg.starts_with('"') {
-                                    // String literal — strip the quotes.
-                                    let unquoted = first_arg
-                                        .trim_start_matches(['\'', '"'])
-                                        .trim_end_matches(['\'', '"']);
-                                    if unquoted.is_empty() {
-                                        None
-                                    } else {
-                                        Some(unquoted)
-                                    }
-                                } else if let Some(class_fqn) = first_arg.strip_suffix("::class") {
-                                    // Class reference — extract the basename
-                                    // (slice into source, no allocation).
-                                    // e.g. `App\Livewire\NestedComponentA::class`
-                                    // → `NestedComponentA`. The basename
-                                    // stays in PascalCase here; if cross-
-                                    // form linkage to `<livewire:kebab-case>`
-                                    // tags is needed later, the salsa layer
-                                    // can normalize when it copies the name
-                                    // into an owned String.
-                                    let trimmed_fqn = class_fqn.trim();
-                                    let basename =
-                                        trimmed_fqn.rsplit('\\').next().unwrap_or(trimmed_fqn);
-                                    if basename.is_empty() {
-                                        None
-                                    } else {
-                                        Some(basename)
-                                    }
-                                } else {
-                                    // Dynamic (`$var`) or anything else
-                                    // we can't resolve at parse time.
+                            let component_name: Option<&str> = if first_arg.starts_with('\'')
+                                || first_arg.starts_with('"')
+                            {
+                                // String literal — strip the quotes.
+                                let unquoted = first_arg
+                                    .trim_start_matches(['\'', '"'])
+                                    .trim_end_matches(['\'', '"']);
+                                // A double-quoted name with interpolation
+                                // (`@livewire("edit-{$type}-flow")`) is built
+                                // at runtime — not a static reference, skip.
+                                if unquoted.is_empty() || name_is_runtime_constructed(unquoted) {
                                     None
-                                };
+                                } else {
+                                    Some(unquoted)
+                                }
+                            } else if let Some(class_fqn) = first_arg.strip_suffix("::class") {
+                                // Class reference — extract the basename
+                                // (slice into source, no allocation).
+                                // e.g. `App\Livewire\NestedComponentA::class`
+                                // → `NestedComponentA`. The basename
+                                // stays in PascalCase here; if cross-
+                                // form linkage to `<livewire:kebab-case>`
+                                // tags is needed later, the salsa layer
+                                // can normalize when it copies the name
+                                // into an owned String.
+                                let trimmed_fqn = class_fqn.trim();
+                                let basename =
+                                    trimmed_fqn.rsplit('\\').next().unwrap_or(trimmed_fqn);
+                                if basename.is_empty() {
+                                    None
+                                } else {
+                                    Some(basename)
+                                }
+                            } else {
+                                // Dynamic (`$var`) or anything else
+                                // we can't resolve at parse time.
+                                None
+                            };
 
                             if let Some(name) = component_name {
                                 result.livewire.push(LivewireMatch {

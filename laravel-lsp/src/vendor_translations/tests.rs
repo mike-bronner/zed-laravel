@@ -137,3 +137,105 @@ fn first_registration_wins_on_namespace_conflict() {
     let s = resolved.to_string_lossy();
     assert!(s.contains("first") || s.contains("second"), "got: {}", s);
 }
+
+// ─── Fluent package-builder registrations (->name()->hasTranslations()) ──
+
+#[test]
+fn builder_has_translations_registers_short_name_namespace() {
+    // The Filament shape: ->name('filament-tables')->hasTranslations(), with
+    // translations at <pkg>/resources/lang (the builder's basePath convention).
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(
+        project.path(),
+        "filament",
+        "tables",
+        "TablesServiceProvider",
+    );
+    let lang_dir = provider.parent().unwrap().join("../resources/lang/en");
+    fs::create_dir_all(&lang_dir).unwrap();
+    fs::write(
+        lang_dir.join("table.php"),
+        "<?php return ['grouping' => []];",
+    )
+    .unwrap();
+    fs::write(
+        &provider,
+        r#"<?php
+namespace Filament\Tables;
+use Spatie\LaravelPackageTools\PackageServiceProvider;
+class TablesServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package
+            ->name('filament-tables')
+            ->hasTranslations()
+            ->hasViews();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    let resolved = map
+        .get("filament-tables")
+        .expect("builder registration must yield the filament-tables namespace");
+    assert!(
+        resolved.join("en/table.php").exists(),
+        "namespace must point at the package lang dir: {resolved:?}"
+    );
+}
+
+#[test]
+fn builder_name_strips_laravel_prefix_for_translation_namespace() {
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "tools", "ToolsServiceProvider");
+    fs::create_dir_all(provider.parent().unwrap().join("../resources/lang")).unwrap();
+    fs::write(
+        &provider,
+        r#"<?php
+class ToolsServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('laravel-tools')->hasTranslations();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    assert!(
+        map.contains_key("tools"),
+        "->name('laravel-tools') must register namespace 'tools', got {map:?}"
+    );
+}
+
+#[test]
+fn builder_without_has_translations_registers_nothing() {
+    // ->hasViews() alone (no ->hasTranslations()) must not synthesize a
+    // translation namespace.
+    let project = TempDir::new().unwrap();
+    let provider = fake_vendor_package(project.path(), "acme", "ui", "UiServiceProvider");
+    fs::write(
+        &provider,
+        r#"<?php
+class UiServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme-ui')->hasViews();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let map = scan_vendor_translation_namespaces(project.path());
+    assert!(
+        map.is_empty(),
+        "no ->hasTranslations() means no translation namespace, got {map:?}"
+    );
+}

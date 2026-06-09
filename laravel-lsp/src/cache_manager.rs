@@ -170,6 +170,10 @@ pub struct CachedLaravelConfig {
     /// — prefix → view-relative directory.
     #[serde(default)]
     pub anonymous_component_namespaces: HashMap<String, String>,
+    /// Class-backed component registrations from Blade::component('tag',
+    /// Class::class) — tag → resolved class file.
+    #[serde(default)]
+    pub class_component_files: HashMap<String, PathBuf>,
 }
 
 /// Cached environment variables

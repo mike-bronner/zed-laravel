@@ -109,6 +109,7 @@ fn make_config_with_alias(alias: &str, view: &str) -> LaravelConfigData {
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: aliases,
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -128,6 +129,7 @@ fn make_config_with_icon(tag: &str, svg_path: &str) -> LaravelConfigData {
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: icons,
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -226,6 +228,7 @@ fn make_config_with_anonymous_path(prefix: &str, abs_dir: &str) -> LaravelConfig
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -245,6 +248,7 @@ fn make_config_with_anonymous_namespace(prefix: &str, dir: &str) -> LaravelConfi
         anonymous_component_namespaces: anon,
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -769,6 +773,184 @@ fn collect_returns_empty_for_no_matches() {
     );
 }
 
+// ─── Shared component resolution (issue #69) ────────────────────────────
+//
+// `component_candidate_paths` is the single source of truth shared by
+// goto-definition and the "component not found" diagnostic. These tests pin
+// the class-based `Blade::componentNamespace` (PSR-4) resolution that the
+// naive guesses in `resolve_component_path` missed — the Filament / mail
+// failure case from the issue — plus the false-negative guarantee.
+
+use crate::composer_autoload::ComposerAutoload;
+use tempfile::TempDir;
+
+/// Build a Laravel-shaped tempdir with the given (relative path, body) pairs.
+fn project_with_files(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    for (relpath, body) in files {
+        let full = dir.path().join(relpath);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, body).unwrap();
+    }
+    let root = dir.path().to_path_buf();
+    (dir, root)
+}
+
+/// Config whose only interesting field is a set of `Blade::componentNamespace`
+/// registrations (`prefix => PHP namespace`), rooted at `root`.
+fn config_with_component_namespaces(root: &Path, ns: &[(&str, &str)]) -> LaravelConfigData {
+    let mut component_namespaces = HashMap::new();
+    for (prefix, php_ns) in ns {
+        component_namespaces.insert(prefix.to_string(), php_ns.to_string());
+    }
+    LaravelConfigData {
+        root: root.to_path_buf(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces,
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    }
+}
+
+/// Mirror of the live resolver's existence check: a component "resolves" when
+/// any candidate path exists on disk.
+fn resolves(name: &str, config: &LaravelConfigData, autoload: &ComposerAutoload) -> bool {
+    component_candidate_paths(name, config, autoload)
+        .iter()
+        .any(|p| p.exists())
+}
+
+#[test]
+fn psr4_class_namespace_component_resolves_across_two_namespaces() {
+    // Two separate package namespaces registered via componentNamespace, each
+    // shipped under a PSR-4 vendor layout that the naive
+    // `vendor/<Namespace>/...` guess in resolve_component_path can't find.
+    // Both `<x-filament::badge>` and `<x-nightshade::alert-banner>` must
+    // resolve through the autoload map (issue #69 — at least two namespaces).
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/support",
+                "autoload": { "psr-4": { "Filament\\Support\\": "src/" } },
+                "install-path": "../filament/support"
+            },
+            {
+                "name": "nightshade/ui",
+                "autoload": { "psr-4": { "Nightshade\\Ui\\": "src/" } },
+                "install-path": "../nightshade/ui"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/support/src/View/Components/Badge.php",
+            "<?php namespace Filament\\Support\\View\\Components; class Badge {}",
+        ),
+        (
+            "vendor/nightshade/ui/src/View/Components/AlertBanner.php",
+            "<?php namespace Nightshade\\Ui\\View\\Components; class AlertBanner {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[
+            ("filament", "Filament\\Support\\View\\Components"),
+            ("nightshade", "Nightshade\\Ui\\View\\Components"),
+        ],
+    );
+
+    assert!(
+        resolves("filament::badge", &config, &autoload),
+        "filament::badge must resolve via PSR-4 autoload: {:#?}",
+        component_candidate_paths("filament::badge", &config, &autoload),
+    );
+    // kebab tag → PascalCase class file under the same namespace.
+    assert!(
+        resolves("nightshade::alert-banner", &config, &autoload),
+        "nightshade::alert-banner must resolve via PSR-4 autoload: {:#?}",
+        component_candidate_paths("nightshade::alert-banner", &config, &autoload),
+    );
+}
+
+#[test]
+fn psr4_class_namespace_resolves_dotted_subnamespace() {
+    // `<x-filament::forms.text-input>` → Forms/TextInput.php under the
+    // registered namespace.
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/forms",
+                "autoload": { "psr-4": { "Filament\\Forms\\": "src/" } },
+                "install-path": "../filament/forms"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/forms/src/View/Components/Forms/TextInput.php",
+            "<?php namespace Filament\\Forms\\View\\Components\\Forms; class TextInput {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[("filament", "Filament\\Forms\\View\\Components")],
+    );
+
+    assert!(
+        resolves("filament::forms.text-input", &config, &autoload),
+        "dotted namespaced component must map to a sub-namespaced class: {:#?}",
+        component_candidate_paths("filament::forms.text-input", &config, &autoload),
+    );
+}
+
+#[test]
+fn missing_namespaced_component_still_reports_not_found() {
+    // A registered namespace whose class file does NOT exist must NOT resolve —
+    // diagnostics still fire (issue #69, no false negatives).
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "filament/support",
+                "autoload": { "psr-4": { "Filament\\Support\\": "src/" } },
+                "install-path": "../filament/support"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/filament/support/src/View/Components/Badge.php",
+            "<?php class Badge {}",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(
+        &root,
+        &[("filament", "Filament\\Support\\View\\Components")],
+    );
+
+    assert!(
+        !resolves("filament::does-not-exist", &config, &autoload),
+        "a namespaced component with no backing file must not resolve",
+    );
+    // An entirely unregistered namespace must not resolve either.
+    assert!(
+        !resolves("unknown::widget", &config, &autoload),
+        "an unregistered namespace must not resolve",
+    );
+}
+
 // ─── Member-access capture data model (M2) ──────────────────────────────
 
 /// A captured property-form access with the capture-time defaults (the
@@ -916,4 +1098,369 @@ fn blade_loop_iterable_bare_var_has_no_member_access() {
     // `@foreach($users as $user)` — a bare collection var, no `->member`.
     let content = "@foreach ($users as $user)\n{{ $user->x }}\n@endforeach\n";
     assert!(blade_loop_iterable_accesses(content).is_empty());
+}
+
+// ─── Generic builder-form view-namespace discovery (issue #69) ──────────
+//
+// Packages registered through a fluent package-builder (e.g. Filament via
+// laravel-package-tools) declare views with `->name('x')->hasViews()`, and the
+// real `loadViewsFrom` runs in a base class with runtime args — invisible to
+// the literal `loadViewsFrom(__DIR__.'lit','lit')` extractor. These tests pin
+// the builder-form recognizer that reconstructs the (namespace, directory)
+// registration so `<x-x::component>` resolves through the existing
+// view-namespace path.
+
+#[test]
+fn builder_short_name_strips_leading_laravel_prefix() {
+    assert_eq!(builder_short_name("filament"), "filament");
+    assert_eq!(builder_short_name("laravel-foo"), "foo");
+    assert_eq!(builder_short_name("my-laravel-bar"), "bar");
+}
+
+/// Collect the (namespace, view_path) pairs a provider source registers.
+fn discovered_view_namespaces(source: &str, provider_path: &str) -> Vec<(String, Option<PathBuf>)> {
+    let db = LaravelDatabase::default();
+    let file =
+        ServiceProviderFile::new(&db, PathBuf::from(provider_path), 0, source.to_string(), 1);
+    let parsed = parse_service_provider_source(&db, file, PathBuf::from("/proj"));
+    parsed
+        .view_namespaces(&db)
+        .iter()
+        .map(|vn| {
+            (
+                vn.namespace(&db).namespace(&db).clone(),
+                vn.view_path(&db).clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn builder_hasviews_registers_namespace_at_package_resources_views() {
+    // Provider in `<pkg>/src` → views at `<pkg>/resources/views` (normalized,
+    // since the path doesn't exist on disk in this unit test).
+    let source = r#"<?php
+class WidgetsServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews();
+    }
+}"#;
+    let found = discovered_view_namespaces(
+        source,
+        "/proj/vendor/acme/widgets/src/WidgetsServiceProvider.php",
+    );
+    assert!(
+        found.iter().any(|(ns, p)| ns == "acme"
+            && *p == Some(PathBuf::from("/proj/vendor/acme/widgets/resources/views"))),
+        "->name('acme')->hasViews() must register 'acme' → package resources/views, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_hasviews_explicit_namespace_overrides_package_name() {
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews('custom');
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/pkg/src/P.php");
+    assert!(
+        found.iter().any(|(ns, _)| ns == "custom"),
+        "explicit ->hasViews('custom') must win over the package name, got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|(ns, _)| ns == "acme"),
+        "the package name must not also register when an explicit namespace is given, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_hasviews_strips_laravel_prefix_for_namespace() {
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('laravel-widgets')->hasViews();
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/widgets/src/P.php");
+    assert!(
+        found.iter().any(|(ns, _)| ns == "widgets"),
+        "->name('laravel-widgets') must register namespace 'widgets', got {found:?}"
+    );
+}
+
+#[test]
+fn builder_name_without_hasviews_registers_no_view_namespace() {
+    // A package that declares a name + commands but no views must not have a
+    // view namespace synthesized from its `->name()` call.
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasCommands([SomeCommand::class]);
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/pkg/src/P.php");
+    assert!(
+        found.is_empty(),
+        "no ->hasViews() means no builder-form view namespace, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_discovered_namespace_resolves_anonymous_view_component() {
+    // End-to-end: a real builder provider + a real package view file. Discovery
+    // must register the namespace so `resolve_component_path` finds the view —
+    // the exact `<x-filament::input.wrapper>` failure from issue #69.
+    let provider = r#"<?php
+class SupportServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews();
+    }
+}"#;
+    let (_dir, root) = project_with_files(&[
+        (
+            "vendor/acme/support/src/SupportServiceProvider.php",
+            provider,
+        ),
+        (
+            "vendor/acme/support/resources/views/components/input/wrapper.blade.php",
+            "<div>{{ $slot }}</div>",
+        ),
+    ]);
+
+    // Discover the namespace from the provider on disk.
+    let db = LaravelDatabase::default();
+    let provider_path = root.join("vendor/acme/support/src/SupportServiceProvider.php");
+    let text = std::fs::read_to_string(&provider_path).unwrap();
+    let file = ServiceProviderFile::new(&db, provider_path, 0, text, 1);
+    let parsed = parse_service_provider_source(&db, file, root.clone());
+
+    let mut view_namespaces = HashMap::new();
+    for vn in parsed.view_namespaces(&db) {
+        if let Some(p) = vn.view_path(&db).clone() {
+            view_namespaces.insert(vn.namespace(&db).namespace(&db).clone(), p);
+        }
+    }
+    assert!(
+        view_namespaces.contains_key("acme"),
+        "discovery must register the 'acme' view namespace, got {view_namespaces:?}"
+    );
+
+    // Build a config carrying that namespace and resolve the dotted component.
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces,
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    let candidates = config.resolve_component_path("acme::input.wrapper");
+    assert!(
+        candidates.iter().any(|p| p.exists()),
+        "acme::input.wrapper must resolve to the real package view via the \
+         discovered namespace: {candidates:#?}"
+    );
+}
+
+// ─── Class-backed component registrations (dynamic-component, issue #69) ─
+//
+// Laravel core registers `<x-dynamic-component>` with an ordinary class
+// alias — `$blade->component('dynamic-component', DynamicComponent::class)`
+// inside ViewServiceProvider — using the *instance* receiver and a *short*
+// class name resolved by a `use` import. These tests pin the broadened
+// registration parsing (both receivers, both argument orders, use-statement
+// expansion) and the shared-resolver consumption of the resulting map.
+
+#[test]
+fn expand_class_via_use_statements_resolves_short_names() {
+    let source = r#"<?php
+namespace Illuminate\View;
+
+use Illuminate\View\DynamicComponent;
+use Foo\Bar as Baz;
+use function array_map;
+
+class P {}
+"#;
+    assert_eq!(
+        expand_class_via_use_statements("DynamicComponent", source),
+        "Illuminate\\View\\DynamicComponent"
+    );
+    // Aliased import resolves through the alias.
+    assert_eq!(expand_class_via_use_statements("Baz", source), "Foo\\Bar");
+    // Already-qualified names pass through untouched.
+    assert_eq!(
+        expand_class_via_use_statements("App\\View\\Alert", source),
+        "App\\View\\Alert"
+    );
+    // No matching import → unchanged (resolution fails downstream, as before).
+    assert_eq!(
+        expand_class_via_use_statements("Unknown", source),
+        "Unknown"
+    );
+}
+
+/// Parse a provider source against a root and return (tag, class, file) per
+/// class-backed component registration.
+fn parsed_blade_components(
+    source: &str,
+    provider_path: PathBuf,
+    root: PathBuf,
+) -> Vec<(String, String, Option<PathBuf>)> {
+    let db = LaravelDatabase::default();
+    let file = ServiceProviderFile::new(&db, provider_path, 0, source.to_string(), 0);
+    let parsed = parse_service_provider_source(&db, file, root);
+    parsed
+        .blade_components(&db)
+        .iter()
+        .map(|bc| {
+            (
+                bc.tag_name(&db).name(&db).clone(),
+                bc.class_name(&db).clone(),
+                bc.file_path(&db).clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn instance_form_component_registration_is_discovered_and_resolved() {
+    // The exact framework shape: instance receiver inside a tap() closure,
+    // short class name brought in by a use import.
+    let provider = r#"<?php
+namespace Illuminate\View;
+
+use Illuminate\View\DynamicComponent;
+
+class ViewServiceProvider
+{
+    public function registerBladeCompiler()
+    {
+        $this->app->singleton('blade.compiler', function ($app) {
+            return tap(new BladeCompiler(), function ($blade) {
+                $blade->component('dynamic-component', DynamicComponent::class);
+            });
+        });
+    }
+}
+"#;
+    let (_dir, root) = project_with_files(&[(
+        "vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php",
+        "<?php namespace Illuminate\\View; class DynamicComponent {}",
+    )]);
+
+    let found = parsed_blade_components(
+        provider,
+        root.join("vendor/laravel/framework/src/Illuminate/View/ViewServiceProvider.php"),
+        root.clone(),
+    );
+
+    assert!(
+        found.iter().any(|(tag, class, file)| {
+            tag == "dynamic-component"
+                && class == "Illuminate\\View\\DynamicComponent"
+                && file
+                    .as_ref()
+                    .is_some_and(|f| f.ends_with("Illuminate/View/DynamicComponent.php"))
+        }),
+        "instance-form registration must be discovered with the use-expanded \
+         FQN and a resolved file, got {found:?}"
+    );
+}
+
+#[test]
+fn class_first_argument_order_is_discovered() {
+    // Canonical order: Blade::component(AlertComponent::class, 'alert').
+    let provider = r#"<?php
+use App\View\Components\AlertComponent;
+
+class AppServiceProvider
+{
+    public function boot()
+    {
+        Blade::component(AlertComponent::class, 'alert');
+    }
+}
+"#;
+    let (_dir, root) = project_with_files(&[(
+        "app/View/Components/AlertComponent.php",
+        "<?php namespace App\\View\\Components; class AlertComponent {}",
+    )]);
+
+    let found = parsed_blade_components(
+        provider,
+        root.join("app/Providers/AppServiceProvider.php"),
+        root.clone(),
+    );
+
+    assert!(
+        found.iter().any(|(tag, class, file)| {
+            tag == "alert" && class == "App\\View\\Components\\AlertComponent" && file.is_some()
+        }),
+        "class-first argument order must be discovered, got {found:?}"
+    );
+}
+
+#[test]
+fn class_component_registration_resolves_via_candidate_paths() {
+    // End of the chain: a tag present in `class_component_files` must surface
+    // from `component_candidate_paths`, so the shared diagnostic/goto resolver
+    // stops flagging `<x-dynamic-component>`.
+    let (_dir, root) = project_with_files(&[(
+        "vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php",
+        "<?php namespace Illuminate\\View; class DynamicComponent {}",
+    )]);
+    let class_file = root.join("vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php");
+
+    let mut class_component_files = HashMap::new();
+    class_component_files.insert("dynamic-component".to_string(), class_file.clone());
+
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files,
+    };
+    let autoload = ComposerAutoload::load(&root);
+
+    let candidates = component_candidate_paths("dynamic-component", &config, &autoload);
+    assert!(
+        candidates.iter().any(|p| *p == class_file && p.exists()),
+        "a class-registered tag must resolve to its class file via the shared \
+         resolver: {candidates:#?}"
+    );
+
+    // An unregistered tag must not pick up the class file.
+    let other = component_candidate_paths("some-other-component", &config, &autoload);
+    assert!(
+        !other.contains(&class_file),
+        "class registrations must not bleed into unrelated lookups"
+    );
 }

@@ -4951,6 +4951,7 @@ impl LaravelLanguageServer {
                     icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(
                         &cached_config.root,
                     ),
+                    class_component_files: cached_config.class_component_files.clone(),
                 };
                 // Store directly in memory - no Salsa channel call!
                 *self.cached_config.write().await = Some(config_data);
@@ -5018,6 +5019,7 @@ impl LaravelLanguageServer {
                 anonymous_component_namespaces: c.anonymous_component_namespaces.clone(),
                 component_aliases: laravel_lsp::config::load_component_aliases(&c.root),
                 icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&c.root),
+                class_component_files: c.class_component_files.clone(),
             });
 
             tokio::spawn(async move {
@@ -5675,6 +5677,7 @@ impl LaravelLanguageServer {
                 component_namespaces: config.component_namespaces.clone(),
                 anonymous_component_paths: config.anonymous_component_paths.clone(),
                 anonymous_component_namespaces: config.anonymous_component_namespaces.clone(),
+                class_component_files: config.class_component_files.clone(),
             };
             info!(
                 "📋 Caching Laravel config: {} view paths, {} anon-component paths",
@@ -12571,9 +12574,46 @@ return [
 
     /// Check if a translation file exists for the given key
     ///
-    /// Dotted keys like "validation.required" look in lang/en/validation.php
-    /// Text keys like "Welcome to our app" look in lang/en.json
-    fn check_translation_file(root: &Path, translation_key: &str) -> TranslationCheck {
+    /// Dotted keys like "validation.required" look in lang/en/validation.php.
+    /// Text keys like "Welcome to our app" look in lang/en.json.
+    /// Namespaced keys like "filament-tables::table.label" resolve through
+    /// [`laravel_lsp::translation_lookup`] — published `lang/vendor/<ns>/`
+    /// first, then the package's own lang dir via `vendor_map` (see
+    /// [`laravel_lsp::vendor_translations`]) — the same machinery hover uses,
+    /// so the diagnostic and hover can't disagree.
+    fn check_translation_file(
+        root: &Path,
+        translation_key: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> TranslationCheck {
+        if let Some((namespace, rest)) = translation_key.split_once("::") {
+            let file_segment = rest.split('.').next().unwrap_or(rest);
+            let nested_key = rest.split_once('.').map(|(_, k)| k.to_string());
+
+            let exists = laravel_lsp::translation_lookup::resolve_translation_detailed(
+                root,
+                translation_key,
+                "en",
+                vendor_map,
+            )
+            .is_some();
+
+            // Expected location for the diagnostic message: the package's real
+            // lang dir when the vendor scan knows it, else the published path.
+            let lang_dir = vendor_map
+                .and_then(|m| m.get(namespace).cloned())
+                .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
+            let expected = lang_dir.join("en").join(format!("{file_segment}.php"));
+
+            return TranslationCheck {
+                exists,
+                is_dotted_key: true,
+                file_exists: expected.exists(),
+                expected_path: Some(expected),
+                nested_key,
+            };
+        }
+
         let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
         let is_multi_word = translation_key.contains(' ');
 
@@ -12872,37 +12912,50 @@ return [
         None
     }
 
+    /// Resolve a Blade component tag name to the file backing it on disk.
+    ///
+    /// The single shared entry point for goto-definition and the
+    /// "component not found" diagnostic (issue #69): both walk the exact same
+    /// candidate list from [`laravel_lsp::salsa_impl::component_candidate_paths`]
+    /// with the same cached existence check, so they can never disagree about
+    /// whether a component resolves. Returns the first existing candidate, or
+    /// `None` when nothing matches.
+    async fn resolve_component_existing_file(&self, name: &str) -> Option<PathBuf> {
+        let config = self.get_cached_config().await?;
+        let root = self.root_path.read().await.clone()?;
+        let autoload = laravel_lsp::composer_autoload::ComposerAutoload::for_project(&root);
+
+        for path in laravel_lsp::salsa_impl::component_candidate_paths(name, &config, autoload) {
+            if self.file_exists_cached(&path).await {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     /// Create LocationLink for a component reference from Salsa data
     async fn create_component_location_from_salsa(
         &self,
         comp: &ComponentReferenceData,
     ) -> Option<GotoDefinitionResponse> {
-        let config = self.get_cached_config().await?;
-        let possible_paths = config.resolve_component_path(&comp.name);
-
-        for path in possible_paths {
-            if self.file_exists_cached(&path).await {
-                if let Ok(target_uri) = Url::from_file_path(&path) {
-                    let origin_selection_range = Range {
-                        start: Position {
-                            line: comp.line,
-                            character: comp.column,
-                        },
-                        end: Position {
-                            line: comp.line,
-                            character: comp.end_column,
-                        },
-                    };
-                    return Some(GotoDefinitionResponse::Link(vec![LocationLink {
-                        origin_selection_range: Some(origin_selection_range),
-                        target_uri,
-                        target_range: Range::default(),
-                        target_selection_range: Range::default(),
-                    }]));
-                }
-            }
-        }
-        None
+        let path = self.resolve_component_existing_file(&comp.name).await?;
+        let target_uri = Url::from_file_path(&path).ok()?;
+        let origin_selection_range = Range {
+            start: Position {
+                line: comp.line,
+                character: comp.column,
+            },
+            end: Position {
+                line: comp.line,
+                character: comp.end_column,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: Some(origin_selection_range),
+            target_uri,
+            target_range: Range::default(),
+            target_selection_range: Range::default(),
+        }]))
     }
 
     /// Create LocationLink for an `<x-slot:name>` tag.
@@ -15147,8 +15200,10 @@ return [
             // Check translation calls using Salsa patterns - warn about missing translation files
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
+                let vendor_map = self.vendor_translation_namespaces_for(root).await;
                 for trans_ref in &patterns.translation_refs {
-                    let check = Self::check_translation_file(root, &trans_ref.key);
+                    let check =
+                        Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
                     if !check.exists {
                         diagnostics.push(Self::create_translation_diagnostic(
                             &trans_ref.key,
@@ -15467,8 +15522,10 @@ return [
         // Check translation calls in Blade files (includes {{ __() }} syntax)
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
+            let vendor_map = self.vendor_translation_namespaces_for(root).await;
             for trans_ref in &patterns.translation_refs {
-                let check = Self::check_translation_file(root, &trans_ref.key);
+                let check =
+                    Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
                 if !check.exists {
                     diagnostics.push(Self::create_translation_diagnostic(
                         &trans_ref.key,
@@ -15531,61 +15588,56 @@ return [
         }
 
         // Check Blade components (<x-button>) using Salsa patterns. A
-        // component is considered to exist if EITHER a conventional view
-        // file (`resources/views/components/{name}.blade.php`) OR a class
-        // file (`app/View/Components/{Pascal}.php`) is on disk. The class-
-        // only case covers components like `<x-app-layout>` whose
-        // `render()` method returns a view at a non-conventional path
-        // (`view('layouts.app')`) — common in Laravel Breeze/Jetstream
-        // starter kits.
-        let root_for_components = self.root_path.read().await;
+        // component is considered to exist when the SAME resolver the
+        // goto-definition handler uses finds a backing file — conventional
+        // view, anonymous-path/namespace, package view, vendor-published,
+        // a conventional class file (`app/View/Components/{Pascal}.php`), or
+        // a PSR-4 class-based `Blade::componentNamespace` component such as
+        // `<x-filament::badge>` / `<x-mail::message>` (issue #69). Sharing
+        // `resolve_component_existing_file` guarantees diagnostics and
+        // goto-definition can never disagree about whether a component exists.
         for comp_ref in &patterns.components {
-            let possible_paths = config.resolve_component_path(&comp_ref.name);
-            let view_exists = possible_paths.iter().any(|p| p.exists());
-
-            let class_path =
-                laravel_lsp::component_declaration_locator::conventional_class_file_path(
-                    &comp_ref.name,
-                    &config,
-                );
-            let class_exists = class_path.is_file();
-
-            if !view_exists && !class_exists {
-                // Neither view nor class exists — surface as "not found"
-                // so the user gets a Create Missing View / Create Missing
-                // Component code action.
-                let expected_path = possible_paths
-                    .first()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let diagnostic = Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: comp_ref.line,
-                            character: comp_ref.column,
-                        },
-                        end: Position {
-                            line: comp_ref.line,
-                            character: comp_ref.end_column,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: None,
-                    source: Some("laravel".to_string()),
-                    message: format!(
-                        "Blade component not found: '{}'\nExpected at: {}",
-                        comp_ref.name, expected_path
-                    ),
-                    related_information: None,
-                    tags: None,
-                    code_description: None,
-                    data: None,
-                };
-                diagnostics.push(diagnostic);
+            if self
+                .resolve_component_existing_file(&comp_ref.name)
+                .await
+                .is_some()
+            {
+                continue;
             }
+
+            // Nothing resolved — surface as "not found" so the user gets a
+            // Create Missing View / Create Missing Component code action.
+            let possible_paths = config.resolve_component_path(&comp_ref.name);
+            let expected_path = possible_paths
+                .first()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let diagnostic = Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: comp_ref.line,
+                        character: comp_ref.column,
+                    },
+                    end: Position {
+                        line: comp_ref.line,
+                        character: comp_ref.end_column,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: None,
+                source: Some("laravel".to_string()),
+                message: format!(
+                    "Blade component not found: '{}'\nExpected at: {}",
+                    comp_ref.name, expected_path
+                ),
+                related_information: None,
+                tags: None,
+                code_description: None,
+                data: None,
+            };
+            diagnostics.push(diagnostic);
         }
-        drop(root_for_components);
 
         // Check Livewire components using Salsa patterns. The resolver
         // routes through three layers in order:
@@ -15637,13 +15689,18 @@ return [
         // Check @lang directives for translation files using Salsa patterns
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
+            let vendor_map = self.vendor_translation_namespaces_for(root).await;
             for dir_ref in &patterns.directives {
                 // Only validate @lang directives
                 if dir_ref.name == "lang" {
                     if let Some(ref args) = dir_ref.arguments {
                         if let Some(translation_key) = Self::extract_view_from_directive_args(args)
                         {
-                            let check = Self::check_translation_file(root, &translation_key);
+                            let check = Self::check_translation_file(
+                                root,
+                                &translation_key,
+                                vendor_map.as_deref(),
+                            );
                             if !check.exists {
                                 diagnostics.push(Self::create_translation_diagnostic(
                                     &translation_key,

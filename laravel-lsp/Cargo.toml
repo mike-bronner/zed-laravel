@@ -11,7 +11,7 @@ license = "MIT"
 tower-lsp = "0.20"
 
 # Salsa incremental computation
-salsa = "0.26"
+salsa = "0.27"
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }

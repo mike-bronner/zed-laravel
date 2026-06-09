@@ -4493,7 +4493,8 @@ impl LaravelLanguageServer {
                     // entries back so the import below still owns them — no clone.
                     let root_for_msave = root_for_save.clone();
                     let magic_entries = match tokio::task::spawn_blocking(move || {
-                        let res = laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_entries);
+                        let res =
+                            laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_entries);
                         (res, magic_entries)
                     })
                     .await
@@ -15871,6 +15872,492 @@ return [
         (confirmed, php_type, mig_link)
     }
 
+    /// Column rename (M8): rename a DB column project-wide. Fires when the
+    /// cursor resolves to a `MagicMemberKind::Column` (`$user->email`,
+    /// `where('email', …)`). `None` when the cursor isn't a column, so the
+    /// caller falls through to the method-based magic-member rename and then
+    /// the literal-symbol flow.
+    ///
+    /// The resulting `WorkspaceEdit` rewrites:
+    /// 1. property-form usages (`$user->email`, `{{ $user->email }}`) — from
+    ///    the magic-member inverted index;
+    /// 2. string-literal column args in query chains — only in chains whose
+    ///    table resolves to the column's table (qualified literals must also
+    ///    have a matching qualifier);
+    /// 3. the declaring model's `$fillable` / `$casts` / `$hidden` / `$guarded`
+    ///    / `$dates` array entries.
+    ///
+    /// It also emits a reversible `renameColumn` migration as a `CreateFile`.
+    async fn column_rename_edit(
+        &self,
+        file_path: &Path,
+        position: Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        // 1. Identify the column under the cursor: model FQCN + column name.
+        let data = self
+            .salsa
+            .resolve_magic_member_at(file_path.to_path_buf(), position.line, position.character)
+            .await
+            .ok()
+            .flatten()?;
+        if !matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+            return None;
+        }
+        let model_fqcn = data.declaring_fqcn.clone();
+        let old_column = data.member.clone();
+
+        let root = self.root_path.read().await.clone()?;
+
+        // The column's table: model→table with the snake_pluralize fallback.
+        let table = laravel_lsp::query_chain::eloquent_completion::resolve_table_for_model(
+            &model_fqcn,
+            &root,
+        )
+        .await
+        .unwrap_or_else(|| {
+            let basename = model_fqcn.rsplit('\\').next().unwrap_or(&model_fqcn);
+            laravel_lsp::query_chain::eloquent_completion::snake_pluralize(basename)
+        });
+
+        // Confirm the column actually exists (migrations first, then DB) before
+        // doing anything destructive. `resolve_magic_member_at` classifies a
+        // *tentative* column for any unresolved member on a model — including a
+        // typo like `$user->emial` — which would otherwise still generate a
+        // bogus `renameColumn` migration. No confirmation → no rename.
+        let confirmed = {
+            let in_migration = self
+                .migration_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|mi| mi.column(&table, &old_column).is_some());
+            if in_migration {
+                true
+            } else {
+                let guard = self.database_schema.read().await;
+                match guard.as_ref() {
+                    Some(db) => db
+                        .get_columns_with_types(&table)
+                        .await
+                        .iter()
+                        .any(|(name, _)| name == &old_column),
+                    None => false,
+                }
+            }
+        };
+        if !confirmed {
+            return None;
+        }
+
+        // The target model's own file. Used twice: to rewrite its `$fillable`/…
+        // arrays, and as the enclosing-model fallback for the chain scan — a
+        // local scope (`scopeActive($query) { $query->where('email') }`) has no
+        // model on the chain, so an unresolved bare-column chain *inside this
+        // file* is taken to operate on this model's table.
+        let model_decl_file = laravel_lsp::class_locator::find_php_class_file(&model_fqcn, &root);
+
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = Vec::new();
+
+        // 2. Property-form usages from the magic-member index ($user->email,
+        //    {{ $user->email }}). Rewritten to the new name verbatim.
+        if let Ok(refs) = self
+            .salsa
+            .find_references(
+                laravel_lsp::salsa_impl::SymbolRefData::MagicMember {
+                    fqcn: model_fqcn.clone(),
+                    member: old_column.clone(),
+                },
+                false,
+            )
+            .await
+        {
+            targets.extend(refs.into_iter().map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+                new_text: new_name.to_string(),
+            }));
+        }
+
+        // 3. Model array entries in the declaring model file.
+        if let Some(decl_file) = model_decl_file.clone() {
+            if let Ok(src) = tokio::fs::read_to_string(&decl_file).await {
+                let old = old_column.clone();
+                let sites = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::column_rename::model_array_sites(&src, &old)
+                })
+                .await
+                .unwrap_or_default();
+                targets.extend(sites.into_iter().map(|s| laravel_lsp::rename::EditTarget {
+                    file_path: decl_file.clone(),
+                    line: s.line,
+                    start_column: s.start_column,
+                    end_column: s.end_column,
+                    new_text: new_name.to_string(),
+                }));
+            }
+        }
+
+        // 4. Project-wide query-chain literal scan. Heavy work runs entirely on
+        //    the blocking pool: a fast `source.contains(old_column)` byte check
+        //    skips files that can't mention the column before any parse, and a
+        //    semaphore bounds concurrent parses so a large project can't
+        //    saturate threads/RAM (see the warming path for the same caps).
+        let chain_targets = self
+            .column_chain_targets(
+                &root,
+                &old_column,
+                &table,
+                new_name,
+                model_decl_file.as_deref(),
+            )
+            .await;
+        targets.extend(chain_targets);
+
+        // 5. The migration: a reversible renameColumn, emitted as CreateFile +
+        //    content. Built from the current wall-clock as the filename prefix.
+        let migration = self.build_rename_migration(&root, &table, &old_column, new_name);
+
+        Self::build_column_rename_workspace_edit(targets, migration)
+    }
+
+    /// Scan the project for query-chain column-arg literals that name
+    /// `old_column` and belong to a chain resolving to `table`, returning the
+    /// rewrite targets. Bounded + off the async runtime per the throttling
+    /// rules: byte pre-filter, per-file size cap, semaphore-gated blocking
+    /// parses, chain table resolution done async only for files with hits.
+    async fn column_chain_targets(
+        &self,
+        root: &Path,
+        old_column: &str,
+        table: &str,
+        new_name: &str,
+        model_decl_file: Option<&Path>,
+    ) -> Vec<laravel_lsp::rename::EditTarget> {
+        use std::sync::Arc;
+        const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
+        const MAX_CONCURRENT_PARSES: usize = 8;
+
+        let root_owned = root.to_path_buf();
+        let files = tokio::task::spawn_blocking(move || {
+            laravel_lsp::salsa_impl::collect_source_files(&root_owned)
+        })
+        .await
+        .unwrap_or_default();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PARSES));
+        let mut handles = Vec::new();
+        for path in files {
+            let permit_owner = semaphore.clone();
+            let old = old_column.to_string();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                // Per-file size cap — skip oversized files (data dumps).
+                let metadata = std::fs::metadata(&path).ok()?;
+                if metadata.len() > MAX_FILE_SIZE_BYTES {
+                    return None;
+                }
+                let path_for_task = path.clone();
+                // Parse + extract literals on the blocking pool. The cheap
+                // `contains` check happens FIRST so files that can't mention
+                // the column are never parsed.
+                let result = tokio::task::spawn_blocking(move || {
+                    let source = std::fs::read_to_string(&path_for_task).ok()?;
+                    if !source.contains(&old) {
+                        return None;
+                    }
+                    let lits = laravel_lsp::column_rename::chain_column_literals(&source, &old);
+                    if lits.is_empty() {
+                        return None;
+                    }
+                    // Re-extract chains so the table resolver can read receivers.
+                    let tree = laravel_lsp::parser::parse_php(&source).ok()?;
+                    let chains = laravel_lsp::query_chain::extract_chains(&tree, &source);
+                    Some((chains, lits))
+                })
+                .await
+                .ok()
+                .flatten()?;
+                Some((path, result))
+            }));
+        }
+
+        let mut targets = Vec::new();
+        for handle in handles {
+            let Ok(Some((path, (chains, lits)))) = handle.await else {
+                continue;
+            };
+            // Resolve each chain's table once (async model→table), then keep
+            // only the literal sites whose chain matches the target table.
+            let chains_arc: Vec<Arc<laravel_lsp::query_chain::BuilderChain>> =
+                chains.into_iter().map(Arc::new).collect();
+            // Cache per-chain accessible-table sets so a chain with multiple
+            // matching literals resolves its model→table only once.
+            let mut resolved: std::collections::HashMap<
+                usize,
+                Vec<laravel_lsp::query_chain::AccessibleTable>,
+            > = std::collections::HashMap::new();
+            for lit in lits {
+                let tables = match resolved.get(&lit.chain_index) {
+                    Some(t) => t,
+                    None => {
+                        let t = self
+                            .accessible_tables_for_chain(&chains_arc, lit.chain_index, root)
+                            .await;
+                        resolved.entry(lit.chain_index).or_insert(t)
+                    }
+                };
+                // Enclosing-model fallback: when the chain's table can't be
+                // resolved (an untyped `$query` in a local scope), a *bare*
+                // (unqualified) column inside the target model's own file is
+                // taken to operate on that model's table. A qualified
+                // `other.email` is excluded — it names a different table
+                // explicitly.
+                let enclosing_match = tables.is_empty()
+                    && lit.qualifier.is_none()
+                    && model_decl_file.is_some_and(|f| f == path.as_path());
+                if enclosing_match
+                    || Self::chain_matches_table(tables, table, lit.qualifier.as_deref())
+                {
+                    targets.push(laravel_lsp::rename::EditTarget {
+                        file_path: path.clone(),
+                        line: lit.site.line,
+                        start_column: lit.site.start_column,
+                        end_column: lit.site.end_column,
+                        new_text: new_name.to_string(),
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// Resolve the accessible tables for the chain at `chain_index`, reusing the
+    /// cursor resolver + the same `accessible_tables_for_goto` pipeline goto-def
+    /// uses. Anchors the cursor at the chain's own span so `detect_chain_context_at`
+    /// finds it. Returns an empty `Vec` when the chain's receiver can't be
+    /// resolved (unknown var type, etc.) — an unresolved chain matches nothing,
+    /// which is the safe default for a rename.
+    async fn accessible_tables_for_chain(
+        &self,
+        chains: &[std::sync::Arc<laravel_lsp::query_chain::BuilderChain>],
+        chain_index: usize,
+        root: &Path,
+    ) -> Vec<laravel_lsp::query_chain::AccessibleTable> {
+        let Some(chain) = chains.get(chain_index) else {
+            return Vec::new();
+        };
+        // Anchor inside the chain's span so the resolver picks this chain. The
+        // start byte sits on the receiver, which is always within the chain.
+        let anchor = chain.span_byte_range.0;
+        let Some(ctx) = laravel_lsp::query_chain::detect_chain_context_at(chains, anchor) else {
+            return Vec::new();
+        };
+        Self::accessible_tables_for_goto(&ctx, root).await
+    }
+
+    /// True when a column literal in a chain refers to `target_table`:
+    /// - **qualified** (`users.email`) → some accessible table's qualifier
+    ///   matches the literal's qualifier AND its real table is `target_table`;
+    /// - **bare** (`email`) → `target_table` is among the chain's accessible
+    ///   tables (by real name or qualifier).
+    fn chain_matches_table(
+        tables: &[laravel_lsp::query_chain::AccessibleTable],
+        target_table: &str,
+        qualifier: Option<&str>,
+    ) -> bool {
+        match qualifier {
+            Some(q) => tables
+                .iter()
+                .any(|t| t.qualifier() == q && t.table == target_table),
+            None => tables
+                .iter()
+                .any(|t| t.table == target_table || t.qualifier() == target_table),
+        }
+    }
+
+    /// Build the `(uri, content)` for the column-rename migration. The filename
+    /// uses the current wall-clock as Laravel's `YYYY_MM_DD_HHMMSS` prefix.
+    /// `None` if the URI can't be formed.
+    fn build_rename_migration(
+        &self,
+        root: &Path,
+        table: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Option<(Url, String)> {
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let timestamp =
+            laravel_lsp::query_chain::code_actions::format_migration_timestamp(unix_secs);
+        let filename = laravel_lsp::column_rename::rename_migration_filename(
+            &timestamp, old_column, new_column, table,
+        );
+        let path = root.join("database").join("migrations").join(&filename);
+        let uri = Url::from_file_path(&path).ok()?;
+        let content =
+            laravel_lsp::column_rename::rename_migration_content(table, old_column, new_column);
+        Some((uri, content))
+    }
+
+    /// Assemble the column-rename `WorkspaceEdit`: the migration `CreateFile`
+    /// (+ its content insert at 0:0) followed by every text-rewrite target,
+    /// grouped per file into `TextDocumentEdit`s. Uses `DocumentChanges::
+    /// Operations` so the resource op and edits ride in one workspace edit.
+    /// `None` when there's nothing to do (no targets and no migration).
+    fn build_column_rename_workspace_edit(
+        targets: Vec<laravel_lsp::rename::EditTarget>,
+        migration: Option<(Url, String)>,
+    ) -> Option<WorkspaceEdit> {
+        if targets.is_empty() && migration.is_none() {
+            return None;
+        }
+
+        let mut ops: Vec<DocumentChangeOperation> = Vec::new();
+
+        // Migration first: create the file, then write its content.
+        if let Some((uri, content)) = migration {
+            ops.push(DocumentChangeOperation::Op(ResourceOp::Create(
+                CreateFile {
+                    uri: uri.clone(),
+                    options: Some(CreateFileOptions {
+                        overwrite: Some(false),
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                },
+            )));
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: vec![OneOf::Left(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    new_text: content,
+                })],
+            }));
+        }
+
+        // Group text targets per file into one TextDocumentEdit each.
+        let mut grouped: std::collections::HashMap<Url, Vec<TextEdit>> =
+            std::collections::HashMap::new();
+        for t in targets {
+            let Ok(uri) = Url::from_file_path(&t.file_path) else {
+                continue;
+            };
+            grouped.entry(uri).or_default().push(TextEdit {
+                range: Range {
+                    start: Position {
+                        line: t.line,
+                        character: t.start_column,
+                    },
+                    end: Position {
+                        line: t.line,
+                        character: t.end_column,
+                    },
+                },
+                new_text: t.new_text,
+            });
+        }
+        for (uri, edits) in grouped {
+            ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }));
+        }
+
+        if ops.is_empty() {
+            return None;
+        }
+
+        Some(WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            change_annotations: None,
+        })
+    }
+
+    /// Magic-member rename (M7): rewrite a method-backed magic member's
+    /// declaration (transformed: `active`→`scopeActive`, `full_name`→
+    /// `getFullNameAttribute`, `posts`→`posts`) plus every cached usage site
+    /// (the new usage name verbatim). `None` when the cursor isn't a renameable
+    /// magic member, so the caller falls through to the literal-symbol flow.
+    /// The declaring file is read off the async side (not the Salsa actor).
+    async fn magic_member_rename_edit(
+        &self,
+        file_path: &Path,
+        position: Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        let data = self
+            .salsa
+            .resolve_magic_member_rename_at(
+                file_path.to_path_buf(),
+                position.line,
+                position.character,
+            )
+            .await
+            .ok()
+            .flatten()?;
+
+        // Every cached usage site → the new usage name verbatim.
+        let call_sites = self
+            .salsa
+            .find_references(
+                laravel_lsp::salsa_impl::SymbolRefData::MagicMember {
+                    fqcn: data.fqcn.clone(),
+                    member: data.member.clone(),
+                },
+                false,
+            )
+            .await
+            .ok()?;
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = call_sites
+            .into_iter()
+            .map(|r| laravel_lsp::rename::EditTarget {
+                file_path: r.file_path,
+                line: r.line,
+                start_column: r.column,
+                end_column: r.end_column,
+                new_text: new_name.to_string(),
+            })
+            .collect();
+
+        // Declaration: rewrite just the method-name token, transformed for the
+        // kind (scope/accessor affixes preserved). Read from the declaring file.
+        if let Ok(src) = tokio::fs::read_to_string(&data.decl_file).await {
+            if let Some((line, start_column, end_column)) =
+                laravel_lsp::rename::locate_method_name(&src, &data.method_name)
+            {
+                let new_method = laravel_lsp::rename::magic_member_decl_name(
+                    data.kind,
+                    &data.method_name,
+                    new_name,
+                );
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: data.decl_file.clone(),
+                    line,
+                    start_column,
+                    end_column,
+                    new_text: new_method,
+                });
+            }
+        }
+
+        laravel_lsp::rename::build_rename_edit(&targets)
+    }
+
     /// Blade component — distinguishes class-backed components (Laravel
     /// renders these via an `app/View/Components/<Pascal>.php` class) from
     /// anonymous Blade components (just a `.blade.php` template).
@@ -16989,7 +17476,6 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
     }
 }
 
-
 impl LaravelLanguageServer {
     /// Collect every code-lens item for a file — each a `(range, symbols)` pair.
     /// Position lenses (magic members, routes, env, config, translation) carry
@@ -17040,8 +17526,7 @@ impl LaravelLanguageServer {
                         laravel_lsp::route_name_locator::extract_route_name_declarations(source);
                     if !decls.is_empty() {
                         let ext = index.external_prefixes_for(path);
-                        targets
-                            .extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
+                        targets.extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
                     }
                 }
             }
@@ -18581,6 +19066,60 @@ impl LanguageServer for LaravelLanguageServer {
             _ => return Ok(None),
         };
 
+        // Magic member (M7): a method-backed magic member under the cursor
+        // (relationship / scope / accessor) renames over its member-name token.
+        // Checked before the literal-symbol classifier, which doesn't know
+        // magic members and would fall through to the class-rename path.
+        if let Ok(Some(_)) = self
+            .salsa
+            .resolve_magic_member_rename_at(file_path.clone(), position.line, position.character)
+            .await
+        {
+            if let Some(laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m)) =
+                patterns.find_at_position(position.line, position.character)
+            {
+                return Ok(Some(PrepareRenameResponse::Range(Range {
+                    start: Position {
+                        line: m.line,
+                        character: m.column,
+                    },
+                    end: Position {
+                        line: m.line,
+                        character: m.end_column,
+                    },
+                })));
+            }
+        }
+
+        // Column (M8): a DB column under the cursor (`$user->email`, or a
+        // `where('email', …)` literal) renames over the column-name token.
+        // `resolve_magic_member_at` classifies property-form columns; for a
+        // chain literal the classifier below returns the string range. Handle
+        // the property-form case here so F2 on `$user->email` highlights just
+        // `email`.
+        if let Ok(Some(data)) = self
+            .salsa
+            .resolve_magic_member_at(file_path.clone(), position.line, position.character)
+            .await
+        {
+            if matches!(data.kind, laravel_lsp::salsa_impl::MagicMemberKind::Column) {
+                if let Some(laravel_lsp::salsa_impl::PatternAtPosition::MemberAccess(m)) =
+                    patterns.find_at_position(position.line, position.character)
+                {
+                    return Ok(Some(PrepareRenameResponse::Range(Range {
+                        start: Position {
+                            line: m.line,
+                            character: m.column,
+                        },
+                        end: Position {
+                            line: m.line,
+                            character: m.end_column,
+                        },
+                    })));
+                }
+            }
+        }
+
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(
             self,
@@ -18666,6 +19205,29 @@ impl LanguageServer for LaravelLanguageServer {
             Ok(Some(p)) => p,
             _ => return Ok(None),
         };
+
+        // Column (M8): renaming a DB column (cursor on `email` in `$user->email`
+        // or `where('email', …)`) rewrites column literals project-wide, the
+        // model's array entries, the property-form usages, and generates a
+        // `renameColumn` migration. Checked first — a Column routes here; the
+        // method-backed magic members route to `magic_member_rename_edit`.
+        if let Some(edit) = self
+            .column_rename_edit(&file_path, position, &new_name)
+            .await
+        {
+            return Ok(Some(edit));
+        }
+
+        // Magic member (M7): rename a method-backed magic member (relationship /
+        // scope / accessor) across its declaration + every cached usage site.
+        // Checked before the literal-symbol classifier (which doesn't know magic
+        // members) and the class-rename fallback.
+        if let Some(edit) = self
+            .magic_member_rename_edit(&file_path, position, &new_name)
+            .await
+        {
+            return Ok(Some(edit));
+        }
 
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(

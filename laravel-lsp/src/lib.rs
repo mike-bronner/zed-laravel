@@ -19,6 +19,7 @@ pub mod cache_manager;
 pub mod class_locator;
 pub mod class_rename;
 pub mod code_lens;
+pub mod column_rename;
 pub mod completion_format;
 pub mod component_completion;
 pub mod component_declaration_locator;

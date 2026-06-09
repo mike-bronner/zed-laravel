@@ -2458,6 +2458,22 @@ pub struct MagicMemberHoverData {
     pub tentative: bool,
 }
 
+/// Resolution result for renaming a magic member (M7). Crosses the async
+/// boundary (owns plain data). Only method-backed kinds — relationship, scope,
+/// accessor, dynamic finder — produce this; columns/plain members return `None`
+/// (a DB column rename is a migration concern, out of scope).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MagicMemberRenameData {
+    pub fqcn: String,
+    /// Usage name (the find-references key + the call-site rewrite text).
+    pub member: String,
+    pub kind: MagicMemberKind,
+    /// The actual declared method name (`scopeActive`, `getFullNameAttribute`,
+    /// `posts`) — the decl site to rewrite, transformed by the caller.
+    pub method_name: String,
+    pub decl_file: PathBuf,
+}
+
 /// Laravel configuration data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaravelConfigData {
@@ -3403,6 +3419,15 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Option<MagicMemberHoverData>>,
     },
 
+    /// Resolve the magic member at a cursor for rename (M7) — method-backed
+    /// kinds only; returns the declaring method to rewrite.
+    ResolveMagicMemberRenameAt {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Option<MagicMemberRenameData>>,
+    },
+
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
     RegisterServiceProviderRegistry {
@@ -4081,6 +4106,30 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::ResolveMagicMemberAt {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve the magic member at `(line, column)` for rename (M7). `Ok(None)`
+    /// unless it's a method-backed magic member (relationship / scope /
+    /// accessor / dynamic finder).
+    pub async fn resolve_magic_member_rename_at(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Option<MagicMemberRenameData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveMagicMemberRenameAt {
                 path,
                 line,
                 column,
@@ -5129,6 +5178,15 @@ impl SalsaActor {
                     reply,
                 } => {
                     let result = self.handle_resolve_magic_member_at(&path, line, column);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveMagicMemberRenameAt {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_magic_member_rename_at(&path, line, column);
                     let _ = reply.send(result);
                 }
 
@@ -6704,7 +6762,11 @@ impl SalsaActor {
                         .iter()
                         .find(|m| candidates.iter().any(|c| *c == m.name))
                     {
-                        (Some(node.file_path.clone()), Some(m.start_line), Some(m.end_line))
+                        (
+                            Some(node.file_path.clone()),
+                            Some(m.start_line),
+                            Some(m.end_line),
+                        )
                     } else if let Some(p) =
                         node.properties.iter().find(|p| p.name == member_ref.member)
                     {
@@ -6725,6 +6787,80 @@ impl SalsaActor {
             decl_line,
             decl_end_line,
             tentative,
+        })
+    }
+
+    /// Resolve the magic member at a position for rename (M7). Only
+    /// method-backed kinds (relationship / scope / accessor / dynamic finder)
+    /// qualify — a column/plain member returns `None` (renaming a DB column is a
+    /// migration concern). Returns the declaring method name + file so the
+    /// caller can rewrite the declaration (transformed) alongside the call
+    /// sites. HIGH/MEDIUM confidence only.
+    fn handle_resolve_magic_member_rename_at(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Option<MagicMemberRenameData> {
+        let patterns = self.handle_get_patterns(path)?;
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return None,
+        };
+        let project_root = self.config_root.clone()?;
+
+        self.ensure_file_registered(path);
+        let file = self.files.get(path)?;
+        let text = file.text(&self.db).clone();
+
+        let tree = crate::parser::parse_php(&text).ok()?;
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let receiver = tree.root_node().descendant_for_byte_range(
+            member_ref.receiver_byte_start,
+            member_ref.receiver_byte_end,
+        )?;
+        let resolved = crate::member_resolver::resolve_and_classify(
+            receiver,
+            &member_ref.member,
+            crate::member_resolver::AccessForm::Property,
+            bytes,
+            &aliases,
+            &self.class_hierarchy_index,
+            &mut classviews,
+            &project_root,
+        )?;
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            return None;
+        }
+        // Only method-backed kinds rename; a column/plain member can't.
+        if !matches!(
+            resolved.kind,
+            MagicMemberKind::Relationship
+                | MagicMemberKind::Scope
+                | MagicMemberKind::Accessor
+                | MagicMemberKind::DynamicFinder
+        ) {
+            return None;
+        }
+
+        // Find the declaring method (its real name + file) via the kind-aware
+        // candidate names — the same mapping the hover uses.
+        let node = self.class_hierarchy_index.get(&resolved.declaring_fqcn)?;
+        let candidates = crate::hover::candidate_method_names(resolved.kind, &member_ref.member);
+        let method = node
+            .methods
+            .iter()
+            .find(|m| candidates.iter().any(|c| *c == m.name))?;
+
+        Some(MagicMemberRenameData {
+            fqcn: resolved.declaring_fqcn,
+            member: member_ref.member.clone(),
+            kind: resolved.kind,
+            method_name: method.name.clone(),
+            decl_file: node.file_path.clone(),
         })
     }
 
@@ -7398,7 +7534,7 @@ const SKIP_SCAN_DIRS: &[&str] = &["vendor", "node_modules", ".git", "storage", "
 /// dependency and runtime dirs. Feeds the magic-member reverse index, whose
 /// usages can live in any source file — not just controllers and Blade views.
 /// (`.blade.php` is included because it also ends with `.php`.)
-fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
     use walkdir::WalkDir;
     let mut out = Vec::new();
     for entry in WalkDir::new(root)

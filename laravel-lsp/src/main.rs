@@ -4951,6 +4951,7 @@ impl LaravelLanguageServer {
                     icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(
                         &cached_config.root,
                     ),
+                    class_component_files: cached_config.class_component_files.clone(),
                 };
                 // Store directly in memory - no Salsa channel call!
                 *self.cached_config.write().await = Some(config_data);
@@ -5018,6 +5019,7 @@ impl LaravelLanguageServer {
                 anonymous_component_namespaces: c.anonymous_component_namespaces.clone(),
                 component_aliases: laravel_lsp::config::load_component_aliases(&c.root),
                 icon_aliases: laravel_lsp::config::scan_vendor_for_icon_sets(&c.root),
+                class_component_files: c.class_component_files.clone(),
             });
 
             tokio::spawn(async move {
@@ -5675,6 +5677,7 @@ impl LaravelLanguageServer {
                 component_namespaces: config.component_namespaces.clone(),
                 anonymous_component_paths: config.anonymous_component_paths.clone(),
                 anonymous_component_namespaces: config.anonymous_component_namespaces.clone(),
+                class_component_files: config.class_component_files.clone(),
             };
             info!(
                 "📋 Caching Laravel config: {} view paths, {} anon-component paths",

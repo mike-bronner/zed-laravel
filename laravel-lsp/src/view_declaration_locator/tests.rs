@@ -17,6 +17,7 @@ fn config_for(root: &Path) -> LaravelConfigData {
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 

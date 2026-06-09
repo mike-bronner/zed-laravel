@@ -109,6 +109,7 @@ fn make_config_with_alias(alias: &str, view: &str) -> LaravelConfigData {
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: aliases,
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -128,6 +129,7 @@ fn make_config_with_icon(tag: &str, svg_path: &str) -> LaravelConfigData {
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: icons,
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -226,6 +228,7 @@ fn make_config_with_anonymous_path(prefix: &str, abs_dir: &str) -> LaravelConfig
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -245,6 +248,7 @@ fn make_config_with_anonymous_namespace(prefix: &str, dir: &str) -> LaravelConfi
         anonymous_component_namespaces: anon,
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -811,6 +815,7 @@ fn config_with_component_namespaces(root: &Path, ns: &[(&str, &str)]) -> Laravel
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     }
 }
 
@@ -1265,6 +1270,7 @@ class SupportServiceProvider extends PackageServiceProvider
         anonymous_component_namespaces: HashMap::new(),
         component_aliases: HashMap::new(),
         icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
     };
 
     let candidates = config.resolve_component_path("acme::input.wrapper");
@@ -1272,5 +1278,189 @@ class SupportServiceProvider extends PackageServiceProvider
         candidates.iter().any(|p| p.exists()),
         "acme::input.wrapper must resolve to the real package view via the \
          discovered namespace: {candidates:#?}"
+    );
+}
+
+// ─── Class-backed component registrations (dynamic-component, issue #69) ─
+//
+// Laravel core registers `<x-dynamic-component>` with an ordinary class
+// alias — `$blade->component('dynamic-component', DynamicComponent::class)`
+// inside ViewServiceProvider — using the *instance* receiver and a *short*
+// class name resolved by a `use` import. These tests pin the broadened
+// registration parsing (both receivers, both argument orders, use-statement
+// expansion) and the shared-resolver consumption of the resulting map.
+
+#[test]
+fn expand_class_via_use_statements_resolves_short_names() {
+    let source = r#"<?php
+namespace Illuminate\View;
+
+use Illuminate\View\DynamicComponent;
+use Foo\Bar as Baz;
+use function array_map;
+
+class P {}
+"#;
+    assert_eq!(
+        expand_class_via_use_statements("DynamicComponent", source),
+        "Illuminate\\View\\DynamicComponent"
+    );
+    // Aliased import resolves through the alias.
+    assert_eq!(expand_class_via_use_statements("Baz", source), "Foo\\Bar");
+    // Already-qualified names pass through untouched.
+    assert_eq!(
+        expand_class_via_use_statements("App\\View\\Alert", source),
+        "App\\View\\Alert"
+    );
+    // No matching import → unchanged (resolution fails downstream, as before).
+    assert_eq!(
+        expand_class_via_use_statements("Unknown", source),
+        "Unknown"
+    );
+}
+
+/// Parse a provider source against a root and return (tag, class, file) per
+/// class-backed component registration.
+fn parsed_blade_components(
+    source: &str,
+    provider_path: PathBuf,
+    root: PathBuf,
+) -> Vec<(String, String, Option<PathBuf>)> {
+    let db = LaravelDatabase::default();
+    let file = ServiceProviderFile::new(&db, provider_path, 0, source.to_string(), 0);
+    let parsed = parse_service_provider_source(&db, file, root);
+    parsed
+        .blade_components(&db)
+        .iter()
+        .map(|bc| {
+            (
+                bc.tag_name(&db).name(&db).clone(),
+                bc.class_name(&db).clone(),
+                bc.file_path(&db).clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn instance_form_component_registration_is_discovered_and_resolved() {
+    // The exact framework shape: instance receiver inside a tap() closure,
+    // short class name brought in by a use import.
+    let provider = r#"<?php
+namespace Illuminate\View;
+
+use Illuminate\View\DynamicComponent;
+
+class ViewServiceProvider
+{
+    public function registerBladeCompiler()
+    {
+        $this->app->singleton('blade.compiler', function ($app) {
+            return tap(new BladeCompiler(), function ($blade) {
+                $blade->component('dynamic-component', DynamicComponent::class);
+            });
+        });
+    }
+}
+"#;
+    let (_dir, root) = project_with_files(&[(
+        "vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php",
+        "<?php namespace Illuminate\\View; class DynamicComponent {}",
+    )]);
+
+    let found = parsed_blade_components(
+        provider,
+        root.join("vendor/laravel/framework/src/Illuminate/View/ViewServiceProvider.php"),
+        root.clone(),
+    );
+
+    assert!(
+        found.iter().any(|(tag, class, file)| {
+            tag == "dynamic-component"
+                && class == "Illuminate\\View\\DynamicComponent"
+                && file
+                    .as_ref()
+                    .is_some_and(|f| f.ends_with("Illuminate/View/DynamicComponent.php"))
+        }),
+        "instance-form registration must be discovered with the use-expanded \
+         FQN and a resolved file, got {found:?}"
+    );
+}
+
+#[test]
+fn class_first_argument_order_is_discovered() {
+    // Canonical order: Blade::component(AlertComponent::class, 'alert').
+    let provider = r#"<?php
+use App\View\Components\AlertComponent;
+
+class AppServiceProvider
+{
+    public function boot()
+    {
+        Blade::component(AlertComponent::class, 'alert');
+    }
+}
+"#;
+    let (_dir, root) = project_with_files(&[(
+        "app/View/Components/AlertComponent.php",
+        "<?php namespace App\\View\\Components; class AlertComponent {}",
+    )]);
+
+    let found = parsed_blade_components(
+        provider,
+        root.join("app/Providers/AppServiceProvider.php"),
+        root.clone(),
+    );
+
+    assert!(
+        found.iter().any(|(tag, class, file)| {
+            tag == "alert" && class == "App\\View\\Components\\AlertComponent" && file.is_some()
+        }),
+        "class-first argument order must be discovered, got {found:?}"
+    );
+}
+
+#[test]
+fn class_component_registration_resolves_via_candidate_paths() {
+    // End of the chain: a tag present in `class_component_files` must surface
+    // from `component_candidate_paths`, so the shared diagnostic/goto resolver
+    // stops flagging `<x-dynamic-component>`.
+    let (_dir, root) = project_with_files(&[(
+        "vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php",
+        "<?php namespace Illuminate\\View; class DynamicComponent {}",
+    )]);
+    let class_file = root.join("vendor/laravel/framework/src/Illuminate/View/DynamicComponent.php");
+
+    let mut class_component_files = HashMap::new();
+    class_component_files.insert("dynamic-component".to_string(), class_file.clone());
+
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces: HashMap::new(),
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files,
+    };
+    let autoload = ComposerAutoload::load(&root);
+
+    let candidates = component_candidate_paths("dynamic-component", &config, &autoload);
+    assert!(
+        candidates.iter().any(|p| *p == class_file && p.exists()),
+        "a class-registered tag must resolve to its class file via the shared \
+         resolver: {candidates:#?}"
+    );
+
+    // An unregistered tag must not pick up the class file.
+    let other = component_candidate_paths("some-other-component", &config, &autoload);
+    assert!(
+        !other.contains(&class_file),
+        "class registrations must not bleed into unrelated lookups"
     );
 }

@@ -1094,3 +1094,183 @@ fn blade_loop_iterable_bare_var_has_no_member_access() {
     let content = "@foreach ($users as $user)\n{{ $user->x }}\n@endforeach\n";
     assert!(blade_loop_iterable_accesses(content).is_empty());
 }
+
+// ─── Generic builder-form view-namespace discovery (issue #69) ──────────
+//
+// Packages registered through a fluent package-builder (e.g. Filament via
+// laravel-package-tools) declare views with `->name('x')->hasViews()`, and the
+// real `loadViewsFrom` runs in a base class with runtime args — invisible to
+// the literal `loadViewsFrom(__DIR__.'lit','lit')` extractor. These tests pin
+// the builder-form recognizer that reconstructs the (namespace, directory)
+// registration so `<x-x::component>` resolves through the existing
+// view-namespace path.
+
+#[test]
+fn builder_short_name_strips_leading_laravel_prefix() {
+    assert_eq!(builder_short_name("filament"), "filament");
+    assert_eq!(builder_short_name("laravel-foo"), "foo");
+    assert_eq!(builder_short_name("my-laravel-bar"), "bar");
+}
+
+/// Collect the (namespace, view_path) pairs a provider source registers.
+fn discovered_view_namespaces(source: &str, provider_path: &str) -> Vec<(String, Option<PathBuf>)> {
+    let db = LaravelDatabase::default();
+    let file =
+        ServiceProviderFile::new(&db, PathBuf::from(provider_path), 0, source.to_string(), 1);
+    let parsed = parse_service_provider_source(&db, file, PathBuf::from("/proj"));
+    parsed
+        .view_namespaces(&db)
+        .iter()
+        .map(|vn| {
+            (
+                vn.namespace(&db).namespace(&db).clone(),
+                vn.view_path(&db).clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn builder_hasviews_registers_namespace_at_package_resources_views() {
+    // Provider in `<pkg>/src` → views at `<pkg>/resources/views` (normalized,
+    // since the path doesn't exist on disk in this unit test).
+    let source = r#"<?php
+class WidgetsServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews();
+    }
+}"#;
+    let found = discovered_view_namespaces(
+        source,
+        "/proj/vendor/acme/widgets/src/WidgetsServiceProvider.php",
+    );
+    assert!(
+        found.iter().any(|(ns, p)| ns == "acme"
+            && *p == Some(PathBuf::from("/proj/vendor/acme/widgets/resources/views"))),
+        "->name('acme')->hasViews() must register 'acme' → package resources/views, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_hasviews_explicit_namespace_overrides_package_name() {
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews('custom');
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/pkg/src/P.php");
+    assert!(
+        found.iter().any(|(ns, _)| ns == "custom"),
+        "explicit ->hasViews('custom') must win over the package name, got {found:?}"
+    );
+    assert!(
+        !found.iter().any(|(ns, _)| ns == "acme"),
+        "the package name must not also register when an explicit namespace is given, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_hasviews_strips_laravel_prefix_for_namespace() {
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('laravel-widgets')->hasViews();
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/widgets/src/P.php");
+    assert!(
+        found.iter().any(|(ns, _)| ns == "widgets"),
+        "->name('laravel-widgets') must register namespace 'widgets', got {found:?}"
+    );
+}
+
+#[test]
+fn builder_name_without_hasviews_registers_no_view_namespace() {
+    // A package that declares a name + commands but no views must not have a
+    // view namespace synthesized from its `->name()` call.
+    let source = r#"<?php
+class P extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasCommands([SomeCommand::class]);
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/vendor/acme/pkg/src/P.php");
+    assert!(
+        found.is_empty(),
+        "no ->hasViews() means no builder-form view namespace, got {found:?}"
+    );
+}
+
+#[test]
+fn builder_discovered_namespace_resolves_anonymous_view_component() {
+    // End-to-end: a real builder provider + a real package view file. Discovery
+    // must register the namespace so `resolve_component_path` finds the view —
+    // the exact `<x-filament::input.wrapper>` failure from issue #69.
+    let provider = r#"<?php
+class SupportServiceProvider extends PackageServiceProvider
+{
+    public function configurePackage(Package $package): void
+    {
+        $package->name('acme')->hasViews();
+    }
+}"#;
+    let (_dir, root) = project_with_files(&[
+        (
+            "vendor/acme/support/src/SupportServiceProvider.php",
+            provider,
+        ),
+        (
+            "vendor/acme/support/resources/views/components/input/wrapper.blade.php",
+            "<div>{{ $slot }}</div>",
+        ),
+    ]);
+
+    // Discover the namespace from the provider on disk.
+    let db = LaravelDatabase::default();
+    let provider_path = root.join("vendor/acme/support/src/SupportServiceProvider.php");
+    let text = std::fs::read_to_string(&provider_path).unwrap();
+    let file = ServiceProviderFile::new(&db, provider_path, 0, text, 1);
+    let parsed = parse_service_provider_source(&db, file, root.clone());
+
+    let mut view_namespaces = HashMap::new();
+    for vn in parsed.view_namespaces(&db) {
+        if let Some(p) = vn.view_path(&db).clone() {
+            view_namespaces.insert(vn.namespace(&db).namespace(&db).clone(), p);
+        }
+    }
+    assert!(
+        view_namespaces.contains_key("acme"),
+        "discovery must register the 'acme' view namespace, got {view_namespaces:?}"
+    );
+
+    // Build a config carrying that namespace and resolve the dotted component.
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces,
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+    };
+
+    let candidates = config.resolve_component_path("acme::input.wrapper");
+    assert!(
+        candidates.iter().any(|p| p.exists()),
+        "acme::input.wrapper must resolve to the real package view via the \
+         discovered namespace: {candidates:#?}"
+    );
+}

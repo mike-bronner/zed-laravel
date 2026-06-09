@@ -1618,6 +1618,25 @@ pub fn parse_service_provider_source<'db>(
         static ref COMPONENT_NAMESPACE_RE: Regex = Regex::new(
             r#"Blade::componentNamespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
+
+        /// Matches a fluent package-builder name declaration: `->name('package')`.
+        /// The literal `loadViewsFrom`/`loadTranslationsFrom` patterns above only
+        /// see Laravel-native registration. Builder-convention providers (the
+        /// dominant one being laravel-package-tools, but this is form-based, not
+        /// vendor-tied) declare capabilities fluently — `->name('x')->hasViews()`
+        /// — and the real `loadViewsFrom($computedDir, $name)` runs in a base
+        /// class with runtime args the literal patterns can't see. This pair of
+        /// patterns reconstructs that registration form.
+        static ref BUILDER_NAME_RE: Regex = Regex::new(
+            r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#
+        ).unwrap();
+
+        /// Matches the builder view capability: `->hasViews()` or
+        /// `->hasViews('explicit-namespace')`. The optional capture is the
+        /// namespace override; absent, the namespace is the package short-name.
+        static ref BUILDER_HAS_VIEWS_RE: Regex = Regex::new(
+            r#"->hasViews\s*\(\s*(?:['"]([^'"]+)['"])?\s*\)"#
+        ).unwrap();
     }
 
     let text = file.text(db);
@@ -1845,6 +1864,53 @@ pub fn parse_service_provider_source<'db>(
                 priority,
                 path.clone(),
             ));
+        }
+    }
+
+    // Parse the fluent package-builder view registration form:
+    //   $package->name('filament')->hasViews();
+    // Builder-convention providers register views from a base class
+    // (`loadViewsFrom($computedDir, $name)`) with runtime-computed arguments, so
+    // the literal LOAD_VIEWS_RE above never sees them. Reconstruct the
+    // (namespace, directory) pair from the convention: the namespace is the
+    // explicit `->hasViews('ns')` argument or the package short-name (a leading
+    // `laravel-` stripped, matching the builder's own `shortName()` rule), and
+    // the directory is the package's `resources/views` — one level up from the
+    // provider's `src/` dir, which is where these builders resolve their base
+    // path. The capability (`->hasViews(`) gates this: without it the provider
+    // isn't registering views, so a stray `->name(` elsewhere can't misfire.
+    if let Some(has_views) = BUILDER_HAS_VIEWS_RE.captures(text) {
+        if let Some(name_cap) = BUILDER_NAME_RE.captures(text) {
+            let package_name = name_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let namespace = has_views
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| builder_short_name(package_name));
+
+            if !namespace.is_empty() {
+                let line = text[..name_cap.get(0).map(|m| m.start()).unwrap_or(0)]
+                    .lines()
+                    .count() as u32;
+
+                // Convention: provider in `<pkg>/src`, views at `<pkg>/resources/views`.
+                let provider_dir = path.parent().unwrap_or(path.as_path());
+                let view_path = provider_dir.join("../resources/views");
+                let resolved_path = if view_path.exists() {
+                    Some(view_path.canonicalize().unwrap_or(view_path))
+                } else {
+                    Some(normalize_path(&view_path))
+                };
+
+                let pkg_namespace = PackageNamespace::new(db, namespace);
+                view_namespaces.push(ParsedViewNamespaceReg::new(
+                    db,
+                    pkg_namespace,
+                    resolved_path,
+                    line,
+                    priority,
+                    path.clone(),
+                ));
+            }
         }
     }
 
@@ -2078,6 +2144,19 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+/// The namespace a fluent package-builder derives from a package name when
+/// `->hasViews()` is called without an explicit argument: everything after a
+/// leading `laravel-`. Mirrors the builder's own `shortName()`
+/// (`Str::after($name, 'laravel-')`) so discovery matches runtime resolution.
+///
+/// `filament` → `filament`; `laravel-foo` → `foo`; `my-laravel-bar` → `bar`.
+fn builder_short_name(package_name: &str) -> String {
+    package_name
+        .split_once("laravel-")
+        .map(|(_, after)| after.to_string())
+        .unwrap_or_else(|| package_name.to_string())
 }
 
 /// Resolve a class name to a file path using PSR-4 conventions

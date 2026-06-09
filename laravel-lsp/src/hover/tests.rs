@@ -233,18 +233,29 @@ fn magic_member_card_with_definition_renders_php_code_block() {
     );
     // Definition renders as a php fence (render prepends the <?php opener) and
     // sits between the detail line and any source link.
-    assert!(out.contains("```php\n<?php\npublic function account()"), "got: {out}");
+    assert!(
+        out.contains("```php\n<?php\npublic function account()"),
+        "got: {out}"
+    );
     assert!(out.contains("belongsTo(Account::class)"), "got: {out}");
 }
 
 #[test]
 fn magic_member_card_labels_each_kind() {
     let label = |k| {
-        magic_member_card(k, "x", "App\\Models\\User", Confidence::High, None, None, None)
-            .lines()
-            .next()
-            .unwrap()
-            .to_string()
+        magic_member_card(
+            k,
+            "x",
+            "App\\Models\\User",
+            Confidence::High,
+            None,
+            None,
+            None,
+        )
+        .lines()
+        .next()
+        .unwrap()
+        .to_string()
     };
     assert_eq!(label(MagicMemberKind::Scope), "**Eloquent scope**");
     assert_eq!(label(MagicMemberKind::Accessor), "**Eloquent accessor**");
@@ -335,7 +346,10 @@ fn extract_member_snippet_caps_long_bodies() {
     let body: String = (0..40).map(|i| format!("    line{i}\n")).collect();
     let src = format!("<?php\nclass X {{\n{body}}}\n");
     let snippet = extract_member_snippet(&src, 2, 41);
-    assert!(snippet.lines().count() <= 21, "should cap at MAX_LINES + marker");
+    assert!(
+        snippet.lines().count() <= 21,
+        "should cap at MAX_LINES + marker"
+    );
     assert!(snippet.ends_with("// …"));
 }
 

@@ -93,10 +93,7 @@ pub fn load(project_root: &Path) -> Option<Vec<(PathBuf, Vec<MagicMemberEntry>)>
 /// a temp-file rename so a crash mid-write leaves the previous cache intact.
 /// Returns the number of files written. Errors are advisory — failing to
 /// persist doesn't affect the in-memory index.
-pub fn save(
-    project_root: &Path,
-    entries: &[(PathBuf, Vec<MagicMemberEntry>)],
-) -> Result<usize> {
+pub fn save(project_root: &Path, entries: &[(PathBuf, Vec<MagicMemberEntry>)]) -> Result<usize> {
     let cache_path =
         cache_file_path(project_root).context("could not resolve cache directory for project")?;
     let total = entries.len();

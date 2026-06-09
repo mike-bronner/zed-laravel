@@ -216,7 +216,10 @@ pub fn magic_member_card(
 /// (`active` ← `scopeActive`, `full_name` ← `getFullNameAttribute` or the
 /// new-style `fullName(): Attribute`). Used to locate the declaration for the
 /// hover snippet.
-pub fn candidate_method_names(kind: crate::salsa_impl::MagicMemberKind, member: &str) -> Vec<String> {
+pub fn candidate_method_names(
+    kind: crate::salsa_impl::MagicMemberKind,
+    member: &str,
+) -> Vec<String> {
     use crate::salsa_impl::MagicMemberKind;
     let pascal = crate::naming::snake_to_pascal(member);
     match kind {

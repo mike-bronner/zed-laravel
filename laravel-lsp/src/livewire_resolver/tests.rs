@@ -353,7 +353,8 @@ fn reverse_v4_mfc_class_and_blade_both_resolve() {
         Some("counter")
     );
     assert_eq!(
-        livewire_name_for_path(&dir.join("counter.blade.php"), &cfg, LivewireVersion::V4).as_deref(),
+        livewire_name_for_path(&dir.join("counter.blade.php"), &cfg, LivewireVersion::V4)
+            .as_deref(),
         Some("counter")
     );
 }
@@ -364,7 +365,10 @@ fn reverse_v3_class_nested() {
     let root = tmp.path();
     let cfg = config_for(root);
     let path = root.join("app/Livewire/Admin/UserList.php");
-    write(&path, "<?php namespace App\\Livewire\\Admin; class UserList {}");
+    write(
+        &path,
+        "<?php namespace App\\Livewire\\Admin; class UserList {}",
+    );
 
     assert_eq!(
         livewire_name_for_path(&path, &cfg, LivewireVersion::V4).as_deref(),

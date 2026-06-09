@@ -359,7 +359,10 @@ fn references_at_returns_full_bucket_for_clicked_usage() {
     let model = PathBuf::from("/proj/app/Models/Post.php");
     let blade = PathBuf::from("/proj/resources/views/blog/index.blade.php");
     // One PHP self-reference + two Blade usages of Post#status.
-    idx.insert_magic_members(&model, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+    idx.insert_magic_members(
+        &model,
+        &[magic_at("App\\Models\\Post", "status", 65, 22, 28)],
+    );
     idx.insert_magic_members(
         &blade,
         &[
@@ -370,7 +373,11 @@ fn references_at_returns_full_bucket_for_clicked_usage() {
 
     // Click inside the member name in the Blade file (col 45 ∈ 43..49).
     let hits = idx.references_at(&blade, 78, 45);
-    assert_eq!(hits.len(), 3, "should return every reference, not just the click");
+    assert_eq!(
+        hits.len(),
+        3,
+        "should return every reference, not just the click"
+    );
     assert!(hits.iter().any(|l| l.file_path == model && l.line == 65));
     assert_eq!(hits.iter().filter(|l| l.file_path == blade).count(), 2);
 }
@@ -379,10 +386,21 @@ fn references_at_returns_full_bucket_for_clicked_usage() {
 fn references_at_matches_span_boundaries_and_misses_outside() {
     let mut idx = SymbolIndex::default();
     let blade = PathBuf::from("/proj/resources/views/x.blade.php");
-    idx.insert_magic_members(&blade, &[magic_at("App\\Models\\Post", "status", 10, 43, 49)]);
+    idx.insert_magic_members(
+        &blade,
+        &[magic_at("App\\Models\\Post", "status", 10, 43, 49)],
+    );
 
-    assert_eq!(idx.references_at(&blade, 10, 43).len(), 1, "start col inclusive");
-    assert_eq!(idx.references_at(&blade, 10, 49).len(), 1, "end col inclusive");
+    assert_eq!(
+        idx.references_at(&blade, 10, 43).len(),
+        1,
+        "start col inclusive"
+    );
+    assert_eq!(
+        idx.references_at(&blade, 10, 49).len(),
+        1,
+        "end col inclusive"
+    );
     assert!(idx.references_at(&blade, 10, 42).is_empty(), "before span");
     assert!(idx.references_at(&blade, 10, 50).is_empty(), "after span");
     assert!(idx.references_at(&blade, 11, 45).is_empty(), "wrong line");
@@ -427,7 +445,10 @@ fn remove_literal_entries_preserves_magic_members() {
     let path = PathBuf::from("/proj/app/Models/Post.php");
     // Literals (view + route) and a magic member, all from one file.
     idx.insert_file(&path, &fixture("welcome", "home"));
-    idx.insert_magic_members(&path, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+    idx.insert_magic_members(
+        &path,
+        &[magic_at("App\\Models\\Post", "status", 65, 22, 28)],
+    );
 
     idx.remove_literal_entries(&path);
 
@@ -439,7 +460,11 @@ fn remove_literal_entries_preserves_magic_members() {
         fqcn: "App\\Models\\Post".into(),
         member: "status".into(),
     });
-    assert_eq!(magic_hits.len(), 1, "magic member must survive a literal-only eviction");
+    assert_eq!(
+        magic_hits.len(),
+        1,
+        "magic member must survive a literal-only eviction"
+    );
     // And the position lookup still resolves (by_file retained the magic key).
     assert_eq!(idx.references_at(&path, 65, 24).len(), 1);
 }
@@ -449,13 +474,20 @@ fn remove_literal_entries_then_reinsert_has_no_duplicates() {
     let mut idx = SymbolIndex::default();
     let path = PathBuf::from("/proj/app/Models/Post.php");
     idx.insert_file(&path, &fixture("welcome", "home"));
-    idx.insert_magic_members(&path, &[magic_at("App\\Models\\Post", "status", 65, 22, 28)]);
+    idx.insert_magic_members(
+        &path,
+        &[magic_at("App\\Models\\Post", "status", 65, 22, 28)],
+    );
 
     // Simulate the dirty-drain: evict literals, re-parse, re-insert literals.
     idx.remove_literal_entries(&path);
     idx.insert_file(&path, &fixture("welcome", "home"));
 
-    assert_eq!(idx.find(&SymbolRefData::View("welcome".into())).len(), 1, "no literal dupes");
+    assert_eq!(
+        idx.find(&SymbolRefData::View("welcome".into())).len(),
+        1,
+        "no literal dupes"
+    );
     assert_eq!(
         idx.find(&SymbolRefData::MagicMember {
             fqcn: "App\\Models\\Post".into(),

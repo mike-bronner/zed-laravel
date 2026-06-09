@@ -202,7 +202,10 @@ fn enumerate_returns_all_keys_in_order_with_positions() {
         keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
         vec!["APP_NAME", "APP_ENV", "DB_HOST"]
     );
-    assert_eq!((keys[0].1.line, keys[0].1.start_column, keys[0].1.end_column), (0, 0, 8));
+    assert_eq!(
+        (keys[0].1.line, keys[0].1.start_column, keys[0].1.end_column),
+        (0, 0, 8)
+    );
     assert_eq!(keys[2].1.line, 2);
 }
 

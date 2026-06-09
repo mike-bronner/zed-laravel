@@ -299,12 +299,7 @@ impl SymbolIndex {
     /// A union-typed receiver (`$post` inferred as two classes) can produce two
     /// symbols at the same position; we return the union of their references,
     /// de-duplicated by `(file, line, column)`.
-    pub fn references_at(
-        &self,
-        path: &Path,
-        line: u32,
-        column: u32,
-    ) -> Vec<ReferenceLocationData> {
+    pub fn references_at(&self, path: &Path, line: u32, column: u32) -> Vec<ReferenceLocationData> {
         let Some(keys) = self.by_file.get(path) else {
             return Vec::new();
         };

@@ -6757,11 +6757,7 @@ impl SalsaActor {
             match self.class_hierarchy_index.get(&declaring_fqcn) {
                 Some(node) => {
                     let candidates = crate::hover::candidate_method_names(kind, &member_ref.member);
-                    if let Some(m) = node
-                        .methods
-                        .iter()
-                        .find(|m| candidates.iter().any(|c| *c == m.name))
-                    {
+                    if let Some(m) = node.methods.iter().find(|m| candidates.contains(&m.name)) {
                         (
                             Some(node.file_path.clone()),
                             Some(m.start_line),
@@ -6850,10 +6846,7 @@ impl SalsaActor {
         // candidate names — the same mapping the hover uses.
         let node = self.class_hierarchy_index.get(&resolved.declaring_fqcn)?;
         let candidates = crate::hover::candidate_method_names(resolved.kind, &member_ref.member);
-        let method = node
-            .methods
-            .iter()
-            .find(|m| candidates.iter().any(|c| *c == m.name))?;
+        let method = node.methods.iter().find(|m| candidates.contains(&m.name))?;
 
         Some(MagicMemberRenameData {
             fqcn: resolved.declaring_fqcn,

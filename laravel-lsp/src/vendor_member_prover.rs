@@ -137,9 +137,7 @@ fn node_reads_member(node: Node, bytes: &[u8], member: &str) -> bool {
             let Some(object) = node.child_by_field_name("object") else {
                 return false;
             };
-            if object.kind() != "variable_name"
-                || object.utf8_text(bytes).ok() != Some("$this")
-            {
+            if object.kind() != "variable_name" || object.utf8_text(bytes).ok() != Some("$this") {
                 return false;
             }
             node.child_by_field_name("name")

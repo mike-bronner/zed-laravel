@@ -152,7 +152,11 @@ use crate::route_name_locator::RouteNameDeclaration;
 fn decl(full_name: &str, line: u32, start: u32, end: u32) -> RouteNameDeclaration {
     RouteNameDeclaration {
         full_name: full_name.to_string(),
-        local_segment: full_name.rsplit('.').next().unwrap_or(full_name).to_string(),
+        local_segment: full_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(full_name)
+            .to_string(),
         line,
         start_column: start,
         end_column: end,
@@ -171,12 +175,18 @@ fn route_names(targets: &[CodeLensTarget]) -> Vec<&str> {
 
 #[test]
 fn route_lens_no_external_prefix_uses_bare_full_name() {
-    let decls = [decl("users.index", 10, 42, 53), decl("users.show", 11, 42, 52)];
+    let decls = [
+        decl("users.index", 10, 42, 53),
+        decl("users.show", 11, 42, 52),
+    ];
     let targets = route_lens_targets(&decls, &[]);
 
     assert_eq!(route_names(&targets), vec!["users.index", "users.show"]);
     // Anchors on the name string content, on the declaration line.
-    assert_eq!((targets[0].line, targets[0].column, targets[0].end_column), (10, 42, 53));
+    assert_eq!(
+        (targets[0].line, targets[0].column, targets[0].end_column),
+        (10, 42, 53)
+    );
 }
 
 #[test]
@@ -195,7 +205,9 @@ fn route_lens_emits_one_target_per_external_prefix() {
     let targets = route_lens_targets(&decls, &["admin.".to_string(), "staff.".to_string()]);
 
     assert_eq!(route_names(&targets), vec!["admin.index", "staff.index"]);
-    assert!(targets.iter().all(|t| t.line == 5 && t.column == 20 && t.end_column == 25));
+    assert!(targets
+        .iter()
+        .all(|t| t.line == 5 && t.column == 20 && t.end_column == 25));
 }
 
 #[test]
@@ -221,7 +233,10 @@ fn env_lens_targets_one_per_key_with_positions() {
     let targets = env_lens_targets(src);
     assert_eq!(env_keys(&targets), vec!["APP_NAME", "DB_HOST"]);
     // Anchors on the key text.
-    assert_eq!((targets[0].line, targets[0].column, targets[0].end_column), (1, 0, 8));
+    assert_eq!(
+        (targets[0].line, targets[0].column, targets[0].end_column),
+        (1, 0, 8)
+    );
 }
 
 #[test]
@@ -282,7 +297,10 @@ return [
 ];
 "#;
     let targets = translation_lens_targets("auth", src);
-    assert_eq!(translation_keys(&targets), vec!["auth.failed", "auth.throttle"]);
+    assert_eq!(
+        translation_keys(&targets),
+        vec!["auth.failed", "auth.throttle"]
+    );
     assert_eq!((targets[0].line, targets[0].column > 0), (2, true));
 }
 

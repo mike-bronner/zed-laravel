@@ -104,14 +104,22 @@ fn unread_property_in_chain_is_not_proven() {
             "<?php\nnamespace Acme\\Base;\nclass Thing { public function check() { return $this->flag; } }\n",
         ),
     ]);
-    assert!(!member_read_in_chain(&root, "App\\Models\\Widget", "orphan"));
+    assert!(!member_read_in_chain(
+        &root,
+        "App\\Models\\Widget",
+        "orphan"
+    ));
 }
 
 #[test]
 fn synthetic_component_key_returns_false_without_io() {
     // A `volt::<path>` key doesn't name a class — must short-circuit, not walk.
     let root = PathBuf::from("/nonexistent-root-should-not-be-touched");
-    assert!(!member_read_in_chain(&root, "volt::/proj/resources/views/x.php", "count"));
+    assert!(!member_read_in_chain(
+        &root,
+        "volt::/proj/resources/views/x.php",
+        "count"
+    ));
 }
 
 #[test]

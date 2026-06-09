@@ -31,6 +31,25 @@ lazy_static! {
     static ref LOAD_TRANSLATIONS_RE: Regex = Regex::new(
         r#"\$this->loadTranslationsFrom\s*\(\s*__DIR__\s*\.\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
     ).unwrap();
+
+    /// Matches a fluent package-builder name declaration: `->name('package')`.
+    /// Builder-convention providers (e.g. Filament via laravel-package-tools)
+    /// never call `loadTranslationsFrom` with literal arguments — the real call
+    /// runs in a base class as
+    /// `$this->loadTranslationsFrom($computedDir, $this->package->shortName())`.
+    /// This pair of patterns reconstructs that registration form, the same way
+    /// the view-namespace discovery in [`crate::salsa_impl`] does for
+    /// `->hasViews()`.
+    static ref BUILDER_NAME_RE: Regex = Regex::new(
+        r#"->name\s*\(\s*['"]([^'"]+)['"]\s*\)"#
+    ).unwrap();
+
+    /// Matches the builder translation capability: `->hasTranslations()`.
+    /// Unlike `->hasViews('ns')` there is no explicit-namespace argument —
+    /// the namespace is always the package short-name.
+    static ref BUILDER_HAS_TRANSLATIONS_RE: Regex = Regex::new(
+        r#"->hasTranslations\s*\(\s*\)"#
+    ).unwrap();
 }
 
 /// Walk `vendor/` for service providers that register translation namespaces.
@@ -75,11 +94,12 @@ pub fn scan_vendor_translation_namespaces(root: &Path) -> HashMap<String, PathBu
         let Ok(source) = fs::read_to_string(path) else {
             continue;
         };
-        if !source.contains("loadTranslationsFrom") {
+        if !source.contains("loadTranslationsFrom") && !source.contains("hasTranslations") {
             continue;
         }
 
         extract_translations_from(&source, path, &mut namespaces);
+        extract_builder_translations_from(&source, path, &mut namespaces);
     }
 
     namespaces
@@ -120,6 +140,40 @@ fn extract_translations_from(
             .entry(ns.as_str().to_string())
             .or_insert(resolved);
     }
+}
+
+/// Reconstruct the fluent package-builder translation registration:
+/// `$package->name('filament-tables')->hasTranslations()`. The builder's base
+/// class registers `loadTranslationsFrom(<pkg>/resources/lang, shortName())`
+/// at runtime — both arguments computed, invisible to [`LOAD_TRANSLATIONS_RE`].
+/// The namespace is the package short-name (leading `laravel-` stripped) and
+/// the directory follows the builder's `basePath('/../resources/lang')`
+/// convention: one level up from the provider's `src/` dir.
+fn extract_builder_translations_from(
+    source: &str,
+    provider_path: &Path,
+    namespaces: &mut HashMap<String, PathBuf>,
+) {
+    if !BUILDER_HAS_TRANSLATIONS_RE.is_match(source) {
+        return;
+    }
+    let Some(name_cap) = BUILDER_NAME_RE.captures(source) else {
+        return;
+    };
+    let Some(package_name) = name_cap.get(1) else {
+        return;
+    };
+    let namespace = crate::salsa_impl::builder_short_name(package_name.as_str());
+    if namespace.is_empty() {
+        return;
+    }
+
+    let Some(provider_dir) = provider_path.parent() else {
+        return;
+    };
+    let lang_dir = provider_dir.join("../resources/lang");
+    let resolved = lang_dir.canonicalize().unwrap_or(lang_dir);
+    namespaces.entry(namespace).or_insert(resolved);
 }
 
 #[cfg(test)]

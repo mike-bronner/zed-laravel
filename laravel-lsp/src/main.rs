@@ -12574,9 +12574,46 @@ return [
 
     /// Check if a translation file exists for the given key
     ///
-    /// Dotted keys like "validation.required" look in lang/en/validation.php
-    /// Text keys like "Welcome to our app" look in lang/en.json
-    fn check_translation_file(root: &Path, translation_key: &str) -> TranslationCheck {
+    /// Dotted keys like "validation.required" look in lang/en/validation.php.
+    /// Text keys like "Welcome to our app" look in lang/en.json.
+    /// Namespaced keys like "filament-tables::table.label" resolve through
+    /// [`laravel_lsp::translation_lookup`] — published `lang/vendor/<ns>/`
+    /// first, then the package's own lang dir via `vendor_map` (see
+    /// [`laravel_lsp::vendor_translations`]) — the same machinery hover uses,
+    /// so the diagnostic and hover can't disagree.
+    fn check_translation_file(
+        root: &Path,
+        translation_key: &str,
+        vendor_map: Option<&HashMap<String, PathBuf>>,
+    ) -> TranslationCheck {
+        if let Some((namespace, rest)) = translation_key.split_once("::") {
+            let file_segment = rest.split('.').next().unwrap_or(rest);
+            let nested_key = rest.split_once('.').map(|(_, k)| k.to_string());
+
+            let exists = laravel_lsp::translation_lookup::resolve_translation_detailed(
+                root,
+                translation_key,
+                "en",
+                vendor_map,
+            )
+            .is_some();
+
+            // Expected location for the diagnostic message: the package's real
+            // lang dir when the vendor scan knows it, else the published path.
+            let lang_dir = vendor_map
+                .and_then(|m| m.get(namespace).cloned())
+                .unwrap_or_else(|| root.join("lang/vendor").join(namespace));
+            let expected = lang_dir.join("en").join(format!("{file_segment}.php"));
+
+            return TranslationCheck {
+                exists,
+                is_dotted_key: true,
+                file_exists: expected.exists(),
+                expected_path: Some(expected),
+                nested_key,
+            };
+        }
+
         let is_dotted_key = translation_key.contains('.') && !translation_key.contains(' ');
         let is_multi_word = translation_key.contains(' ');
 
@@ -15163,8 +15200,10 @@ return [
             // Check translation calls using Salsa patterns - warn about missing translation files
             let root_guard = self.root_path.read().await;
             if let Some(root) = root_guard.as_ref() {
+                let vendor_map = self.vendor_translation_namespaces_for(root).await;
                 for trans_ref in &patterns.translation_refs {
-                    let check = Self::check_translation_file(root, &trans_ref.key);
+                    let check =
+                        Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
                     if !check.exists {
                         diagnostics.push(Self::create_translation_diagnostic(
                             &trans_ref.key,
@@ -15483,8 +15522,10 @@ return [
         // Check translation calls in Blade files (includes {{ __() }} syntax)
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
+            let vendor_map = self.vendor_translation_namespaces_for(root).await;
             for trans_ref in &patterns.translation_refs {
-                let check = Self::check_translation_file(root, &trans_ref.key);
+                let check =
+                    Self::check_translation_file(root, &trans_ref.key, vendor_map.as_deref());
                 if !check.exists {
                     diagnostics.push(Self::create_translation_diagnostic(
                         &trans_ref.key,
@@ -15648,13 +15689,18 @@ return [
         // Check @lang directives for translation files using Salsa patterns
         let root_guard = self.root_path.read().await;
         if let Some(root) = root_guard.as_ref() {
+            let vendor_map = self.vendor_translation_namespaces_for(root).await;
             for dir_ref in &patterns.directives {
                 // Only validate @lang directives
                 if dir_ref.name == "lang" {
                     if let Some(ref args) = dir_ref.arguments {
                         if let Some(translation_key) = Self::extract_view_from_directive_args(args)
                         {
-                            let check = Self::check_translation_file(root, &translation_key);
+                            let check = Self::check_translation_file(
+                                root,
+                                &translation_key,
+                                vendor_map.as_deref(),
+                            );
                             if !check.exists {
                                 diagnostics.push(Self::create_translation_diagnostic(
                                     &translation_key,

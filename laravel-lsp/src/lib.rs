@@ -75,6 +75,10 @@ pub mod symbol_index;
 // Project-wide class-hierarchy + member index (structural code lenses)
 pub mod class_hierarchy_index;
 
+// Prove a member is read across the inheritance chain (incl. vendor) — used to
+// avoid flagging framework-read config properties (e.g. $timestamps) as unused
+pub mod vendor_member_prover;
+
 // Magic-member resolve + classify engine (find-references / lens / hover)
 pub mod member_resolver;
 

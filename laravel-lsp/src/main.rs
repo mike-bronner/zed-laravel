@@ -261,6 +261,17 @@ struct ValidationRuleInfo {
     source: String,
 }
 
+/// One code-lens item: where the lens sits and the symbol(s) whose references
+/// it counts. Position lenses (magic members, routes, env, config, translation)
+/// carry a single symbol; the compound file-level lens carries the file's
+/// view/component/livewire identities. Shared by the `code_lens` handler (which
+/// renders the reference-count lens) and the unused-symbol diagnostic (which
+/// flags items with zero non-test references).
+struct LensItem {
+    range: Range,
+    symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData>,
+}
+
 /// Context for validation rule parameter completion (e.g., "exists:█" or "after:█")
 struct ValidationParamContext {
     /// The rule name (e.g., "exists", "after", "dimensions")
@@ -1883,6 +1894,11 @@ struct LaravelLanguageServer {
     /// `None` disables them; defaults to `WARNING`. Set via the
     /// `diagnostics.severity` LSP setting.
     chain_diagnostic_severity: Arc<RwLock<Option<DiagnosticSeverity>>>,
+    /// Master opt-in for the code-lens feature (#59): reference-count lenses AND
+    /// the unused-symbol diagnostic. Default `false` — the feature is still
+    /// maturing, so users opt in via `codeLens.enabled`. Gates both surfaces so
+    /// nothing from #59 appears unless explicitly enabled.
+    code_lens_enabled: Arc<RwLock<bool>>,
     /// Whether we've shown the vendor missing diagnostic this session
     vendor_diagnostic_shown: Arc<RwLock<bool>>,
     /// Cached validation rule names (parsed from Laravel framework at startup)
@@ -1900,6 +1916,12 @@ struct LaravelLanguageServer {
     /// Populated at init by walking routes/, vendor/*/routes/, and content-matched
     /// vendor PHP files. Replaces the legacy hard-coded route-file scan.
     route_index: Arc<RwLock<Option<RouteIndex>>>,
+
+    /// `true` once first-load warming has built the reference indexes. The
+    /// unused-symbol diagnostic gates on this — running it mid-warm (empty
+    /// index) would flag every lensed symbol with a false "no references"
+    /// warning, flooding the Problems panel.
+    warm_complete: Arc<std::sync::atomic::AtomicBool>,
 
     /// Project-wide index of column/table definitions parsed from
     /// `database/migrations/*.php`. Powers goto-definition on chain literals
@@ -2006,6 +2028,21 @@ fn default_auto_complete_debounce() -> u64 {
     DEFAULT_SALSA_DEBOUNCE_MS
 }
 
+/// Code-lens feature settings (#59). Configured via:
+/// `{ "lsp": { "laravel-lsp": { "settings": { "codeLens": { "enabled": true } } } } }`
+///
+/// A single master switch covering both the reference-count lenses and the
+/// unused-symbol diagnostic. Default `false` (opt-in) while the feature matures.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CodeLensSettings {
+    /// Turn on reference-count lenses + the unused-symbol diagnostic. Note this
+    /// is *in addition* to Zed's global `"code_lens": "on"`, which controls
+    /// whether the editor requests lenses at all.
+    #[serde(default)]
+    enabled: bool,
+}
+
 /// LSP settings object from Zed
 /// Configured via: { "lsp": { "laravel-lsp": { "settings": { ... } } } }
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -2020,6 +2057,8 @@ struct LspSettings {
     blade: BladeSettings,
     #[serde(default)]
     diagnostics: DiagnosticsSettings,
+    #[serde(default)]
+    code_lens: CodeLensSettings,
 }
 
 // ============================================================================
@@ -3814,12 +3853,14 @@ impl LaravelLanguageServer {
             auto_complete_debounce_ms: Arc::new(RwLock::new(DEFAULT_SALSA_DEBOUNCE_MS)),
             directive_spacing: Arc::new(RwLock::new(false)),
             chain_diagnostic_severity: Arc::new(RwLock::new(Some(DiagnosticSeverity::WARNING))),
+            code_lens_enabled: Arc::new(RwLock::new(false)),
             vendor_diagnostic_shown: Arc::new(RwLock::new(false)),
             cached_validation_rule_names: Arc::new(RwLock::new(Vec::new())),
             cached_directive_names: Arc::new(RwLock::new(None)),
             database_schema: Arc::new(RwLock::new(None)),
             database_diagnostic_shown: Arc::new(RwLock::new(false)),
             route_index: Arc::new(RwLock::new(None)),
+            warm_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_index: Arc::new(RwLock::new(None)),
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -3863,6 +3904,73 @@ impl LaravelLanguageServer {
             );
             *self.chain_diagnostic_severity.write().await = new_severity;
         }
+
+        // Code-lens feature master switch (lenses + unused diagnostic, #59)
+        let new_code_lens = settings.code_lens.enabled;
+        let old_code_lens = *self.code_lens_enabled.read().await;
+        if new_code_lens != old_code_lens {
+            info!(
+                "⚙️  Updating code-lens feature: {} → {}",
+                old_code_lens, new_code_lens
+            );
+            *self.code_lens_enabled.write().await = new_code_lens;
+        }
+    }
+
+    /// Pull `lsp.laravel-lsp.settings` from the client via
+    /// `workspace/configuration` and apply it. Zed (and most editors) deliver
+    /// per-server `settings` through this PULL request — the
+    /// `didChangeConfiguration` push arrives as an empty `{}`, so relying on it
+    /// alone silently kept every setting at its default. We request the whole
+    /// settings object (`section: None`) and, as a fallback for editors that
+    /// namespace by server id, also `section: "laravel-lsp"`. The first
+    /// non-empty, parseable response wins; empties are skipped so we never reset
+    /// live settings to defaults.
+    async fn pull_and_apply_settings(&self) {
+        let items = vec![
+            ConfigurationItem {
+                scope_uri: None,
+                section: None,
+            },
+            ConfigurationItem {
+                scope_uri: None,
+                section: Some("laravel-lsp".to_string()),
+            },
+        ];
+        let values = match self.client.configuration(items).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("⚠️  workspace/configuration request failed: {e}");
+                return;
+            }
+        };
+        debug!(
+            "📥 workspace/configuration returned {} item(s): {:?}",
+            values.len(),
+            values
+        );
+        for value in values {
+            // Null or `{}` would reset everything to defaults — skip them.
+            if value.is_null() || value.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                continue;
+            }
+            match serde_json::from_value::<LspSettings>(value.clone()) {
+                Ok(settings) => {
+                    info!(
+                        "⚙️  Pulled settings: codeLens.enabled={}, blade.directiveSpacing={}, autoCompleteDebounce={}ms",
+                        settings.code_lens.enabled,
+                        settings.blade.directive_spacing,
+                        settings.auto_complete_debounce
+                    );
+                    self.update_settings(&settings).await;
+                    return;
+                }
+                Err(e) => {
+                    warn!("⚠️  Could not parse pulled configuration: {e} (value: {value:?})")
+                }
+            }
+        }
+        info!("⚙️  workspace/configuration carried no usable settings (kept current values)");
     }
 
     /// The set of Blade directive names to highlight — standard directives plus
@@ -4097,6 +4205,7 @@ impl LaravelLanguageServer {
         // Cloned for the post-warm `code_lens_refresh` (re-request lenses that
         // resolved against an empty index during warming).
         let client_for_warm = self.client.clone();
+        let warm_complete_for_warm = self.warm_complete.clone();
         let root_for_save = root_path.to_path_buf();
         // View roots for the warm Blade view-variable resolution (file →
         // view-name mapping). Cloned here because `view_paths` was moved into
@@ -4416,6 +4525,10 @@ impl LaravelLanguageServer {
             // refreshes them — but files opened after warm resolve correctly,
             // and the disk cache keeps warm short.
             let _ = client_for_warm.code_lens_refresh().await;
+            // Reference indexes are ready — the unused-symbol diagnostic may now
+            // run (it's suppressed mid-warm to avoid flagging everything while
+            // the index is empty). It surfaces on the next open/edit of a file.
+            warm_complete_for_warm.store(true, std::sync::atomic::Ordering::Relaxed);
 
             let elapsed = started_at.elapsed();
             info!(
@@ -14233,12 +14346,14 @@ return [
             auto_complete_debounce_ms: self.auto_complete_debounce_ms.clone(),
             directive_spacing: self.directive_spacing.clone(),
             chain_diagnostic_severity: self.chain_diagnostic_severity.clone(),
+            code_lens_enabled: self.code_lens_enabled.clone(),
             vendor_diagnostic_shown: self.vendor_diagnostic_shown.clone(),
             cached_validation_rule_names: self.cached_validation_rule_names.clone(),
             cached_directive_names: self.cached_directive_names.clone(),
             database_schema: self.database_schema.clone(),
             database_diagnostic_shown: self.database_diagnostic_shown.clone(),
             route_index: self.route_index.clone(),
+            warm_complete: self.warm_complete.clone(),
             migration_index: self.migration_index.clone(),
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
@@ -15170,6 +15285,11 @@ return [
                 ));
             }
 
+            // Unused-symbol diagnostics (#59): lensed symbols (model magic
+            // members, routes, config/translation keys, …) with zero non-test
+            // references.
+            diagnostics.extend(self.unused_symbol_diagnostics(&file_path, source).await);
+
             // Store and publish diagnostics for PHP files
             self.diagnostics
                 .write()
@@ -15513,6 +15633,10 @@ return [
                 &patterns.route_refs,
             ));
         }
+
+        // Unused-symbol diagnostics (#59): Blade-addressed symbols (views,
+        // components, Livewire) with zero non-test references.
+        diagnostics.extend(self.unused_symbol_diagnostics(&file_path, source).await);
 
         self.diagnostics
             .write()
@@ -16739,6 +16863,237 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
     }
 }
 
+
+impl LaravelLanguageServer {
+    /// Collect every code-lens item for a file — each a `(range, symbols)` pair.
+    /// Position lenses (magic members, routes, env, config, translation) carry
+    /// one symbol; the compound file-level lens carries the file's
+    /// view/component/livewire identities. Shared by `code_lens` (renders the
+    /// count) and `unused_symbol_diagnostics` (flags zero-reference items).
+    async fn collect_lens_items(&self, path: &Path, source: &str) -> Vec<LensItem> {
+        use laravel_lsp::salsa_impl::SymbolRefData;
+
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+        let is_env = file_name == ".env" || file_name.starts_with(".env.");
+        let root = self.root_path.read().await.clone();
+        // A `config/<file>.php` (direct child of the project's config dir).
+        let is_config = file_name.ends_with(".php")
+            && root
+                .as_ref()
+                .is_some_and(|r| path.parent() == Some(r.join("config").as_path()));
+        // A `lang/<locale>/<file>.php` (or legacy `resources/lang/<locale>/…`).
+        let is_translation = file_name.ends_with(".php")
+            && root.as_ref().is_some_and(|r| {
+                path.parent()
+                    .and_then(|locale| locale.parent())
+                    .is_some_and(|lang| {
+                        lang == r.join("lang") || lang == r.join("resources").join("lang")
+                    })
+            });
+
+        // Position (single-symbol) lenses by file type.
+        let position_targets = if is_env {
+            laravel_lsp::code_lens::env_lens_targets(source)
+        } else if is_config {
+            laravel_lsp::code_lens::config_lens_targets(file_stem, source)
+        } else if is_translation {
+            laravel_lsp::code_lens::translation_lens_targets(file_stem, source)
+        } else {
+            let mut targets = laravel_lsp::code_lens::code_lens_targets(path, source);
+            // Route-name declarations in an open routes file: declarations come
+            // from the live buffer, external-load prefixes (#43) from the cached
+            // warm-built route index (no per-request route-file re-parsing).
+            let guard = self.route_index.read().await;
+            if let Some(index) = guard.as_ref() {
+                if index
+                    .source_files
+                    .contains(&laravel_lsp::route_discovery::normalize_path(path))
+                {
+                    let decls =
+                        laravel_lsp::route_name_locator::extract_route_name_declarations(source);
+                    if !decls.is_empty() {
+                        let ext = index.external_prefixes_for(path);
+                        targets
+                            .extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
+                    }
+                }
+            }
+            drop(guard);
+            targets
+        };
+
+        let mut items: Vec<LensItem> = position_targets
+            .into_iter()
+            .map(|t| LensItem {
+                range: Range {
+                    start: Position {
+                        line: t.line,
+                        character: t.column,
+                    },
+                    end: Position {
+                        line: t.line,
+                        character: t.end_column,
+                    },
+                },
+                symbols: vec![t.symbol],
+            })
+            .collect();
+
+        // Compound file-level item: ONE lens whose count is the SUM across every
+        // identity the file is referenced under — Livewire (`<livewire:…>`),
+        // component (`<x-…>`), and view (`view()` / `@include`). A file can have
+        // several (a component blade is also a view; a Livewire companion view
+        // is also a view). Skipped for env/config/translation files.
+        if !is_env && !is_config && !is_translation && file_name.ends_with(".php") {
+            let mut file_symbols: Vec<SymbolRefData> = Vec::new();
+            if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
+                if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
+                    path, &lw_config, lw_version,
+                ) {
+                    file_symbols.push(SymbolRefData::Livewire(name));
+                }
+            }
+            if file_name.ends_with(".blade.php") {
+                if let Some(config) = self.get_cached_config().await {
+                    file_symbols.extend(laravel_lsp::code_lens::file_level_symbols(path, &config));
+                }
+            }
+            if !file_symbols.is_empty() {
+                items.push(LensItem {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    symbols: file_symbols,
+                });
+            }
+        }
+        items
+    }
+
+    /// Diagnostics for lensed symbols with zero NON-test references — the
+    /// "unused / referenced-only-in-tests" warnings (#59). Reuses the same
+    /// item collection as the code lenses, so coverage matches exactly.
+    ///
+    /// Gated on warm completion: running mid-warm (empty index) would flag
+    /// every symbol with a false "no references" warning. A reference whose
+    /// file lives under `<root>/tests` is counted as a test reference. Worded
+    /// factually (not "dead code") and WARNING-level, because a zero count can
+    /// also mean dynamic / by-convention usage we can't see statically (a
+    /// URL-hit route, `config()`-read env, `$model->$dynamic` access).
+    async fn unused_symbol_diagnostics(&self, path: &Path, source: &str) -> Vec<Diagnostic> {
+        // Opt-in (#59): suppressed unless the user enables `codeLens.enabled`.
+        if !*self.code_lens_enabled.read().await {
+            return Vec::new();
+        }
+        if !self
+            .warm_complete
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let Some(root) = self.root_path.read().await.clone() else {
+            return Vec::new();
+        };
+        let tests_dir = root.join("tests");
+        let first_line_len = source
+            .lines()
+            .next()
+            .map(|l| l.chars().count() as u32)
+            .unwrap_or(0);
+
+        let mut out = Vec::new();
+        for item in self.collect_lens_items(path, source).await {
+            let mut non_test = 0usize;
+            let mut test = 0usize;
+            for symbol in &item.symbols {
+                for loc in self
+                    .salsa
+                    .find_references(symbol.clone(), false)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if loc.file_path.starts_with(&tests_dir) {
+                        test += 1;
+                    } else {
+                        non_test += 1;
+                    }
+                }
+            }
+            if non_test > 0 {
+                continue;
+            }
+            // A member with zero project references may still be read by the
+            // framework through inheritance — a model's `$timestamps` is read by
+            // `HasTimestamps`, never by app code. Prove that across the chain
+            // (parents + traits, including vendor) before flagging it. Runs only
+            // for the already-zero-reference case (a handful of members per
+            // file) and off the async worker, since the walk does FS IO +
+            // parsing.
+            if self.any_member_framework_read(&root, &item.symbols).await {
+                continue;
+            }
+            let message = if test > 0 {
+                "Referenced only in tests — possibly dead code?".to_string()
+            } else {
+                "No references found — possibly dead code?".to_string()
+            };
+            // Widen a zero-width (file-level) range to the first line so the
+            // squiggle is visible.
+            let mut range = item.range;
+            if range.start == range.end {
+                range.end = Position {
+                    line: range.start.line,
+                    character: first_line_len.max(1),
+                };
+            }
+            out.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("laravel-lsp".to_string()),
+                message,
+                ..Default::default()
+            });
+        }
+        out
+    }
+
+    /// Whether any `MagicMember` in `symbols` is read across its inheritance
+    /// chain (parents + traits, including vendor) — i.e. framework-read rather
+    /// than dead. Spares configuration properties like a model's `$timestamps`
+    /// from the unused-symbol warning. Each check runs on a blocking thread so
+    /// the filesystem IO + parsing never stalls the async worker or other
+    /// in-flight requests.
+    async fn any_member_framework_read(
+        &self,
+        root: &Path,
+        symbols: &[laravel_lsp::salsa_impl::SymbolRefData],
+    ) -> bool {
+        for symbol in symbols {
+            if let laravel_lsp::salsa_impl::SymbolRefData::MagicMember { fqcn, member } = symbol {
+                let root = root.to_path_buf();
+                let fqcn = fqcn.clone();
+                let member = member.clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    laravel_lsp::vendor_member_prover::member_read_in_chain(&root, &fqcn, &member)
+                })
+                .await
+                .unwrap_or(false);
+                if read {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
@@ -16750,14 +17105,16 @@ impl LanguageServer for LaravelLanguageServer {
         if let Some(init_options) = params.initialization_options {
             match serde_json::from_value::<LspSettings>(init_options) {
                 Ok(settings) => {
-                    info!("⚙️  Initial settings: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
-                        settings.auto_complete_debounce, settings.blade.directive_spacing);
+                    info!("⚙️  Initial settings: autoCompleteDebounce={}ms, blade.directiveSpacing={}, codeLens.enabled={}",
+                        settings.auto_complete_debounce, settings.blade.directive_spacing, settings.code_lens.enabled);
                     self.update_settings(&settings).await;
                 }
                 Err(e) => {
-                    debug!("Could not parse initialization_options: {}", e);
+                    warn!("⚠️  Could not parse initialization_options: {}", e);
                 }
             }
+        } else {
+            info!("⚙️  No initialization_options sent (laravel-lsp config lives under `settings` → expect workspace/didChangeConfiguration instead)");
         }
 
         // Store the root path - lightweight operation
@@ -16847,11 +17204,14 @@ impl LanguageServer for LaravelLanguageServer {
                 // pattern kind are returned.
                 references_provider: Some(OneOf::Left(true)),
 
-                // ✅ Code lens — reference-count indicators (#59). Lenses appear
-                // when the user sets `"code_lens": "on"`. Covers the Laravel
-                // symbols we index accurately: magic members, component members,
-                // and literal references (routes/views/…) — what a generic PHP
-                // LSP can't.
+                // ✅ Code lens — reference-count indicators (#59). Opt-in while
+                // the feature matures: the capability is always advertised, but
+                // the handler returns nothing unless the user enables our
+                // `codeLens.enabled` setting (which also gates the unused-symbol
+                // diagnostic). Lenses additionally require Zed's global
+                // `"code_lens": "on"`. Covers the Laravel symbols we index
+                // accurately: magic members, component members, and literal
+                // references (routes/views/…) — what a generic PHP LSP can't.
                 //
                 // A lens resolved while first-load warming is still in progress
                 // shows an honest "indexing references…" placeholder instead of
@@ -16938,6 +17298,12 @@ impl LanguageServer for LaravelLanguageServer {
         info!("========================================");
         info!("🚀 Laravel ({}) initialized", env!("LARAVEL_LSP_GIT_HASH"));
         info!("========================================");
+
+        // Pull `lsp.laravel-lsp.settings` now — Zed delivers per-server settings
+        // via the workspace/configuration PULL, not the didChangeConfiguration
+        // push (which arrives as `{}`). Without this, `codeLens.enabled` and
+        // every other setting stayed at its default.
+        self.pull_and_apply_settings().await;
 
         // Get root path
         let root = match self.root_path.read().await.clone() {
@@ -17090,6 +17456,15 @@ impl LanguageServer for LaravelLanguageServer {
     /// properties). Counts are deferred to `code_lens_resolve` to keep this
     /// response cheap; each lens carries its index key in `data`.
     async fn code_lens(&self, params: CodeLensParams) -> jsonrpc::Result<Option<Vec<CodeLens>>> {
+        // Opt-in (#59): no lenses unless the user enables `codeLens.enabled`.
+        let enabled = *self.code_lens_enabled.read().await;
+        debug!(
+            "🔎 code_lens requested for {} (codeLens.enabled={})",
+            params.text_document.uri, enabled
+        );
+        if !enabled {
+            return Ok(Some(Vec::new()));
+        }
         let uri = params.text_document.uri;
         let Ok(path) = uri.to_file_path() else {
             return Ok(None);
@@ -17103,136 +17478,22 @@ impl LanguageServer for LaravelLanguageServer {
             },
         };
 
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let file_stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-        let is_env = file_name == ".env" || file_name.starts_with(".env.");
-        let root = self.root_path.read().await.clone();
-        // A `config/<file>.php` (direct child of the project's config dir).
-        let is_config = file_name.ends_with(".php")
-            && root
-                .as_ref()
-                .is_some_and(|r| path.parent() == Some(r.join("config").as_path()));
-        // A `lang/<locale>/<file>.php` (or legacy `resources/lang/<locale>/…`).
-        let is_translation = file_name.ends_with(".php")
-            && root.as_ref().is_some_and(|r| {
-                path.parent()
-                    .and_then(|locale| locale.parent())
-                    .is_some_and(|lang| {
-                        lang == r.join("lang") || lang == r.join("resources").join("lang")
-                    })
-            });
-
-        let targets = if is_env {
-            // Env-var lenses: each `KEY=` in an open `.env*` file counts
-            // `env('KEY')` usages. (`.env` is the only non-PHP file type we
-            // lens; Zed routes it to our LSP as Shell Script.)
-            laravel_lsp::code_lens::env_lens_targets(&source)
-        } else if is_config {
-            // Config-key lenses: each key in `config/<stem>.php` counts
-            // `config('<stem>.<dotted-key>')` usages.
-            laravel_lsp::code_lens::config_lens_targets(file_stem, &source)
-        } else if is_translation {
-            // Translation-key lenses: each key in `lang/<locale>/<stem>.php`
-            // counts `__()` / `trans('<stem>.<dotted-key>')` usages. JSON lang
-            // files are not yet covered (PHP-array walker only).
-            laravel_lsp::code_lens::translation_lens_targets(file_stem, &source)
-        } else {
-            let mut targets = laravel_lsp::code_lens::code_lens_targets(&path, &source);
-
-            // Literal-symbol lenses: route-name declarations in an open routes
-            // file. Each `->name('x')` gets a lens counting `route('x')` usages.
-            // Declarations come from the live buffer (accurate mid-edit); the
-            // fully-qualified name's external-load prefixes (#43) come from the
-            // map cached on the warm-built route index — so this stays O(decls)
-            // with no per-request route-file re-parsing.
-            let guard = self.route_index.read().await;
-            if let Some(index) = guard.as_ref() {
-                if index
-                    .source_files
-                    .contains(&laravel_lsp::route_discovery::normalize_path(&path))
-                {
-                    let decls =
-                        laravel_lsp::route_name_locator::extract_route_name_declarations(&source);
-                    if !decls.is_empty() {
-                        let ext = index.external_prefixes_for(&path);
-                        targets
-                            .extend(laravel_lsp::code_lens::route_lens_targets(&decls, &ext));
-                    }
-                }
-            }
-            drop(guard);
-            targets
-        };
-
-        let mut lenses: Vec<CodeLens> = targets
+        let lenses = self
+            .collect_lens_items(&path, &source)
+            .await
             .into_iter()
-            .map(|t| CodeLens {
-                range: Range {
-                    start: Position {
-                        line: t.line,
-                        character: t.column,
-                    },
-                    end: Position {
-                        line: t.line,
-                        character: t.end_column,
-                    },
-                },
+            .map(|item| CodeLens {
+                range: item.range,
                 command: None,
-                // Carry the symbol key + the document URI so `resolve` can both
-                // count and build the `showReferences` command (resolve doesn't
-                // receive the document URI otherwise).
+                // `symbols` (a list) + the document URI so `resolve` can sum
+                // references across them and build the `showReferences` command
+                // (resolve doesn't receive the document URI otherwise).
                 data: Some(serde_json::json!({
-                    "symbol": &t.symbol,
+                    "symbols": item.symbols,
                     "uri": uri.as_str(),
                 })),
             })
             .collect();
-
-        // Compound file-level lens (Phase 4 / 4b): ONE top-of-file lens whose
-        // count is the SUM across every identity the file is referenced under —
-        // Livewire (`<livewire:…>`), component (`<x-…>`), and view (`view()` /
-        // `@include`). A file can have several (a component blade is also a
-        // view; a Livewire companion view is also a view), so we collect them
-        // all and `resolve` combines their reference sites. Skipped for
-        // env/config/translation files (handled above).
-        if !is_env && !is_config && !is_translation && file_name.ends_with(".php") {
-            let mut file_symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = Vec::new();
-            if let Some((lw_config, lw_version)) = self.get_cached_livewire().await {
-                if let Some(name) = laravel_lsp::livewire_resolver::livewire_name_for_path(
-                    &path, &lw_config, lw_version,
-                ) {
-                    file_symbols.push(laravel_lsp::salsa_impl::SymbolRefData::Livewire(name));
-                }
-            }
-            if file_name.ends_with(".blade.php") {
-                if let Some(config) = self.get_cached_config().await {
-                    file_symbols
-                        .extend(laravel_lsp::code_lens::file_level_symbols(&path, &config));
-                }
-            }
-            if !file_symbols.is_empty() {
-                lenses.push(CodeLens {
-                    range: Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                    },
-                    command: None,
-                    // `symbols` (plural) — `resolve` sums references across all
-                    // of them. Single-symbol lenses above use `symbol`.
-                    data: Some(serde_json::json!({
-                        "symbols": &file_symbols,
-                        "uri": uri.as_str(),
-                    })),
-                });
-            }
-        }
-
         Ok(Some(lenses))
     }
 
@@ -17245,18 +17506,13 @@ impl LanguageServer for LaravelLanguageServer {
         let Some(data) = lens.data.clone() else {
             return Ok(lens);
         };
-        // A lens carries either a single `symbol` (position lenses) or a
-        // `symbols` list (the compound file-level lens, which sums references
-        // across the file's view/component/livewire identities).
-        let symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = match data.get("symbols") {
-            Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
-            None => match data.get("symbol").cloned().and_then(|s| {
-                serde_json::from_value::<laravel_lsp::salsa_impl::SymbolRefData>(s).ok()
-            }) {
-                Some(s) => vec![s],
-                None => return Ok(lens),
-            },
-        };
+        // Every lens carries a `symbols` list (usually one; the compound
+        // file-level lens carries the file's view/component/livewire
+        // identities). `resolve` sums references across them.
+        let symbols: Vec<laravel_lsp::salsa_impl::SymbolRefData> = data
+            .get("symbols")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         if symbols.is_empty() {
             return Ok(lens);
         }
@@ -17703,19 +17959,32 @@ impl LanguageServer for LaravelLanguageServer {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Handle runtime configuration changes without requiring LSP restart
-        // Settings are configured via: { "lsp": { "laravel-lsp": { "settings": { "laravel": { ... } } } } }
-        debug!("🔧 Configuration changed: {:?}", params.settings);
+        // Settings live under `lsp.laravel-lsp.settings`. Zed sends `{}` here and
+        // delivers the real values via the workspace/configuration PULL, so
+        // applying this payload directly would reset everything to defaults.
+        debug!("🔧 did_change_configuration received: {}", params.settings);
 
-        match serde_json::from_value::<LspSettings>(params.settings) {
-            Ok(settings) => {
-                info!("⚙️  Configuration updated: autoCompleteDebounce={}ms, blade.directiveSpacing={}",
-                    settings.auto_complete_debounce, settings.blade.directive_spacing);
-                self.update_settings(&settings).await;
-            }
-            Err(e) => {
-                debug!("Could not parse configuration settings: {}", e);
+        // Honor a non-empty push (editors that send settings inline), otherwise
+        // re-pull (Zed's path).
+        let has_push = params
+            .settings
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        if has_push {
+            match serde_json::from_value::<LspSettings>(params.settings) {
+                Ok(settings) => {
+                    info!("⚙️  Applying pushed configuration: autoCompleteDebounce={}ms, blade.directiveSpacing={}, codeLens.enabled={}",
+                        settings.auto_complete_debounce, settings.blade.directive_spacing, settings.code_lens.enabled);
+                    self.update_settings(&settings).await;
+                    return;
+                }
+                Err(e) => {
+                    warn!("⚠️  Could not parse pushed configuration: {e} — falling back to pull");
+                }
             }
         }
+        self.pull_and_apply_settings().await;
     }
 
     async fn goto_definition(

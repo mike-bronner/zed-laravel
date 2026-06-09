@@ -2435,6 +2435,24 @@ pub struct MemberAccessReferenceData {
     pub confidence: Confidence,
 }
 
+/// Hover payload for a resolved magic member (M6). Crosses the Salsa async
+/// boundary, so it owns plain data (no lifetimes / borrows). `decl_file` /
+/// `decl_line` locate the declaration for a source link — `None` when the
+/// declaring class isn't in the hierarchy index.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MagicMemberHoverData {
+    pub declaring_fqcn: String,
+    pub member: String,
+    pub kind: MagicMemberKind,
+    pub confidence: Confidence,
+    pub decl_file: Option<PathBuf>,
+    /// 0-based start line of the declaration (method or property), for the link.
+    pub decl_line: Option<u32>,
+    /// 0-based end line — present only for a *method* declaration, so the async
+    /// hover builder knows to read the declaring file and extract a snippet.
+    pub decl_end_line: Option<u32>,
+}
+
 /// Laravel configuration data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaravelConfigData {
@@ -3371,6 +3389,15 @@ pub enum SalsaRequest {
         reply: oneshot::Sender<Vec<ReferenceLocationData>>,
     },
 
+    /// Resolve + classify the magic member at a cursor position for a hover
+    /// card (M6). Returns the classification, not references.
+    ResolveMagicMemberAt {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Option<MagicMemberHoverData>>,
+    },
+
     // === Service Provider Management ===
     /// Register the service provider registry from the existing analyzer
     RegisterServiceProviderRegistry {
@@ -4026,6 +4053,29 @@ impl SalsaHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(SalsaRequest::FindMemberReferences {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve + classify the magic member at `(line, column)` for a hover card
+    /// (M6). `Ok(None)` when the position isn't a resolvable magic member.
+    pub async fn resolve_magic_member_at(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Option<MagicMemberHoverData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveMagicMemberAt {
                 path,
                 line,
                 column,
@@ -5065,6 +5115,15 @@ impl SalsaActor {
                     reply,
                 } => {
                     let result = self.handle_find_member_references(&path, line, column);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveMagicMemberAt {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_magic_member_at(&path, line, column);
                     let _ = reply.send(result);
                 }
 
@@ -6556,6 +6615,92 @@ impl SalsaActor {
             }
         }
         Vec::new()
+    }
+
+    /// Resolve + classify the magic member at a position for a hover card (M6).
+    /// Mirrors the live-resolution path of `handle_find_member_references`, but
+    /// returns the classification (kind + declaring class + a declaration link)
+    /// rather than references. Gated to HIGH/MEDIUM confidence — we never guess.
+    /// Scoped to Eloquent-model magic members (a resolvable declaring FQCN);
+    /// component `$this->` members are out of scope for M6.1.
+    fn handle_resolve_magic_member_at(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Option<MagicMemberHoverData> {
+        let patterns = self.handle_get_patterns(path)?;
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return None,
+        };
+        let project_root = self.config_root.clone()?;
+
+        self.ensure_file_registered(path);
+        let file = self.files.get(path)?;
+        let text = file.text(&self.db).clone();
+
+        let tree = crate::parser::parse_php(&text).ok()?;
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let receiver = tree.root_node().descendant_for_byte_range(
+            member_ref.receiver_byte_start,
+            member_ref.receiver_byte_end,
+        )?;
+        let resolved = crate::member_resolver::resolve_and_classify(
+            receiver,
+            &member_ref.member,
+            crate::member_resolver::AccessForm::Property,
+            bytes,
+            &aliases,
+            &self.class_hierarchy_index,
+            &mut classviews,
+            &project_root,
+        )?;
+
+        // Hover threshold mirrors find-references: HIGH + MEDIUM only.
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            return None;
+        }
+
+        // Locate the declaration in the declaring class. A method-backed member
+        // (relationship / scope / accessor / finder) yields both start+end lines
+        // so the hover can show its source; a property (column / plain) yields
+        // just the start line for the link; otherwise fall back to the class's
+        // own start line.
+        let (decl_file, decl_line, decl_end_line) =
+            match self.class_hierarchy_index.get(&resolved.declaring_fqcn) {
+                Some(node) => {
+                    let candidates =
+                        crate::hover::candidate_method_names(resolved.kind, &member_ref.member);
+                    if let Some(m) = node
+                        .methods
+                        .iter()
+                        .find(|m| candidates.iter().any(|c| *c == m.name))
+                    {
+                        (Some(node.file_path.clone()), Some(m.start_line), Some(m.end_line))
+                    } else if let Some(p) =
+                        node.properties.iter().find(|p| p.name == member_ref.member)
+                    {
+                        (Some(node.file_path.clone()), Some(p.start_line), None)
+                    } else {
+                        (Some(node.file_path.clone()), Some(node.start_line), None)
+                    }
+                }
+                None => (None, None, None),
+            };
+
+        Some(MagicMemberHoverData {
+            declaring_fqcn: resolved.declaring_fqcn,
+            member: member_ref.member.clone(),
+            kind: resolved.kind,
+            confidence: resolved.confidence,
+            decl_file,
+            decl_line,
+            decl_end_line,
+        })
     }
 
     fn handle_find_references(

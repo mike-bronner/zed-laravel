@@ -196,3 +196,153 @@ fn truncate_for_display_handles_multibyte_chars_at_boundary() {
     assert!(out.ends_with('…'));
     assert_eq!(out.chars().count(), 201); // 200 + ellipsis
 }
+
+// ============================================================================
+// magic_member_card (M6) — classification hover for Eloquent magic members
+// ============================================================================
+
+use crate::salsa_impl::{Confidence, MagicMemberKind};
+
+#[test]
+fn magic_member_card_relationship_high_confidence() {
+    let out = magic_member_card(
+        MagicMemberKind::Relationship,
+        "posts",
+        "App\\Models\\User",
+        Confidence::High,
+        None,
+        Some("[app/Models/User.php:12](file:///p/app/Models/User.php#L12)"),
+    );
+    assert_eq!(
+        out,
+        "**Eloquent relationship**\n\n`posts` on `App\\Models\\User`\n\n[app/Models/User.php:12](file:///p/app/Models/User.php#L12)"
+    );
+}
+
+#[test]
+fn magic_member_card_with_definition_renders_php_code_block() {
+    let out = magic_member_card(
+        MagicMemberKind::Relationship,
+        "account",
+        "App\\Models\\User",
+        Confidence::High,
+        Some("public function account()\n{\n    return $this->belongsTo(Account::class);\n}"),
+        None,
+    );
+    // Definition renders as a php fence (render prepends the <?php opener) and
+    // sits between the detail line and any source link.
+    assert!(out.contains("```php\n<?php\npublic function account()"), "got: {out}");
+    assert!(out.contains("belongsTo(Account::class)"), "got: {out}");
+}
+
+#[test]
+fn magic_member_card_labels_each_kind() {
+    let label = |k| {
+        magic_member_card(k, "x", "App\\Models\\User", Confidence::High, None, None)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(label(MagicMemberKind::Scope), "**Eloquent scope**");
+    assert_eq!(label(MagicMemberKind::Accessor), "**Eloquent accessor**");
+    assert_eq!(label(MagicMemberKind::Column), "**Database column**");
+    assert_eq!(label(MagicMemberKind::DynamicFinder), "**Dynamic finder**");
+}
+
+#[test]
+fn magic_member_card_plain_member_is_empty() {
+    // Generic properties are Intelephense's job — no card, no duplication.
+    let out = magic_member_card(
+        MagicMemberKind::PlainMember,
+        "name",
+        "App\\Models\\User",
+        Confidence::High,
+        None,
+        None,
+    );
+    assert_eq!(out, "");
+}
+
+#[test]
+fn magic_member_card_medium_confidence_adds_inferred_trailer() {
+    let out = magic_member_card(
+        MagicMemberKind::Scope,
+        "active",
+        "App\\Models\\User",
+        Confidence::Medium,
+        None,
+        None,
+    );
+    assert!(out.ends_with("*receiver type inferred*"), "got: {out}");
+}
+
+#[test]
+fn magic_member_card_high_confidence_has_no_trailer() {
+    let out = magic_member_card(
+        MagicMemberKind::Scope,
+        "active",
+        "App\\Models\\User",
+        Confidence::High,
+        None,
+        None,
+    );
+    assert!(!out.contains("inferred"), "got: {out}");
+}
+
+#[test]
+fn candidate_method_names_by_kind() {
+    // Relationship / finder: accessed verbatim.
+    assert_eq!(
+        candidate_method_names(MagicMemberKind::Relationship, "account"),
+        vec!["account".to_string()]
+    );
+    // Scope: scope{Pascal}.
+    assert_eq!(
+        candidate_method_names(MagicMemberKind::Scope, "active"),
+        vec!["scopeActive".to_string()]
+    );
+    // Accessor: old-style get{Pascal}Attribute + new-style camelCase.
+    assert_eq!(
+        candidate_method_names(MagicMemberKind::Accessor, "full_name"),
+        vec!["getFullNameAttribute".to_string(), "fullName".to_string()]
+    );
+}
+
+#[test]
+fn extract_member_snippet_dedents_and_slices() {
+    let src = "<?php\nclass User {\n    public function account()\n    {\n        return $this->belongsTo(Account::class);\n    }\n}\n";
+    // Method spans lines 2..=5 (0-based): signature, brace, body, close.
+    let snippet = extract_member_snippet(src, 2, 5);
+    assert_eq!(
+        snippet,
+        "public function account()\n{\n    return $this->belongsTo(Account::class);\n}"
+    );
+}
+
+#[test]
+fn extract_member_snippet_out_of_bounds_is_empty() {
+    assert_eq!(extract_member_snippet("a\nb\n", 9, 12), "");
+}
+
+#[test]
+fn extract_member_snippet_caps_long_bodies() {
+    let body: String = (0..40).map(|i| format!("    line{i}\n")).collect();
+    let src = format!("<?php\nclass X {{\n{body}}}\n");
+    let snippet = extract_member_snippet(&src, 2, 41);
+    assert!(snippet.lines().count() <= 21, "should cap at MAX_LINES + marker");
+    assert!(snippet.ends_with("// …"));
+}
+
+#[test]
+fn magic_member_card_without_link_omits_source_section() {
+    let out = magic_member_card(
+        MagicMemberKind::Column,
+        "email",
+        "App\\Models\\User",
+        Confidence::High,
+        None,
+        None,
+    );
+    assert_eq!(out, "**Database column**\n\n`email` on `App\\Models\\User`");
+}

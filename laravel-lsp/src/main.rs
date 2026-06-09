@@ -15703,12 +15703,14 @@ return [
             PatternAtPosition::Binding(binding) => self.hover_for_binding(&binding.name).await,
             PatternAtPosition::Asset(asset) => self.hover_for_asset(&asset).await,
             PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
+            // M6 — semantic hover card for a resolved Eloquent magic member.
+            PatternAtPosition::MemberAccess(member_ref) => {
+                self.hover_for_magic_member(&member_ref, uri).await
+            }
             // Patterns we don't yet surface in hover — silently drop.
-            // `MemberAccess` gets semantic hover cards in M6.
             PatternAtPosition::Directive(_)
             | PatternAtPosition::Action(_)
-            | PatternAtPosition::Feature(_)
-            | PatternAtPosition::MemberAccess(_) => return None,
+            | PatternAtPosition::Feature(_) => return None,
         };
 
         if rendered.is_empty() {
@@ -15743,6 +15745,55 @@ return [
             trailer,
             ..Default::default()
         })
+    }
+
+    /// M6 — semantic hover for an Eloquent magic member: a scope (`->active()`),
+    /// relationship (`$user->posts`), accessor (`$model->full_name`), or column
+    /// (`$user->email`) — the sites Intelephense can't see through. Resolves the
+    /// member at its position via the Salsa actor, then renders a classification
+    /// card linking to the declaring class. Returns `""` (→ no hover) for
+    /// unresolvable members, plain properties, and component `$this->` members.
+    async fn hover_for_magic_member(
+        &self,
+        member_ref: &laravel_lsp::salsa_impl::MemberAccessReferenceData,
+        uri: &Url,
+    ) -> String {
+        use laravel_lsp::hover;
+        let Ok(path) = uri.to_file_path() else {
+            return String::new();
+        };
+        let data = match self
+            .salsa
+            .resolve_magic_member_at(path, member_ref.line, member_ref.column)
+            .await
+        {
+            Ok(Some(d)) => d,
+            _ => return String::new(),
+        };
+        // `decl_line` is 0-based (repo convention); source links are 1-based.
+        let link = match &data.decl_file {
+            Some(f) => Some(self.source_link(f, data.decl_line.map(|l| l + 1)).await),
+            None => None,
+        };
+        // For a method-backed member, read the *declaring* file (usually a
+        // different file — the model, not the cursor file) off the async side
+        // (not the Salsa actor) and slice its source for the hover snippet.
+        let definition = match (&data.decl_file, data.decl_line, data.decl_end_line) {
+            (Some(f), Some(start), Some(end)) => tokio::fs::read_to_string(f)
+                .await
+                .ok()
+                .map(|src| hover::extract_member_snippet(&src, start, end))
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        };
+        hover::magic_member_card(
+            data.kind,
+            &data.member,
+            &data.declaring_fqcn,
+            data.confidence,
+            definition.as_deref(),
+            link.as_deref(),
+        )
     }
 
     /// Blade component — distinguishes class-backed components (Laravel

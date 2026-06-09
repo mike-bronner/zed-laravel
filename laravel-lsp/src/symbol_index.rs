@@ -54,6 +54,25 @@ pub enum SymbolKind {
     Livewire,
     Middleware,
     Binding,
+    /// Eloquent magic member / plain class member (M4). The `name` is the
+    /// composite `<declaring_fqcn>#<member>` produced by the M3 resolver, so
+    /// usages of an inherited or trait-shared member all share one key.
+    MagicMember,
+}
+
+/// A resolved magic-member occurrence ready to ingest: the inheritance-
+/// resolved declaring class, the member name, and the usage site's position.
+/// Built by the actor from a file's `member_access_refs` after M3 resolution.
+/// `Serialize`/`Deserialize` so the resolved index can be persisted to disk
+/// (the resolution pass is the dominant warm cost; caching it makes a clean
+/// reload near-instant — see `magic_disk_cache`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MagicMemberEntry {
+    pub fqcn: String,
+    pub member: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
 }
 
 /// Composite key for the forward map. Names are heap-allocated Strings
@@ -122,8 +141,48 @@ impl SymbolIndex {
         ingest!(binding_refs, SymbolKind::Binding, name);
 
         if !keys.is_empty() {
-            self.by_file.insert(path.to_path_buf(), keys);
+            // Append rather than overwrite so a file's literal-symbol keys and
+            // its magic-member keys (added via `insert_magic_members`) coexist
+            // in `by_file` regardless of call order. Safe under the
+            // remove-before-reinsert contract — `by_file[path]` is empty when
+            // a fresh insert runs.
+            self.by_file
+                .entry(path.to_path_buf())
+                .or_default()
+                .extend(keys);
         }
+    }
+
+    /// Add resolved magic-member entries (M4) into the forward map under
+    /// `SymbolKind::MagicMember` keys, recording them in `by_file` for
+    /// eviction. The entries are produced by the actor running the M3 resolver
+    /// over a file's captured `member_access_refs`; this method is the dumb
+    /// store — all resolution/classification has already happened.
+    ///
+    /// Call alongside `insert_file` for the same path (order-independent).
+    pub fn insert_magic_members(&mut self, path: &Path, entries: &[MagicMemberEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut keys: Vec<SymbolKey> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let key = SymbolKey {
+                kind: SymbolKind::MagicMember,
+                name: magic_member_key_name(&e.fqcn, &e.member),
+            };
+            let loc = ReferenceLocationData {
+                file_path: path.to_path_buf(),
+                line: e.line,
+                column: e.column,
+                end_column: e.end_column,
+            };
+            self.forward.entry(key.clone()).or_default().push(loc);
+            keys.push(key);
+        }
+        self.by_file
+            .entry(path.to_path_buf())
+            .or_default()
+            .extend(keys);
     }
 
     /// Yank every entry this file contributed out of `forward`, using
@@ -142,6 +201,39 @@ impl SymbolIndex {
                     self.forward.remove(&key);
                 }
             }
+        }
+    }
+
+    /// Evict only this file's *literal-symbol* keys (views, routes, config,
+    /// …), leaving its magic-member entries untouched.
+    ///
+    /// The lazy dirty-drain re-parses a file and re-inserts its literals on
+    /// demand via [`insert_file`], but magic members are resolved only by the
+    /// warm/save passes ([`insert_magic_members`]). So a plain [`remove_file`]
+    /// here would drop the file's magic entries with nothing to restore them
+    /// until the next save — which silently zeroes magic-member find-references
+    /// and code-lens counts the moment an indexed file is edited or reopened.
+    /// The drain uses this instead so magic survives. Real file *deletes* still
+    /// use [`remove_file`] to drop everything.
+    pub fn remove_literal_entries(&mut self, path: &Path) {
+        let Some(keys) = self.by_file.remove(path) else {
+            return;
+        };
+        let mut retained: Vec<SymbolKey> = Vec::new();
+        for key in keys {
+            if key.kind == SymbolKind::MagicMember {
+                retained.push(key);
+                continue;
+            }
+            if let Some(entries) = self.forward.get_mut(&key) {
+                entries.retain(|loc| loc.file_path.as_path() != path);
+                if entries.is_empty() {
+                    self.forward.remove(&key);
+                }
+            }
+        }
+        if !retained.is_empty() {
+            self.by_file.insert(path.to_path_buf(), retained);
         }
     }
 
@@ -194,6 +286,51 @@ impl SymbolIndex {
         self.forward.get(&key).cloned().unwrap_or_default()
     }
 
+    /// Reverse lookup: every reference sharing the magic-member symbol whose
+    /// occurrence covers `(line, column)` in `path`.
+    ///
+    /// The index is already a position→symbol map — each resolved member access
+    /// was stored with its usage position. So find-references invoked *at a
+    /// usage site* (`$post->status`, `$this->status`, …) doesn't need to
+    /// re-resolve the receiver: we just find which symbol owns the clicked
+    /// position and return its whole bucket. This is the only path that works
+    /// for Blade, where re-parsing the template as PHP can't locate the node.
+    ///
+    /// A union-typed receiver (`$post` inferred as two classes) can produce two
+    /// symbols at the same position; we return the union of their references,
+    /// de-duplicated by `(file, line, column)`.
+    pub fn references_at(&self, path: &Path, line: u32, column: u32) -> Vec<ReferenceLocationData> {
+        let Some(keys) = self.by_file.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ReferenceLocationData> = Vec::new();
+        let mut seen_keys: HashSet<&SymbolKey> = HashSet::new();
+        let mut seen_locs: HashSet<(PathBuf, u32, u32)> = HashSet::new();
+        for key in keys {
+            if key.kind != SymbolKind::MagicMember || !seen_keys.insert(key) {
+                continue;
+            }
+            let Some(locs) = self.forward.get(key) else {
+                continue;
+            };
+            let covers = locs.iter().any(|l| {
+                l.file_path.as_path() == path
+                    && l.line == line
+                    && column >= l.column
+                    && column <= l.end_column
+            });
+            if !covers {
+                continue;
+            }
+            for l in locs {
+                if seen_locs.insert((l.file_path.clone(), l.line, l.column)) {
+                    out.push(l.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Total entry count across all symbols. Useful for logging.
     pub fn entry_count(&self) -> usize {
         self.forward.values().map(|v| v.len()).sum()
@@ -216,20 +353,28 @@ impl SymbolIndex {
 /// additions backward-compatible).
 fn symbol_to_key(symbol: &SymbolRefData) -> Option<SymbolKey> {
     let (kind, name) = match symbol {
-        SymbolRefData::View(n) => (SymbolKind::View, n),
-        SymbolRefData::Route(n) => (SymbolKind::Route, n),
-        SymbolRefData::Config(n) => (SymbolKind::Config, n),
-        SymbolRefData::Translation(n) => (SymbolKind::Translation, n),
-        SymbolRefData::Env(n) => (SymbolKind::Env, n),
-        SymbolRefData::Component(n) => (SymbolKind::Component, n),
-        SymbolRefData::Livewire(n) => (SymbolKind::Livewire, n),
-        SymbolRefData::Middleware(n) => (SymbolKind::Middleware, n),
-        SymbolRefData::Binding(n) => (SymbolKind::Binding, n),
+        SymbolRefData::View(n) => (SymbolKind::View, n.clone()),
+        SymbolRefData::Route(n) => (SymbolKind::Route, n.clone()),
+        SymbolRefData::Config(n) => (SymbolKind::Config, n.clone()),
+        SymbolRefData::Translation(n) => (SymbolKind::Translation, n.clone()),
+        SymbolRefData::Env(n) => (SymbolKind::Env, n.clone()),
+        SymbolRefData::Component(n) => (SymbolKind::Component, n.clone()),
+        SymbolRefData::Livewire(n) => (SymbolKind::Livewire, n.clone()),
+        SymbolRefData::Middleware(n) => (SymbolKind::Middleware, n.clone()),
+        SymbolRefData::Binding(n) => (SymbolKind::Binding, n.clone()),
+        SymbolRefData::MagicMember { fqcn, member } => {
+            (SymbolKind::MagicMember, magic_member_key_name(fqcn, member))
+        }
     };
-    Some(SymbolKey {
-        kind,
-        name: name.clone(),
-    })
+    Some(SymbolKey { kind, name })
+}
+
+/// Composite name for a magic-member key: `<declaring_fqcn>#<member>`. Used by
+/// both the index population (M4) and `symbol_to_key` so they agree on the
+/// exact string. `#` can't appear in a PHP FQCN or member name, so it's an
+/// unambiguous separator.
+pub fn magic_member_key_name(fqcn: &str, member: &str) -> String {
+    format!("{fqcn}#{member}")
 }
 
 #[cfg(test)]

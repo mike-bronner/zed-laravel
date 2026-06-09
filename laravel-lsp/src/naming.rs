@@ -51,6 +51,24 @@ pub fn pascal_to_kebab(s: &str) -> String {
     result
 }
 
+/// `snake_case` → `PascalCase`: `full_name` → `FullName`, `active` → `Active`.
+/// Splits on `_`, upper-cases each segment's first ASCII char. Used to map a
+/// magic-member usage name back to its declaring method (`scope{Pascal}`,
+/// `get{Pascal}Attribute`). A name with no underscores just gets its first
+/// letter capitalized.
+pub fn snake_to_pascal(s: &str) -> String {
+    s.split('_')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 /// Split a dotted component name into its segments.
 ///
 /// `"admin.user-list"` → `["admin", "user-list"]`.

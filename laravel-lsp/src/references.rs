@@ -100,10 +100,13 @@ pub fn classify_pattern_at_cursor(
             Some(SymbolRef::View(view_name))
         }
         // Patterns that don't yet participate in cross-file references.
+        // `MemberAccess` is captured (M2) but not yet resolved/classified —
+        // it gets armed for find-references in M4.
         PatternAtPosition::Asset(_)
         | PatternAtPosition::Url(_)
         | PatternAtPosition::Action(_)
-        | PatternAtPosition::Feature(_) => None,
+        | PatternAtPosition::Feature(_)
+        | PatternAtPosition::MemberAccess(_) => None,
     }
 }
 

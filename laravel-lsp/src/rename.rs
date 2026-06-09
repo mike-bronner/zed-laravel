@@ -332,5 +332,70 @@ fn path_to_uri(path: &Path) -> Option<Url> {
     Url::from_file_path(path).ok()
 }
 
+// ── Magic-member rename (M7) ──────────────────────────────────────────────
+
+/// The new *declaring method* name when renaming a magic member's usage name.
+///
+/// Call sites use the usage name verbatim (`->active()`, `$u->posts`), but the
+/// declaring method often differs and must move in lockstep:
+/// - **Scope** → `scope{Pascal(new)}` (the method was `scope{Pascal(old)}`).
+/// - **Accessor**, old style (`get{Pascal}Attribute`) → `get{Pascal(new)}Attribute`.
+/// - **Accessor**, new style (camelCase method returning `Attribute`) → `{camel(new)}`.
+/// - **Relationship / dynamic finder** → the method name *is* the usage name → `new`.
+///
+/// `current_method` is the actual declared method name (used to detect the
+/// accessor style); `kind` selects the affix scheme.
+pub fn magic_member_decl_name(
+    kind: crate::salsa_impl::MagicMemberKind,
+    current_method: &str,
+    new_member: &str,
+) -> String {
+    use crate::salsa_impl::MagicMemberKind;
+    let pascal = crate::naming::snake_to_pascal(new_member);
+    match kind {
+        MagicMemberKind::Scope => format!("scope{pascal}"),
+        MagicMemberKind::Accessor => {
+            if current_method.starts_with("get") && current_method.ends_with("Attribute") {
+                format!("get{pascal}Attribute")
+            } else {
+                // New-style accessor: a camelCase method returning `Attribute`.
+                let mut chars = pascal.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_lowercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        }
+        // Relationship / dynamic finder / column / plain: method == usage name.
+        _ => new_member.to_string(),
+    }
+}
+
+/// Locate the name token of method `method_name` in `source`, as 0-based
+/// `(line, start_column, end_column)`. Used to rewrite a magic member's
+/// declaration during rename — we rewrite just the name token, not the line.
+/// First match wins (PSR-4 puts one class per file).
+pub fn locate_method_name(source: &str, method_name: &str) -> Option<(u32, u32, u32)> {
+    let tree = crate::parser::parse_php(source).ok()?;
+    let bytes = source.as_bytes();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "method_declaration" {
+            if let Some(name) = n.child_by_field_name("name") {
+                if name.utf8_text(bytes).ok() == Some(method_name) {
+                    let s = name.start_position();
+                    let e = name.end_position();
+                    return Some((s.row as u32, s.column as u32, e.column as u32));
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;

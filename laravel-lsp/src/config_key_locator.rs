@@ -62,6 +62,49 @@ pub fn locate_in_source(source: &str, key_path: &[&str]) -> Option<KeyPosition> 
     locate_at_path(array_node, bytes, key_path)
 }
 
+/// Enumerate every string-keyed entry in a config/lang `return [...]` array,
+/// in document order, as `(in-file dotted path, key position)`. Both leaf and
+/// intermediate keys are emitted (`database.connections` AND
+/// `database.connections.mysql.host`), since each is a referenceable
+/// `config()`/`__()` key. Non-string keys (numeric list entries, dynamic keys)
+/// are skipped. The caller prepends the file stem to form the full dotted key
+/// (`database.` / `auth.`). Powers config + translation code lenses (#59).
+pub fn enumerate_keys_in_source(source: &str) -> Vec<(String, KeyPosition)> {
+    let Ok(tree) = crate::parser::parse_php(source) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let Some(array) = find_return_array(tree.root_node()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_keys(array, bytes, "", &mut out);
+    out
+}
+
+/// Recurse an array literal, accumulating the dotted key path. `prefix` is the
+/// path to `array` (empty at the top level).
+fn collect_keys(array: Node, source: &[u8], prefix: &str, out: &mut Vec<(String, KeyPosition)>) {
+    let mut cursor = array.walk();
+    for child in array.children(&mut cursor) {
+        if child.kind() != "array_element_initializer" {
+            continue;
+        }
+        let Some(entry) = parse_array_entry(child, source) else {
+            continue;
+        };
+        let dotted = if prefix.is_empty() {
+            entry.key_text.clone()
+        } else {
+            format!("{prefix}.{}", entry.key_text)
+        };
+        out.push((dotted.clone(), entry.key_position));
+        if let Some(nested) = find_array_in_expression(entry.value_node) {
+            collect_keys(nested, source, &dotted, out);
+        }
+    }
+}
+
 /// Walk the AST looking for the top-level `return <array>;` statement and
 /// return the array literal node. We scan the file root's children so the
 /// usual `<?php` opener, `use` statements, etc. don't confuse us.

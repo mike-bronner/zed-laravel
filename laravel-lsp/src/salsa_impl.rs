@@ -2269,6 +2269,211 @@ pub struct FeatureReferenceData {
     pub end_column: u32,
 }
 
+/// Confidence that a captured member-access site's receiver was resolved to a
+/// concrete declaring class.
+///
+/// Populated by M3's receiver resolution; at capture time (M2) every site is
+/// [`Confidence::Unresolved`]. The tiers mirror the plan's resolution tiers:
+/// HIGH (static call, `(new X)`, typed param, `@var`, simple local assignment),
+/// MEDIUM (multi-hop reassignment / indirect flow), LOW (foreach iter var,
+/// typed property, return chain — captured but not yet resolvable; widened in
+/// later work, never guessed).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+    /// Not yet run through the resolver — the state at capture time (M2).
+    #[default]
+    Unresolved,
+}
+
+/// The kind of member a resolved access maps to.
+///
+/// `None` on the reference until M3 classifies the site against the
+/// class-hierarchy index. The Eloquent-magic variants are what make
+/// find-references / rename / hover magic-aware; `PlainMember` is a generic
+/// (non-magic) property on a resolved class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MagicMemberKind {
+    /// Eloquent local scope accessed via `__call` (`scopeActive` → `->active()`).
+    Scope,
+    /// Eloquent accessor / attribute (`getFullNameAttribute` / `Attribute`).
+    Accessor,
+    /// Eloquent relationship method accessed as a property (`$user->posts`).
+    Relationship,
+    /// Database column surfaced as a model attribute (`$user->email`).
+    Column,
+    /// Dynamic finder (`User::whereEmail(...)` → `where('email', ...)`).
+    DynamicFinder,
+    /// Generic (non-magic) property on a resolved class.
+    PlainMember,
+}
+
+/// A property-form member access (`$user->email`, `$this->profile`,
+/// `$user?->name`) captured for the magic-member semantic index.
+///
+/// **Capture-only at M2.** The `member`, `receiver`, byte ranges, nullsafe
+/// flag, and position fields are populated now. The resolution fields
+/// (`declaring_fqcn`, `kind`, `confidence`) are a reserved scaffold M3 fills
+/// once receiver resolution + `ClassView` classification land — until then
+/// `declaring_fqcn`/`kind` are `None` and `confidence` is
+/// [`Confidence::Unresolved`]. Wiring the index here once keeps M3 a pure
+/// "fill in resolution" diff with no structural churn.
+/// A Blade `@foreach`/`@forelse` loop's item variable + iterable, captured for
+/// magic-member loop-variable typing. `{{ $user->email }}` inside
+/// `@foreach($users as $user)` types `$user` from `$users`' element type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BladeLoopVar {
+    /// Loop value variable, without `$` (`user` from `… as $user`).
+    pub item_var: String,
+    /// Iterable expression, as written (`$users`, `$this->users`, `User::all()`).
+    pub iterable: String,
+    /// 0-based line of the `@foreach`/`@forelse` directive.
+    pub start_line: u32,
+    /// 0-based line of the matching `@endforeach`/`@endforelse`; `u32::MAX` if
+    /// the loop is unclosed (treat as extending to end of file).
+    pub end_line: u32,
+}
+
+/// Extract the `@foreach`/`@forelse` loops worth capturing for loop-variable
+/// typing: those with an iterable and a value variable. The value variable is
+/// the last of the parsed loop variables (`$key => $value` keeps `value`).
+pub fn blade_loop_vars(content: &str) -> Vec<BladeLoopVar> {
+    use crate::blade_loops::{find_loop_blocks, BladeLoopType};
+    find_loop_blocks(content)
+        .into_iter()
+        .filter(|b| matches!(b.loop_type, BladeLoopType::Foreach | BladeLoopType::Forelse))
+        .filter_map(|b| {
+            let iterable = b.iterable?;
+            let item_var = b.variables.last()?.0.clone();
+            Some(BladeLoopVar {
+                item_var,
+                iterable,
+                start_line: b.start_line as u32,
+                end_line: b.end_line.map(|e| e as u32).unwrap_or(u32::MAX),
+            })
+        })
+        .collect()
+}
+
+/// Member accesses written inside `@foreach`/`@forelse` *iterable* expressions
+/// (`@foreach($this->entities as $e)` → a read of `$this->entities`). These
+/// live in directive arguments, not `{{ }}` echoes or PHP blocks, so the normal
+/// capture misses them — yet they're real references a find-references should
+/// surface. We synthesize a `MemberAccessReferenceData` for the last `->member`
+/// of each member-access iterable, positioned at the member name in the
+/// directive line.
+pub fn blade_loop_iterable_accesses(content: &str) -> Vec<MemberAccessReferenceData> {
+    let mut out = Vec::new();
+    for loop_var in blade_loop_vars(content) {
+        let iter = loop_var.iterable.trim();
+        // Only member-access iterables (`$x->y`, `$this->y`); a bare `$users`
+        // collection has no member to reference.
+        let Some(arrow) = iter.rfind("->") else {
+            continue;
+        };
+        let member = &iter[arrow + 2..];
+        let receiver = &iter[..arrow];
+        if member.is_empty() || !member.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        // Locate the iterable on its directive line to position the member.
+        let Some(line_text) = content.lines().nth(loop_var.start_line as usize) else {
+            continue;
+        };
+        let Some(iter_col) = line_text.find(iter) else {
+            continue;
+        };
+        let member_col = (iter_col + arrow + 2) as u32;
+        out.push(MemberAccessReferenceData {
+            member: member.to_string(),
+            receiver: receiver.to_string(),
+            receiver_byte_start: 0,
+            receiver_byte_end: 0,
+            is_nullsafe: false,
+            line: loop_var.start_line,
+            column: member_col,
+            end_column: member_col + member.len() as u32,
+            declaring_fqcn: None,
+            kind: None,
+            confidence: Confidence::Unresolved,
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemberAccessReferenceData {
+    /// The accessed member name (`email`, `posts`, `profile`).
+    pub member: String,
+    /// Raw source text of the receiver expression (`$user`, `$this`).
+    pub receiver: String,
+    /// Byte range of the receiver expression in the file — lets the M3
+    /// resolver locate the receiver node in the live tree for
+    /// `var_type::resolve`.
+    pub receiver_byte_start: usize,
+    pub receiver_byte_end: usize,
+    /// Whether the access used the nullsafe operator (`?->`).
+    pub is_nullsafe: bool,
+    /// Position of the member name (0-based — repo convention).
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+    // ─── Reserved resolution scaffold (filled by M3) ───
+    /// Declaring class FQCN once the receiver resolves (inheritance/trait
+    /// resolved). `None` until M3.
+    #[serde(default)]
+    pub declaring_fqcn: Option<String>,
+    /// What kind of member this resolves to. `None` until M3 classifies.
+    #[serde(default)]
+    pub kind: Option<MagicMemberKind>,
+    /// Resolution confidence. [`Confidence::Unresolved`] until M3.
+    #[serde(default)]
+    pub confidence: Confidence,
+}
+
+/// Hover payload for a resolved magic member (M6). Crosses the Salsa async
+/// boundary, so it owns plain data (no lifetimes / borrows). `decl_file` /
+/// `decl_line` locate the declaration for a source link — `None` when the
+/// declaring class isn't in the hierarchy index.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MagicMemberHoverData {
+    pub declaring_fqcn: String,
+    pub member: String,
+    pub kind: MagicMemberKind,
+    pub confidence: Confidence,
+    pub decl_file: Option<PathBuf>,
+    /// 0-based start line of the declaration (method or property), for the link.
+    pub decl_line: Option<u32>,
+    /// 0-based end line — present only for a *method* declaration, so the async
+    /// hover builder knows to read the declaring file and extract a snippet.
+    pub decl_end_line: Option<u32>,
+    /// True when the resolver couldn't classify the member but the receiver
+    /// resolved to a model — a likely *plain DB column* (not `$casts`-declared,
+    /// so invisible to the source-only `ClassView`). The main side must confirm
+    /// it against migrations/DB before rendering, and skip the card otherwise.
+    pub tentative: bool,
+}
+
+/// Resolution result for renaming a magic member (M7). Crosses the async
+/// boundary (owns plain data). Only method-backed kinds — relationship, scope,
+/// accessor, dynamic finder — produce this; columns/plain members return `None`
+/// (a DB column rename is a migration concern, out of scope).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MagicMemberRenameData {
+    pub fqcn: String,
+    /// Usage name (the find-references key + the call-site rewrite text).
+    pub member: String,
+    pub kind: MagicMemberKind,
+    /// The actual declared method name (`scopeActive`, `getFullNameAttribute`,
+    /// `posts`) — the decl site to rewrite, transformed by the caller.
+    pub method_name: String,
+    pub decl_file: PathBuf,
+}
+
 /// Laravel configuration data for transfer across async boundaries
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaravelConfigData {
@@ -2530,7 +2735,7 @@ pub enum FileReferenceType {
 /// requested symbol when (a) the parser tagged the position as that pattern
 /// kind AND (b) the carried name matches. Random PHP strings that happen to
 /// share the shape are not returned.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolRefData {
     View(String),
     Route(String),
@@ -2541,6 +2746,16 @@ pub enum SymbolRefData {
     Livewire(String),
     Middleware(String),
     Binding(String),
+    /// An Eloquent magic member (accessor / column / relationship / scope /
+    /// dynamic finder) or a plain class member, keyed by its inheritance-
+    /// resolved declaring class FQCN + member name. Unlike the literal kinds
+    /// above — whose name is a raw string the parser tagged — this key is
+    /// produced by the M3 resolver, so a trait-shared member keys once and
+    /// every inheriting model's usages collapse to the same entry.
+    MagicMember {
+        fqcn: String,
+        member: String,
+    },
 }
 
 /// Location of a single parser-classified reference. Generic across pattern
@@ -2783,6 +2998,31 @@ pub struct ParsedPatternsData {
     /// populates chains properly.
     #[serde(default)]
     pub chains: Vec<Arc<crate::query_chain::BuilderChain>>,
+    /// Property-form member accesses (`$user->email`, `$this->profile`)
+    /// captured for the magic-member semantic index (M2). Like `chains`,
+    /// stored here rather than as a `ParsedPatterns` Salsa field because that
+    /// struct is at its 12-element tuple-Hash cap.
+    ///
+    /// `#[serde(default)]` so older disk-cache entries (written before this
+    /// field existed) deserialize with an empty list; the next edit re-runs
+    /// extraction and repopulates.
+    #[serde(default)]
+    pub member_access_refs: Vec<Arc<MemberAccessReferenceData>>,
+    /// Whether this (Blade) file is a Volt component — captured once at parse
+    /// time (the source is already in hand) so the magic-build's Blade pass can
+    /// route Volt vs. controller-rendered resolution without re-reading the
+    /// file. Critical on projects with large published Blade sets (e.g. Flux's
+    /// ~58k FontAwesome icon templates): without it the pass would open every
+    /// one just to check the Volt signature. Always `false` for `.php` files.
+    #[serde(default)]
+    pub is_volt: bool,
+    /// Blade `@foreach`/`@forelse` loops in this file — item variable, iterable
+    /// expression, and line range. Lets the magic-build type a loop variable
+    /// (`@foreach($users as $user) … {{ $user->email }}`) from its iterable's
+    /// element type without re-reading the file at build time. Captured at parse
+    /// (source in hand). Empty for `.php` files.
+    #[serde(default)]
+    pub blade_loops: Vec<BladeLoopVar>,
     /// Sorted index of all patterns by (line, column) for O(log n) lookup.
     /// Skipped during (de)serialization — when loading from the on-disk
     /// cache, the caller must invoke `build_position_index()` to rebuild
@@ -2812,6 +3052,7 @@ pub enum PatternAtPosition {
     Url(Arc<UrlReferenceData>),
     Action(Arc<ActionReferenceData>),
     Feature(Arc<FeatureReferenceData>),
+    MemberAccess(Arc<MemberAccessReferenceData>),
 }
 
 impl ParsedPatternsData {
@@ -2944,6 +3185,15 @@ impl ParsedPatternsData {
                 column: feature.column,
                 end_column: feature.end_column,
                 pattern: PatternAtPosition::Feature(feature.clone()),
+            });
+        }
+
+        for member in &self.member_access_refs {
+            entries.push(PositionEntry {
+                line: member.line,
+                column: member.column,
+                end_column: member.end_column,
+                pattern: PatternAtPosition::MemberAccess(member.clone()),
             });
         }
 
@@ -3095,6 +3345,14 @@ pub enum SalsaRequest {
         include_declaration: bool,
         reply: oneshot::Sender<Vec<ReferenceLocationData>>,
     },
+    /// Count references for a symbol straight from the inverted index — the
+    /// cheap, lazy primitive behind code-lens `resolve` (#59). Unlike
+    /// `FindReferences` it does no dirty-refresh / project walk; it's a direct
+    /// `symbol_index` lookup returning the occurrence count.
+    CountSymbolReferences {
+        symbol: SymbolRefData,
+        reply: oneshot::Sender<usize>,
+    },
     /// Return every project file path the actor currently has registered.
     /// Used by the warming task to compute which files to parse out-of-band.
     ListProjectFiles {
@@ -3107,6 +3365,67 @@ pub enum SalsaRequest {
     BulkImportPatterns {
         entries: Vec<(PathBuf, Arc<ParsedPatternsData>)>,
         reply: oneshot::Sender<usize>,
+    },
+    /// Bulk-import class-hierarchy nodes parsed out-of-actor during warming.
+    /// Each entry's nodes replace any existing entry for that path. Replies
+    /// with the total class count after import (for logging).
+    BulkImportHierarchy {
+        entries: Vec<(PathBuf, Vec<crate::class_hierarchy_index::ClassNode>)>,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Snapshot the `fqcn → declaring file` map for the out-of-actor
+    /// magic-member index build (M4).
+    SnapshotClassFiles {
+        reply: oneshot::Sender<Arc<std::collections::HashMap<String, PathBuf>>>,
+    },
+    /// Snapshot every indexed class grouped by file, so warming can persist
+    /// the hierarchy to the disk cache.
+    SnapshotHierarchyNodes {
+        reply: oneshot::Sender<
+            std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        >,
+    },
+    /// Bulk-import resolved magic-member occurrences into the symbol index
+    /// (M4). Appends to each path's existing (literal-symbol) entries.
+    BulkImportMagicMembers {
+        entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Re-index a single file's symbols after an edit (instant per-file half of
+    /// the incremental refresh): drop the file's prior keys, re-insert its
+    /// literal symbols from the current pattern cache, then insert the freshly
+    /// resolved magic members. Keeps find-references on the edited file current
+    /// without a project-wide rebuild.
+    ReindexFileMagic {
+        path: PathBuf,
+        entries: Vec<crate::symbol_index::MagicMemberEntry>,
+        reply: oneshot::Sender<()>,
+    },
+    /// find-references for the magic member under the cursor (M4): resolve the
+    /// `member_access` site at `(line, column)` and return its indexed usages.
+    FindMemberReferences {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Vec<ReferenceLocationData>>,
+    },
+
+    /// Resolve + classify the magic member at a cursor position for a hover
+    /// card (M6). Returns the classification, not references.
+    ResolveMagicMemberAt {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Option<MagicMemberHoverData>>,
+    },
+
+    /// Resolve the magic member at a cursor for rename (M7) — method-backed
+    /// kinds only; returns the declaring method to rewrite.
+    ResolveMagicMemberRenameAt {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        reply: oneshot::Sender<Option<MagicMemberRenameData>>,
     },
 
     // === Service Provider Management ===
@@ -3595,6 +3914,25 @@ impl SalsaHandle {
             .map_err(|_| "Salsa actor dropped reply channel")
     }
 
+    /// Count references for `symbol` directly from the inverted index (cheap;
+    /// no project walk). Backs code-lens `resolve`.
+    pub async fn count_symbol_references(
+        &self,
+        symbol: SymbolRefData,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::CountSymbolReferences {
+                symbol,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     /// Return every project file path the actor currently has registered.
     pub async fn list_project_files(&self) -> Result<Vec<PathBuf>, &'static str> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3632,6 +3970,176 @@ impl SalsaHandle {
             self.pattern_cache.insert(path, (0, data));
         }
         Ok(total)
+    }
+
+    /// Bulk-import class-hierarchy nodes into the actor-owned index. Unlike
+    /// `bulk_import_patterns` (which writes the shared cache directly), the
+    /// hierarchy index lives inside the actor, so this round-trips through
+    /// the request queue. Replies with the total class count after import.
+    pub async fn bulk_import_hierarchy(
+        &self,
+        entries: Vec<(PathBuf, Vec<crate::class_hierarchy_index::ClassNode>)>,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BulkImportHierarchy {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot the actor's `fqcn → declaring file` map. The magic-member
+    /// index build (M4) runs in a parallel pass outside the actor and uses
+    /// this owned copy to resolve receivers without borrowing the index.
+    pub async fn snapshot_class_files(
+        &self,
+    ) -> Result<Arc<std::collections::HashMap<String, PathBuf>>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotClassFiles { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Snapshot every indexed class grouped by declaring file, so warming can
+    /// persist the hierarchy to the disk cache (it survives a warm restart
+    /// only if persisted — fresh parses are the sole other populator).
+    pub async fn snapshot_hierarchy_nodes(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
+        &'static str,
+    > {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::SnapshotHierarchyNodes { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Bulk-import resolved magic-member occurrences into the actor-owned
+    /// symbol index (M4). Mirrors `bulk_import_hierarchy`; replies with the
+    /// total magic-member entry count ingested.
+    pub async fn bulk_import_magic_members(
+        &self,
+        entries: Vec<(PathBuf, Vec<crate::symbol_index::MagicMemberEntry>)>,
+    ) -> Result<usize, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::BulkImportMagicMembers {
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Re-index a single edited file's symbols (instant per-file refresh):
+    /// evict its prior keys, re-add literals from the pattern cache, then insert
+    /// the freshly resolved magic members.
+    pub async fn reindex_file_magic(
+        &self,
+        path: PathBuf,
+        entries: Vec<crate::symbol_index::MagicMemberEntry>,
+    ) -> Result<(), &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ReindexFileMagic {
+                path,
+                entries,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// find-references for the magic member under the cursor (M4). The actor
+    /// resolves the `member_access` site at `(line, column)` to its declaring
+    /// class + member, then returns every indexed usage of that key. Empty
+    /// when the cursor isn't on a resolvable magic member.
+    pub async fn find_member_references(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Vec<ReferenceLocationData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FindMemberReferences {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve + classify the magic member at `(line, column)` for a hover card
+    /// (M6). `Ok(None)` when the position isn't a resolvable magic member.
+    pub async fn resolve_magic_member_at(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Option<MagicMemberHoverData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveMagicMemberAt {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Resolve the magic member at `(line, column)` for rename (M7). `Ok(None)`
+    /// unless it's a method-backed magic member (relationship / scope /
+    /// accessor / dynamic finder).
+    pub async fn resolve_magic_member_rename_at(
+        &self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Result<Option<MagicMemberRenameData>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ResolveMagicMemberRenameAt {
+                path,
+                line,
+                column,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
     }
 
     // === Service Provider Methods ===
@@ -4284,6 +4792,15 @@ pub struct SalsaActor {
     /// the warming-stage filters (`.json.php` skip, 256KB size cap) to
     /// drop the auto-generated noise.
     vendor_files: Vec<PathBuf>,
+    /// Every non-vendor `*.php` / `*.blade.php` in the project (app/, database/,
+    /// tests/, config/, resources/, routes/, …). The categorized lists above
+    /// only cover controllers + Blade views + routes, which is enough for the
+    /// view/route/livewire navigation features but misses the broad source the
+    /// magic-member reverse index needs — a `$user->email` usage can live in any
+    /// model, service, job, action, or Volt `.php` page. This bucket feeds the
+    /// warm parse so those usages are indexed, not just files the user happens
+    /// to open. Excludes vendor (covered separately) and noise dirs.
+    source_files: Vec<PathBuf>,
 
     /// Root directories captured from the most recent
     /// `register_project_files` call. We retain them so the file-watcher
@@ -4301,6 +4818,18 @@ pub struct SalsaActor {
     /// `BuildSymbolIndex` message; kept fresh thereafter via the
     /// `mark_dirty` / `take_dirty` pattern (see `symbol_index.rs`).
     symbol_index: crate::symbol_index::SymbolIndex,
+
+    /// Project-wide class-hierarchy + member index. Populated at warming from
+    /// the same parse that feeds the pattern cache; powers structural code
+    /// lenses (implementations / usages / overrides / parent) and cross-file
+    /// inheritance resolution. See `class_hierarchy_index.rs`.
+    class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex,
+    /// Cached class→file map handed to `snapshot_class_files`, shared by `Arc`
+    /// so the hot edit path and the debounced rebuild don't re-clone the whole
+    /// map every call. Set to `None` whenever the hierarchy's FQCN→file mapping
+    /// actually changes (see the invalidation at each mutation site); a typical
+    /// method-body edit leaves it intact so the next snapshot is O(1).
+    class_files_snapshot: Option<Arc<HashMap<String, PathBuf>>>,
 
     // === Service Provider Registry ===
     /// Cached middleware aliases from service provider analysis
@@ -4372,8 +4901,11 @@ impl SalsaActor {
                 livewire_files: Vec::new(),
                 route_files: Vec::new(),
                 vendor_files: Vec::new(),
+                source_files: Vec::new(),
                 project_root_paths: ProjectRootPaths::default(),
                 symbol_index: crate::symbol_index::SymbolIndex::default(),
+                class_hierarchy_index: crate::class_hierarchy_index::ClassHierarchyIndex::default(),
+                class_files_snapshot: None,
                 // Service provider registry
                 sp_middleware_aliases: HashMap::new(),
                 sp_bindings: HashMap::new(),
@@ -4454,6 +4986,10 @@ impl SalsaActor {
                     // correct: there's no future state to refresh
                     // to — the file is gone.
                     self.symbol_index.remove_file(&path);
+                    if self.class_hierarchy_index.contains_file(&path) {
+                        self.class_hierarchy_index.remove_file(&path);
+                        self.class_files_snapshot = None; // hierarchy changed
+                    }
                     let _ = reply.send(());
                 }
 
@@ -4534,19 +5070,29 @@ impl SalsaActor {
                     let result = self.handle_find_references(&symbol, include_declaration);
                     let _ = reply.send(result);
                 }
+                SalsaRequest::CountSymbolReferences { symbol, reply } => {
+                    // Direct inverted-index lookup — no dirty-refresh or project
+                    // walk (code-lens resolve must stay cheap on large files).
+                    let count = self.symbol_index.find(&symbol).len();
+                    let _ = reply.send(count);
+                }
                 SalsaRequest::ListProjectFiles { reply } => {
-                    // Vendor is chained in last so its paths are at the
-                    // tail of the warming spawn order — purely a
-                    // cosmetic choice. User-code paths get parsed first
-                    // when the semaphore frees up, so users see results
-                    // for their own code faster on cold start.
+                    // User code (the whole non-vendor source bucket, which
+                    // supersets the categorized controller/view/livewire/route
+                    // lists) is chained first so it parses first when the
+                    // semaphore frees up; vendor is tailed last. Deduplicated —
+                    // the categorized lists overlap `source_files`, and an
+                    // absolute view path could fall outside the project root.
+                    let mut seen = std::collections::HashSet::new();
                     let paths: Vec<PathBuf> = self
-                        .controller_files
+                        .source_files
                         .iter()
+                        .chain(self.controller_files.iter())
                         .chain(self.view_files.iter())
                         .chain(self.livewire_files.iter())
                         .chain(self.route_files.iter())
                         .chain(self.vendor_files.iter())
+                        .filter(|p| seen.insert((*p).clone()))
                         .cloned()
                         .collect();
                     let _ = reply.send(paths);
@@ -4563,6 +5109,85 @@ impl SalsaActor {
                         self.pattern_cache.insert(path, (0, data));
                     }
                     let _ = reply.send(total);
+                }
+                SalsaRequest::BulkImportHierarchy { entries, reply } => {
+                    for (path, nodes) in entries {
+                        // remove_file first so a re-warm refreshes cleanly.
+                        self.class_hierarchy_index.remove_file(&path);
+                        self.class_hierarchy_index.insert_file(&path, nodes);
+                    }
+                    // Bulk restore always changes the mapping — drop the cache.
+                    self.class_files_snapshot = None;
+                    let _ = reply.send(self.class_hierarchy_index.class_count());
+                }
+                SalsaRequest::SnapshotClassFiles { reply } => {
+                    // Build once, then hand out cheap `Arc` clones until the
+                    // hierarchy's FQCN→file mapping changes (invalidated below).
+                    if self.class_files_snapshot.is_none() {
+                        let map = self.class_hierarchy_index.fqcn_file_map();
+                        self.class_files_snapshot = Some(Arc::new(map));
+                    }
+                    let snapshot = self.class_files_snapshot.clone().unwrap_or_default();
+                    let _ = reply.send(snapshot);
+                }
+                SalsaRequest::SnapshotHierarchyNodes { reply } => {
+                    let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
+                }
+                SalsaRequest::BulkImportMagicMembers { entries, reply } => {
+                    // Append-only: `build_symbol_index` already inserted this
+                    // path's literal-symbol keys, and `insert_magic_members`
+                    // extends `by_file` rather than overwriting, so the two
+                    // coexist and evict together via `remove_file`.
+                    let mut count = 0usize;
+                    for (path, members) in entries {
+                        count += members.len();
+                        self.symbol_index.insert_magic_members(&path, &members);
+                    }
+                    let _ = reply.send(count);
+                }
+                SalsaRequest::ReindexFileMagic {
+                    path,
+                    entries,
+                    reply,
+                } => {
+                    // Evict the file's prior keys (literals + magic), then
+                    // rebuild: literals from the current pattern cache + the
+                    // freshly resolved magic members. `remove_file` clears both
+                    // kinds, so re-inserting literals here keeps them alive.
+                    self.symbol_index.remove_file(&path);
+                    if let Some(cached) = self.pattern_cache.get(&path) {
+                        let (_, ref patterns) = *cached;
+                        self.symbol_index.insert_file(&path, patterns);
+                    }
+                    self.symbol_index.insert_magic_members(&path, &entries);
+                    let _ = reply.send(());
+                }
+                SalsaRequest::FindMemberReferences {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_find_member_references(&path, line, column);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveMagicMemberAt {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_magic_member_at(&path, line, column);
+                    let _ = reply.send(result);
+                }
+                SalsaRequest::ResolveMagicMemberRenameAt {
+                    path,
+                    line,
+                    column,
+                    reply,
+                } => {
+                    let result = self.handle_resolve_magic_member_rename_at(&path, line, column);
+                    let _ = reply.send(result);
                 }
 
                 // === Service Provider Handlers ===
@@ -4783,6 +5408,7 @@ impl SalsaActor {
         // new patterns aren't parsed until something asks for them
         // via get_patterns anyway. Lazy refresh amortizes both costs.
         self.symbol_index.mark_dirty(&path);
+        self.class_hierarchy_index.mark_dirty(&path);
 
         if let Some(file) = self.files.get(&path) {
             // Update existing file
@@ -5098,6 +5724,7 @@ impl SalsaActor {
         let mut url_refs = Vec::new();
         let mut action_refs = Vec::new();
         let mut feature_refs = Vec::new();
+        let mut member_access_refs: Vec<Arc<MemberAccessReferenceData>> = Vec::new();
         let mut chains: Vec<Arc<crate::query_chain::BuilderChain>> = Vec::new();
 
         // Skip the full-file PHP parse for Blade files — same rationale as
@@ -5149,6 +5776,27 @@ impl SalsaActor {
                             end_column: f.end_column as u32,
                         }));
                     }
+
+                    // Property-form member-access sites (`$user->email`).
+                    // Captured raw here (M2); the receiver-resolution fields
+                    // stay at their `None`/`Unresolved` defaults until M3.
+                    // Blade-embedded member access is intentionally deferred —
+                    // resolving Blade-scope receivers is M3 work.
+                    for m in php_patterns.member_accesses {
+                        member_access_refs.push(Arc::new(MemberAccessReferenceData {
+                            member: m.member.to_string(),
+                            receiver: m.receiver.to_string(),
+                            receiver_byte_start: m.receiver_byte_start,
+                            receiver_byte_end: m.receiver_byte_end,
+                            is_nullsafe: m.is_nullsafe,
+                            line: m.row as u32,
+                            column: m.column as u32,
+                            end_column: m.end_column as u32,
+                            declaring_fqcn: None,
+                            kind: None,
+                            confidence: Confidence::Unresolved,
+                        }));
+                    }
                 }
 
                 // Extract Eloquent / DB query builder chains from the same
@@ -5156,6 +5804,25 @@ impl SalsaActor {
                 // produced above for route/url/action/feature extraction.
                 for chain in crate::query_chain::extract_chains(&tree, text) {
                     chains.push(Arc::new(chain));
+                }
+
+                // Keep the class-hierarchy index current for this file. The
+                // on-demand parse path (did_open / edits / cache misses) is the
+                // ONLY populator for files warming skipped because they were
+                // already cached — without this, an open/edited model's own
+                // class is absent from the hierarchy, so magic-member
+                // resolution (`$this->email` → its declaring class) fails.
+                let nodes = crate::class_hierarchy_index::classes_from_tree(path, &tree, text);
+                // Invalidate the cached class→file snapshot only when this
+                // file's set of declared FQCNs actually changed — a method-body
+                // edit leaves it intact, keeping the next snapshot O(1).
+                let mapping_changed = self.class_hierarchy_index.fqcns_changed(path, &nodes);
+                self.class_hierarchy_index.remove_file(path);
+                if !nodes.is_empty() {
+                    self.class_hierarchy_index.insert_file(path, nodes);
+                }
+                if mapping_changed {
+                    self.class_files_snapshot = None;
                 }
             }
         } // end if !path_is_blade
@@ -5261,6 +5928,39 @@ impl SalsaActor {
                     }));
                 }
 
+                // Property-form member accesses inside this Blade region
+                // (`{{ $user->email }}`). Positions are mapped to outer-file
+                // coords; byte ranges stay snippet-local (Blade resolution uses
+                // the receiver text + view-variable inference, not a whole-file
+                // PHP parse).
+                for m in snippet_patterns.member_accesses {
+                    let (line, col) = adjust_inner_position(
+                        m.row as u32,
+                        m.column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    let (_, end_col) = adjust_inner_position(
+                        m.row as u32,
+                        m.end_column as u32,
+                        region.row,
+                        region.column,
+                    );
+                    member_access_refs.push(Arc::new(MemberAccessReferenceData {
+                        member: m.member.to_string(),
+                        receiver: m.receiver.to_string(),
+                        receiver_byte_start: m.receiver_byte_start,
+                        receiver_byte_end: m.receiver_byte_end,
+                        is_nullsafe: m.is_nullsafe,
+                        line,
+                        column: col,
+                        end_column: end_col,
+                        declaring_fqcn: None,
+                        kind: None,
+                        confidence: Confidence::Unresolved,
+                    }));
+                }
+
                 // Eloquent / DB query builder chains inside this Blade-
                 // embedded PHP region. Snippet-local byte ranges produced by
                 // the extractor reference the `<?php `-wrapped source; shift
@@ -5275,6 +5975,14 @@ impl SalsaActor {
                     );
                     chains.push(Arc::new(chain));
                 }
+            }
+        }
+
+        // Capture member accesses inside `@foreach` iterables (`$this->entities`)
+        // — directive args the region loop above doesn't reach.
+        if path_is_blade {
+            for m in blade_loop_iterable_accesses(text) {
+                member_access_refs.push(Arc::new(m));
             }
         }
 
@@ -5294,6 +6002,16 @@ impl SalsaActor {
             action_refs,
             feature_refs,
             chains,
+            member_access_refs,
+            // Captured here (source in hand) so the magic-build Blade pass
+            // routes Volt vs. controller-rendered resolution without re-reading.
+            is_volt: path_is_blade
+                && crate::livewire_resolver::source_contains_volt_signature(text),
+            blade_loops: if path_is_blade {
+                blade_loop_vars(text)
+            } else {
+                Vec::new()
+            },
             sorted_positions: Vec::new(),
         };
 
@@ -5553,6 +6271,7 @@ impl SalsaActor {
         self.livewire_files.clear();
         self.route_files.clear();
         self.vendor_files.clear();
+        self.source_files.clear();
 
         // Capture the absolute roots we're about to walk so the file-
         // watcher handler can classify Created/Deleted events back into
@@ -5698,6 +6417,13 @@ impl SalsaActor {
                 // handle_get_patterns for the architectural why.
             }
         }
+
+        // Scan the whole project (minus vendor + noise dirs) for every
+        // `*.php` / `*.blade.php`. The categorized scans above cover the
+        // navigation features; this broad bucket feeds the magic-member reverse
+        // index, whose usages can live in any model / service / job / action /
+        // Volt page — not just controllers and Blade views.
+        self.source_files = collect_source_files(&root_path);
 
         // Create the ProjectFiles input
         self.project_files = Some(ProjectFiles::new(
@@ -5861,6 +6587,276 @@ impl SalsaActor {
     /// freezes the actor long enough that Zed times out the LSP and
     /// resets the connection — a stale-but-live answer beats a dead
     /// server every time.
+    /// Resolve the magic member under the cursor and return its indexed usages
+    /// (M4). The cursor-side resolution runs here, not in
+    /// `classify_pattern_at_cursor`, because it needs the live parse tree plus
+    /// the actor-owned class-hierarchy index.
+    fn handle_find_member_references(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Vec<ReferenceLocationData> {
+        // Primary: the reverse index is already a position→symbol map. If the
+        // click lands on a resolved usage (PHP `$this->status`, Blade
+        // `$post->status`, Volt `$this->entities`, …) the index knows which
+        // symbol that position belongs to — return its references directly. No
+        // receiver re-resolution, and (unlike the fallback below) this works in
+        // Blade, where re-parsing the whole template as PHP can't locate nodes.
+        let indexed = self.symbol_index.references_at(path, line, column);
+        if !indexed.is_empty() {
+            return indexed;
+        }
+
+        // Fallback: live resolution for usages not yet in the index — e.g. a
+        // usage typed since the last save-time magic refresh. Resolves the
+        // receiver from the cursor file's own PHP AST.
+        let Some(patterns) = self.handle_get_patterns(path) else {
+            return Vec::new();
+        };
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return Vec::new(),
+        };
+        let Some(project_root) = self.config_root.clone() else {
+            return Vec::new();
+        };
+
+        // In-memory source for the cursor file (reflects unsaved edits).
+        self.ensure_file_registered(path);
+        let Some(file) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let text = file.text(&self.db).clone();
+
+        let Ok(tree) = crate::parser::parse_php(&text) else {
+            return Vec::new();
+        };
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+
+        // Model magic member: resolve the receiver node to its class and key on
+        // that. Needs the receiver node (located by byte range — valid for PHP;
+        // Blade-embedded refs may not locate, which is fine — the component
+        // fallback below is text-based).
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        if let Some(receiver) = tree
+            .root_node()
+            .descendant_for_byte_range(member_ref.receiver_byte_start, member_ref.receiver_byte_end)
+        {
+            if let Some(resolved) = crate::member_resolver::resolve_and_classify(
+                receiver,
+                &member_ref.member,
+                crate::member_resolver::AccessForm::Property,
+                bytes,
+                &aliases,
+                &self.class_hierarchy_index,
+                &mut classviews,
+                &project_root,
+            ) {
+                // find-references threshold: HIGH + MEDIUM.
+                if matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+                    return self.symbol_index.find(&SymbolRefData::MagicMember {
+                        fqcn: resolved.declaring_fqcn,
+                        member: member_ref.member.clone(),
+                    });
+                }
+            }
+        }
+
+        // Component-member fallback: `$this->member` in a Livewire/Volt
+        // component. The component is often an anonymous class (no FQCN), so it's
+        // keyed under a synthetic per-component id shared across its `.php` and
+        // `.blade.php`. Text-based, so it works even when the receiver node above
+        // didn't locate (Blade template clicks).
+        if member_ref.receiver.trim() == "$this" {
+            if let Some(key) = crate::view_var_index::volt_component_key(path, &text) {
+                return self.symbol_index.find(&SymbolRefData::MagicMember {
+                    fqcn: key,
+                    member: member_ref.member.clone(),
+                });
+            }
+        }
+        Vec::new()
+    }
+
+    /// Resolve + classify the magic member at a position for a hover card (M6).
+    /// Mirrors the live-resolution path of `handle_find_member_references`, but
+    /// returns the classification (kind + declaring class + a declaration link)
+    /// rather than references. Gated to HIGH/MEDIUM confidence — we never guess.
+    /// Scoped to Eloquent-model magic members (a resolvable declaring FQCN);
+    /// component `$this->` members are out of scope for M6.1.
+    fn handle_resolve_magic_member_at(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Option<MagicMemberHoverData> {
+        let patterns = self.handle_get_patterns(path)?;
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return None,
+        };
+        let project_root = self.config_root.clone()?;
+
+        self.ensure_file_registered(path);
+        let file = self.files.get(path)?;
+        let text = file.text(&self.db).clone();
+
+        let tree = crate::parser::parse_php(&text).ok()?;
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let receiver = tree.root_node().descendant_for_byte_range(
+            member_ref.receiver_byte_start,
+            member_ref.receiver_byte_end,
+        )?;
+        // Classify the member; HIGH/MEDIUM only (mirrors find-references). If the
+        // member doesn't classify but the receiver still resolves to a model, it
+        // may be a plain DB column the source-only ClassView can't see (not in
+        // `$casts`) — mark it tentative and let the main side confirm it against
+        // migrations/DB.
+        let (declaring_fqcn, kind, confidence, tentative) =
+            match crate::member_resolver::resolve_and_classify(
+                receiver,
+                &member_ref.member,
+                crate::member_resolver::AccessForm::Property,
+                bytes,
+                &aliases,
+                &self.class_hierarchy_index,
+                &mut classviews,
+                &project_root,
+            ) {
+                Some(r) if matches!(r.confidence, Confidence::High | Confidence::Medium) => {
+                    (r.declaring_fqcn, r.kind, r.confidence, false)
+                }
+                Some(_) => return None,
+                None => {
+                    let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
+                        receiver,
+                        bytes,
+                        &aliases,
+                        &self.class_hierarchy_index,
+                        &mut classviews,
+                        &project_root,
+                    )?;
+                    if !matches!(confidence, Confidence::High | Confidence::Medium) {
+                        return None;
+                    }
+                    (fqcn, MagicMemberKind::Column, confidence, true)
+                }
+            };
+
+        // Locate the declaration in the declaring class. A method-backed member
+        // (relationship / scope / accessor / finder) yields both start+end lines
+        // so the hover can show its source; a property (column / plain) yields
+        // just the start line for the link; otherwise fall back to the class's
+        // own start line.
+        let (decl_file, decl_line, decl_end_line) =
+            match self.class_hierarchy_index.get(&declaring_fqcn) {
+                Some(node) => {
+                    let candidates = crate::hover::candidate_method_names(kind, &member_ref.member);
+                    if let Some(m) = node.methods.iter().find(|m| candidates.contains(&m.name)) {
+                        (
+                            Some(node.file_path.clone()),
+                            Some(m.start_line),
+                            Some(m.end_line),
+                        )
+                    } else if let Some(p) =
+                        node.properties.iter().find(|p| p.name == member_ref.member)
+                    {
+                        (Some(node.file_path.clone()), Some(p.start_line), None)
+                    } else {
+                        (Some(node.file_path.clone()), Some(node.start_line), None)
+                    }
+                }
+                None => (None, None, None),
+            };
+
+        Some(MagicMemberHoverData {
+            declaring_fqcn,
+            member: member_ref.member.clone(),
+            kind,
+            confidence,
+            decl_file,
+            decl_line,
+            decl_end_line,
+            tentative,
+        })
+    }
+
+    /// Resolve the magic member at a position for rename (M7). Only
+    /// method-backed kinds (relationship / scope / accessor / dynamic finder)
+    /// qualify — a column/plain member returns `None` (renaming a DB column is a
+    /// migration concern). Returns the declaring method name + file so the
+    /// caller can rewrite the declaration (transformed) alongside the call
+    /// sites. HIGH/MEDIUM confidence only.
+    fn handle_resolve_magic_member_rename_at(
+        &mut self,
+        path: &PathBuf,
+        line: u32,
+        column: u32,
+    ) -> Option<MagicMemberRenameData> {
+        let patterns = self.handle_get_patterns(path)?;
+        let member_ref = match patterns.find_at_position(line, column) {
+            Some(PatternAtPosition::MemberAccess(m)) => m,
+            _ => return None,
+        };
+        let project_root = self.config_root.clone()?;
+
+        self.ensure_file_registered(path);
+        let file = self.files.get(path)?;
+        let text = file.text(&self.db).clone();
+
+        let tree = crate::parser::parse_php(&text).ok()?;
+        let bytes = text.as_bytes();
+        let aliases = crate::query_chain::use_aliases::extract_use_aliases(&tree, &text);
+
+        let mut classviews = crate::member_resolver::ClassViewCache::new();
+        let receiver = tree.root_node().descendant_for_byte_range(
+            member_ref.receiver_byte_start,
+            member_ref.receiver_byte_end,
+        )?;
+        let resolved = crate::member_resolver::resolve_and_classify(
+            receiver,
+            &member_ref.member,
+            crate::member_resolver::AccessForm::Property,
+            bytes,
+            &aliases,
+            &self.class_hierarchy_index,
+            &mut classviews,
+            &project_root,
+        )?;
+        if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            return None;
+        }
+        // Only method-backed kinds rename; a column/plain member can't.
+        if !matches!(
+            resolved.kind,
+            MagicMemberKind::Relationship
+                | MagicMemberKind::Scope
+                | MagicMemberKind::Accessor
+                | MagicMemberKind::DynamicFinder
+        ) {
+            return None;
+        }
+
+        // Find the declaring method (its real name + file) via the kind-aware
+        // candidate names — the same mapping the hover uses.
+        let node = self.class_hierarchy_index.get(&resolved.declaring_fqcn)?;
+        let candidates = crate::hover::candidate_method_names(resolved.kind, &member_ref.member);
+        let method = node.methods.iter().find(|m| candidates.contains(&m.name))?;
+
+        Some(MagicMemberRenameData {
+            fqcn: resolved.declaring_fqcn,
+            member: member_ref.member.clone(),
+            kind: resolved.kind,
+            method_name: method.name.clone(),
+            decl_file: node.file_path.clone(),
+        })
+    }
+
     fn handle_find_references(
         &mut self,
         symbol: &SymbolRefData,
@@ -5877,6 +6873,15 @@ impl SalsaActor {
         // we can't hold a `&mut` on `self.symbol_index` across that
         // call. So `take_dirty` clones the paths out FIRST (releasing
         // the borrow), then we iterate them serially.
+        // Magic members are never refreshed by this drain — `insert_file`
+        // re-adds only *literal* patterns; magic entries come from the separate
+        // resolution pass (warm / save). So the (potentially multi-second)
+        // re-parse below can't change a magic-member result — skip straight to
+        // the O(1) lookup for them.
+        if matches!(symbol, SymbolRefData::MagicMember { .. }) {
+            return self.symbol_index.find(symbol);
+        }
+
         let start = std::time::Instant::now();
         let dirty = self.symbol_index.take_dirty();
         let dirty_count = dirty.len();
@@ -5914,7 +6919,13 @@ impl SalsaActor {
                 symbol
             );
             for path in dirty {
-                self.symbol_index.remove_file(&path);
+                // Literal-only eviction: re-parsing restores literals via
+                // `insert_file`, but magic members are resolved only by the
+                // warm/save passes. A full `remove_file` here would drop this
+                // file's magic entries with nothing to restore them until the
+                // next save — silently zeroing magic-member counts. Preserve
+                // them.
+                self.symbol_index.remove_literal_entries(&path);
                 if let Some(patterns) = self.handle_get_patterns(&path) {
                     self.symbol_index.insert_file(&path, &patterns);
                 }
@@ -6507,6 +7518,35 @@ fn extract_view_from_args(args: &str) -> Option<String> {
     }
 }
 
+/// Directories never worth walking for project source: dependency trees, VCS
+/// metadata, and runtime/cache output. `vendor` is excluded here because it's
+/// scanned separately (with its own size/noise filters at warm time).
+const SKIP_SCAN_DIRS: &[&str] = &["vendor", "node_modules", ".git", "storage", ".cache"];
+
+/// Collect every non-vendor `*.php` / `*.blade.php` under `root`, skipping
+/// dependency and runtime dirs. Feeds the magic-member reverse index, whose
+/// usages can live in any source file — not just controllers and Blade views.
+/// (`.blade.php` is included because it also ends with `.php`.)
+pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+    use walkdir::WalkDir;
+    let mut out = Vec::new();
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_name()
+                .to_str()
+                .map(|s| !SKIP_SCAN_DIRS.contains(&s))
+                .unwrap_or(true)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".php") {
+            out.push(entry.path().to_path_buf());
+        }
+    }
+    out
+}
+
 /// Append every parser-classified reference in `patterns` that matches `symbol`
 /// into `out`. Only the pattern collection corresponding to the symbol kind is
 /// scanned — a `SymbolRef::Route` never matches a coincidental config-key
@@ -6605,6 +7645,12 @@ fn collect_matches_for_symbol(
                 }
             }
         }
+        // Magic members can't be matched by raw pattern scanning — a
+        // `member_access_ref` only resolves to a `(declaring_fqcn, member)` key
+        // through the M3 resolver (which needs the class-hierarchy index). They
+        // are served from the resolved inverted index (`insert_magic_members`),
+        // so this per-file scanner contributes nothing for them.
+        SymbolRefData::MagicMember { .. } => {}
     }
 }
 

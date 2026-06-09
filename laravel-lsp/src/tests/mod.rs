@@ -3,6 +3,7 @@ mod asset_path_resolution;
 mod blade_component_context;
 mod cast_type_context;
 mod class_locator_and_properties;
+mod code_lens_opt_in;
 mod diagnostic_severity;
 mod dynamic_where_sparseness;
 mod generic_type_parsing;

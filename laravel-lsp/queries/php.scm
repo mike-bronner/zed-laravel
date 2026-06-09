@@ -2221,3 +2221,28 @@
     default_value: (encapsed_string
       (string_content) @feature_name_value))
   (#eq? @_feature_name_prop "$name"))
+
+; ============================================================================
+; Pattern 40: Property-form member access ($user->email, $this->profile)
+; ============================================================================
+; Matches: $user->email          (potential accessor / column)
+;          $user->posts          (potential relationship)
+;          $this->profile        (typed-property access)
+;          $user?->name          (nullsafe form)
+;
+; Captures the member NAME node; the receiver expression (object) and the
+; nullsafe-ness are read from its parent in `extract_all_php_patterns`. This
+; is the property-form half of the magic-member capture (M2 of the semantic-
+; index plan) — method calls ($user->posts()) are `member_call_expression`
+; and are already covered by builder-chain extraction, so they are NOT matched
+; here. Receiver resolution + classification happen later (M3); this query is
+; the raw capture only.
+;
+; `name: (name)` restricts to static identifiers — dynamic access like
+; `$user->$prop` (name is a variable) is intentionally excluded.
+
+(member_access_expression
+  name: (name) @member_access_name)
+
+(nullsafe_member_access_expression
+  name: (name) @member_access_name)

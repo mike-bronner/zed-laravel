@@ -336,6 +336,35 @@ pub struct FeatureNamePropertyMatch<'a> {
     pub end_column: usize,
 }
 
+/// Represents a property-form member access (`$user->email`, `$this->profile`,
+/// `$user?->name`) in PHP code.
+///
+/// Method calls (`$user->posts()`) are NOT captured here — those are
+/// `member_call_expression` nodes already covered by builder-chain extraction.
+/// This is the raw capture only: resolving the receiver to a declaring class
+/// and classifying the member (scope / accessor / relationship / column /
+/// dynamic finder) happens later (M3 of the semantic-index plan).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberAccessMatch<'a> {
+    /// The accessed member name (e.g. `email`, `posts`, `profile`).
+    pub member: &'a str,
+    /// Raw source text of the receiver expression (e.g. `$user`, `$this`).
+    pub receiver: &'a str,
+    /// Byte range of the receiver expression — lets the M3 resolver locate the
+    /// receiver node in the live tree to run `var_type::resolve`.
+    pub receiver_byte_start: usize,
+    pub receiver_byte_end: usize,
+    /// Whether the access used the nullsafe operator (`?->`).
+    pub is_nullsafe: bool,
+    /// Byte range of the member name node.
+    pub byte_start: usize,
+    pub byte_end: usize,
+    /// Position of the member name (0-based — repo convention).
+    pub row: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
 // ============================================================================
 // Extracted Patterns - Result structs for single-pass extraction
 // ============================================================================
@@ -359,6 +388,9 @@ pub struct ExtractedPhpPatterns<'a> {
     pub feature_calls: Vec<FeatureMatch<'a>>,
     /// Custom $name property values from feature classes
     pub feature_name_properties: Vec<FeatureNamePropertyMatch<'a>>,
+    /// Property-form member accesses (`$user->email`, `$this->profile`).
+    /// Raw capture for the semantic-index magic-member work (M2).
+    pub member_accesses: Vec<MemberAccessMatch<'a>>,
 }
 
 /// Represents PHP content inside Blade echo statements {{ ... }}
@@ -783,6 +815,33 @@ pub fn extract_all_php_patterns<'a>(
                         column: start_pos.column,
                         end_column: end_pos.column,
                     });
+            }
+
+            // Property-form member access ($user->email, $this->profile).
+            // `node` is the member NAME; its parent is the
+            // (nullsafe_)member_access_expression carrying the receiver.
+            "member_access_name" => {
+                let Some(parent) = node.parent() else {
+                    continue;
+                };
+                let Some(object) = parent.child_by_field_name("object") else {
+                    continue;
+                };
+                let Ok(receiver) = object.utf8_text(source_bytes) else {
+                    continue;
+                };
+                result.member_accesses.push(MemberAccessMatch {
+                    member: text,
+                    receiver,
+                    receiver_byte_start: object.start_byte(),
+                    receiver_byte_end: object.end_byte(),
+                    is_nullsafe: parent.kind() == "nullsafe_member_access_expression",
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
             }
 
             // Ignore other captures (function_name, class_name, etc. used for matching)

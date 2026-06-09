@@ -128,3 +128,79 @@ fn returns_empty_for_unparseable_garbage() {
     assert!(data.route_refs.is_empty());
     assert!(data.config_refs.is_empty());
 }
+
+#[test]
+fn warming_path_populates_member_access_refs() {
+    // Regression: the warming path (`parse_owned`/`parse_owned_with_hierarchy`)
+    // must capture property-form member accesses, like the lazy
+    // `handle_get_patterns` path does. Without this, the magic-member index
+    // (M4) builds empty and find-references on `$this->email` finds nothing.
+    let path = PathBuf::from("/fixture/app/Models/User.php");
+    let src = r#"<?php
+namespace App\Models;
+class User {
+    public function gravatar(): string {
+        return md5($this->email);
+    }
+}
+"#;
+    let data = parse_owned(&path, src);
+    let members: Vec<&str> = data
+        .member_access_refs
+        .iter()
+        .map(|m| m.member.as_str())
+        .collect();
+    assert!(
+        members.contains(&"email"),
+        "warming path must capture `$this->email`, got {members:?}"
+    );
+}
+
+#[test]
+fn blade_embedded_member_access_is_captured_with_outer_positions() {
+    // Blade view-var inference (phase 1): `{{ $user->email }}` is now captured,
+    // with the member-name position mapped back into outer-file coordinates.
+    let path = PathBuf::from("/fixture/resources/views/show.blade.php");
+    let src = "<div>{{ $user->email }}</div>\n";
+    let data = parse_owned(&path, src);
+    let email = data
+        .member_access_refs
+        .iter()
+        .find(|m| m.member == "email")
+        .expect("Blade-embedded $user->email should be captured");
+    assert_eq!(email.receiver, "$user");
+    // Outer-file row 0; `email` sits at column 15 in `<div>{{ $user->email }}`.
+    assert_eq!(email.line, 0);
+    assert_eq!(email.column, 15);
+}
+
+#[test]
+fn blade_bound_attribute_member_access_is_captured() {
+    // PHP inside a bound attribute (`:tooltip="$post->is_published ? …"`) is a
+    // real member access the echo/@php passes don't reach.
+    let path = PathBuf::from("/fixture/resources/views/x.blade.php");
+    let src = "<flux:button :tooltip=\"$post->is_published ? 'a' : 'b'\">Go</flux:button>\n";
+    let data = parse_owned(&path, src);
+    let m = data
+        .member_access_refs
+        .iter()
+        .find(|m| m.member == "is_published")
+        .expect("bound-attribute $post->is_published should be captured");
+    assert_eq!(m.receiver, "$post");
+    assert_eq!(m.line, 0);
+}
+
+#[test]
+fn blade_directive_attribute_param_member_access_is_captured() {
+    // `@class(['x' => $post->active])` — the directive parameter is PHP.
+    let path = PathBuf::from("/fixture/resources/views/y.blade.php");
+    let src = "<div @class(['on' => $post->active])>x</div>\n";
+    let data = parse_owned(&path, src);
+    assert!(
+        data.member_access_refs
+            .iter()
+            .any(|m| m.member == "active" && m.receiver == "$post"),
+        "directive-attribute param member access captured, got {:?}",
+        data.member_access_refs
+    );
+}

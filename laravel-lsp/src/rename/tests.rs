@@ -421,3 +421,69 @@ fn supports_per_target_new_text() {
         vec!["app.label".to_string(), "label".to_string()]
     );
 }
+
+// ── Magic-member rename (M7) ──────────────────────────────────────────────
+
+use crate::salsa_impl::MagicMemberKind;
+
+#[test]
+fn magic_member_decl_name_relationship_is_verbatim() {
+    // Relationship method name == usage name → no transform.
+    assert_eq!(
+        magic_member_decl_name(MagicMemberKind::Relationship, "posts", "articles"),
+        "articles"
+    );
+    assert_eq!(
+        magic_member_decl_name(MagicMemberKind::DynamicFinder, "whereEmail", "whereLogin"),
+        "whereLogin"
+    );
+}
+
+#[test]
+fn magic_member_decl_name_scope_keeps_affix() {
+    // active (scopeActive) → enabled (scopeEnabled).
+    assert_eq!(
+        magic_member_decl_name(MagicMemberKind::Scope, "scopeActive", "enabled"),
+        "scopeEnabled"
+    );
+    // Multi-word usage name.
+    assert_eq!(
+        magic_member_decl_name(MagicMemberKind::Scope, "scopeActive", "recently_seen"),
+        "scopeRecentlySeen"
+    );
+}
+
+#[test]
+fn magic_member_decl_name_accessor_old_and_new_style() {
+    // Old style: getFullNameAttribute → getDisplayNameAttribute.
+    assert_eq!(
+        magic_member_decl_name(
+            MagicMemberKind::Accessor,
+            "getFullNameAttribute",
+            "display_name"
+        ),
+        "getDisplayNameAttribute"
+    );
+    // New style: a camelCase method (fullName(): Attribute) → camelCase.
+    assert_eq!(
+        magic_member_decl_name(MagicMemberKind::Accessor, "fullName", "display_name"),
+        "displayName"
+    );
+}
+
+#[test]
+fn locate_method_name_finds_the_name_token() {
+    let src = "<?php\nclass User {\n    public function scopeActive($q) { return $q; }\n}\n";
+    // Method on line 2 (0-based); name token columns within the line.
+    let (line, start, end) = locate_method_name(src, "scopeActive").expect("found");
+    assert_eq!(line, 2);
+    let line_text = src.lines().nth(2).unwrap();
+    assert_eq!(start as usize, line_text.find("scopeActive").unwrap());
+    assert_eq!((end - start) as usize, "scopeActive".len());
+}
+
+#[test]
+fn locate_method_name_absent_is_none() {
+    let src = "<?php\nclass User {\n    public function posts() {}\n}\n";
+    assert!(locate_method_name(src, "missing").is_none());
+}

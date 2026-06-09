@@ -156,6 +156,127 @@ pub fn render(content: &HoverContent<'_>) -> String {
     sections.join("\n\n")
 }
 
+/// Build a semantic hover card for a resolved magic member (M6) — the
+/// Eloquent-magic sites Intelephense can't see through (`->active()` is a
+/// scope, `$user->posts` a relationship, `$model->full_name` an accessor,
+/// `$user->email` a column). `source_link` is a pre-built markdown link to the
+/// declaring class, or `None` if it couldn't be located.
+///
+/// Returns an empty string for [`MagicMemberKind::PlainMember`] — a generic
+/// property is Intelephense's job, and duplicating it would just add noise (the
+/// multi-LSP dedup policy: suppress at the source).
+pub fn magic_member_card(
+    kind: crate::salsa_impl::MagicMemberKind,
+    member: &str,
+    declaring_fqcn: &str,
+    confidence: crate::salsa_impl::Confidence,
+    definition: Option<&str>,
+    type_hint: Option<&str>,
+    source_link: Option<&str>,
+) -> String {
+    use crate::salsa_impl::{Confidence, MagicMemberKind};
+    let kind_label = match kind {
+        MagicMemberKind::Scope => "Eloquent scope",
+        MagicMemberKind::Accessor => "Eloquent accessor",
+        MagicMemberKind::Relationship => "Eloquent relationship",
+        MagicMemberKind::Column => "Database column",
+        MagicMemberKind::DynamicFinder => "Dynamic finder",
+        // Generic property — Intelephense already covers it. Don't duplicate.
+        MagicMemberKind::PlainMember => return String::new(),
+    };
+    let detail = format!("`{member}` on `{declaring_fqcn}`");
+    // For a column, the resolved PHP type (cast-aware) from the DB schema.
+    let type_desc = type_hint.map(|t| format!("Type `{t}`"));
+    // A MEDIUM-confidence resolution leaned on an inferred receiver type — flag
+    // it so the reader knows it's a best-effort, not a static guarantee.
+    let trailer = match confidence {
+        Confidence::Medium => Some("*receiver type inferred*"),
+        _ => None,
+    };
+    render(&HoverContent {
+        header: Some(kind_label),
+        detail: Some(&detail),
+        description: type_desc.as_deref(),
+        // The declaring method's source — for a relationship this reveals the
+        // target model (`$this->belongsTo(Account::class)`), for a scope its
+        // query body, for an accessor what it computes.
+        code: definition.map(|d| CodeBlock {
+            language: CodeLanguage::Php,
+            content: d,
+        }),
+        source_link,
+        trailer,
+        ..Default::default()
+    })
+}
+
+/// The declaring method names a magic-member usage name could map to, by kind.
+/// Relationships/finders are accessed under their method name verbatim
+/// (`$user->account` ← `account()`); scopes and accessors transform
+/// (`active` ← `scopeActive`, `full_name` ← `getFullNameAttribute` or the
+/// new-style `fullName(): Attribute`). Used to locate the declaration for the
+/// hover snippet.
+pub fn candidate_method_names(
+    kind: crate::salsa_impl::MagicMemberKind,
+    member: &str,
+) -> Vec<String> {
+    use crate::salsa_impl::MagicMemberKind;
+    let pascal = crate::naming::snake_to_pascal(member);
+    match kind {
+        MagicMemberKind::Scope => vec![format!("scope{pascal}")],
+        MagicMemberKind::Accessor => {
+            // Old-style `get{Pascal}Attribute` + new-style camelCase method.
+            let camel = {
+                let mut c = pascal.chars();
+                match c.next() {
+                    Some(first) => first.to_ascii_lowercase().to_string() + c.as_str(),
+                    None => String::new(),
+                }
+            };
+            vec![format!("get{pascal}Attribute"), camel]
+        }
+        // Relationship / DynamicFinder / PlainMember: accessed by method name.
+        _ => vec![member.to_string()],
+    }
+}
+
+/// Slice a declaration's source (0-based `start_line..=end_line`) into a snippet
+/// for a hover code block: dedents by the first line's indentation and caps
+/// runaway bodies. Returns `""` if the range is out of bounds.
+pub fn extract_member_snippet(source: &str, start_line: u32, end_line: u32) -> String {
+    const MAX_LINES: usize = 20;
+    let lines: Vec<&str> = source.lines().collect();
+    let start = start_line as usize;
+    if start >= lines.len() {
+        return String::new();
+    }
+    let end = (end_line as usize).min(lines.len() - 1);
+    if end < start {
+        return String::new();
+    }
+    let slice = &lines[start..=end];
+    let indent = slice
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .unwrap_or(0);
+    let mut out: Vec<String> = slice
+        .iter()
+        .map(|l| {
+            if l.len() >= indent {
+                l[indent..].to_string()
+            } else {
+                l.trim_start().to_string()
+            }
+        })
+        .collect();
+    if out.len() > MAX_LINES {
+        out.truncate(MAX_LINES);
+        out.push("// …".to_string());
+    }
+    out.join("\n")
+}
+
 // ============================================================================
 // Caller utilities
 // ============================================================================

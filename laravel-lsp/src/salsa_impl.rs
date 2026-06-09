@@ -2550,9 +2550,16 @@ pub fn component_candidate_paths(
     // PSR-4 class-based componentNamespace resolution.
     if let Some((namespace, component)) = name.split_once("::") {
         if let Some(php_namespace) = config.component_namespaces.get(namespace) {
-            // `forms.input-text` → relative class path `Forms/InputText.php`,
-            // matching the FQCN `<php_namespace>\Forms\InputText`.
-            let class_name = kebab_to_pascal_case(&component.replace('.', "\\"));
+            // `forms.text-input` → relative class path `Forms/TextInput.php`,
+            // matching the FQCN `<php_namespace>\Forms\TextInput`. Each
+            // `\`-delimited segment must be PascalCased independently, since
+            // `kebab_to_pascal_case` only splits on `-`.
+            let class_name = component
+                .replace('.', "\\")
+                .split('\\')
+                .map(kebab_to_pascal_case)
+                .collect::<Vec<_>>()
+                .join("\\");
             let mut rel = PathBuf::new();
             for segment in class_name.split('\\') {
                 rel.push(segment);

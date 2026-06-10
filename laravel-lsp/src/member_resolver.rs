@@ -367,13 +367,15 @@ fn resolve_receiver(
             resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
         }
         // `User::…` — an explicit class-name receiver (static call). Resolve
-        // through the file's use-aliases; a name the class graph doesn't know
-        // (an unimported bare alias, a facade proxying elsewhere) stays
+        // through the file's use-aliases, then qualify a bare same-namespace
+        // name with the file's namespace (PHP name-resolution semantics — a
+        // sibling model needs no import). A name the class graph still doesn't
+        // know (an unimported alias, a facade proxying elsewhere) stays
         // unresolved rather than guessed. `self::`/`static::` arrive as
         // `relative_scope` nodes and fall through to `None` below.
         "name" | "qualified_name" => {
             let raw = receiver.utf8_text(bytes).ok()?;
-            let fqcn = resolve_class_name(raw, aliases);
+            let fqcn = qualify_fqcn(resolve_class_name(raw, aliases), receiver, bytes);
             if resolver.class_file(&fqcn).is_some() {
                 Some((fqcn, Confidence::High))
             } else {

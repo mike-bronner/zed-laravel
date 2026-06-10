@@ -15917,7 +15917,25 @@ return [
             PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
             // M6 — semantic hover card for a resolved Eloquent magic member.
             PatternAtPosition::MemberAccess(member_ref) => {
-                self.hover_for_magic_member(&member_ref, uri).await
+                let card = self.hover_for_magic_member(&member_ref, uri).await;
+                // Blade fallback: in a template, a member access that yields
+                // no card (receiver resolution parses the template as raw PHP,
+                // where snippet-local byte ranges can't locate the node) would
+                // otherwise swallow the position — find_hover_target only
+                // tries the Blade-variable extractor when NO pattern matched.
+                // Fall through so `{{ $user->posts()->count() }}` keeps the
+                // variable hover it had before call-form capture (#77).
+                if card.is_empty() && uri.path().ends_with(".blade.php") {
+                    if let Some((var_name, property)) = self
+                        .blade_variable_at_position(uri, member_ref.line, member_ref.column)
+                        .await
+                    {
+                        return self
+                            .build_blade_variable_hover_content(uri, &var_name, property)
+                            .await;
+                    }
+                }
+                card
             }
             // Patterns we don't yet surface in hover — silently drop.
             PatternAtPosition::Directive(_)
@@ -16056,16 +16074,10 @@ return [
         model_fqcn: &str,
         column: &str,
     ) -> (bool, Option<String>, Option<String>) {
-        use laravel_lsp::query_chain::eloquent_completion;
         let Some(root) = self.root_path.read().await.clone() else {
             return (false, None, None);
         };
-        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
-            .await
-            .unwrap_or_else(|| {
-                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
-                eloquent_completion::snake_pluralize(basename)
-            });
+        let table = Self::model_table(model_fqcn, &root).await;
 
         // Migrations first: existence + a definition link (offline-capable).
         let mig_site = {
@@ -16174,23 +16186,49 @@ return [
         Self::goto_link(&decl_file, line, start, end)
     }
 
-    /// Column → the migration line that defines it. Mirrors the table
-    /// resolution `resolve_column_hover` uses (the model's `$table`, falling
-    /// back to the conventional snake-plural name), then reuses the
-    /// chain-literal goto's migration-site response.
+    /// The Blade variable (and optional property) under a position, read from
+    /// the live document — the hover fallback for member-access patterns that
+    /// produced no magic-member card in a template.
+    async fn blade_variable_at_position(
+        &self,
+        uri: &Url,
+        line: u32,
+        column: u32,
+    ) -> Option<(String, Option<String>)> {
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let line_text = content.lines().nth(line as usize)?;
+        laravel_lsp::livewire_resolver::extract_blade_variable_at_cursor(line_text, column)
+    }
+
+    /// Resolve a model FQCN to its table — `$table` / convention via
+    /// `resolve_table_for_model`, falling back to the snake-plural of the
+    /// class basename. Single source of truth for the column hover and the
+    /// column/finder goto.
+    async fn model_table(model_fqcn: &str, root: &Path) -> String {
+        use laravel_lsp::query_chain::eloquent_completion;
+        eloquent_completion::resolve_table_for_model(model_fqcn, root)
+            .await
+            .unwrap_or_else(|| {
+                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
+                eloquent_completion::snake_pluralize(basename)
+            })
+    }
+
+    /// Column → the migration line that defines it. Shares `model_table` with
+    /// `resolve_column_hover`, then reuses the chain-literal goto's
+    /// migration-site response.
     async fn column_migration_location(
         &self,
         model_fqcn: &str,
         column: &str,
     ) -> Option<GotoDefinitionResponse> {
-        use laravel_lsp::query_chain::eloquent_completion;
         let root = self.root_path.read().await.clone()?;
-        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
-            .await
-            .unwrap_or_else(|| {
-                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
-                eloquent_completion::snake_pluralize(basename)
-            });
+        let table = Self::model_table(model_fqcn, &root).await;
         let guard = self.migration_index.read().await;
         let site = guard.as_ref()?.column(&table, column)?.clone();
         drop(guard);

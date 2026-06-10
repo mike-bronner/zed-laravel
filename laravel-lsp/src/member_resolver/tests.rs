@@ -1446,3 +1446,26 @@ $slug = Str::slug('Laravel');
         resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
     assert!(entries.is_empty(), "{entries:?}");
 }
+
+#[test]
+fn static_receiver_resolves_same_namespace_without_import() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // A sibling model in the same namespace needs no `use` import — PHP
+    // resolves the bare name to the current namespace. Regression for the
+    // PR #76 review: the static-receiver arm must qualify bare names with
+    // the file's namespace, not just expand use-aliases.
+    let caller = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Order extends Model {
+    public function activeUsers() { return User::active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "same-namespace unimported static receiver should resolve; got {entries:?}"
+    );
+}

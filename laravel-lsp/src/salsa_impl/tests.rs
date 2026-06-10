@@ -1807,3 +1807,65 @@ class C {
         "an unclassified CALL must not resolve as a tentative column; got {data:?}"
     );
 }
+
+#[tokio::test]
+async fn dynamic_finder_is_not_renameable() {
+    // `whereEmail` has no declared method to rewrite — finder rename must be
+    // refused BY KIND, not by accident of the candidate-method lookup
+    // missing (PR #76 review finding).
+    let model_src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $casts = ['email' => 'string'];
+}
+"#;
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function find() { return User::whereEmail('a@b.test')->first(); }
+}
+"#;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, model_src).unwrap();
+    let caller_path = root.join("app/Http/Controllers/C.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, model_src.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(model_path).await.unwrap();
+
+    let (line, col) = position_of(caller_src, "whereEmail");
+    // Precondition: the finder itself resolves (hover/goto see it)...
+    let hover = handle
+        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .await
+        .unwrap()
+        .expect("finder should classify for hover/goto");
+    assert_eq!(hover.kind, MagicMemberKind::DynamicFinder);
+    // ...but rename refuses it by kind.
+    let rename = handle
+        .resolve_magic_member_rename_at(caller_path, line, col)
+        .await
+        .unwrap();
+    assert!(
+        rename.is_none(),
+        "a dynamic finder must not be renameable; got {rename:?}"
+    );
+}

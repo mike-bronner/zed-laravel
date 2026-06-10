@@ -2543,8 +2543,10 @@ pub enum MagicMemberKind {
 /// possible: a scope is only reachable via a call, an accessor only via a
 /// property read. Lives here (not `member_resolver`, which re-exports it)
 /// because it travels inside [`MemberAccessReferenceData`] through the
-/// per-file pattern cache; `#[serde(default)]` on that field plus `Property`
-/// as the default keeps older serialized shapes decodable.
+/// per-file pattern cache. NOTE: that cache is bincode (non-self-describing),
+/// so `serde(default)` does NOT make old caches decodable — the
+/// `pattern_disk_cache` SCHEMA_VERSION bump is what protects against stale
+/// shapes. Any future field change here needs another bump.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -2674,8 +2676,9 @@ pub struct MemberAccessReferenceData {
     pub is_nullsafe: bool,
     /// How the member was accessed. Call-form sites can only classify as
     /// scopes / dynamic finders / relationships; property-form as accessors /
-    /// relationships / columns. Defaults to `Property` so pre-call-form
-    /// serialized patterns stay decodable.
+    /// relationships / columns. (`serde(default)` helps only self-describing
+    /// formats — the bincode pattern cache is guarded by its SCHEMA_VERSION
+    /// bump, not by this default.)
     #[serde(default)]
     pub form: AccessForm,
     /// Position of the member name (0-based — repo convention).
@@ -7206,13 +7209,15 @@ impl SalsaActor {
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
             return None;
         }
-        // Only method-backed kinds rename; a column/plain member can't.
+        // Only method-backed kinds rename. A column/plain member can't, and a
+        // dynamic finder is EXPLICITLY excluded — `whereEmail` has no declared
+        // method to rewrite (it's `__call` sugar over the column; renaming the
+        // column is the real operation). Relying on the candidate-method
+        // lookup below to miss would make finder renameability an accident of
+        // `candidate_method_names`' behavior.
         if !matches!(
             resolved.kind,
-            MagicMemberKind::Relationship
-                | MagicMemberKind::Scope
-                | MagicMemberKind::Accessor
-                | MagicMemberKind::DynamicFinder
+            MagicMemberKind::Relationship | MagicMemberKind::Scope | MagicMemberKind::Accessor
         ) {
             return None;
         }

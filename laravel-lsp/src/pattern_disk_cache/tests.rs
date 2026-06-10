@@ -5,7 +5,7 @@
 //! roots get distinct cache files.
 
 use super::*;
-use crate::salsa_impl::ViewReferenceData;
+use crate::salsa_impl::{AccessForm, ViewReferenceData};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -219,6 +219,7 @@ fn member_access_refs_survive_save_and_load() {
             receiver_byte_start: 0,
             receiver_byte_end: 5,
             is_nullsafe: false,
+            form: AccessForm::Property,
             line: 1,
             column: 4,
             end_column: 9,

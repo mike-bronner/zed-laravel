@@ -847,6 +847,7 @@ fn member_refs_of(source: &str) -> Vec<Arc<MemberAccessReferenceData>> {
                 receiver_byte_start: m.receiver_byte_start,
                 receiver_byte_end: m.receiver_byte_end,
                 is_nullsafe: m.is_nullsafe,
+                form: m.form,
                 line: m.row as u32,
                 column: m.column as u32,
                 end_column: m.end_column as u32,
@@ -1265,4 +1266,183 @@ $users->map(function ($user) {
         entries.is_empty(),
         "an ordinary closure's untyped $user must not resolve to the auth model; got {entries:?}"
     );
+}
+
+// ─── Call-form magic members (#77): scopes, finders, relationship calls ───
+
+const SCOPED_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    protected $casts = ['email' => 'string'];
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+    public function scopeActive(Builder $query): Builder { return $query; }
+}
+"#;
+
+#[test]
+fn dynamic_finder_column_maps_finder_names() {
+    assert_eq!(
+        dynamic_finder_column("whereEmail").as_deref(),
+        Some("email")
+    );
+    assert_eq!(
+        dynamic_finder_column("orWhereEmailAddress").as_deref(),
+        Some("email_address")
+    );
+    // Not finder-shaped: bare `where`, lowercase remainder, unrelated word.
+    assert!(dynamic_finder_column("where").is_none());
+    assert!(dynamic_finder_column("whereabouts").is_none());
+    assert!(dynamic_finder_column("posts").is_none());
+}
+
+#[test]
+fn population_indexes_static_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        return User::active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "static scope call should index under its usage name; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_instance_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "instance scope call should index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_relationship_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->posts()->count();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "posts"),
+        "relationship call should index under the same key as property reads; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_dynamic_finder_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function find() {
+        return User::whereEmail('a@b.test')->first();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "whereEmail"),
+        "dynamic finder call should index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_prunes_plain_method_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->posts()->count();
+    }
+    public function helper(User $user) { return $user->helperMethod(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    // `count()` (unresolvable/plain) and `helperMethod()` (not on the model)
+    // must not index; only the relationship call survives.
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "count"),
+        "{entries:?}"
+    );
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "helperMethod"),
+        "{entries:?}"
+    );
+    assert!(has_entry(&entries, "App\\Models\\User", "posts"));
+}
+
+#[test]
+fn static_receiver_resolves_via_use_alias() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // Aliased import: `use App\Models\User as Account;`.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User as Account;
+class C {
+    public function index() {
+        return Account::active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "aliased static receiver should resolve through use-imports; got {entries:?}"
+    );
+}
+
+#[test]
+fn unknown_static_receiver_does_not_index() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // `Str` is not in the class graph — the call must drop, not guess.
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+$slug = Str::slug('Laravel');
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(entries.is_empty(), "{entries:?}");
 }

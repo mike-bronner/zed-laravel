@@ -51,25 +51,10 @@ impl ClassFileResolver for HashMap<String, PathBuf> {
     }
 }
 
-/// How a member was syntactically accessed. Drives which magic kinds are even
-/// possible: a scope is only reachable via a call, an accessor only via a
-/// property read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessForm {
-    /// `$user->email` — property read (no call parens).
-    Property,
-    /// `User::active()` — static call (`::`).
-    StaticCall,
-    /// `$user->active()` / `$user->posts()` — instance method call (`->m()`).
-    InstanceCall,
-}
-
-impl AccessForm {
-    /// Call-form (`::m()` or `->m()`) vs property read.
-    fn is_call(self) -> bool {
-        matches!(self, AccessForm::StaticCall | AccessForm::InstanceCall)
-    }
-}
+// `AccessForm` moved to `salsa_impl` (it now travels inside
+// `MemberAccessReferenceData` through the pattern cache); re-exported here so
+// the engine's callers keep their `member_resolver::AccessForm` paths.
+pub use crate::salsa_impl::AccessForm;
 
 /// The classification of a resolved member: which declaring class owns it
 /// (inheritance/trait resolved) and what magic kind it is.
@@ -247,7 +232,7 @@ pub fn resolve_member_access_entries(
         let Some(resolved) = resolve_and_classify(
             receiver,
             &m.member,
-            AccessForm::Property,
+            m.form,
             bytes,
             &aliases,
             resolver,
@@ -258,6 +243,14 @@ pub fn resolve_member_access_entries(
         };
         // find-references gate: HIGH + MEDIUM (rename will gate to HIGH later).
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            continue;
+        }
+        // Call-form plain methods are every `->get()` / `->save()` in the
+        // codebase — Intelephense's territory and pure index bloat. Only the
+        // magic kinds (scope / finder / relationship) index from calls.
+        // Property-form plain members stay (bounded: declared properties on
+        // resolved classes).
+        if m.form.is_call() && resolved.kind == MagicMemberKind::PlainMember {
             continue;
         }
         out.push(MagicMemberEntry {
@@ -372,6 +365,20 @@ fn resolve_receiver(
         // `$obj->method()` — resolve via the method's return type.
         "member_call_expression" | "nullsafe_member_call_expression" => {
             resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
+        }
+        // `User::…` — an explicit class-name receiver (static call). Resolve
+        // through the file's use-aliases; a name the class graph doesn't know
+        // (an unimported bare alias, a facade proxying elsewhere) stays
+        // unresolved rather than guessed. `self::`/`static::` arrive as
+        // `relative_scope` nodes and fall through to `None` below.
+        "name" | "qualified_name" => {
+            let raw = receiver.utf8_text(bytes).ok()?;
+            let fqcn = resolve_class_name(raw, aliases);
+            if resolver.class_file(&fqcn).is_some() {
+                Some((fqcn, Confidence::High))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -910,14 +917,7 @@ fn first_class_const(node: Node, bytes: &[u8]) -> Option<String> {
 /// Multi-segment finders (`whereEmailAndStatus`) are not handled — only the
 /// single-column form, which covers the overwhelming majority of real usage.
 fn classify_dynamic_finder(view: &ClassView, member: &str) -> Option<ClassifiedMember> {
-    let rest = member
-        .strip_prefix("where")
-        .or_else(|| member.strip_prefix("orWhere"))?;
-    // Must have a StudlyCase remainder — guards against `where`/`whereabouts`.
-    if !rest.chars().next()?.is_ascii_uppercase() {
-        return None;
-    }
-    let column = pascal_to_snake(rest);
+    let column = dynamic_finder_column(member)?;
     if view.column_surface.iter().any(|c| c.name == column) {
         return Some(ClassifiedMember {
             declaring_fqcn: view.fqcn.clone(),
@@ -925,6 +925,21 @@ fn classify_dynamic_finder(view: &ClassView, member: &str) -> Option<ClassifiedM
         });
     }
     None
+}
+
+/// The column a dynamic finder name targets: `whereEmail` / `orWhereEmail` →
+/// `email`. `None` when the name isn't finder-shaped (`where`, `whereabouts`).
+/// Shared by classification and the goto/hover dispatch (a finder has no
+/// declaring method — its definition site is the column's migration line).
+pub fn dynamic_finder_column(member: &str) -> Option<String> {
+    let rest = member
+        .strip_prefix("where")
+        .or_else(|| member.strip_prefix("orWhere"))?;
+    // Must have a StudlyCase remainder — guards against `where`/`whereabouts`.
+    if !rest.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    Some(pascal_to_snake(rest))
 }
 
 #[cfg(test)]

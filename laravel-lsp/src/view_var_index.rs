@@ -209,14 +209,28 @@ pub fn resolve_blade_member_accesses(
             var_types(var, m.line)
                 .into_iter()
                 .filter_map(|fqcn| {
-                    classify_fqcn_member(&fqcn, &m.member, resolver, classviews, project_root)
-                        .map(|c| c.declaring_fqcn)
+                    classify_fqcn_member(
+                        &fqcn,
+                        &m.member,
+                        m.form,
+                        resolver,
+                        classviews,
+                        project_root,
+                    )
+                    .map(|c| c.declaring_fqcn)
                 })
                 .collect()
         } else {
-            resolve_chain_receiver(receiver, &m.member, resolver, classviews, project_root)
-                .map(|c| vec![c.declaring_fqcn])
-                .unwrap_or_default()
+            resolve_chain_receiver(
+                receiver,
+                &m.member,
+                m.form,
+                resolver,
+                classviews,
+                project_root,
+            )
+            .map(|c| vec![c.declaring_fqcn])
+            .unwrap_or_default()
         };
 
         for fqcn in declaring {
@@ -248,17 +262,18 @@ fn bare_variable(text: &str) -> Option<&str> {
     }
 }
 
-/// Classify `member` (property form) against `fqcn`'s resolved surfaces.
+/// Classify `member` against `fqcn`'s resolved surfaces.
 fn classify_fqcn_member(
     fqcn: &str,
     member: &str,
+    form: AccessForm,
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
 ) -> Option<ClassifiedMember> {
     let file = resolver.class_file(fqcn)?;
     let view = classviews.get_or_build(fqcn, &file, project_root)?;
-    classify_member(&view, member, AccessForm::Property)
+    classify_member(&view, member, form)
 }
 
 /// Resolve a non-variable receiver (`auth()->user()`, `Auth::user()`, a chain)
@@ -268,6 +283,7 @@ fn classify_fqcn_member(
 fn resolve_chain_receiver(
     receiver_text: &str,
     member: &str,
+    form: AccessForm,
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
@@ -282,7 +298,7 @@ fn resolve_chain_receiver(
     if !matches!(confidence, Confidence::High | Confidence::Medium) {
         return None;
     }
-    classify_fqcn_member(&fqcn, member, resolver, classviews, project_root)
+    classify_fqcn_member(&fqcn, member, form, resolver, classviews, project_root)
 }
 
 /// The expression of the first `expression_statement` in a parsed snippet
@@ -765,7 +781,7 @@ pub fn resolve_volt_member_accesses(
         let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
             // Direct prop read (`$this->user`, or a bare public-prop/state read).
             let direct = prop_types.get(prop).and_then(|fqcn| {
-                classify_fqcn_member(fqcn, &m.member, resolver, classviews, project_root)
+                classify_fqcn_member(fqcn, &m.member, m.form, resolver, classviews, project_root)
                     .map(|c| c.declaring_fqcn)
             });
             // Loop fallback: a bare `$user` that isn't a prop but is the item of
@@ -776,13 +792,27 @@ pub fn resolve_volt_member_accesses(
                 let iter = enclosing_loop_iterable(blade_loops, var, m.line)?;
                 let iter_prop = volt_base_prop(iter)?;
                 prop_types.get(iter_prop).and_then(|fqcn| {
-                    classify_fqcn_member(fqcn, &m.member, resolver, classviews, project_root)
-                        .map(|c| c.declaring_fqcn)
+                    classify_fqcn_member(
+                        fqcn,
+                        &m.member,
+                        m.form,
+                        resolver,
+                        classviews,
+                        project_root,
+                    )
+                    .map(|c| c.declaring_fqcn)
                 })
             })
         } else {
-            resolve_chain_receiver(receiver, &m.member, resolver, classviews, project_root)
-                .map(|c| c.declaring_fqcn)
+            resolve_chain_receiver(
+                receiver,
+                &m.member,
+                m.form,
+                resolver,
+                classviews,
+                project_root,
+            )
+            .map(|c| c.declaring_fqcn)
         };
 
         if let Some(fqcn) = declaring {

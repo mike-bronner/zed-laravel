@@ -319,6 +319,7 @@ fn push_php_patterns(
                 receiver_byte_start: m.receiver_byte_start,
                 receiver_byte_end: m.receiver_byte_end,
                 is_nullsafe: m.is_nullsafe,
+                form: m.form,
                 line,
                 column: col,
                 end_column: end_col,

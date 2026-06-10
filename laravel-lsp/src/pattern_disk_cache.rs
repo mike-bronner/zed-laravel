@@ -81,7 +81,10 @@ use crate::salsa_impl::ParsedPatternsData;
 ///        "$post->is_published ? …"`) and directive (`@class(['x' => $p->y])`)
 ///        — now captured. Caches from before lack these usages on restored
 ///        files; bump to force a re-parse that captures them.
-const SCHEMA_VERSION: u32 = 8;
+///   v9 — call-form member accesses (`->active()`, `User::whereEmail()`, #77)
+///        now captured with an `AccessForm` field. Caches from before lack
+///        every call-form site; bump to force a re-parse.
+const SCHEMA_VERSION: u32 = 9;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

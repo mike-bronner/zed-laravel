@@ -13,6 +13,8 @@ use std::time::Instant;
 use tracing::{info, warn};
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::salsa_impl::AccessForm;
+
 // ============================================================================
 // Query File Embedding & Cached Compilation
 // ============================================================================
@@ -336,14 +338,14 @@ pub struct FeatureNamePropertyMatch<'a> {
     pub end_column: usize,
 }
 
-/// Represents a property-form member access (`$user->email`, `$this->profile`,
-/// `$user?->name`) in PHP code.
+/// Represents a member access in PHP code — property-form (`$user->email`,
+/// `$this->profile`, `$user?->name`) or call-form (`$user->active()`,
+/// `User::whereEmail()`), distinguished by [`MemberAccessMatch::form`].
 ///
-/// Method calls (`$user->posts()`) are NOT captured here — those are
-/// `member_call_expression` nodes already covered by builder-chain extraction.
 /// This is the raw capture only: resolving the receiver to a declaring class
 /// and classifying the member (scope / accessor / relationship / column /
-/// dynamic finder) happens later (M3 of the semantic-index plan).
+/// dynamic finder) happens later (M3 of the semantic-index plan; call-form
+/// added in #77).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberAccessMatch<'a> {
     /// The accessed member name (e.g. `email`, `posts`, `profile`).
@@ -356,6 +358,9 @@ pub struct MemberAccessMatch<'a> {
     pub receiver_byte_end: usize,
     /// Whether the access used the nullsafe operator (`?->`).
     pub is_nullsafe: bool,
+    /// Property read vs instance/static call (`$user->email` vs
+    /// `$user->active()` / `User::whereEmail()`).
+    pub form: AccessForm,
     /// Byte range of the member name node.
     pub byte_start: usize,
     pub byte_end: usize,
@@ -836,6 +841,64 @@ pub fn extract_all_php_patterns<'a>(
                     receiver_byte_start: object.start_byte(),
                     receiver_byte_end: object.end_byte(),
                     is_nullsafe: parent.kind() == "nullsafe_member_access_expression",
+                    form: AccessForm::Property,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Call-form member access, instance ($user->active(), $user->posts()).
+            // Same shape as the property arm; the receiver is the call's
+            // `object` field. (#77)
+            "member_call_name" => {
+                let Some(parent) = node.parent() else {
+                    continue;
+                };
+                let Some(object) = parent.child_by_field_name("object") else {
+                    continue;
+                };
+                let Ok(receiver) = object.utf8_text(source_bytes) else {
+                    continue;
+                };
+                result.member_accesses.push(MemberAccessMatch {
+                    member: text,
+                    receiver,
+                    receiver_byte_start: object.start_byte(),
+                    receiver_byte_end: object.end_byte(),
+                    is_nullsafe: parent.kind() == "nullsafe_member_call_expression",
+                    form: AccessForm::InstanceCall,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    row: start_pos.row,
+                    column: start_pos.column,
+                    end_column: end_pos.column,
+                });
+            }
+
+            // Call-form member access, static (User::active(), User::whereEmail()).
+            // The receiver is the call's `scope` field — a class name /
+            // qualified name (or `relative_scope` for self::/static::, which
+            // later fails receiver resolution and drops). (#77)
+            "scoped_call_name" => {
+                let Some(parent) = node.parent() else {
+                    continue;
+                };
+                let Some(scope) = parent.child_by_field_name("scope") else {
+                    continue;
+                };
+                let Ok(receiver) = scope.utf8_text(source_bytes) else {
+                    continue;
+                };
+                result.member_accesses.push(MemberAccessMatch {
+                    member: text,
+                    receiver,
+                    receiver_byte_start: scope.start_byte(),
+                    receiver_byte_end: scope.end_byte(),
+                    is_nullsafe: false,
+                    form: AccessForm::StaticCall,
                     byte_start: node.start_byte(),
                     byte_end: node.end_byte(),
                     row: start_pos.row,

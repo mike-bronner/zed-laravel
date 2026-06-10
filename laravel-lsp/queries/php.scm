@@ -2233,10 +2233,8 @@
 ; Captures the member NAME node; the receiver expression (object) and the
 ; nullsafe-ness are read from its parent in `extract_all_php_patterns`. This
 ; is the property-form half of the magic-member capture (M2 of the semantic-
-; index plan) — method calls ($user->posts()) are `member_call_expression`
-; and are already covered by builder-chain extraction, so they are NOT matched
-; here. Receiver resolution + classification happen later (M3); this query is
-; the raw capture only.
+; index plan). Receiver resolution + classification happen later (M3); this
+; query is the raw capture only.
 ;
 ; `name: (name)` restricts to static identifiers — dynamic access like
 ; `$user->$prop` (name is a variable) is intentionally excluded.
@@ -2246,3 +2244,30 @@
 
 (nullsafe_member_access_expression
   name: (name) @member_access_name)
+
+; ============================================================================
+; Pattern 41: Call-form member access ($user->active(), User::whereEmail())
+; ============================================================================
+; Matches: $user->active()       (potential scope, instance form)
+;          $user->posts()        (relationship called as a method)
+;          User::active()        (potential scope, static form)
+;          User::whereEmail(...) (potential dynamic finder)
+;          $user?->posts()       (nullsafe form)
+;
+; The call-form half of the magic-member capture (#77). Captures the method
+; NAME node; the receiver (`object` for instance calls, `scope` for static
+; calls) is read from the parent in `extract_all_php_patterns`. Classification
+; prunes the firehose: a call only indexes when its receiver resolves to a
+; known class AND the member classifies as a scope / dynamic finder /
+; relationship — plain method calls are dropped (Intelephense's territory).
+; `self::` / `static::` receivers arrive as `relative_scope` nodes and simply
+; fail receiver resolution.
+
+(member_call_expression
+  name: (name) @member_call_name)
+
+(nullsafe_member_call_expression
+  name: (name) @member_call_name)
+
+(scoped_call_expression
+  name: (name) @scoped_call_name)

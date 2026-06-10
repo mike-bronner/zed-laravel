@@ -275,6 +275,7 @@ fn member_ref(
         receiver_byte_start: 0,
         receiver_byte_end: 0,
         is_nullsafe: false,
+        form: AccessForm::Property,
         line,
         column,
         end_column: column + member.len() as u32,

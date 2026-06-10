@@ -2539,8 +2539,34 @@ pub enum MagicMemberKind {
     PlainMember,
 }
 
-/// A property-form member access (`$user->email`, `$this->profile`,
-/// `$user?->name`) captured for the magic-member semantic index.
+/// How a member was syntactically accessed. Drives which magic kinds are even
+/// possible: a scope is only reachable via a call, an accessor only via a
+/// property read. Lives here (not `member_resolver`, which re-exports it)
+/// because it travels inside [`MemberAccessReferenceData`] through the
+/// per-file pattern cache; `#[serde(default)]` on that field plus `Property`
+/// as the default keeps older serialized shapes decodable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum AccessForm {
+    /// `$user->email` — property read (no call parens).
+    #[default]
+    Property,
+    /// `User::active()` — static call (`::`).
+    StaticCall,
+    /// `$user->active()` / `$user->posts()` — instance method call (`->m()`).
+    InstanceCall,
+}
+
+impl AccessForm {
+    /// Call-form (`::m()` or `->m()`) vs property read.
+    pub fn is_call(self) -> bool {
+        matches!(self, AccessForm::StaticCall | AccessForm::InstanceCall)
+    }
+}
+
+/// A member access (`$user->email`, `$user->active()`, `User::whereEmail()`)
+/// captured for the magic-member semantic index.
 ///
 /// **Capture-only at M2.** The `member`, `receiver`, byte ranges, nullsafe
 /// flag, and position fields are populated now. The resolution fields
@@ -2621,6 +2647,7 @@ pub fn blade_loop_iterable_accesses(content: &str) -> Vec<MemberAccessReferenceD
             receiver_byte_start: 0,
             receiver_byte_end: 0,
             is_nullsafe: false,
+            form: AccessForm::Property,
             line: loop_var.start_line,
             column: member_col,
             end_column: member_col + member.len() as u32,
@@ -2645,6 +2672,12 @@ pub struct MemberAccessReferenceData {
     pub receiver_byte_end: usize,
     /// Whether the access used the nullsafe operator (`?->`).
     pub is_nullsafe: bool,
+    /// How the member was accessed. Call-form sites can only classify as
+    /// scopes / dynamic finders / relationships; property-form as accessors /
+    /// relationships / columns. Defaults to `Property` so pre-call-form
+    /// serialized patterns stay decodable.
+    #[serde(default)]
+    pub form: AccessForm,
     /// Position of the member name (0-based — repo convention).
     pub line: u32,
     pub column: u32,
@@ -6096,6 +6129,7 @@ impl SalsaActor {
                             receiver_byte_start: m.receiver_byte_start,
                             receiver_byte_end: m.receiver_byte_end,
                             is_nullsafe: m.is_nullsafe,
+                            form: m.form,
                             line: m.row as u32,
                             column: m.column as u32,
                             end_column: m.end_column as u32,
@@ -6259,6 +6293,7 @@ impl SalsaActor {
                         receiver_byte_start: m.receiver_byte_start,
                         receiver_byte_end: m.receiver_byte_end,
                         is_nullsafe: m.is_nullsafe,
+                        form: m.form,
                         line,
                         column: col,
                         end_column: end_col,
@@ -6984,7 +7019,7 @@ impl SalsaActor {
             if let Some(resolved) = crate::member_resolver::resolve_and_classify(
                 receiver,
                 &member_ref.member,
-                crate::member_resolver::AccessForm::Property,
+                member_ref.form,
                 bytes,
                 &aliases,
                 &self.class_hierarchy_index,
@@ -7058,7 +7093,7 @@ impl SalsaActor {
             match crate::member_resolver::resolve_and_classify(
                 receiver,
                 &member_ref.member,
-                crate::member_resolver::AccessForm::Property,
+                member_ref.form,
                 bytes,
                 &aliases,
                 &self.class_hierarchy_index,
@@ -7069,6 +7104,9 @@ impl SalsaActor {
                     (r.declaring_fqcn, r.kind, r.confidence, false)
                 }
                 Some(_) => return None,
+                // An unclassified CALL can't be a column — the tentative-column
+                // fallback below is a property-read concept.
+                None if member_ref.form.is_call() => return None,
                 None => {
                     let (fqcn, confidence) = crate::member_resolver::resolve_expression_type(
                         receiver,
@@ -7158,7 +7196,7 @@ impl SalsaActor {
         let resolved = crate::member_resolver::resolve_and_classify(
             receiver,
             &member_ref.member,
-            crate::member_resolver::AccessForm::Property,
+            member_ref.form,
             bytes,
             &aliases,
             &self.class_hierarchy_index,

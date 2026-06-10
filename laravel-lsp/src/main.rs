@@ -16009,6 +16009,20 @@ return [
             }
             type_hint = php_type;
             column_link = mig_link;
+        } else if matches!(
+            data.kind,
+            laravel_lsp::salsa_impl::MagicMemberKind::DynamicFinder
+        ) {
+            // A finder is `__call` sugar over its column — enrich the card
+            // with the column's type and link it to the migration line.
+            if let Some(column) = laravel_lsp::member_resolver::dynamic_finder_column(&data.member)
+            {
+                let (_confirmed, php_type, mig_link) = self
+                    .resolve_column_hover(&data.declaring_fqcn, &column)
+                    .await;
+                type_hint = php_type;
+                column_link = mig_link;
+            }
         }
 
         // Link: prefer the migration site for a column (the column's actual
@@ -16083,20 +16097,24 @@ return [
         (confirmed, php_type, mig_link)
     }
 
-    /// Goto-definition for a property-form Eloquent magic member — the
-    /// `PatternAtPosition::MemberAccess` arm of the goto handler. Resolves the
-    /// cursor through the same Salsa path as the M6 hover card (HIGH/MEDIUM
-    /// confidence only), then dispatches by kind:
+    /// Goto-definition for an Eloquent magic member — the
+    /// `PatternAtPosition::MemberAccess` arm of the goto handler, covering
+    /// property-form (`$user->email`) and call-form (`->active()`,
+    /// `User::whereEmail()`, #77) sites alike. Resolves the cursor through the
+    /// same Salsa path as the M6 hover card (HIGH/MEDIUM confidence only),
+    /// then dispatches by kind:
     ///
     /// - **Column** → the migration line defining it (the same target the
     ///   hover card links). A *tentative* column (receiver resolved to a
     ///   model but the member didn't classify) requires a migration site —
     ///   never guess. A `$casts`-declared column with no migration falls back
     ///   to its declaration site on the model.
-    /// - **Relationship / accessor** → the declaring method's name token in
-    ///   the declaring class (inheritance/trait-resolved), located the same
-    ///   way the rename path rewrites it; falls back to the declaration's
-    ///   start line when the token can't be located.
+    /// - **Dynamic finder** → the underlying column's migration line
+    ///   (`whereEmail` → `email`); a finder has no declaring method.
+    /// - **Relationship / scope / accessor** → the declaring method's name
+    ///   token in the declaring class (inheritance/trait-resolved), located
+    ///   the same way the rename path rewrites it; falls back to the
+    ///   declaration's start line when the token can't be located.
     /// - **Plain member** → `None` — Intelephense already handles those (the
     ///   multi-LSP dedup policy: suppress at the source).
     async fn create_magic_member_location(
@@ -16132,8 +16150,19 @@ return [
             return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
         }
 
-        // Method-backed (relationship / accessor): narrow to the method-name
-        // token in the declaring file.
+        // A dynamic finder (`whereEmail()`) has no declaring method — it's
+        // `__call` sugar over the column, so its definition site is the
+        // column's migration line. No fallback: jumping to the model's class
+        // line would read as "wrong target".
+        if matches!(data.kind, MagicMemberKind::DynamicFinder) {
+            let column = laravel_lsp::member_resolver::dynamic_finder_column(&data.member)?;
+            return self
+                .column_migration_location(&data.declaring_fqcn, &column)
+                .await;
+        }
+
+        // Method-backed (relationship / scope / accessor): narrow to the
+        // method-name token in the declaring file.
         let decl_file = data.decl_file?;
         let (line, start, end) = match tokio::fs::read_to_string(&decl_file).await {
             Ok(src) => {

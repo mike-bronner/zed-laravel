@@ -60,3 +60,5 @@ DB::table('orders')->join('users', ...)->where('id', 1);
 ```
 
 These diagnostics **under-warn on purpose**: they stay silent on a cold or absent schema, unresolved receivers, qualified/aliased/expression literals, and raw SQL — a missing squiggle never means "this is definitely fine," only "we couldn't prove it's wrong." Severity is configurable via `diagnostics.severity` (`warning` / `error` / `info` / `off`); see [Configuration](../README.md#️-configuration). A working database connection is required — column and relation linting silently disables when the schema can't be introspected.
+
+**Unused-symbol warnings** (opt-in, via `codeLens.enabled`) flag lensed symbols — magic members, route names, config / translation / env keys — that have zero non-test references, with the same under-warning philosophy: vendor-aware (a model's `$timestamps`, read only by the framework, is never flagged) and worded as a question, since a zero count can also mean dynamic usage static analysis can't see. Details in [Code Lens](code-lens.md).

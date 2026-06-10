@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, or container binding. The extension rewrites every call site AND the declaration site (or moves the backing file) in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / scope / accessor), or database column. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
 
 You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
@@ -81,6 +81,28 @@ return view('users.account');
 **Container bindings** follow the same shape as middleware aliases: the quoted name at the registration site PLUS every `app('x')`, `resolve('x')`, `app()->make('x')` call site.
 
 **Eloquent model classes** rename project-wide. Press `F2` on a model class name and every reference rewrites in one pass — `use` imports, `User::` static calls, `new User`, type hints, `::class` references, `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside. Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
+
+**Eloquent magic members** rename from their usage sites. Press `F2` on a relationship, scope, or accessor usage and the declaring method renames with the *inverse name transform* applied — every cached usage follows:
+
+```php
+// F2 on `active` in:
+User::active()->get();
+
+// renames the declaration with the scope prefix re-applied:
+public function scopeActive(Builder $query)   →   public function scopeArchived(Builder $query)
+// and every ->active() / User::active() call site becomes ->archived()
+```
+
+The transforms run both ways: `active` ↔ `scopeActive`, `full_name` ↔ `getFullNameAttribute`, and a relationship's usage name maps verbatim to its method (`$user->posts` ↔ `posts()`). All rewrites land in one `WorkspaceEdit`, so the editor's multi-file diff shows everything before you commit to it.
+
+**Database columns** get the full treatment — a column lives in the database, not in any one method, so renaming `$user->email` → `$user->primary_email` touches four site classes atomically:
+
+1. **A generated migration** — a new timestamped `database/migrations/*_rename_email_to_primary_email_in_users_table.php` with a reversible `Schema::table(…, renameColumn(…))` (`up` and `down`), created as part of the same edit.
+2. **Property-form usages** — `$user->email`, `{{ $user->email }}` in Blade.
+3. **Model array entries** — the `'email'` string in `$fillable`, `$casts`, `$hidden`, `$guarded`, `$dates`.
+4. **Query-chain column literals project-wide** — `where('email', …)`, `orderBy('email')`, `pluck('email')`, … rewritten *only* when the chain resolves to the column's table (with an enclosing-model fallback for local scopes). A qualified literal `'users.email'` rewrites only the `email` segment and only when the qualifier matches; the database itself is never touched — you review the diff, then run the migration.
+
+> ⚠️ **Intelephense overlap on relationship renames.** A relationship's usage name equals its method name, so Intelephense *also* understands `posts()` as a renameable method — on F2 both language servers may contribute edits for the declaration and the call-form sites. Scopes, accessors, and columns don't overlap (Intelephense can't connect `->active()` to `scopeActive()`), so this extension owns those cleanly. There's no surgical way to disable just Intelephense's rename — it has no `rename.enable` setting, and Zed has no per-capability toggle — though `intelephense.rename.exclude` can narrow its scope by glob. Tracked in [#74](https://github.com/mike-bronner/zed-laravel/issues/74).
 
 **Same parser-classified guarantee as [Find References](find-references.md)** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
 

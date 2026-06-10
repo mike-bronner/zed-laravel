@@ -57,10 +57,11 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 
 | Feature | What it does |
 |---|---|
-| [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings — plus query-chain columns / relations / tables |
-| [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern |
-| [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included |
-| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, and model classes |
+| [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings, Artisan commands — plus query-chain columns / relations / tables |
+| [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern, including semantic cards for Eloquent magic (scopes, accessors, relationships, cast-aware column types) |
+| [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included — including the magic-member usages Intelephense can't see |
+| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, model classes, magic members — and database columns, migration included |
+| [🔢 Code Lens](docs/code-lens.md) | Opt-in reference counts above magic members, routes, config / translation / env keys, and Blade templates — plus an unused-symbol warning |
 | [💡 Autocomplete](docs/autocomplete.md) | Cast types, model properties, query chains, builder methods, Blade / loop / slot variables, Pennant flags |
 | [❌ Diagnostics](docs/diagnostics.md) | Missing views / components / features, invalid rules, query-chain typos against your real schema |
 | [⚡ Quick Actions](docs/quick-actions.md) | One-click create missing views, components, middleware, features, and migrations |
@@ -102,6 +103,9 @@ Add any of these to your Zed `settings.json`:
         "blade": {
           "directiveSpacing": false
         },
+        "codeLens": {
+          "enabled": false
+        },
         "diagnostics": {
           "severity": "warning"
         }
@@ -115,6 +119,7 @@ Add any of these to your Zed `settings.json`:
 |---------|---------|-------------|
 | `autoCompleteDebounce` | `200` | Delay (ms) before autocomplete updates after typing. Lower values (50-100ms) give faster feedback. Higher values (300-500ms) reduce CPU usage. |
 | `blade.directiveSpacing` | `false` | Add space between directive name and parentheses. `false`: `@if($condition)` / `true`: `@if ($condition)` |
+| `codeLens.enabled` | `false` | Turn on [reference-count code lenses](docs/code-lens.md) and the unused-symbol diagnostic. Opt-in while the feature matures. |
 | `diagnostics.severity` | `"warning"` | Severity for query-chain diagnostics (unknown column/relation/table in Eloquent & `DB::table()` chains). One of `"warning"`, `"error"`, `"info"`, or `"off"` to disable. Requires a working database connection — diagnostics stay silent when the schema can't be introspected. |
 
 ### 🗄️ Database connection
@@ -223,7 +228,7 @@ After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). For the lic
 
 ## 🚧 Planned Features
 
-**Rename — remaining work** (the class-backed kinds and the Eloquent model-class engine shipped; variables didn't):
+**Rename — remaining work** (the class-backed kinds, the Eloquent model-class engine, magic members, and database columns shipped; variables didn't):
 
 - ✏️ **More PHP class kinds** — the FQCN rename engine (use-statement updates, type-hint / static-call / `new` / `::class` rewrites, docblocks, file move) now powers Eloquent model rename; extending it to controllers, jobs, services, and form requests as first-class symbols is the follow-up.
 - 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.

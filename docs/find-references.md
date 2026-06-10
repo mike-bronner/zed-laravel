@@ -27,5 +27,8 @@ $url = route('users.index', $user);
 | Livewire | `<livewire:counter>` | tags AND `@livewire('counter')` directives |
 | Middleware | `'auth'` | every `->middleware()` registration |
 | Bindings | `app('cache')` | every `app()` / `resolve()` resolution |
+| Magic members | `$user->posts`, `->active()` | every property-form, call-form, and Blade usage of a relationship / scope / accessor / column / dynamic finder |
+
+**Eloquent magic is first-class.** Find references on a usage site — `$user->posts`, a `->active()` scope call, `$model->full_name`, `$user->email`, a `User::whereEmail()` dynamic finder — and every indexed usage of that member surfaces, in PHP and Blade alike. The usage is resolved through the semantic index to its declaring class (inheritance- and trait-aware), so the results are keyed by what the member *is*, not what the string looks like. These are exactly the sites a generic PHP language server can't see through `__call` / `__get`. For the same counts anchored on the *declaration* side (the `posts()` method itself), see [Code Lens](code-lens.md) — each lens is click-to-open into this reference list.
 
 **Parser-classified guarantee:** a coincidental string `'home'` sitting in an unrelated PHP literal is never returned. Only positions the parser has classified as the matching pattern kind appear in results. The LSP `includeDeclaration` flag is honoured — declaration sites (route names, config-key array entries, translation-key array entries) are included or excluded as the client asks.

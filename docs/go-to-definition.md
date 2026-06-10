@@ -48,5 +48,15 @@ DB::table('users')->get();
 //        ^^^^^ → database/migrations/..._create_users_table.php  (Schema::create('users'))
 ```
 
+**Artisan command strings** jump to the `Command` class declaring the matching `protected $signature` — across all four invocation patterns, with app-defined commands taking priority over same-named package/framework commands:
+
+```php
+Artisan::call('emails:send');
+//             ^^^^^^^^^^^ → app/Console/Commands/SendEmails.php  (protected $signature)
+
+$schedule->command('emails:send --queue')->daily();
+//                  ^^^^^^^^^^^ → same — options/arguments after the name are ignored
+```
+
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` · query-chain columns / relations / tables
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables

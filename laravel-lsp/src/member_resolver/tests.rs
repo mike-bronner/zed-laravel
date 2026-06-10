@@ -847,6 +847,7 @@ fn member_refs_of(source: &str) -> Vec<Arc<MemberAccessReferenceData>> {
                 receiver_byte_start: m.receiver_byte_start,
                 receiver_byte_end: m.receiver_byte_end,
                 is_nullsafe: m.is_nullsafe,
+                form: m.form,
                 line: m.row as u32,
                 column: m.column as u32,
                 end_column: m.end_column as u32,
@@ -1265,4 +1266,450 @@ $users->map(function ($user) {
         entries.is_empty(),
         "an ordinary closure's untyped $user must not resolve to the auth model; got {entries:?}"
     );
+}
+
+// ─── Call-form magic members (#77): scopes, finders, relationship calls ───
+
+const SCOPED_MODEL: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    protected $casts = ['email' => 'string'];
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+    public function scopeActive(Builder $query): Builder { return $query; }
+}
+"#;
+
+#[test]
+fn dynamic_finder_column_maps_finder_names() {
+    assert_eq!(
+        dynamic_finder_column("whereEmail").as_deref(),
+        Some("email")
+    );
+    assert_eq!(
+        dynamic_finder_column("orWhereEmailAddress").as_deref(),
+        Some("email_address")
+    );
+    // Not finder-shaped: bare `where`, lowercase remainder, unrelated word.
+    assert!(dynamic_finder_column("where").is_none());
+    assert!(dynamic_finder_column("whereabouts").is_none());
+    assert!(dynamic_finder_column("posts").is_none());
+}
+
+#[test]
+fn population_indexes_static_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        return User::active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "static scope call should index under its usage name; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_instance_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "instance scope call should index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_relationship_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->posts()->count();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "posts"),
+        "relationship call should index under the same key as property reads; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_dynamic_finder_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function find() {
+        return User::whereEmail('a@b.test')->first();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "whereEmail"),
+        "dynamic finder call should index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_prunes_plain_method_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index(User $user) {
+        return $user->posts()->count();
+    }
+    public function helper(User $user) { return $user->helperMethod(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    // `count()` (unresolvable/plain) and `helperMethod()` (not on the model)
+    // must not index; only the relationship call survives.
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "count"),
+        "{entries:?}"
+    );
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "helperMethod"),
+        "{entries:?}"
+    );
+    assert!(has_entry(&entries, "App\\Models\\User", "posts"));
+}
+
+#[test]
+fn static_receiver_resolves_via_use_alias() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // Aliased import: `use App\Models\User as Account;`.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User as Account;
+class C {
+    public function index() {
+        return Account::active()->get();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "aliased static receiver should resolve through use-imports; got {entries:?}"
+    );
+}
+
+#[test]
+fn unknown_static_receiver_does_not_index() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // `Str` is not in the class graph — the call must drop, not guess.
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+$slug = Str::slug('Laravel');
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[test]
+fn static_receiver_resolves_same_namespace_without_import() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    // A sibling model in the same namespace needs no `use` import — PHP
+    // resolves the bare name to the current namespace. Regression for the
+    // PR #76 review: the static-receiver arm must qualify bare names with
+    // the file's namespace, not just expand use-aliases.
+    let caller = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Order extends Model {
+    public function activeUsers() { return User::active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "same-namespace unimported static receiver should resolve; got {entries:?}"
+    );
+}
+
+// ─── Chain-aware call-form resolution (#77, review round 2) ────────────────
+//
+// Mid-chain scope calls are the canonical builder shapes — they MUST index,
+// or scope rename rewrites the declaration + direct sites while silently
+// leaving chained call sites behind (broken code).
+
+#[test]
+fn population_indexes_static_rooted_chain_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a() { return User::query()->active()->get(); }
+    public function b() { return User::where('email', 'x')->active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let active_count = entries
+        .iter()
+        .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
+        .count();
+    assert_eq!(
+        active_count, 2,
+        "both static-rooted chain shapes must index `active`; got {entries:?}"
+    );
+    // The chain links themselves stay out of the index (plain methods).
+    assert!(!has_entry(&entries, "App\\Models\\User", "where"));
+    assert!(!has_entry(&entries, "App\\Models\\User", "get"));
+}
+
+#[test]
+fn population_indexes_builder_param_scope_body_calls() {
+    // `$query->active()` inside another scope's body — the receiver types as
+    // the Eloquent Builder (no scopes declared there); resolution retries
+    // against the enclosing model.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public function scopeRecent(Builder $query): Builder {
+        return $query->active()->where('created_at', '>', now());
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "builder-typed `$query->active()` must resolve via the enclosing model; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_multi_link_builder_param_chains() {
+    // `$query->where(…)->active()` — variable-rooted chain: the root `$query`
+    // types as Builder, classification retries against the enclosing model.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public function scopeFresh(Builder $query): Builder {
+        return $query->where('x', 1)->active();
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "mid-chain `$query->where(…)->active()` must index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_static_rooted_chain_ignores_non_model_roots() {
+    // `Str::of(…)->upper()` — the chain root resolves only if the class graph
+    // knows it, and classification only matches magic surfaces. Neither holds
+    // for a non-model helper: no entry.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+$x = Str::of('laravel')->upper();
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[test]
+fn population_chain_plain_terminals_stay_pruned() {
+    // `User::query()->first()` — the chain root resolves to the model, but
+    // `first` matches no magic surface: pruned, not indexed.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function f() { return User::query()->first(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "first"),
+        "plain chain terminals must not index; got {entries:?}"
+    );
+}
+
+// ─── Round-2 review gates: factory states, relative scopes, closures ───────
+
+#[test]
+fn population_skips_factory_state_calls() {
+    // `User::factory()->active()` — `active` here is a FACTORY STATE, not the
+    // scope, and factory states routinely share scope names. The first-link
+    // gate must refuse (`factory` is no chain starter, scope, or finder), or
+    // a scope rename would rewrite factory-state calls (review round 2,
+    // finding 1 — demonstrated failure before the gate).
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace Tests\Feature;
+use App\Models\User;
+class UserTest {
+    public function test_active() {
+        $user = User::factory()->active()->create();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "active"),
+        "factory-state calls must not index as scope references; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_relative_scope_calls() {
+    // `self::active()` and `static::query()->active()` inside the model —
+    // common in model statics; both must index or scope rename leaves them
+    // behind (review round 2, finding 5).
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public static function activeCount(): int { return self::active()->count(); }
+    public static function freshActive() { return static::query()->active()->get(); }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let active_count = entries
+        .iter()
+        .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
+        .count();
+    assert_eq!(
+        active_count, 2,
+        "self:: and static::query() scope calls must both index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_skips_where_has_closure_builder_calls() {
+    // A Builder-typed param of a `whereHas` CLOSURE is the related model's
+    // builder — retrying it against the enclosing model would misattribute a
+    // same-named scope (review round 2, finding 2). The builder retry is
+    // gated to the enclosing scope method's own parameter.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopePublished(Builder $query): Builder { return $query; }
+    public function scopeRecent(Builder $query): Builder {
+        return $query->whereHas('posts', function (Builder $q) {
+            $q->published();
+        });
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "published"),
+        "a whereHas-closure builder call must not attribute to the enclosing model; got {entries:?}"
+    );
+    // The legitimate `$query->whereHas(...)` receiver still flows: `whereHas`
+    // itself is a plain builder method and stays pruned.
+    assert!(!has_entry(&entries, "App\\Models\\User", "whereHas"));
+}
+
+#[test]
+fn population_skips_relation_hop_chains() {
+    // `$user->posts()->active()` — the chain's subject re-targets to Post at
+    // the relationship link; attributing `active` to User would be wrong (and
+    // rename-hazardous). Conservatively dropped (review round 2, finding 2).
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+    public function scopeActive(Builder $query): Builder { return $query; }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function x(User $user) { return $user->posts()->active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "active"),
+        "a relation-hopped scope call must not attribute to the root model; got {entries:?}"
+    );
+    // The relationship CALL itself still indexes (it is User's member).
+    assert!(has_entry(&entries, "App\\Models\\User", "posts"));
 }

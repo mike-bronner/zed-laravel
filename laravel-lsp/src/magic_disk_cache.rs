@@ -40,8 +40,10 @@ use crate::symbol_index::MagicMemberEntry;
 
 /// Bump when `MagicMemberEntry`'s shape (or this file's layout) changes, so a
 /// stale cache from an older build is discarded on read rather than
-/// mis-deserialized.
-const SCHEMA_VERSION: u32 = 1;
+/// mis-deserialized. v2: call-form usages (#77) — a v1 cache holds only
+/// property-form entries for unchanged files, which would leave scope /
+/// finder references invisible until an unrelated edit; discard wholesale.
+const SCHEMA_VERSION: u32 = 2;
 
 const CACHE_FILENAME: &str = "magic_cache.bin";
 

@@ -51,25 +51,10 @@ impl ClassFileResolver for HashMap<String, PathBuf> {
     }
 }
 
-/// How a member was syntactically accessed. Drives which magic kinds are even
-/// possible: a scope is only reachable via a call, an accessor only via a
-/// property read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessForm {
-    /// `$user->email` — property read (no call parens).
-    Property,
-    /// `User::active()` — static call (`::`).
-    StaticCall,
-    /// `$user->active()` / `$user->posts()` — instance method call (`->m()`).
-    InstanceCall,
-}
-
-impl AccessForm {
-    /// Call-form (`::m()` or `->m()`) vs property read.
-    fn is_call(self) -> bool {
-        matches!(self, AccessForm::StaticCall | AccessForm::InstanceCall)
-    }
-}
+// `AccessForm` moved to `salsa_impl` (it now travels inside
+// `MemberAccessReferenceData` through the pattern cache); re-exported here so
+// the engine's callers keep their `member_resolver::AccessForm` paths.
+pub use crate::salsa_impl::AccessForm;
 
 /// The classification of a resolved member: which declaring class owns it
 /// (inheritance/trait resolved) and what magic kind it is.
@@ -247,7 +232,7 @@ pub fn resolve_member_access_entries(
         let Some(resolved) = resolve_and_classify(
             receiver,
             &m.member,
-            AccessForm::Property,
+            m.form,
             bytes,
             &aliases,
             resolver,
@@ -258,6 +243,14 @@ pub fn resolve_member_access_entries(
         };
         // find-references gate: HIGH + MEDIUM (rename will gate to HIGH later).
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
+            continue;
+        }
+        // Call-form plain methods are every `->get()` / `->save()` in the
+        // codebase — Intelephense's territory and pure index bloat. Only the
+        // magic kinds (scope / finder / relationship) index from calls.
+        // Property-form plain members stay (bounded: declared properties on
+        // resolved classes).
+        if m.form.is_call() && resolved.kind == MagicMemberKind::PlainMember {
             continue;
         }
         out.push(MagicMemberEntry {
@@ -294,15 +287,298 @@ pub fn resolve_and_classify(
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
     let (fqcn, confidence) =
-        resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root)?;
-    let file_path = resolver.class_file(&fqcn)?;
-    let view = classviews.get_or_build(&fqcn, &file_path, project_root)?;
+        match resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root) {
+            Some(r) => r,
+            // Call-form receivers are frequently builder CHAINS
+            // (`User::query()->active()`, `User::where(…)->active()`) whose
+            // links the direct resolver can't type. The chain's subject is its
+            // root — resolve that instead (#77 review). Property-form chains
+            // (`User::first()->full_name`) deliberately stay chain-blind: the
+            // column surface makes property terminals a far bigger
+            // false-positive net than the call surfaces gated below.
+            None if form.is_call() => resolve_call_chain_receiver(
+                receiver,
+                bytes,
+                aliases,
+                resolver,
+                classviews,
+                project_root,
+            )?,
+            None => return None,
+        };
+
+    if let Some(resolved) = classify_against(
+        &fqcn,
+        member,
+        form,
+        confidence,
+        resolver,
+        classviews,
+        project_root,
+    ) {
+        return Some(resolved);
+    }
+
+    // Builder-typed receiver retry: `$query->active()` inside a scope body
+    // types as the Eloquent Builder, which declares no scopes — retry against
+    // the lexically enclosing class (the model whose scope body this is), the
+    // same enclosing-model convention column rename uses. Gated to receivers
+    // rooted in the enclosing `scope*` method's own parameter: a Builder
+    // param inside a `whereHas` CLOSURE belongs to the related model, and
+    // retrying it against the enclosing class would misattribute same-named
+    // scopes. (Trade-off: correct attributions inside global-scope closures
+    // are dropped too.) MEDIUM confidence — informational (every consumer
+    // gate accepts High|Medium); the scope-param gate and classification are
+    // the actual safety here.
+    if form.is_call() && is_eloquent_builder(&fqcn) && is_scope_param_receiver(receiver, bytes) {
+        let model = enclosing_class_fqcn(receiver, bytes)?;
+        let resolved = classify_against(
+            &model,
+            member,
+            form,
+            Confidence::Medium,
+            resolver,
+            classviews,
+            project_root,
+        )?;
+        return Some(resolved);
+    }
+    None
+}
+
+/// Classify `member` against `fqcn`'s resolved surfaces — the shared tail of
+/// [`resolve_and_classify`]'s direct path and its builder retry.
+fn classify_against(
+    fqcn: &str,
+    member: &str,
+    form: AccessForm,
+    confidence: Confidence,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<ResolvedMemberAccess> {
+    let file_path = resolver.class_file(fqcn)?;
+    let view = classviews.get_or_build(fqcn, &file_path, project_root)?;
     let classified = classify_member(&view, member, form)?;
     Some(ResolvedMemberAccess {
         declaring_fqcn: classified.declaring_fqcn,
         kind: classified.kind,
         confidence,
     })
+}
+
+/// Resolve a call-chain receiver by its ROOT (#77 review). The chain's
+/// subject stays its root only for genuine BUILDER chains, so the static
+/// branch is gated twice:
+///
+/// - **First-link gate**: the root's static method must actually forward to
+///   the query builder — an Eloquent chain starter (`query`, `where`,
+///   `find`, …; the same list receiver detection uses) or one of the class's
+///   own scopes / dynamic finders. Declared statics returning non-builder
+///   objects (`factory()`, `fake()`, bespoke constructors) must NOT resolve:
+///   Factory states routinely share names with scopes, and a scope rename
+///   would rewrite `User::factory()->active()`.
+/// - **Relation-hop bail**: a relationship link re-targets the chain's
+///   subject to the related model (`$user->posts()->active()` is Post's
+///   scope, not User's) — conservatively drop rather than misattribute.
+///
+/// Static roots resolve at HIGH (explicit class name; `static::` late-binds,
+/// so it gets MEDIUM via the enclosing class as a lower bound). A variable
+/// root re-enters the direct resolver capped at MEDIUM — informational
+/// (consumer gates accept High|Medium alike); the gates above plus
+/// classification are the real safety.
+fn resolve_call_chain_receiver(
+    receiver: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let root = chain_root(receiver);
+    if root.kind() == "scoped_call_expression" {
+        let scope = root.child_by_field_name("scope")?;
+        let (fqcn, confidence) = match scope.kind() {
+            "name" | "qualified_name" => {
+                let raw = scope.utf8_text(bytes).ok()?;
+                (
+                    qualify_fqcn(resolve_class_name(raw, aliases), scope, bytes),
+                    Confidence::High,
+                )
+            }
+            // `self::query()->…` / `static::query()->…` — the enclosing
+            // class. `self` binds statically; `static` late-binds to the
+            // runtime subclass, so the enclosing class is a lower bound.
+            // `parent::` would need the parent FQCN from the hierarchy —
+            // drops conservatively.
+            "relative_scope" => {
+                let raw = scope.utf8_text(bytes).ok()?;
+                let fqcn = enclosing_class_fqcn(receiver, bytes)?;
+                match raw {
+                    "self" => (fqcn, Confidence::High),
+                    "static" => (fqcn, Confidence::Medium),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let file = resolver.class_file(&fqcn)?;
+        let view = classviews.get_or_build(&fqcn, &file, project_root)?;
+        let first = root
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())?;
+        let first_is_forwarding = crate::query_chain::methods::is_eloquent_static_starter(first)
+            || matches!(
+                classify_call(&view, first).map(|c| c.kind),
+                Some(MagicMemberKind::Scope) | Some(MagicMemberKind::DynamicFinder)
+            );
+        if !first_is_forwarding {
+            return None;
+        }
+        if has_relationship_link(receiver, bytes, &view) {
+            return None;
+        }
+        return Some((fqcn, confidence));
+    }
+    if root.id() != receiver.id() {
+        let (fqcn, confidence) =
+            resolve_receiver(root, bytes, aliases, resolver, classviews, project_root)?;
+        // Relation-hop bail, same reasoning as the static branch. A view
+        // that can't build (e.g. the vendor Builder outside the fixture
+        // graph) skips the check — classification downstream still gates.
+        if let Some(file) = resolver.class_file(&fqcn) {
+            if let Some(view) = classviews.get_or_build(&fqcn, &file, project_root) {
+                if has_relationship_link(receiver, bytes, &view) {
+                    return None;
+                }
+            }
+        }
+        let capped = match confidence {
+            Confidence::High => Confidence::Medium,
+            other => other,
+        };
+        return Some((fqcn, capped));
+    }
+    None
+}
+
+/// Does any link between the cursor's member and the chain root (exclusive)
+/// name a relationship on `view`? For `$user->posts()->active()` with the
+/// cursor on `active`, the receiver is the `posts()` call → links =
+/// `["posts"]` → true when `posts` is a relationship.
+fn has_relationship_link(
+    receiver: Node,
+    bytes: &[u8],
+    view: &crate::laravel_introspector::chain::ClassView,
+) -> bool {
+    let mut cur = receiver;
+    while matches!(
+        cur.kind(),
+        "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+    ) {
+        if let Some(name) = cur.child_by_field_name("name") {
+            if let Ok(text) = name.utf8_text(bytes) {
+                if view.relationships.iter().any(|r| r.method_name == text) {
+                    return true;
+                }
+            }
+        }
+        match cur.child_by_field_name("object") {
+            Some(o) => cur = o,
+            None => break,
+        }
+    }
+    false
+}
+
+/// Does this receiver chain root back to a parameter of the enclosing
+/// `scope*` method? Gates the builder→enclosing-model retry to canonical
+/// scope bodies (`scopeRecent(Builder $query) { $query->active() }`). A
+/// Builder param belonging to an intervening closure (`whereHas('posts',
+/// fn (Builder $q) => $q->published())`) is the related model's builder, not
+/// the enclosing model's — those must not retry. (A closure param that
+/// SHADOWS the scope's param name still slips through; accepted edge.)
+fn is_scope_param_receiver(receiver: Node, bytes: &[u8]) -> bool {
+    let root = chain_root(receiver);
+    if root.kind() != "variable_name" {
+        return false;
+    }
+    let Some(var) = root
+        .utf8_text(bytes)
+        .ok()
+        .map(|t| t.trim_start_matches('$'))
+    else {
+        return false;
+    };
+    let mut cur = root.parent();
+    while let Some(n) = cur {
+        if n.kind() == "method_declaration" {
+            let is_scope = n
+                .child_by_field_name("name")
+                .and_then(|x| x.utf8_text(bytes).ok())
+                .is_some_and(|name| name.len() > "scope".len() && name.starts_with("scope"));
+            return is_scope && method_has_param(n, bytes, var);
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Is `$var` one of `method`'s declared parameters?
+fn method_has_param(method: Node, bytes: &[u8], var: &str) -> bool {
+    let Some(params) = method.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut stack = vec![params];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "variable_name" {
+            if let Ok(text) = n.utf8_text(bytes) {
+                if text.trim_start_matches('$') == var {
+                    return true;
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    false
+}
+
+/// The root expression of a call/access chain: descend through the `object`
+/// field of member calls/accesses. `User::query()->where(…)->active()` → the
+/// `User::query()` scoped call; `$q->where(…)->active()` → `$q`.
+fn chain_root(receiver: Node) -> Node {
+    let mut cur = receiver;
+    while matches!(
+        cur.kind(),
+        "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+    ) {
+        match cur.child_by_field_name("object") {
+            Some(o) => cur = o,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Is `fqcn` the Eloquent query builder (the type of a scope's `$query`
+/// param)? The base `Query\Builder` is deliberately excluded — scopes don't
+/// exist on it, and `DB::table(…)` chains must not retry against an
+/// enclosing model they have nothing to do with.
+fn is_eloquent_builder(fqcn: &str) -> bool {
+    matches!(
+        fqcn,
+        "Illuminate\\Database\\Eloquent\\Builder"
+            | "Illuminate\\Contracts\\Database\\Eloquent\\Builder"
+    )
 }
 
 /// Resolve an arbitrary expression node to its class `(FQCN, confidence)` —
@@ -372,6 +648,37 @@ fn resolve_receiver(
         // `$obj->method()` — resolve via the method's return type.
         "member_call_expression" | "nullsafe_member_call_expression" => {
             resolve_method_return(receiver, bytes, aliases, resolver, classviews, project_root)
+        }
+        // `User::…` — an explicit class-name receiver (static call). Resolve
+        // through the file's use-aliases, then qualify a bare same-namespace
+        // name with the file's namespace (PHP name-resolution semantics — a
+        // sibling model needs no import). A name the class graph still doesn't
+        // know (an unimported alias, a facade proxying elsewhere) stays
+        // unresolved rather than guessed.
+        "name" | "qualified_name" => {
+            let raw = receiver.utf8_text(bytes).ok()?;
+            let fqcn = qualify_fqcn(resolve_class_name(raw, aliases), receiver, bytes);
+            if resolver.class_file(&fqcn).is_some() {
+                Some((fqcn, Confidence::High))
+            } else {
+                None
+            }
+        }
+        // `self::…` / `static::…` — the enclosing class. `self` binds
+        // statically (HIGH); `static` late-binds to the runtime subclass, so
+        // the enclosing class is a lower bound (MEDIUM). `parent::` would
+        // need the parent's FQCN from the hierarchy — drops conservatively.
+        // The keyword kinds are matched alongside `relative_scope` because a
+        // byte-range receiver lookup lands on the anonymous keyword TOKEN
+        // inside the `relative_scope` node, not the node itself.
+        "relative_scope" | "self" | "static" | "parent" => {
+            let raw = receiver.utf8_text(bytes).ok()?;
+            let fqcn = enclosing_class_fqcn(receiver, bytes)?;
+            match raw {
+                "self" => Some((fqcn, Confidence::High)),
+                "static" => Some((fqcn, Confidence::Medium)),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -614,6 +921,11 @@ fn resolve_typed_property(
 /// expands `use`-aliases and absolute (`\Foo`) names, but leaves a bare
 /// same-namespace name unqualified — so qualify those with the file's
 /// namespace (matching how the class-hierarchy index keys its FQCNs).
+///
+/// TODO: a namespace-RELATIVE qualified name (`Models\User` inside
+/// `namespace App;`) is treated as already-qualified and won't resolve to
+/// `App\Models\User` — a false negative both the static-receiver arm and the
+/// chain-root arm inherit.
 fn qualify_fqcn(name: String, node: Node, bytes: &[u8]) -> String {
     let trimmed = name.trim_start_matches('\\').to_string();
     if trimmed.contains('\\') {
@@ -910,14 +1222,7 @@ fn first_class_const(node: Node, bytes: &[u8]) -> Option<String> {
 /// Multi-segment finders (`whereEmailAndStatus`) are not handled — only the
 /// single-column form, which covers the overwhelming majority of real usage.
 fn classify_dynamic_finder(view: &ClassView, member: &str) -> Option<ClassifiedMember> {
-    let rest = member
-        .strip_prefix("where")
-        .or_else(|| member.strip_prefix("orWhere"))?;
-    // Must have a StudlyCase remainder — guards against `where`/`whereabouts`.
-    if !rest.chars().next()?.is_ascii_uppercase() {
-        return None;
-    }
-    let column = pascal_to_snake(rest);
+    let column = dynamic_finder_column(member)?;
     if view.column_surface.iter().any(|c| c.name == column) {
         return Some(ClassifiedMember {
             declaring_fqcn: view.fqcn.clone(),
@@ -925,6 +1230,21 @@ fn classify_dynamic_finder(view: &ClassView, member: &str) -> Option<ClassifiedM
         });
     }
     None
+}
+
+/// The column a dynamic finder name targets: `whereEmail` / `orWhereEmail` →
+/// `email`. `None` when the name isn't finder-shaped (`where`, `whereabouts`).
+/// Shared by classification and the goto/hover dispatch (a finder has no
+/// declaring method — its definition site is the column's migration line).
+pub fn dynamic_finder_column(member: &str) -> Option<String> {
+    let rest = member
+        .strip_prefix("where")
+        .or_else(|| member.strip_prefix("orWhere"))?;
+    // Must have a StudlyCase remainder — guards against `where`/`whereabouts`.
+    if !rest.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    Some(pascal_to_snake(rest))
 }
 
 #[cfg(test)]

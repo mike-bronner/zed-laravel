@@ -962,6 +962,7 @@ fn unresolved_member_access(member: &str, line: u32, col: u32) -> MemberAccessRe
         receiver_byte_start: 0,
         receiver_byte_end: 5,
         is_nullsafe: false,
+        form: AccessForm::Property,
         line,
         column: col,
         end_column: col + member.len() as u32,
@@ -1655,4 +1656,274 @@ fn class_component_registration_resolves_via_candidate_paths() {
         !other.contains(&class_file),
         "class registrations must not bleed into unrelated lookups"
     );
+}
+
+// ─── Call-form magic members at the cursor (#77) ───────────────────────────
+//
+// End-to-end through the actor: register a model + a caller, then resolve the
+// cursor on a CALL-form usage (`User::active()`, `$user->active()`). These
+// exercise the `member_ref.form` plumbing — before #77 the resolvers
+// hardcoded `AccessForm::Property`, so a scope call could never classify.
+
+const SCOPE_MODEL_SRC: &str = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+}
+"#;
+
+const SCOPE_CALLER_SRC: &str = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class UserController {
+    public function index() {
+        return User::active()->get();
+    }
+}
+"#;
+
+/// `(line, column)` of the first `needle` occurrence, 0-based.
+fn position_of(src: &str, needle: &str) -> (u32, u32) {
+    for (row, line) in src.lines().enumerate() {
+        if let Some(col) = line.find(needle) {
+            return (row as u32, col as u32);
+        }
+    }
+    panic!("{needle} not found in fixture");
+}
+
+/// Spawn an actor over a tempdir project holding the scope model + caller.
+async fn scope_project() -> (TempDir, SalsaHandle, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, SCOPE_MODEL_SRC).unwrap();
+    let caller_path = root.join("app/Http/Controllers/UserController.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, SCOPE_CALLER_SRC).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, SCOPE_MODEL_SRC.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, SCOPE_CALLER_SRC.to_string())
+        .await
+        .unwrap();
+    // Patterns parse lazily; forcing the model's parse is what feeds the
+    // class-hierarchy index (the on-demand population path).
+    handle.get_patterns(model_path).await.unwrap();
+    (dir, handle, caller_path)
+}
+
+#[tokio::test]
+async fn resolve_magic_member_at_classifies_static_scope_call() {
+    let (_dir, handle, caller_path) = scope_project().await;
+    let (line, col) = position_of(SCOPE_CALLER_SRC, "active");
+
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("scope call should resolve");
+    assert_eq!(data.kind, MagicMemberKind::Scope);
+    assert_eq!(data.declaring_fqcn, "App\\Models\\User");
+    assert_eq!(data.member, "active");
+    // Method-backed: both decl lines present so hover can slice the source.
+    assert!(data.decl_file.is_some());
+    assert!(data.decl_line.is_some());
+    assert!(data.decl_end_line.is_some());
+}
+
+#[tokio::test]
+async fn resolve_magic_member_rename_at_maps_scope_call_to_declaration() {
+    let (_dir, handle, caller_path) = scope_project().await;
+    let (line, col) = position_of(SCOPE_CALLER_SRC, "active");
+
+    let data = handle
+        .resolve_magic_member_rename_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("scope call should be renameable");
+    assert_eq!(data.method_name, "scopeActive");
+    assert_eq!(data.member, "active");
+    assert_eq!(data.kind, MagicMemberKind::Scope);
+    assert!(data.decl_file.ends_with("app/Models/User.php"));
+}
+
+#[tokio::test]
+async fn unclassified_call_does_not_become_tentative_column() {
+    // `$user->somethingUnknown()` — receiver resolves to the model, but the
+    // member classifies as nothing. The tentative-column fallback is a
+    // property-read concept and must NOT fire for calls.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, SCOPE_MODEL_SRC).unwrap();
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function x(User $user) { return $user->somethingUnknown(); }
+}
+"#;
+    let caller_path = root.join("app/Http/Controllers/C.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, SCOPE_MODEL_SRC.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    // Force the model's parse so the receiver RESOLVES — otherwise this test
+    // passes vacuously without exercising the call-form tentative gate.
+    handle.get_patterns(model_path).await.unwrap();
+
+    let (line, col) = position_of(caller_src, "somethingUnknown");
+    let data = handle
+        .resolve_magic_member_at(caller_path, line, col)
+        .await
+        .unwrap();
+    assert!(
+        data.is_none(),
+        "an unclassified CALL must not resolve as a tentative column; got {data:?}"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_finder_is_not_renameable() {
+    // `whereEmail` has no declared method to rewrite — finder rename must be
+    // refused BY KIND, not by accident of the candidate-method lookup
+    // missing (PR #76 review finding).
+    let model_src = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    protected $casts = ['email' => 'string'];
+}
+"#;
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function find() { return User::whereEmail('a@b.test')->first(); }
+}
+"#;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, model_src).unwrap();
+    let caller_path = root.join("app/Http/Controllers/C.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, model_src.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(model_path).await.unwrap();
+
+    let (line, col) = position_of(caller_src, "whereEmail");
+    // Precondition: the finder itself resolves (hover/goto see it)...
+    let hover = handle
+        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .await
+        .unwrap()
+        .expect("finder should classify for hover/goto");
+    assert_eq!(hover.kind, MagicMemberKind::DynamicFinder);
+    // ...but rename refuses it by kind.
+    let rename = handle
+        .resolve_magic_member_rename_at(caller_path, line, col)
+        .await
+        .unwrap();
+    assert!(
+        rename.is_none(),
+        "a dynamic finder must not be renameable; got {rename:?}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_magic_member_at_classifies_mid_chain_scope_call() {
+    // Cursor on `active` in `User::query()->active()` — the chain-aware
+    // receiver resolution (#77 review round 2) must classify it, lighting up
+    // hover, goto, and rename for mid-chain scope usages.
+    let model_src = SCOPE_MODEL_SRC;
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        return User::query()->active()->get();
+    }
+}
+"#;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, model_src).unwrap();
+    let caller_path = root.join("app/Http/Controllers/C.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, model_src.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(model_path).await.unwrap();
+
+    let (line, col) = position_of(caller_src, "active");
+    let data = handle
+        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .await
+        .unwrap()
+        .expect("mid-chain scope call should resolve");
+    assert_eq!(data.kind, MagicMemberKind::Scope);
+    assert_eq!(data.declaring_fqcn, "App\\Models\\User");
+
+    // And rename maps it to the declaration — the completeness that makes
+    // scope rename safe.
+    let rename = handle
+        .resolve_magic_member_rename_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("mid-chain scope call should be renameable");
+    assert_eq!(rename.method_name, "scopeActive");
 }

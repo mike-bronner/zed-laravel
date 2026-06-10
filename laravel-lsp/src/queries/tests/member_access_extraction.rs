@@ -1,13 +1,16 @@
-//! Tests for property-form member-access capture (`$user->email`,
-//! `$this->profile`, `$user?->name`) in `extract_all_php_patterns`.
+//! Tests for member-access capture in `extract_all_php_patterns` —
+//! property-form (`$user->email`, `$this->profile`, `$user?->name`, M2) and
+//! call-form (`$user->active()`, `User::whereEmail()`, #77).
 //!
-//! This is the raw-capture half of the magic-member semantic-index work (M2).
-//! Resolution/classification of the receiver is a later milestone, so these
-//! tests assert only what the capture layer knows: the member name, the raw
-//! receiver text + byte range, nullsafe-ness, and the member-name position.
+//! This is the raw-capture half of the magic-member semantic-index work.
+//! Resolution/classification of the receiver happens later, so these tests
+//! assert only what the capture layer knows: the member name, the raw
+//! receiver text + byte range, nullsafe-ness, the access form, and the
+//! member-name position.
 
 use super::super::*;
 use crate::parser::{language_php, parse_php};
+use crate::salsa_impl::AccessForm;
 
 /// Extract member accesses from PHP source. The returned matches borrow
 /// `php` (not the tree), so dropping the tree here is fine.
@@ -57,19 +60,57 @@ fn captures_nullsafe_access() {
 }
 
 #[test]
-fn ignores_method_calls() {
-    // `$user->posts()` is a member_call_expression, not a member_access_expression.
-    // It is covered by builder-chain extraction, never by this capture.
-    let php = r#"<?php
-$posts = $user->posts();
-$active = User::query()->active();
-"#;
-    let matches = extract(php);
-    assert!(
-        matches.is_empty(),
-        "method calls must not be captured as property accesses, got: {:?}",
-        matches.iter().map(|m| m.member).collect::<Vec<_>>()
-    );
+fn property_form_is_marked_property() {
+    let matches = extract("<?php\n$email = $user->email;\n");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].form, AccessForm::Property);
+}
+
+#[test]
+fn captures_instance_method_calls() {
+    // `$user->posts()` — call-form capture (#77). Raw capture only;
+    // classification later prunes non-magic calls.
+    let matches = extract("<?php\n$posts = $user->posts();\n");
+    assert_eq!(matches.len(), 1);
+    let m = &matches[0];
+    assert_eq!(m.member, "posts");
+    assert_eq!(m.receiver, "$user");
+    assert_eq!(m.form, AccessForm::InstanceCall);
+    assert!(!m.is_nullsafe);
+}
+
+#[test]
+fn captures_static_method_calls() {
+    let matches = extract("<?php\n$active = User::active();\n");
+    assert_eq!(matches.len(), 1);
+    let m = &matches[0];
+    assert_eq!(m.member, "active");
+    assert_eq!(m.receiver, "User");
+    assert_eq!(m.form, AccessForm::StaticCall);
+}
+
+#[test]
+fn captures_chained_call_receivers() {
+    // `User::query()->active()` — two call-form sites: `query` (static, on
+    // `User`) and `active` (instance, on the `User::query()` expression).
+    let matches = extract("<?php\n$active = User::query()->active();\n");
+    let query = matches.iter().find(|m| m.member == "query").expect("query");
+    assert_eq!(query.form, AccessForm::StaticCall);
+    assert_eq!(query.receiver, "User");
+    let active = matches
+        .iter()
+        .find(|m| m.member == "active")
+        .expect("active");
+    assert_eq!(active.form, AccessForm::InstanceCall);
+    assert_eq!(active.receiver, "User::query()");
+}
+
+#[test]
+fn captures_nullsafe_method_calls() {
+    let matches = extract("<?php\n$posts = $user?->posts();\n");
+    assert_eq!(matches.len(), 1);
+    assert!(matches[0].is_nullsafe, "?->() should set is_nullsafe");
+    assert_eq!(matches[0].form, AccessForm::InstanceCall);
 }
 
 #[test]

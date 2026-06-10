@@ -15917,7 +15917,25 @@ return [
             PatternAtPosition::Url(url) => self.hover_for_url(&url.path).await,
             // M6 — semantic hover card for a resolved Eloquent magic member.
             PatternAtPosition::MemberAccess(member_ref) => {
-                self.hover_for_magic_member(&member_ref, uri).await
+                let card = self.hover_for_magic_member(&member_ref, uri).await;
+                // Blade fallback: in a template, a member access that yields
+                // no card (receiver resolution parses the template as raw PHP,
+                // where snippet-local byte ranges can't locate the node) would
+                // otherwise swallow the position — find_hover_target only
+                // tries the Blade-variable extractor when NO pattern matched.
+                // Fall through so `{{ $user->posts()->count() }}` keeps the
+                // variable hover it had before call-form capture (#77).
+                if card.is_empty() && uri.path().ends_with(".blade.php") {
+                    if let Some((var_name, property)) = self
+                        .blade_variable_at_position(uri, member_ref.line, member_ref.column)
+                        .await
+                    {
+                        return self
+                            .build_blade_variable_hover_content(uri, &var_name, property)
+                            .await;
+                    }
+                }
+                card
             }
             // Patterns we don't yet surface in hover — silently drop.
             PatternAtPosition::Directive(_)
@@ -16009,6 +16027,20 @@ return [
             }
             type_hint = php_type;
             column_link = mig_link;
+        } else if matches!(
+            data.kind,
+            laravel_lsp::salsa_impl::MagicMemberKind::DynamicFinder
+        ) {
+            // A finder is `__call` sugar over its column — enrich the card
+            // with the column's type and link it to the migration line.
+            if let Some(column) = laravel_lsp::member_resolver::dynamic_finder_column(&data.member)
+            {
+                let (_confirmed, php_type, mig_link) = self
+                    .resolve_column_hover(&data.declaring_fqcn, &column)
+                    .await;
+                type_hint = php_type;
+                column_link = mig_link;
+            }
         }
 
         // Link: prefer the migration site for a column (the column's actual
@@ -16042,16 +16074,10 @@ return [
         model_fqcn: &str,
         column: &str,
     ) -> (bool, Option<String>, Option<String>) {
-        use laravel_lsp::query_chain::eloquent_completion;
         let Some(root) = self.root_path.read().await.clone() else {
             return (false, None, None);
         };
-        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
-            .await
-            .unwrap_or_else(|| {
-                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
-                eloquent_completion::snake_pluralize(basename)
-            });
+        let table = Self::model_table(model_fqcn, &root).await;
 
         // Migrations first: existence + a definition link (offline-capable).
         let mig_site = {
@@ -16081,6 +16107,164 @@ return [
 
         let confirmed = mig_site.is_some() || php_type.is_some();
         (confirmed, php_type, mig_link)
+    }
+
+    /// Goto-definition for an Eloquent magic member — the
+    /// `PatternAtPosition::MemberAccess` arm of the goto handler, covering
+    /// property-form (`$user->email`) and call-form (`->active()`,
+    /// `User::whereEmail()`, #77) sites alike. Resolves the cursor through the
+    /// same Salsa path as the M6 hover card (HIGH/MEDIUM confidence only),
+    /// then dispatches by kind:
+    ///
+    /// - **Column** → the migration line defining it (the same target the
+    ///   hover card links). A *tentative* column (receiver resolved to a
+    ///   model but the member didn't classify) requires a migration site —
+    ///   never guess. A `$casts`-declared column with no migration falls back
+    ///   to its declaration site on the model.
+    /// - **Dynamic finder** → the underlying column's migration line
+    ///   (`whereEmail` → `email`); a finder has no declaring method.
+    /// - **Relationship / scope / accessor** → the declaring method's name
+    ///   token in the declaring class (inheritance/trait-resolved), located
+    ///   the same way the rename path rewrites it; falls back to the
+    ///   declaration's start line when the token can't be located.
+    /// - **Plain member** → `None` — Intelephense already handles those (the
+    ///   multi-LSP dedup policy: suppress at the source).
+    async fn create_magic_member_location(
+        &self,
+        file_path: &Path,
+        member: &laravel_lsp::salsa_impl::MemberAccessReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::salsa_impl::MagicMemberKind;
+        let data = self
+            .salsa
+            .resolve_magic_member_at(file_path.to_path_buf(), member.line, member.column)
+            .await
+            .ok()
+            .flatten()?;
+
+        if matches!(data.kind, MagicMemberKind::PlainMember) {
+            return None;
+        }
+
+        if matches!(data.kind, MagicMemberKind::Column) {
+            if let Some(response) = self
+                .column_migration_location(&data.declaring_fqcn, &data.member)
+                .await
+            {
+                return Some(response);
+            }
+            if data.tentative {
+                return None;
+            }
+            // `$casts`-declared column with no migration: the Salsa side
+            // already located its declaration site (property / class line).
+            let decl_file = data.decl_file?;
+            return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
+        }
+
+        // A dynamic finder (`whereEmail()`) has no declaring method — it's
+        // `__call` sugar over the column, so its definition site is the
+        // column's migration line. No fallback: jumping to the model's class
+        // line would read as "wrong target".
+        if matches!(data.kind, MagicMemberKind::DynamicFinder) {
+            let column = laravel_lsp::member_resolver::dynamic_finder_column(&data.member)?;
+            return self
+                .column_migration_location(&data.declaring_fqcn, &column)
+                .await;
+        }
+
+        // Method-backed (relationship / scope / accessor): narrow to the
+        // method-name token in the declaring file.
+        let decl_file = data.decl_file?;
+        let (line, start, end) = match tokio::fs::read_to_string(&decl_file).await {
+            Ok(src) => {
+                laravel_lsp::rename::locate_magic_member_declaration(&src, data.kind, &data.member)
+                    .unwrap_or((data.decl_line.unwrap_or(0), 0, 0))
+            }
+            Err(_) => (data.decl_line.unwrap_or(0), 0, 0),
+        };
+        Self::goto_link(&decl_file, line, start, end)
+    }
+
+    /// The Blade variable (and optional property) under a position, read from
+    /// the live document — the hover fallback for member-access patterns that
+    /// produced no magic-member card in a template.
+    async fn blade_variable_at_position(
+        &self,
+        uri: &Url,
+        line: u32,
+        column: u32,
+    ) -> Option<(String, Option<String>)> {
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let line_text = content.lines().nth(line as usize)?;
+        laravel_lsp::livewire_resolver::extract_blade_variable_at_cursor(line_text, column)
+    }
+
+    /// Resolve a model FQCN to its table — `$table` / convention via
+    /// `resolve_table_for_model`, falling back to the snake-plural of the
+    /// class basename. Single source of truth for the column hover and the
+    /// column/finder goto.
+    async fn model_table(model_fqcn: &str, root: &Path) -> String {
+        use laravel_lsp::query_chain::eloquent_completion;
+        eloquent_completion::resolve_table_for_model(model_fqcn, root)
+            .await
+            .unwrap_or_else(|| {
+                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
+                eloquent_completion::snake_pluralize(basename)
+            })
+    }
+
+    /// Column → the migration line that defines it. Shares `model_table` with
+    /// `resolve_column_hover`, then reuses the chain-literal goto's
+    /// migration-site response.
+    async fn column_migration_location(
+        &self,
+        model_fqcn: &str,
+        column: &str,
+    ) -> Option<GotoDefinitionResponse> {
+        let root = self.root_path.read().await.clone()?;
+        let table = Self::model_table(model_fqcn, &root).await;
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.column(&table, column)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Build a single-link goto response targeting a 0-based name-token range,
+    /// with a zero-width caret (the same no-selection convention as
+    /// `location_link_from_migration_site` — a selected token makes Zed
+    /// highlight every matching substring in the file).
+    fn goto_link(
+        file: &Path,
+        line: u32,
+        start_column: u32,
+        end_column: u32,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = Url::from_file_path(file).ok()?;
+        let range = Range {
+            start: Position {
+                line,
+                character: start_column,
+            },
+            end: Position {
+                line,
+                character: end_column,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: range,
+            target_selection_range: Range {
+                start: range.start,
+                end: range.start,
+            },
+        }]))
     }
 
     /// Column rename (M8): rename a DB column project-wide. Fires when the
@@ -18880,7 +19064,7 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         // Get patterns from Salsa (cached, O(1) lookup)
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             Ok(None) => {
                 debug!("Laravel: No patterns cached for file");
@@ -19018,10 +19202,18 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
             }
-            PatternAtPosition::MemberAccess(_) => {
-                // Goto-definition for magic members (the inheritance-resolved
-                // declaration locator) lands in M4.
-                None
+            PatternAtPosition::MemberAccess(member) => {
+                debug!("Laravel: Found magic member access: {}", member.member);
+                let location = self.create_magic_member_location(&file_path, &member).await;
+                // Blade fallback, mirroring hover (#76 round 2): in a template
+                // the receiver byte-ranges are snippet-local, so magic-member
+                // resolution can yield nothing — fall through to the
+                // Blade-variable goto rather than swallowing a position that
+                // jumped before call-form capture existed.
+                if location.is_none() && file_path.to_string_lossy().ends_with(".blade.php") {
+                    return Ok(self.blade_variable_goto_definition(&uri, position).await);
+                }
+                location
             }
         };
 

@@ -37,9 +37,12 @@ User::active()
 $user->email
 //     ^^^^^ hover →  Database column — `email` on `App\Models\User`
 //                    Type `string` (cast-aware: migrations first, live DB as fallback)
+
+User::whereEmail($value)
+//   ^^^^^^^^^^ hover →  Dynamic finder — the email column's type + migration link
 ```
 
-Scopes, accessors, relationships, columns, and dynamic finders (`whereEmail()`) are all covered. When the receiver's type had to be inferred rather than proven, the card says so (*receiver type inferred*). Plain properties Intelephense already understands get **no card** — duplicating its hover would just add noise.
+Scopes, accessors, relationships, columns, and dynamic finders are all covered — property-form (`$user->posts`, `$model->full_name`) and call-form (`->active()`, `User::whereEmail()`) alike. When the receiver's type had to be inferred rather than proven, the card says so (*receiver type inferred*). Plain properties and plain method calls Intelephense already understands get **no card** — duplicating its hover would just add noise.
 
 **Artisan command strings** show the declaring `Command` class and its `$signature`:
 

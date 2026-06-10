@@ -397,5 +397,21 @@ pub fn locate_method_name(source: &str, method_name: &str) -> Option<(u32, u32, 
     None
 }
 
+/// Locate the *declaring method's* name token for a magic-member usage name,
+/// as 0-based `(line, start_column, end_column)`. Tries each kind-aware
+/// candidate name in order (`$user->posts` → `posts()`, `full_name` →
+/// `getFullNameAttribute()` then new-style `fullName()`, `active` →
+/// `scopeActive()`). Goto-definition's counterpart to the declaration rewrite
+/// above — same locator, driven by the usage name instead of the method name.
+pub fn locate_magic_member_declaration(
+    source: &str,
+    kind: crate::salsa_impl::MagicMemberKind,
+    member: &str,
+) -> Option<(u32, u32, u32)> {
+    crate::hover::candidate_method_names(kind, member)
+        .into_iter()
+        .find_map(|name| locate_method_name(source, &name))
+}
+
 #[cfg(test)]
 mod tests;

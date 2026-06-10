@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / scope / accessor), or database column. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / accessor), or database column. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
 
 You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
@@ -82,18 +82,18 @@ return view('users.account');
 
 **Eloquent model classes** rename project-wide. Press `F2` on a model class name and every reference rewrites in one pass — `use` imports, `User::` static calls, `new User`, type hints, `::class` references, `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside. Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
 
-**Eloquent magic members** rename from their usage sites. Press `F2` on a relationship, scope, or accessor usage and the declaring method renames with the *inverse name transform* applied — every cached usage follows:
+**Eloquent magic members** rename from their property-form usage sites. Press `F2` on a relationship or accessor usage and the declaring method renames with the *inverse name transform* applied — every cached usage follows:
 
 ```php
-// F2 on `active` in:
-User::active()->get();
+// F2 on `full_name` in:
+$user->full_name;
 
-// renames the declaration with the scope prefix re-applied:
-public function scopeActive(Builder $query)   →   public function scopeArchived(Builder $query)
-// and every ->active() / User::active() call site becomes ->archived()
+// renames the declaration with the accessor affixes re-applied:
+public function getFullNameAttribute()   →   public function getDisplayNameAttribute()
+// and every $user->full_name usage becomes $user->display_name
 ```
 
-The transforms run both ways: `active` ↔ `scopeActive`, `full_name` ↔ `getFullNameAttribute`, and a relationship's usage name maps verbatim to its method (`$user->posts` ↔ `posts()`). All rewrites land in one `WorkspaceEdit`, so the editor's multi-file diff shows everything before you commit to it.
+The transforms run both ways: `full_name` ↔ `getFullNameAttribute` (new-style `fullName(): Attribute` accessors are handled too), and a relationship's usage name maps verbatim to its method (`$user->posts` ↔ `posts()`). All rewrites land in one `WorkspaceEdit`, so the editor's multi-file diff shows everything before you commit to it. Call-form magic (`->active()` scopes, `whereEmail()` dynamic finders) isn't renameable yet.
 
 **Database columns** get the full treatment — a column lives in the database, not in any one method, so renaming `$user->email` → `$user->primary_email` touches four site classes atomically:
 

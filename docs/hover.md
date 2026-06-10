@@ -30,16 +30,16 @@ $user->posts
 //                    public function posts() { return $this->hasMany(Post::class); }
 //                    (the body reveals the target model)
 
-User::active()
-//    ^^^^^^ hover →  Eloquent scope — `active` on `App\Models\User`
-//                    the scopeActive() query body
+$user->full_name
+//     ^^^^^^^^^ hover →  Eloquent accessor — `full_name` on `App\Models\User`
+//                        the getFullNameAttribute() body
 
 $user->email
 //     ^^^^^ hover →  Database column — `email` on `App\Models\User`
 //                    Type `string` (cast-aware: migrations first, live DB as fallback)
 ```
 
-Scopes, accessors, relationships, columns, and dynamic finders (`whereEmail()`) are all covered. When the receiver's type had to be inferred rather than proven, the card says so (*receiver type inferred*). Plain properties Intelephense already understands get **no card** — duplicating its hover would just add noise.
+Property-form accessors, relationships, and columns are covered; call-form magic (`->active()` scopes, `whereEmail()` dynamic finders) isn't resolved yet. When the receiver's type had to be inferred rather than proven, the card says so (*receiver type inferred*). Plain properties Intelephense already understands get **no card** — duplicating its hover would just add noise.
 
 **Artisan command strings** show the declaring `Command` class and its `$signature`:
 

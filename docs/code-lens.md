@@ -52,6 +52,7 @@ Details worth knowing:
 - **Translation lenses are locale-agnostic** — `auth.failed` is the same key in every locale, so any locale's file shows the same counts. (JSON translation files are a planned follow-up, [#66](https://github.com/mike-bronner/zed-laravel/issues/66).)
 - **A Blade file can be two things at once** — a template under `components/` is reachable both as `<x-name>` and as `view('components.name')`; the file-level lens sums both so neither set of references is lost.
 - **Counts resolve lazily** (`codeLens/resolve`) — the document never blocks on counting.
+- **Known limitation:** only property-form usages (`$user->posts`, `$user->email`) are indexed today — call-form usages (`->active()`, `User::whereEmail()`) are not. A scope's lens therefore always reads 0, and the unused-symbol diagnostic below can mis-flag scopes that are genuinely used. Call-form indexing is the planned fix.
 
 **Deliberately scoped:** plain PHP method calls and class references get no lens — Intelephense and friends already cover those, and this extension only lenses what it counts *accurately* (the same suppress-duplicates-at-the-source policy as [Hover](hover.md)).
 

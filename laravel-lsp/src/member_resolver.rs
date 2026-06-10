@@ -287,15 +287,152 @@ pub fn resolve_and_classify(
     project_root: &Path,
 ) -> Option<ResolvedMemberAccess> {
     let (fqcn, confidence) =
-        resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root)?;
-    let file_path = resolver.class_file(&fqcn)?;
-    let view = classviews.get_or_build(&fqcn, &file_path, project_root)?;
+        match resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root) {
+            Some(r) => r,
+            // Call-form receivers are frequently builder CHAINS
+            // (`User::query()->active()`, `User::where(…)->active()`) whose
+            // links the direct resolver can't type. The chain's subject is its
+            // root — resolve that instead (#77 review).
+            None if form.is_call() => resolve_call_chain_receiver(
+                receiver,
+                bytes,
+                aliases,
+                resolver,
+                classviews,
+                project_root,
+            )?,
+            None => return None,
+        };
+
+    if let Some(resolved) = classify_against(
+        &fqcn,
+        member,
+        form,
+        confidence,
+        resolver,
+        classviews,
+        project_root,
+    ) {
+        return Some(resolved);
+    }
+
+    // Builder-typed receiver retry: `$query->active()` inside a scope body
+    // types as the Eloquent Builder, which declares no scopes — retry against
+    // the lexically enclosing class (the model whose scope body this is), the
+    // same enclosing-model convention column rename uses. MEDIUM confidence:
+    // the receiver type is the builder contract, the model is inferred.
+    if form.is_call() && is_eloquent_builder(&fqcn) {
+        let model = enclosing_class_fqcn(receiver, bytes)?;
+        let resolved = classify_against(
+            &model,
+            member,
+            form,
+            Confidence::Medium,
+            resolver,
+            classviews,
+            project_root,
+        )?;
+        return Some(resolved);
+    }
+    None
+}
+
+/// Classify `member` against `fqcn`'s resolved surfaces — the shared tail of
+/// [`resolve_and_classify`]'s direct path and its builder retry.
+fn classify_against(
+    fqcn: &str,
+    member: &str,
+    form: AccessForm,
+    confidence: Confidence,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<ResolvedMemberAccess> {
+    let file_path = resolver.class_file(fqcn)?;
+    let view = classviews.get_or_build(fqcn, &file_path, project_root)?;
     let classified = classify_member(&view, member, form)?;
     Some(ResolvedMemberAccess {
         declaring_fqcn: classified.declaring_fqcn,
         kind: classified.kind,
         confidence,
     })
+}
+
+/// Resolve a call-chain receiver by its ROOT (#77 review). On an Eloquent
+/// class every static call proxies through `__callStatic` to the query
+/// builder, so the chain's subject stays the class itself:
+/// `User::query()->active()` and `User::where(…)->where(…)->active()` both
+/// resolve to `User` at HIGH confidence (the class is explicit; the chain
+/// contract is Eloquent's own). A non-static chain root
+/// (`$query->where(…)->active()`) re-enters the direct resolver, capped at
+/// MEDIUM — the subject-stays-the-root assumption holds for builder chains
+/// but can misattribute relation-hopping ones, so classification (the member
+/// must match a magic surface on the root's class) is the safety net; a
+/// Builder-typed root then lands in the enclosing-model retry.
+fn resolve_call_chain_receiver(
+    receiver: Node,
+    bytes: &[u8],
+    aliases: &UseAliases,
+    resolver: &impl ClassFileResolver,
+    classviews: &mut ClassViewCache,
+    project_root: &Path,
+) -> Option<(String, Confidence)> {
+    let root = chain_root(receiver);
+    if root.kind() == "scoped_call_expression" {
+        let scope = root.child_by_field_name("scope")?;
+        if !matches!(scope.kind(), "name" | "qualified_name") {
+            return None;
+        }
+        let raw = scope.utf8_text(bytes).ok()?;
+        let fqcn = qualify_fqcn(resolve_class_name(raw, aliases), scope, bytes);
+        return if resolver.class_file(&fqcn).is_some() {
+            Some((fqcn, Confidence::High))
+        } else {
+            None
+        };
+    }
+    if root.id() != receiver.id() {
+        let (fqcn, confidence) =
+            resolve_receiver(root, bytes, aliases, resolver, classviews, project_root)?;
+        let capped = match confidence {
+            Confidence::High => Confidence::Medium,
+            other => other,
+        };
+        return Some((fqcn, capped));
+    }
+    None
+}
+
+/// The root expression of a call/access chain: descend through the `object`
+/// field of member calls/accesses. `User::query()->where(…)->active()` → the
+/// `User::query()` scoped call; `$q->where(…)->active()` → `$q`.
+fn chain_root(receiver: Node) -> Node {
+    let mut cur = receiver;
+    while matches!(
+        cur.kind(),
+        "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+    ) {
+        match cur.child_by_field_name("object") {
+            Some(o) => cur = o,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Is `fqcn` the Eloquent query builder (the type of a scope's `$query`
+/// param)? The base `Query\Builder` is deliberately excluded — scopes don't
+/// exist on it, and `DB::table(…)` chains must not retry against an
+/// enclosing model they have nothing to do with.
+fn is_eloquent_builder(fqcn: &str) -> bool {
+    matches!(
+        fqcn,
+        "Illuminate\\Database\\Eloquent\\Builder"
+            | "Illuminate\\Contracts\\Database\\Eloquent\\Builder"
+    )
 }
 
 /// Resolve an arbitrary expression node to its class `(FQCN, confidence)` —

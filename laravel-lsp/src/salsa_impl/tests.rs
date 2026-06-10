@@ -1869,3 +1869,61 @@ class C {
         "a dynamic finder must not be renameable; got {rename:?}"
     );
 }
+
+#[tokio::test]
+async fn resolve_magic_member_at_classifies_mid_chain_scope_call() {
+    // Cursor on `active` in `User::query()->active()` — the chain-aware
+    // receiver resolution (#77 review round 2) must classify it, lighting up
+    // hover, goto, and rename for mid-chain scope usages.
+    let model_src = SCOPE_MODEL_SRC;
+    let caller_src = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function index() {
+        return User::query()->active()->get();
+    }
+}
+"#;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let model_path = root.join("app/Models/User.php");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, model_src).unwrap();
+    let caller_path = root.join("app/Http/Controllers/C.php");
+    std::fs::create_dir_all(caller_path.parent().unwrap()).unwrap();
+    std::fs::write(&caller_path, caller_src).unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    handle
+        .update_file(model_path.clone(), 1, model_src.to_string())
+        .await
+        .unwrap();
+    handle
+        .update_file(caller_path.clone(), 1, caller_src.to_string())
+        .await
+        .unwrap();
+    handle.get_patterns(model_path).await.unwrap();
+
+    let (line, col) = position_of(caller_src, "active");
+    let data = handle
+        .resolve_magic_member_at(caller_path.clone(), line, col)
+        .await
+        .unwrap()
+        .expect("mid-chain scope call should resolve");
+    assert_eq!(data.kind, MagicMemberKind::Scope);
+    assert_eq!(data.declaring_fqcn, "App\\Models\\User");
+
+    // And rename maps it to the declaration — the completeness that makes
+    // scope rename safe.
+    let rename = handle
+        .resolve_magic_member_rename_at(caller_path, line, col)
+        .await
+        .unwrap()
+        .expect("mid-chain scope call should be renameable");
+    assert_eq!(rename.method_name, "scopeActive");
+}

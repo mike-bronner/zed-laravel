@@ -1469,3 +1469,124 @@ class Order extends Model {
         "same-namespace unimported static receiver should resolve; got {entries:?}"
     );
 }
+
+// ─── Chain-aware call-form resolution (#77, review round 2) ────────────────
+//
+// Mid-chain scope calls are the canonical builder shapes — they MUST index,
+// or scope rename rewrites the declaration + direct sites while silently
+// leaving chained call sites behind (broken code).
+
+#[test]
+fn population_indexes_static_rooted_chain_scope_calls() {
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function a() { return User::query()->active()->get(); }
+    public function b() { return User::where('email', 'x')->active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let active_count = entries
+        .iter()
+        .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
+        .count();
+    assert_eq!(
+        active_count, 2,
+        "both static-rooted chain shapes must index `active`; got {entries:?}"
+    );
+    // The chain links themselves stay out of the index (plain methods).
+    assert!(!has_entry(&entries, "App\\Models\\User", "where"));
+    assert!(!has_entry(&entries, "App\\Models\\User", "get"));
+}
+
+#[test]
+fn population_indexes_builder_param_scope_body_calls() {
+    // `$query->active()` inside another scope's body — the receiver types as
+    // the Eloquent Builder (no scopes declared there); resolution retries
+    // against the enclosing model.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public function scopeRecent(Builder $query): Builder {
+        return $query->active()->where('created_at', '>', now());
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "builder-typed `$query->active()` must resolve via the enclosing model; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_multi_link_builder_param_chains() {
+    // `$query->where(…)->active()` — variable-rooted chain: the root `$query`
+    // types as Builder, classification retries against the enclosing model.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public function scopeFresh(Builder $query): Builder {
+        return $query->where('x', 1)->active();
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        has_entry(&entries, "App\\Models\\User", "active"),
+        "mid-chain `$query->where(…)->active()` must index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_static_rooted_chain_ignores_non_model_roots() {
+    // `Str::of(…)->upper()` — the chain root resolves only if the class graph
+    // knows it, and classification only matches magic surfaces. Neither holds
+    // for a non-model helper: no entry.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+use Illuminate\Support\Str;
+$x = Str::of('laravel')->upper();
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[test]
+fn population_chain_plain_terminals_stay_pruned() {
+    // `User::query()->first()` — the chain root resolves to the model, but
+    // `first` matches no magic surface: pruned, not indexed.
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function f() { return User::query()->first(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "first"),
+        "plain chain terminals must not index; got {entries:?}"
+    );
+}

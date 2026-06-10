@@ -487,3 +487,51 @@ fn locate_method_name_absent_is_none() {
     let src = "<?php\nclass User {\n    public function posts() {}\n}\n";
     assert!(locate_method_name(src, "missing").is_none());
 }
+
+#[test]
+fn locate_magic_member_declaration_relationship_is_verbatim() {
+    // `$user->posts` → the `posts()` method name token.
+    let src = "<?php\nclass User {\n    public function posts() { return $this->hasMany(Post::class); }\n}\n";
+    let (line, start, end) =
+        locate_magic_member_declaration(src, MagicMemberKind::Relationship, "posts")
+            .expect("found");
+    assert_eq!(line, 2);
+    let line_text = src.lines().nth(2).unwrap();
+    assert_eq!(start as usize, line_text.find("posts").unwrap());
+    assert_eq!((end - start) as usize, "posts".len());
+}
+
+#[test]
+fn locate_magic_member_declaration_accessor_old_style() {
+    // `$user->full_name` → `getFullNameAttribute()`.
+    let src = "<?php\nclass User {\n    public function getFullNameAttribute() { return ''; }\n}\n";
+    let (line, start, _end) =
+        locate_magic_member_declaration(src, MagicMemberKind::Accessor, "full_name")
+            .expect("found");
+    assert_eq!(line, 2);
+    let line_text = src.lines().nth(2).unwrap();
+    assert_eq!(
+        start as usize,
+        line_text.find("getFullNameAttribute").unwrap()
+    );
+}
+
+#[test]
+fn locate_magic_member_declaration_accessor_new_style_falls_through() {
+    // No `get…Attribute` method — the new-style camelCase candidate matches.
+    let src = "<?php\nclass User {\n    protected function fullName(): Attribute { return Attribute::make(); }\n}\n";
+    let (line, start, _end) =
+        locate_magic_member_declaration(src, MagicMemberKind::Accessor, "full_name")
+            .expect("found");
+    assert_eq!(line, 2);
+    let line_text = src.lines().nth(2).unwrap();
+    assert_eq!(start as usize, line_text.find("fullName").unwrap());
+}
+
+#[test]
+fn locate_magic_member_declaration_absent_is_none() {
+    let src = "<?php\nclass User {\n    public function posts() {}\n}\n";
+    assert!(
+        locate_magic_member_declaration(src, MagicMemberKind::Relationship, "comments").is_none()
+    );
+}

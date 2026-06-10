@@ -16083,6 +16083,123 @@ return [
         (confirmed, php_type, mig_link)
     }
 
+    /// Goto-definition for a property-form Eloquent magic member — the
+    /// `PatternAtPosition::MemberAccess` arm of the goto handler. Resolves the
+    /// cursor through the same Salsa path as the M6 hover card (HIGH/MEDIUM
+    /// confidence only), then dispatches by kind:
+    ///
+    /// - **Column** → the migration line defining it (the same target the
+    ///   hover card links). A *tentative* column (receiver resolved to a
+    ///   model but the member didn't classify) requires a migration site —
+    ///   never guess. A `$casts`-declared column with no migration falls back
+    ///   to its declaration site on the model.
+    /// - **Relationship / accessor** → the declaring method's name token in
+    ///   the declaring class (inheritance/trait-resolved), located the same
+    ///   way the rename path rewrites it; falls back to the declaration's
+    ///   start line when the token can't be located.
+    /// - **Plain member** → `None` — Intelephense already handles those (the
+    ///   multi-LSP dedup policy: suppress at the source).
+    async fn create_magic_member_location(
+        &self,
+        file_path: &Path,
+        member: &laravel_lsp::salsa_impl::MemberAccessReferenceData,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::salsa_impl::MagicMemberKind;
+        let data = self
+            .salsa
+            .resolve_magic_member_at(file_path.to_path_buf(), member.line, member.column)
+            .await
+            .ok()
+            .flatten()?;
+
+        if matches!(data.kind, MagicMemberKind::PlainMember) {
+            return None;
+        }
+
+        if matches!(data.kind, MagicMemberKind::Column) {
+            if let Some(response) = self
+                .column_migration_location(&data.declaring_fqcn, &data.member)
+                .await
+            {
+                return Some(response);
+            }
+            if data.tentative {
+                return None;
+            }
+            // `$casts`-declared column with no migration: the Salsa side
+            // already located its declaration site (property / class line).
+            let decl_file = data.decl_file?;
+            return Self::goto_link(&decl_file, data.decl_line.unwrap_or(0), 0, 0);
+        }
+
+        // Method-backed (relationship / accessor): narrow to the method-name
+        // token in the declaring file.
+        let decl_file = data.decl_file?;
+        let (line, start, end) = match tokio::fs::read_to_string(&decl_file).await {
+            Ok(src) => {
+                laravel_lsp::rename::locate_magic_member_declaration(&src, data.kind, &data.member)
+                    .unwrap_or((data.decl_line.unwrap_or(0), 0, 0))
+            }
+            Err(_) => (data.decl_line.unwrap_or(0), 0, 0),
+        };
+        Self::goto_link(&decl_file, line, start, end)
+    }
+
+    /// Column → the migration line that defines it. Mirrors the table
+    /// resolution `resolve_column_hover` uses (the model's `$table`, falling
+    /// back to the conventional snake-plural name), then reuses the
+    /// chain-literal goto's migration-site response.
+    async fn column_migration_location(
+        &self,
+        model_fqcn: &str,
+        column: &str,
+    ) -> Option<GotoDefinitionResponse> {
+        use laravel_lsp::query_chain::eloquent_completion;
+        let root = self.root_path.read().await.clone()?;
+        let table = eloquent_completion::resolve_table_for_model(model_fqcn, &root)
+            .await
+            .unwrap_or_else(|| {
+                let basename = model_fqcn.rsplit('\\').next().unwrap_or(model_fqcn);
+                eloquent_completion::snake_pluralize(basename)
+            });
+        let guard = self.migration_index.read().await;
+        let site = guard.as_ref()?.column(&table, column)?.clone();
+        drop(guard);
+        Self::location_from_migration_site(&site)
+    }
+
+    /// Build a single-link goto response targeting a 0-based name-token range,
+    /// with a zero-width caret (the same no-selection convention as
+    /// `location_link_from_migration_site` — a selected token makes Zed
+    /// highlight every matching substring in the file).
+    fn goto_link(
+        file: &Path,
+        line: u32,
+        start_column: u32,
+        end_column: u32,
+    ) -> Option<GotoDefinitionResponse> {
+        let uri = Url::from_file_path(file).ok()?;
+        let range = Range {
+            start: Position {
+                line,
+                character: start_column,
+            },
+            end: Position {
+                line,
+                character: end_column,
+            },
+        };
+        Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: range,
+            target_selection_range: Range {
+                start: range.start,
+                end: range.start,
+            },
+        }]))
+    }
+
     /// Column rename (M8): rename a DB column project-wide. Fires when the
     /// cursor resolves to a `MagicMemberKind::Column` (`$user->email`,
     /// `where('email', …)`). `None` when the cursor isn't a column, so the
@@ -18880,7 +18997,7 @@ impl LanguageServer for LaravelLanguageServer {
         };
 
         // Get patterns from Salsa (cached, O(1) lookup)
-        let patterns = match self.salsa.get_patterns(file_path).await {
+        let patterns = match self.salsa.get_patterns(file_path.clone()).await {
             Ok(Some(p)) => p,
             Ok(None) => {
                 debug!("Laravel: No patterns cached for file");
@@ -19018,10 +19135,9 @@ impl LanguageServer for LaravelLanguageServer {
                 debug!("Laravel: Found feature: {}", feature.feature_name);
                 self.create_feature_location_from_salsa(&feature).await
             }
-            PatternAtPosition::MemberAccess(_) => {
-                // Goto-definition for magic members (the inheritance-resolved
-                // declaration locator) lands in M4.
-                None
+            PatternAtPosition::MemberAccess(member) => {
+                debug!("Laravel: Found magic member access: {}", member.member);
+                self.create_magic_member_location(&file_path, &member).await
             }
         };
 

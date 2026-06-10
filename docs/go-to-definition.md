@@ -48,6 +48,21 @@ DB::table('users')->get();
 //        ^^^^^ → database/migrations/..._create_users_table.php  (Schema::create('users'))
 ```
 
+**Eloquent magic members** resolve through the semantic index — the usage jumps to the declaration that actually backs it, even when the names don't match textually:
+
+```php
+$user->posts;
+//     ^^^^^ → app/Models/User.php  (public function posts(): HasMany)
+
+$user->full_name;
+//     ^^^^^^^^^ → app/Models/User.php  (public function getFullNameAttribute())
+
+$user->email;
+//     ^^^^^ → database/migrations/..._create_users_table.php  ($table->string('email'))
+```
+
+Resolution is inheritance- and trait-aware — a member declared in a trait or a parent model jumps to the file that declares it. Plain properties are left to your PHP language server (no duplicate results), and call-form magic (`->active()` scopes, `whereEmail()` dynamic finders) isn't resolved yet.
+
 **Artisan command strings** jump to the `Command` class declaring the matching `protected $signature` — across all four invocation patterns, with app-defined commands taking priority over same-named package/framework commands:
 
 ```php
@@ -59,4 +74,4 @@ $schedule->command('emails:send --queue')->daily();
 ```
 
 **Supported patterns:**
-`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables
+`view()` `View::make()` `@extends` `@include` `@component` `<x-*>` `</x-*>` `<livewire:*>` `</livewire:*>` `@livewire()` `route()` `to_route()` `signed_route()` `URL::signedRoute()` `config()` `Config::get()` `Config::getMany()` `config()->string()` `env()` `Env::get()` `__()` `trans()` `@lang` `->middleware()` `app()` `resolve()` `App::bound()` `App::isShared()` `asset()` `@vite` `app_path()` `base_path()` `storage_path()` `resource_path()` `public_path()` `Feature::active()` `Feature::inactive()` `Feature::value()` `@feature` `Artisan::call()` `Artisan::queue()` `->command()` `->artisan()` · query-chain columns / relations / tables · magic members (relationships, accessors, columns)

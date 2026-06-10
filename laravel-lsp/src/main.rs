@@ -19204,7 +19204,16 @@ impl LanguageServer for LaravelLanguageServer {
             }
             PatternAtPosition::MemberAccess(member) => {
                 debug!("Laravel: Found magic member access: {}", member.member);
-                self.create_magic_member_location(&file_path, &member).await
+                let location = self.create_magic_member_location(&file_path, &member).await;
+                // Blade fallback, mirroring hover (#76 round 2): in a template
+                // the receiver byte-ranges are snippet-local, so magic-member
+                // resolution can yield nothing — fall through to the
+                // Blade-variable goto rather than swallowing a position that
+                // jumped before call-form capture existed.
+                if location.is_none() && file_path.to_string_lossy().ends_with(".blade.php") {
+                    return Ok(self.blade_variable_goto_definition(&uri, position).await);
+                }
+                location
             }
         };
 

@@ -1590,3 +1590,126 @@ class C {
         "plain chain terminals must not index; got {entries:?}"
     );
 }
+
+// ─── Round-2 review gates: factory states, relative scopes, closures ───────
+
+#[test]
+fn population_skips_factory_state_calls() {
+    // `User::factory()->active()` — `active` here is a FACTORY STATE, not the
+    // scope, and factory states routinely share scope names. The first-link
+    // gate must refuse (`factory` is no chain starter, scope, or finder), or
+    // a scope rename would rewrite factory-state calls (review round 2,
+    // finding 1 — demonstrated failure before the gate).
+    let p = project("app/Models/User.php", SCOPED_MODEL);
+    let caller = r#"<?php
+namespace Tests\Feature;
+use App\Models\User;
+class UserTest {
+    public function test_active() {
+        $user = User::factory()->active()->create();
+    }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "active"),
+        "factory-state calls must not index as scope references; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_indexes_relative_scope_calls() {
+    // `self::active()` and `static::query()->active()` inside the model —
+    // common in model statics; both must index or scope rename leaves them
+    // behind (review round 2, finding 5).
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopeActive(Builder $query): Builder { return $query; }
+    public static function activeCount(): int { return self::active()->count(); }
+    public static function freshActive() { return static::query()->active()->get(); }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let active_count = entries
+        .iter()
+        .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
+        .count();
+    assert_eq!(
+        active_count, 2,
+        "self:: and static::query() scope calls must both index; got {entries:?}"
+    );
+}
+
+#[test]
+fn population_skips_where_has_closure_builder_calls() {
+    // A Builder-typed param of a `whereHas` CLOSURE is the related model's
+    // builder — retrying it against the enclosing model would misattribute a
+    // same-named scope (review round 2, finding 2). The builder retry is
+    // gated to the enclosing scope method's own parameter.
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+class User extends Model {
+    public function scopePublished(Builder $query): Builder { return $query; }
+    public function scopeRecent(Builder $query): Builder {
+        return $query->whereHas('posts', function (Builder $q) {
+            $q->published();
+        });
+    }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let refs = member_refs_of(model);
+    let entries =
+        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "published"),
+        "a whereHas-closure builder call must not attribute to the enclosing model; got {entries:?}"
+    );
+    // The legitimate `$query->whereHas(...)` receiver still flows: `whereHas`
+    // itself is a plain builder method and stays pruned.
+    assert!(!has_entry(&entries, "App\\Models\\User", "whereHas"));
+}
+
+#[test]
+fn population_skips_relation_hop_chains() {
+    // `$user->posts()->active()` — the chain's subject re-targets to Post at
+    // the relationship link; attributing `active` to User would be wrong (and
+    // rename-hazardous). Conservatively dropped (review round 2, finding 2).
+    let model = r#"<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+class User extends Model {
+    public function posts(): HasMany { return $this->hasMany(Post::class); }
+    public function scopeActive(Builder $query): Builder { return $query; }
+}
+"#;
+    let p = project("app/Models/User.php", model);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function x(User $user) { return $user->posts()->active()->get(); }
+}
+"#;
+    let refs = member_refs_of(caller);
+    let entries =
+        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    assert!(
+        !has_entry(&entries, "App\\Models\\User", "active"),
+        "a relation-hopped scope call must not attribute to the root model; got {entries:?}"
+    );
+    // The relationship CALL itself still indexes (it is User's member).
+    assert!(has_entry(&entries, "App\\Models\\User", "posts"));
+}

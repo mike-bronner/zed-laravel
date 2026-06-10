@@ -95,6 +95,8 @@ public function scopeActive(Builder $query)   →   public function scopeArchive
 
 The transforms run both ways: `active` ↔ `scopeActive`, `full_name` ↔ `getFullNameAttribute` (new-style `fullName(): Attribute` accessors are handled too), and a relationship's usage name maps verbatim to its method (`$user->posts` ↔ `posts()` — property reads and method calls rename together). All rewrites land in one `WorkspaceEdit`, so the editor's multi-file diff shows everything before you commit to it. Dynamic finders (`whereEmail()`) aren't renameable — rename the underlying column instead, which is the operation actually being asked for.
 
+**Scope call-site coverage:** direct calls (`User::active()`, `$user->active()`), `self::` / `static::` calls, builder chains (`User::query()->active()`, `User::where(…)->active()`), and `$query->active()` inside scope bodies all rename together. Sites that can't be resolved statically are left untouched — `parent::` receivers, `(new User)->active()`, relation-hopped chains (`$user->posts()->active()` belongs to Post), and builder closures (`whereHas(…, fn ($q) => $q->active())`) — so scan the multi-file diff before applying. Factory states that share a scope's name (`User::factory()->active()`) are deliberately never rewritten.
+
 **Database columns** get the full treatment — a column lives in the database, not in any one method, so renaming `$user->email` → `$user->primary_email` touches four site classes atomically:
 
 1. **A generated migration** — a new timestamped `database/migrations/*_rename_email_to_primary_email_in_users_table.php` with a reversible `Schema::table(…, renameColumn(…))` (`up` and `down`), created as part of the same edit.

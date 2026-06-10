@@ -67,7 +67,7 @@ User::whereEmail($value);
 //   ^^^^^^^^^^ dynamic finder → the email column's migration line
 ```
 
-Resolution is inheritance- and trait-aware — a member declared in a trait or a parent model jumps to the file that declares it. Plain properties and plain method calls are left to your PHP language server (no duplicate results). Dynamic finders classify against the model's source-visible column surface (`$casts`, `$fillable`, timestamps) — a `$guarded = []` model that declares neither won't resolve its finders.
+Resolution is inheritance- and trait-aware — a member declared in a trait or a parent model jumps to the file that declares it — and chain-aware: `User::query()->active()`, `self::` / `static::` calls, and `$query->active()` inside scope bodies all resolve. Plain properties and plain method calls are left to your PHP language server (no duplicate results), and factory states sharing a scope's name (`User::factory()->active()`) are correctly NOT treated as scopes. Dynamic finders classify against the model's source-visible column surface (`$casts`, `$fillable`, timestamps) — a `$guarded = []` model that declares neither won't resolve its finders. Not resolved (conservatively dropped rather than guessed): `parent::` receivers, `(new User)->active()`, and relation-hopped chains (`$user->posts()->active()` — that's Post's scope).
 
 **Artisan command strings** jump to the `Command` class declaring the matching `protected $signature` — across all four invocation patterns, with app-defined commands taking priority over same-named package/framework commands:
 

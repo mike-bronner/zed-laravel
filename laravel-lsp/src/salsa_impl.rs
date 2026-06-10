@@ -1880,6 +1880,29 @@ pub fn parse_service_provider_source<'db>(
         }
     }
 
+    // Parse imperative View-factory namespace registrations:
+    //   View::addNamespace('ai-prompts', app_path('Ai/Prompts'))
+    //   app('view')->prependNamespace('ns', resource_path('views/ns'))
+    // Unlike loadViewsFrom() these take a Laravel path helper rather than a
+    // __DIR__ concatenation, so the directory is resolved via the shared
+    // path-expression resolver.
+    {
+        let provider_dir = path.parent().unwrap_or(path.as_path());
+        for (namespace, directory, line) in
+            extract_add_namespace_view_registrations(text, &root, provider_dir)
+        {
+            let pkg_namespace = PackageNamespace::new(db, namespace);
+            view_namespaces.push(ParsedViewNamespaceReg::new(
+                db,
+                pkg_namespace,
+                Some(directory),
+                line,
+                priority,
+                path.clone(),
+            ));
+        }
+    }
+
     // Parse the fluent package-builder view registration form:
     //   $package->name('filament')->hasViews();
     // Builder-convention providers register views from a base class
@@ -2133,6 +2156,54 @@ fn extract_anonymous_component_paths(
             if let Some(directory) = resolve_php_path_expr(path_expr.as_str(), root, provider_dir) {
                 let line = text[..prefix.start()].lines().count() as u32;
                 out.push((prefix.as_str().to_string(), directory, line));
+            }
+        }
+    }
+    out
+}
+
+/// Extract runtime view-namespace registrations made through the `View` factory:
+///   View::addNamespace('ns', app_path('Ai/Prompts'))
+///   View::prependNamespace('ns', resource_path('views/ns'))
+///   app('view')->addNamespace('ns', base_path('packages/ns/views'))
+///   $factory->addNamespace('ns', __DIR__ . '/../views')
+///
+/// Laravel's literal `$this->loadViewsFrom(__DIR__.'…', 'ns')` is matched
+/// elsewhere (`LOAD_VIEWS_RE`); this covers the imperative facade/factory form,
+/// where the directory argument is commonly a Laravel path helper rather than a
+/// `__DIR__` concatenation. The path expression is delegated to
+/// `resolve_php_path_expr`, so `app_path()`, `base_path()`, `resource_path()`,
+/// the other path helpers, `__DIR__ . '…'`, and bare string literals all
+/// resolve. Registrations whose path argument can't be statically resolved
+/// (e.g. a variable) are skipped. Returns `(namespace, absolute_directory,
+/// source_line)` tuples.
+fn extract_add_namespace_view_registrations(
+    text: &str,
+    root: &Path,
+    provider_dir: &Path,
+) -> Vec<(String, PathBuf, u32)> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+
+    lazy_static! {
+        /// Receiver is the `View` facade, an `app('view')` resolve, or any
+        /// `$factory->` instance; method is `addNamespace` or `prependNamespace`
+        /// (both register a hint path — `prepend` only changes precedence).
+        /// Group 1 is the namespace string; group 2 is the path expression,
+        /// allowing one level of nested parentheses so helper calls like
+        /// `app_path('Ai/Prompts')` are captured whole rather than truncated at
+        /// the inner `)`.
+        static ref ADD_NAMESPACE_RE: Regex = Regex::new(
+            r#"(?:View::|app\(\s*['"]view['"]\s*\)->|\$\w+->)(?:add|prepend)Namespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*((?:[^()]|\([^()]*\))+?)\s*\)"#
+        ).unwrap();
+    }
+
+    let mut out = Vec::new();
+    for cap in ADD_NAMESPACE_RE.captures_iter(text) {
+        if let (Some(namespace), Some(path_expr)) = (cap.get(1), cap.get(2)) {
+            if let Some(directory) = resolve_php_path_expr(path_expr.as_str(), root, provider_dir) {
+                let line = text[..namespace.start()].lines().count() as u32;
+                out.push((namespace.as_str().to_string(), directory, line));
             }
         }
     }

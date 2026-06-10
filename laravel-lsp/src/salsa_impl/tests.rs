@@ -1281,6 +1281,198 @@ class SupportServiceProvider extends PackageServiceProvider
     );
 }
 
+// ─── Imperative View::addNamespace() view-namespace discovery (issue #72) ─
+//
+// A namespace registered at runtime via `View::addNamespace('ns', <path>)`
+// (or the `app('view')->`/`$factory->` receivers, or `prependNamespace`) is
+// invisible to the literal `loadViewsFrom(__DIR__.'…', 'ns')` extractor, so
+// `view('ns::name')` falsely reported "View file not found" and go-to-definition
+// failed. These tests pin the imperative extractor that resolves the directory
+// argument through the shared path-expression resolver (`app_path()`,
+// `base_path()`, `resource_path()`, `__DIR__.'…'`, literals).
+
+#[test]
+fn extract_add_namespace_reads_app_path_registration() {
+    let src = r#"
+        public function boot(): void
+        {
+            View::addNamespace('ai-prompts', app_path('Ai/Prompts'));
+        }
+    "#;
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+
+    let regs = extract_add_namespace_view_registrations(src, &root, &provider_dir);
+
+    assert_eq!(regs.len(), 1);
+    assert_eq!(regs[0].0, "ai-prompts");
+    assert_eq!(regs[0].1, PathBuf::from("/project/app/Ai/Prompts"));
+}
+
+#[test]
+fn extract_add_namespace_handles_all_path_helper_forms() {
+    let src = r#"
+        View::addNamespace('with-app', app_path('Views/A'));
+        View::addNamespace('with-base', base_path('packages/b/views'));
+        View::addNamespace('with-resource', resource_path('views/c'));
+        View::addNamespace('with-dir', __DIR__ . '/../views');
+    "#;
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+
+    let regs = extract_add_namespace_view_registrations(src, &root, &provider_dir);
+    let by_ns: std::collections::HashMap<_, _> = regs
+        .iter()
+        .map(|(ns, dir, _)| (ns.as_str(), dir.clone()))
+        .collect();
+
+    assert_eq!(by_ns["with-app"], PathBuf::from("/project/app/Views/A"));
+    assert_eq!(
+        by_ns["with-base"],
+        PathBuf::from("/project/packages/b/views")
+    );
+    assert_eq!(
+        by_ns["with-resource"],
+        PathBuf::from("/project/resources/views/c")
+    );
+    // __DIR__ resolves against the provider directory.
+    assert_eq!(by_ns["with-dir"], PathBuf::from("/project/app/views"));
+}
+
+#[test]
+fn extract_add_namespace_supports_factory_receivers_and_prepend() {
+    let src = r#"
+        app('view')->addNamespace('via-app', resource_path('views/a'));
+        $factory->prependNamespace('via-factory', base_path('b'));
+    "#;
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+
+    let regs = extract_add_namespace_view_registrations(src, &root, &provider_dir);
+    let names: Vec<&str> = regs.iter().map(|(ns, _, _)| ns.as_str()).collect();
+
+    assert!(
+        names.contains(&"via-app"),
+        "app('view')-> form must register, got {names:?}"
+    );
+    assert!(
+        names.contains(&"via-factory"),
+        "$factory->prependNamespace form must register, got {names:?}"
+    );
+}
+
+#[test]
+fn extract_add_namespace_skips_unresolvable_path_argument() {
+    // A variable directory can't be resolved statically — must be skipped, not
+    // registered with a bogus path.
+    let src = "View::addNamespace('dynamic', $this->promptPath);";
+    let root = PathBuf::from("/project");
+    let provider_dir = PathBuf::from("/project/app/Providers");
+
+    let regs = extract_add_namespace_view_registrations(src, &root, &provider_dir);
+
+    assert!(
+        regs.is_empty(),
+        "unresolvable path must be skipped, got {regs:?}"
+    );
+}
+
+#[test]
+fn add_namespace_registers_view_namespace_through_provider_parse() {
+    let source = r#"<?php
+class AppServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        View::addNamespace('ai-prompts', app_path('Ai/Prompts'));
+    }
+}"#;
+    let found = discovered_view_namespaces(source, "/proj/app/Providers/AppServiceProvider.php");
+    assert!(
+        found
+            .iter()
+            .any(|(ns, p)| ns == "ai-prompts" && *p == Some(PathBuf::from("/proj/app/Ai/Prompts"))),
+        "View::addNamespace must register 'ai-prompts' → app/Ai/Prompts, got {found:?}"
+    );
+}
+
+#[test]
+fn add_namespace_resolves_view_path_for_two_namespaces_end_to_end() {
+    // Two distinct namespaces registered via View::addNamespace, each backed by
+    // a real blade file. The exact issue #72 failure: view('ns::name') must
+    // resolve to the registered directory instead of falling back to the
+    // resources/views/vendor convention.
+    let provider = r#"<?php
+class AppServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        View::addNamespace('ai-prompts', app_path('Ai/Prompts'));
+        View::addNamespace('reports', resource_path('report-views'));
+    }
+}"#;
+    let (_dir, root) = project_with_files(&[
+        ("app/Providers/AppServiceProvider.php", provider),
+        (
+            "app/Ai/Prompts/candidate-proposer.blade.php",
+            "{{ $topic }}",
+        ),
+        ("resources/report-views/monthly.blade.php", "report"),
+    ]);
+
+    let db = LaravelDatabase::default();
+    let provider_path = root.join("app/Providers/AppServiceProvider.php");
+    let text = std::fs::read_to_string(&provider_path).unwrap();
+    let file = ServiceProviderFile::new(&db, provider_path, 0, text, 1);
+    let parsed = parse_service_provider_source(&db, file, root.clone());
+
+    let mut view_namespaces = HashMap::new();
+    for vn in parsed.view_namespaces(&db) {
+        if let Some(p) = vn.view_path(&db).clone() {
+            view_namespaces.insert(vn.namespace(&db).namespace(&db).clone(), p);
+        }
+    }
+    assert!(
+        view_namespaces.contains_key("ai-prompts") && view_namespaces.contains_key("reports"),
+        "both namespaces must be discovered, got {view_namespaces:?}"
+    );
+
+    let config = LaravelConfigData {
+        root: root.clone(),
+        view_paths: vec![PathBuf::from("resources/views")],
+        component_paths: Vec::new(),
+        livewire_path: None,
+        has_livewire: false,
+        view_namespaces,
+        component_namespaces: HashMap::new(),
+        anonymous_component_paths: HashMap::new(),
+        anonymous_component_namespaces: HashMap::new(),
+        component_aliases: HashMap::new(),
+        icon_aliases: HashMap::new(),
+        class_component_files: HashMap::new(),
+    };
+
+    // Both namespaced views resolve to their registered, real files.
+    let prompts = config.resolve_view_path("ai-prompts::candidate-proposer");
+    assert!(
+        prompts.iter().any(|p| p.exists()),
+        "ai-prompts::candidate-proposer must resolve to the registered file: {prompts:#?}"
+    );
+    let reports = config.resolve_view_path("reports::monthly");
+    assert!(
+        reports.iter().any(|p| p.exists()),
+        "reports::monthly must resolve to the registered file: {reports:#?}"
+    );
+
+    // An invalid view under a registered namespace still has no real candidate —
+    // the diagnostic must keep firing (no false negative).
+    let missing = config.resolve_view_path("ai-prompts::does-not-exist");
+    assert!(
+        !missing.is_empty() && !missing.iter().any(|p| p.exists()),
+        "an invalid namespaced view must still produce only non-existent candidates: {missing:#?}"
+    );
+}
+
 // ─── Class-backed component registrations (dynamic-component, issue #69) ─
 //
 // Laravel core registers `<x-dynamic-component>` with an ordinary class

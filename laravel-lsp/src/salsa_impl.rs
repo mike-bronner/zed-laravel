@@ -2028,9 +2028,8 @@ pub fn parse_service_provider_source<'db>(
                     let Some(key) = config_vars.get(var.as_str()) else {
                         continue;
                     };
-                    let prefix =
-                        crate::config::resolve_config_string_for_package(&root, key, path)
-                            .unwrap_or_default();
+                    let prefix = crate::config::resolve_config_string_for_package(&root, key, path)
+                        .unwrap_or_default();
                     let tag = format!("{prefix}{}", suffix.as_str());
                     push_blade_component(&tag, suffix.start(), class);
                 }

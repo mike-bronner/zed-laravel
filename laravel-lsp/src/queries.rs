@@ -161,9 +161,14 @@ pub struct EnvMatch<'a> {
 }
 
 /// Represents a matched config() call in PHP code
+///
+/// `config_key` is a `Cow` because most keys borrow straight from the source
+/// (`config('app.name')`), but keys reconstructed from interpolated strings
+/// (`config("{$config}.export_connection")` with `$config` resolved via
+/// constant propagation) are built at extraction time and must own their text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigMatch<'a> {
-    pub config_key: &'a str,
+    pub config_key: std::borrow::Cow<'a, str>,
     pub byte_start: usize,
     pub byte_end: usize,
     pub row: usize,
@@ -458,6 +463,18 @@ pub fn extract_all_php_patterns<'a>(
         let start_pos = node.start_position();
         let end_pos = node.end_position();
 
+        // Interpolated double-quoted strings parse as an `encapsed_string`
+        // whose literal fragments (`string_content`) sit NEXT TO the
+        // interpolation nodes. A query that captures `(string_content)` inside
+        // one grabs just a fragment — `.export_connection` out of
+        // `"{$config}.export_connection"` — which is garbage as a key/name.
+        // Config keys get a chance to reconstruct the full string via constant
+        // propagation below; every other pattern kind skips the fragment.
+        let interpolated_parent = interpolated_string_parent(node);
+        if interpolated_parent.is_some() && capture_name != "config_key" {
+            continue;
+        }
+
         match capture_name {
             // View patterns
             "view_name" => {
@@ -500,14 +517,53 @@ pub fn extract_all_php_patterns<'a>(
 
             // Config patterns
             "config_key" => {
-                result.config_calls.push(ConfigMatch {
-                    config_key: text,
-                    byte_start: node.start_byte(),
-                    byte_end: node.end_byte(),
-                    row: start_pos.row,
-                    column: start_pos.column,
-                    end_column: end_pos.column,
-                });
+                if let Some(encapsed) = interpolated_parent {
+                    // One encapsed string can hold several literal fragments
+                    // (`"services.{$x}.key"` has two), and the query yields one
+                    // capture per fragment. Resolve the string ONCE, on its
+                    // first fragment only — otherwise every fragment pushes an
+                    // identical match and reference counts double.
+                    let first_fragment = {
+                        let mut c = encapsed.walk();
+                        let id = encapsed
+                            .named_children(&mut c)
+                            .find(|n| n.kind() == "string_content")
+                            .map(|n| n.id());
+                        id
+                    };
+                    if first_fragment != Some(node.id()) {
+                        continue;
+                    }
+                    // Dynamic key: try to reconstruct the full dotted key by
+                    // substituting same-scope literal assignments
+                    // (`$config = 'reporting.redshift_sync';` →
+                    // `"{$config}.export_connection"` becomes
+                    // `reporting.redshift_sync.export_connection`). Positions
+                    // span the whole inner string so navigation/diagnostics
+                    // cover the visible key expression. Unresolvable strings
+                    // are skipped — no key is better than a wrong key.
+                    if let Some(key) = resolve_interpolated_string(encapsed, source_bytes) {
+                        let enc_start = encapsed.start_position();
+                        let enc_end = encapsed.end_position();
+                        result.config_calls.push(ConfigMatch {
+                            config_key: std::borrow::Cow::Owned(key),
+                            byte_start: encapsed.start_byte() + 1,
+                            byte_end: encapsed.end_byte().saturating_sub(1),
+                            row: enc_start.row,
+                            column: enc_start.column + 1,
+                            end_column: enc_end.column.saturating_sub(1),
+                        });
+                    }
+                } else {
+                    result.config_calls.push(ConfigMatch {
+                        config_key: std::borrow::Cow::Borrowed(text),
+                        byte_start: node.start_byte(),
+                        byte_end: node.end_byte(),
+                        row: start_pos.row,
+                        column: start_pos.column,
+                        end_column: end_pos.column,
+                    });
+                }
             }
 
             // Middleware patterns (usage)
@@ -948,6 +1004,252 @@ pub fn extract_all_php_patterns<'a>(
 /// callers skip them instead of emitting a phantom "not found" diagnostic.
 fn name_is_runtime_constructed(name: &str) -> bool {
     name.contains('{') || name.contains('$')
+}
+
+/// If `node` is a `string_content` fragment of an INTERPOLATED double-quoted
+/// string, return the enclosing `encapsed_string`. A pure literal
+/// (`"app.name"`) parses to an `encapsed_string` with exactly one named child,
+/// so `named_child_count() > 1` is the interpolation test — extra children are
+/// interpolations (`variable_name`, `member_access_expression`, …) or escape
+/// sequences, either of which means the fragment alone is not the full string.
+fn interpolated_string_parent(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if node.kind() != "string_content" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() == "encapsed_string" && parent.named_child_count() > 1 {
+        Some(parent)
+    } else {
+        None
+    }
+}
+
+/// Reconstruct the full text of an interpolated double-quoted string by
+/// substituting same-scope literal variable assignments — lightweight constant
+/// propagation. `"{$config}.export_connection"` resolves when the enclosing
+/// scope contains `$config = 'reporting.redshift_sync';` before the use site.
+///
+/// Conservative by design: any part that isn't a literal fragment or a
+/// variable resolvable to a single, unambiguous string literal makes the whole
+/// resolution bail with `None` (property access `{$this->prefix}`, escape
+/// sequences, reassigned or parameter-fed variables, …). Callers treat `None`
+/// as "dynamic — skip", never as an error.
+fn resolve_interpolated_string(encapsed: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    let mut cursor = encapsed.walk();
+    for child in encapsed.named_children(&mut cursor) {
+        match child.kind() {
+            "string_content" => out.push_str(child.utf8_text(source).ok()?),
+            "variable_name" => out.push_str(&resolve_variable_literal(child, source)?),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Resolve a `variable_name` interpolation to a string literal assigned to it
+/// in the same scope, before the use site. Returns `None` unless the variable
+/// has exactly one binding in scope, that binding is an unconditional plain
+/// `$var = '<literal>'` assignment, and it precedes the use. "Exactly one"
+/// keeps control flow honest — a variable bound twice (or bound once inside a
+/// branch, where the other path may carry a parameter or stale value) has no
+/// single provable value. Bindings of every other shape — `.=`, `foreach`
+/// rebinding, destructuring, `static` — are collected as unresolvable so they
+/// disqualify the count rather than being silently invisible.
+fn resolve_variable_literal(var: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let var_text = var.utf8_text(source).ok()?;
+    let use_byte = var.start_byte();
+    let scope = enclosing_scope(var);
+
+    let mut bindings: Vec<(usize, Option<String>)> = Vec::new();
+    collect_variable_bindings(scope, scope, source, var_text, &mut bindings);
+
+    match bindings.as_slice() {
+        [(bind_byte, value)] if *bind_byte < use_byte => value.clone(),
+        _ => None,
+    }
+}
+
+/// The nearest enclosing function-like node, or the file root. This is the
+/// search boundary for constant propagation — assignments outside it are a
+/// different variable (PHP function scoping), so they must not leak in.
+fn enclosing_scope(node: tree_sitter::Node) -> tree_sitter::Node {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if is_scope_boundary(parent.kind()) {
+            return parent;
+        }
+        current = parent;
+    }
+    current
+}
+
+fn is_scope_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition" | "method_declaration" | "anonymous_function" | "arrow_function"
+    )
+}
+
+/// Collect every construct that BINDS `$var` inside `scope` (excluding nested
+/// function scopes — their `$var` is a different variable) as
+/// `(start_byte, literal value or None)`.
+///
+/// A `Some` value is produced only by an unconditional, top-level-of-scope
+/// `$var = '<literal>'` assignment. Everything else that writes the variable
+/// records `None` so it disqualifies resolution instead of being invisible:
+///
+/// - non-literal RHS (`$var = get_prefix()`)
+/// - assignment nested under control flow (`if (...) { $var = 'x'; }` — the
+///   other path may carry a parameter or earlier value)
+/// - compound assignment (`$var .= 'x'`)
+/// - `foreach (... as $var)` / `foreach (... as $k => $var)` rebinding
+/// - destructuring (`[$a, $var] = ...`, `list(..., $var) = ...`)
+/// - `static $var = ...` (persists across calls — not a constant)
+/// - reference aliasing (`$other = &$var` / `$var = &$other` — writes
+///   through either name are writes to both)
+///
+/// Missing a binding shape here would let constant propagation resolve a STALE
+/// value — a wrong key is strictly worse than the phantom keys this machinery
+/// exists to remove, so unknown-but-writing shapes must always land in the
+/// disqualify bucket.
+fn collect_variable_bindings(
+    node: tree_sitter::Node,
+    scope: tree_sitter::Node,
+    source: &[u8],
+    var_text: &str,
+    out: &mut Vec<(usize, Option<String>)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_scope_boundary(child.kind()) {
+            continue;
+        }
+        match child.kind() {
+            "assignment_expression" => {
+                let left = child.child_by_field_name("left");
+                let right = child.child_by_field_name("right");
+                if let (Some(left), Some(right)) = (left, right) {
+                    if left.kind() == "variable_name"
+                        && left.utf8_text(source).ok() == Some(var_text)
+                    {
+                        let value = if is_conditionally_nested(child, scope) {
+                            None
+                        } else {
+                            literal_string_value(right, source)
+                        };
+                        out.push((child.start_byte(), value));
+                    } else if subtree_binds_variable(left, source, var_text) {
+                        // Destructuring: `[$a, $var] = ...` / `list(...)`.
+                        out.push((child.start_byte(), None));
+                    }
+                }
+            }
+            "augmented_assignment_expression"
+                if child
+                    .child_by_field_name("left")
+                    .is_some_and(|l| l.utf8_text(source).ok() == Some(var_text)) =>
+            {
+                out.push((child.start_byte(), None));
+            }
+            "foreach_statement" => {
+                // The binding targets live in the header — every child except
+                // the loop body. The iterable is also matched here; treating a
+                // read as a binding only over-bails, never mis-resolves.
+                let mut c = child.walk();
+                for header in child.named_children(&mut c) {
+                    if header.kind() != "compound_statement"
+                        && subtree_binds_variable(header, source, var_text)
+                    {
+                        out.push((child.start_byte(), None));
+                        break;
+                    }
+                }
+            }
+            "static_variable_declaration" if subtree_binds_variable(child, source, var_text) => {
+                out.push((child.start_byte(), None));
+            }
+            // Reference aliasing (review finding M1, PR #84): after
+            // `$other = &$var`, a write through EITHER name changes the
+            // value both names see — no later write is provably absent, so
+            // any reference assignment touching the variable (either side)
+            // disqualifies it outright.
+            "reference_assignment_expression"
+                if subtree_binds_variable(child, source, var_text) =>
+            {
+                out.push((child.start_byte(), None));
+            }
+            _ => {}
+        }
+        collect_variable_bindings(child, scope, source, var_text, out);
+    }
+}
+
+/// Whether any `variable_name` in `node`'s subtree is exactly `var_text`.
+fn subtree_binds_variable(node: tree_sitter::Node, source: &[u8], var_text: &str) -> bool {
+    if node.kind() == "variable_name" {
+        return node.utf8_text(source).ok() == Some(var_text);
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .any(|c| subtree_binds_variable(c, source, var_text));
+    found
+}
+
+/// Whether `node` sits under control flow between itself and `scope` — an
+/// `if`/loop/`switch`/`try`/`match` ancestor means the binding may not execute
+/// on every path, so its value can't be treated as THE value at the use site.
+fn is_conditionally_nested(node: tree_sitter::Node, scope: tree_sitter::Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == scope.id() {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "if_statement"
+                | "else_clause"
+                | "else_if_clause"
+                | "conditional_expression"
+                | "while_statement"
+                | "do_statement"
+                | "for_statement"
+                | "foreach_statement"
+                | "switch_statement"
+                | "case_statement"
+                | "default_statement"
+                | "try_statement"
+                | "catch_clause"
+                | "finally_clause"
+                | "match_expression"
+        ) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// The content of `node` if it is a plain (non-interpolated) string literal —
+/// single-quoted `string` or a double-quoted `encapsed_string` whose only
+/// named child is one `string_content`. `None` for everything else.
+fn literal_string_value(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "string" && node.kind() != "encapsed_string" {
+        return None;
+    }
+    match node.named_child_count() {
+        0 => Some(String::new()),
+        1 => {
+            let child = node.named_child(0)?;
+            if child.kind() == "string_content" {
+                Some(child.utf8_text(source).ok()?.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Extract all Blade patterns in a single tree traversal

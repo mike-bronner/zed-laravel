@@ -19,9 +19,13 @@
 {{-- Livewire v4 default component namespace (config/livewire.php): --}}
 {{-- 'layouts' => resource_path('views/layouts') --}}
 <x-layouts::app>
-    {{-- MaryUI registers class components dynamically with a config prefix: --}}
-    {{-- vendor/robsontenorio/mary/src/View/Components/Card.php --}}
+    {{-- MaryUI literal class registration: Blade::component('mary-card', Card::class) --}}
+    {{-- → vendor/robsontenorio/mary/src/View/Components/Card.php (via PSR-4) --}}
     <x-mary-card title="A card" />
+
+    {{-- MaryUI prefix-computed registration: Blade::component($prefix . 'badge', Badge::class) --}}
+    {{-- with $prefix = config('mary.prefix') — '' by default in this project --}}
+    <x-badge value="New" />
 
     {{-- Negative fixture: must STILL report "component not found". --}}
     <x-filament::does-not-exist />

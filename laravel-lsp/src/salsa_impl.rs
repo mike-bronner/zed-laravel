@@ -3818,6 +3818,28 @@ pub enum SalsaRequest {
             std::collections::HashMap<PathBuf, Vec<crate::class_hierarchy_index::ClassNode>>,
         >,
     },
+    /// Surface signatures (`fqcn → u64`) for every class `path` declares.
+    /// The save flow snapshots this *before* pushing the saved buffer into
+    /// Salsa, then diffs against the re-parse to decide whether the edit
+    /// could affect other files (incremental refresh, #80).
+    FileClassSurfaces {
+        path: PathBuf,
+        reply: oneshot::Sender<std::collections::HashMap<String, u64>>,
+    },
+    /// Expand `seeds` to include every transitive descendant (subclasses,
+    /// implementers, trait users) — the class-level blast radius of a
+    /// surface change.
+    ExpandClassDescendants {
+        seeds: Vec<String>,
+        reply: oneshot::Sender<std::collections::HashSet<String>>,
+    },
+    /// Export every magic-member entry grouped by usage file, for the
+    /// incremental magic-cache re-save (#80).
+    ExportMagicMembers {
+        reply: oneshot::Sender<
+            std::collections::HashMap<PathBuf, Vec<crate::symbol_index::MagicMemberEntry>>,
+        >,
+    },
     /// Bulk-import resolved magic-member occurrences into the symbol index
     /// (M4). Appends to each path's existing (literal-symbol) entries.
     BulkImportMagicMembers {
@@ -4445,6 +4467,63 @@ impl SalsaHandle {
     /// Snapshot every indexed class grouped by declaring file, so warming can
     /// persist the hierarchy to the disk cache (it survives a warm restart
     /// only if persisted — fresh parses are the sole other populator).
+    /// Surface signatures for every class `path` currently declares (empty
+    /// if the file is unknown to the hierarchy). Snapshot side of the
+    /// save-time surface diff (#80).
+    pub async fn file_class_surfaces(
+        &self,
+        path: PathBuf,
+    ) -> Result<std::collections::HashMap<String, u64>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::FileClassSurfaces {
+                path,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// `seeds` plus every transitive descendant — the class-level blast
+    /// radius of a surface change (#80).
+    pub async fn expand_class_descendants(
+        &self,
+        seeds: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>, &'static str> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ExpandClassDescendants {
+                seeds,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
+    /// Export every magic-member entry grouped by usage file — the live
+    /// index contents, for the incremental magic-cache re-save (#80).
+    pub async fn export_magic_members(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<PathBuf, Vec<crate::symbol_index::MagicMemberEntry>>,
+        &'static str,
+    > {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(SalsaRequest::ExportMagicMembers { reply: reply_tx })
+            .await
+            .map_err(|_| "Salsa actor disconnected")?;
+        reply_rx
+            .await
+            .map_err(|_| "Salsa actor dropped reply channel")
+    }
+
     pub async fn snapshot_hierarchy_nodes(
         &self,
     ) -> Result<
@@ -5565,6 +5644,15 @@ impl SalsaActor {
                 }
                 SalsaRequest::SnapshotHierarchyNodes { reply } => {
                     let _ = reply.send(self.class_hierarchy_index.nodes_by_file());
+                }
+                SalsaRequest::FileClassSurfaces { path, reply } => {
+                    let _ = reply.send(self.class_hierarchy_index.file_surfaces(&path));
+                }
+                SalsaRequest::ExpandClassDescendants { seeds, reply } => {
+                    let _ = reply.send(self.class_hierarchy_index.expand_with_descendants(&seeds));
+                }
+                SalsaRequest::ExportMagicMembers { reply } => {
+                    let _ = reply.send(self.symbol_index.magic_members_by_file());
                 }
                 SalsaRequest::BulkImportMagicMembers { entries, reply } => {
                     // Append-only: `build_symbol_index` already inserted this
@@ -7130,6 +7218,7 @@ impl SalsaActor {
                 &self.class_hierarchy_index,
                 &mut classviews,
                 &project_root,
+                None, // query-time path — no dependency recording
             ) {
                 // find-references threshold: HIGH + MEDIUM.
                 if matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
@@ -7204,6 +7293,7 @@ impl SalsaActor {
                 &self.class_hierarchy_index,
                 &mut classviews,
                 &project_root,
+                None, // query-time path — no dependency recording
             ) {
                 Some(r) if matches!(r.confidence, Confidence::High | Confidence::Medium) => {
                     (r.declaring_fqcn, r.kind, r.confidence, false)
@@ -7307,6 +7397,7 @@ impl SalsaActor {
             &self.class_hierarchy_index,
             &mut classviews,
             &project_root,
+            None, // query-time path — no dependency recording
         )?;
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
             return None;

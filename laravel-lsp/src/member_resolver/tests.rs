@@ -347,6 +347,7 @@ fn resolve_in(p: &Project, caller: &str, member: &str) -> Option<ResolvedMemberA
         &p.index,
         &mut cache,
         &p.root,
+        None,
     )
 }
 
@@ -878,8 +879,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "email"),
         "{entries:?}"
@@ -907,6 +914,7 @@ function show($mystery) {
         &p.index,
         &mut ClassViewCache::new(),
         &p.root,
+        None,
     );
     assert!(
         entries.is_empty(),
@@ -933,6 +941,7 @@ class C {
         &p.index,
         &mut ClassViewCache::new(),
         &p.root,
+        None,
     );
     assert!(entries.is_empty(), "{entries:?}");
 }
@@ -941,7 +950,7 @@ class C {
 fn population_empty_refs_is_empty() {
     let p = project("app/Models/User.php", USER_MODEL);
     let entries =
-        resolve_member_access_entries("", &[], &p.index, &mut ClassViewCache::new(), &p.root);
+        resolve_member_access_entries("", &[], &p.index, &mut ClassViewCache::new(), &p.root, None);
     assert!(entries.is_empty());
 }
 
@@ -993,6 +1002,7 @@ class User extends Model {
         &snapshot,
         &mut ClassViewCache::new(),
         dir.path(),
+        None,
     );
     assert!(
         entries
@@ -1071,6 +1081,7 @@ class User extends Authenticatable {
         &snapshot,
         &mut ClassViewCache::new(),
         dir.path(),
+        None,
     );
     assert!(
         entries
@@ -1170,7 +1181,14 @@ fn resolve_auth_caller(
     caller: &str,
 ) -> Vec<MagicMemberEntry> {
     let refs = member_refs_of(caller);
-    resolve_member_access_entries(caller, &refs, index, &mut ClassViewCache::new(), dir.path())
+    resolve_member_access_entries(
+        caller,
+        &refs,
+        index,
+        &mut ClassViewCache::new(),
+        dir.path(),
+        None,
+    )
 }
 
 #[test]
@@ -1311,8 +1329,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "static scope call should index under its usage name; got {entries:?}"
@@ -1332,8 +1356,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "instance scope call should index; got {entries:?}"
@@ -1353,8 +1383,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "posts"),
         "relationship call should index under the same key as property reads; got {entries:?}"
@@ -1374,8 +1410,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "whereEmail"),
         "dynamic finder call should index; got {entries:?}"
@@ -1396,8 +1438,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     // `count()` (unresolvable/plain) and `helperMethod()` (not on the model)
     // must not index; only the relationship call survives.
     assert!(
@@ -1425,8 +1473,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "aliased static receiver should resolve through use-imports; got {entries:?}"
@@ -1442,8 +1496,14 @@ use Illuminate\Support\Str;
 $slug = Str::slug('Laravel');
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(entries.is_empty(), "{entries:?}");
 }
 
@@ -1462,8 +1522,14 @@ class Order extends Model {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "same-namespace unimported static receiver should resolve; got {entries:?}"
@@ -1488,8 +1554,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     let active_count = entries
         .iter()
         .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
@@ -1521,8 +1593,14 @@ class User extends Model {
 "#;
     let p = project("app/Models/User.php", model);
     let refs = member_refs_of(model);
-    let entries =
-        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        model,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "builder-typed `$query->active()` must resolve via the enclosing model; got {entries:?}"
@@ -1546,8 +1624,14 @@ class User extends Model {
 "#;
     let p = project("app/Models/User.php", model);
     let refs = member_refs_of(model);
-    let entries =
-        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        model,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         has_entry(&entries, "App\\Models\\User", "active"),
         "mid-chain `$query->where(…)->active()` must index; got {entries:?}"
@@ -1565,8 +1649,14 @@ use Illuminate\Support\Str;
 $x = Str::of('laravel')->upper();
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(entries.is_empty(), "{entries:?}");
 }
 
@@ -1583,8 +1673,14 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         !has_entry(&entries, "App\\Models\\User", "first"),
         "plain chain terminals must not index; got {entries:?}"
@@ -1611,8 +1707,14 @@ class UserTest {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         !has_entry(&entries, "App\\Models\\User", "active"),
         "factory-state calls must not index as scope references; got {entries:?}"
@@ -1636,8 +1738,14 @@ class User extends Model {
 "#;
     let p = project("app/Models/User.php", model);
     let refs = member_refs_of(model);
-    let entries =
-        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        model,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     let active_count = entries
         .iter()
         .filter(|e| e.fqcn == "App\\Models\\User" && e.member == "active")
@@ -1669,8 +1777,14 @@ class User extends Model {
 "#;
     let p = project("app/Models/User.php", model);
     let refs = member_refs_of(model);
-    let entries =
-        resolve_member_access_entries(model, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        model,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         !has_entry(&entries, "App\\Models\\User", "published"),
         "a whereHas-closure builder call must not attribute to the enclosing model; got {entries:?}"
@@ -1704,12 +1818,95 @@ class C {
 }
 "#;
     let refs = member_refs_of(caller);
-    let entries =
-        resolve_member_access_entries(caller, &refs, &p.index, &mut ClassViewCache::new(), &p.root);
+    let entries = resolve_member_access_entries(
+        caller,
+        &refs,
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        None,
+    );
     assert!(
         !has_entry(&entries, "App\\Models\\User", "active"),
         "a relation-hopped scope call must not attribute to the root model; got {entries:?}"
     );
     // The relationship CALL itself still indexes (it is User's member).
     assert!(has_entry(&entries, "App\\Models\\User", "posts"));
+}
+
+// ─── Dependency recording (incremental save, #80) ──────────────────────────
+
+#[test]
+fn deps_record_receiver_fqcn_on_successful_classification() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->email;
+    }
+}
+"#;
+    let mut deps = std::collections::HashSet::new();
+    let entries = resolve_member_access_entries(
+        caller,
+        &member_refs_of(caller),
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        Some(&mut deps),
+    );
+    assert!(!entries.is_empty());
+    assert!(deps.contains("App\\Models\\User"), "{deps:?}");
+}
+
+#[test]
+fn deps_record_receiver_fqcn_even_when_member_classification_fails() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    // `notAColumn` doesn't exist on User → no index entry, but the file
+    // still depends on User: adding the member later must re-resolve it.
+    let caller = r#"<?php
+namespace App\Http\Controllers;
+use App\Models\User;
+class C {
+    public function show(User $user) {
+        return $user->notAColumn;
+    }
+}
+"#;
+    let mut deps = std::collections::HashSet::new();
+    let entries = resolve_member_access_entries(
+        caller,
+        &member_refs_of(caller),
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        Some(&mut deps),
+    );
+    assert!(entries.is_empty(), "{entries:?}");
+    assert!(
+        deps.contains("App\\Models\\User"),
+        "failed classification must still record the receiver dependency, got {deps:?}"
+    );
+}
+
+#[test]
+fn deps_record_nothing_for_unresolvable_receivers() {
+    let p = project("app/Models/User.php", USER_MODEL);
+    let caller = r#"<?php
+function show($mystery) {
+    return $mystery->email;
+}
+"#;
+    let mut deps = std::collections::HashSet::new();
+    resolve_member_access_entries(
+        caller,
+        &member_refs_of(caller),
+        &p.index,
+        &mut ClassViewCache::new(),
+        &p.root,
+        Some(&mut deps),
+    );
+    assert!(deps.is_empty(), "{deps:?}");
 }

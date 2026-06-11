@@ -129,6 +129,172 @@ fn empty_inputs_return_false() {
     assert!(!member_read_in_chain(&root, "App\\Models\\Widget", ""));
 }
 
+// ── consumer scan (interface package reads the member duck-typed) ──────────
+
+#[test]
+fn proves_read_via_interface_package_consumer() {
+    // Mike's SyncRedshiftFromQueue case: the job's `$tries` is read by NOTHING
+    // in its chain — the framework reads `$job->tries` in the package that
+    // owns the ShouldQueue contract the job implements.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nclass SyncJob implements ShouldQueue { public int $tries = 1; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface ShouldQueue {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Queue.php",
+            "<?php\nnamespace Acme\\Queue;\nclass Queue { public function getJobTries($job) { return $job->tries ?? null; } }\n",
+        ),
+    ]);
+    assert!(member_read_in_chain(&root, "App\\Jobs\\SyncJob", "tries"));
+}
+
+#[test]
+fn proves_read_via_interface_implemented_by_vendor_parent() {
+    // The interface comes from a vendor PARENT in the chain, not the app class
+    // itself — interfaces must be collected across the whole walk.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\BaseJob;\nclass SyncJob extends BaseJob { public int $timeout = 30; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/BaseJob.php",
+            "<?php\nnamespace Acme\\Queue;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nabstract class BaseJob implements ShouldQueue {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface ShouldQueue {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Worker.php",
+            "<?php\nnamespace Acme\\Queue;\nclass Worker { public function run($job) { return $job?->timeout; } }\n",
+        ),
+    ]);
+    assert!(member_read_in_chain(&root, "App\\Jobs\\SyncJob", "timeout"));
+}
+
+#[test]
+fn proves_read_via_parent_contract_in_different_package() {
+    // The implemented interface extends a contract in a DIFFERENT package, and
+    // the consumer read lives with the parent — the hop walk must follow
+    // `interface A extends B` across package boundaries.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nclass SyncJob implements ShouldQueue { public int $attempts = 2; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\nuse Base\\Contracts\\Job;\ninterface ShouldQueue extends Job {}\n",
+        ),
+        (
+            "vendor/base/contracts/src/Job.php",
+            "<?php\nnamespace Base\\Contracts;\ninterface Job {}\n",
+        ),
+        (
+            "vendor/base/contracts/src/Runner.php",
+            "<?php\nnamespace Base\\Contracts;\nclass Runner { public function f($j) { return $j->attempts; } }\n",
+        ),
+    ]);
+    assert!(member_read_in_chain(
+        &root,
+        "App\\Jobs\\SyncJob",
+        "attempts"
+    ));
+}
+
+#[test]
+fn member_unread_by_interface_package_is_not_proven() {
+    // The package owns the interface but never touches the member — the scan
+    // must not turn "implements a vendor interface" into blanket immunity.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nclass SyncJob implements ShouldQueue { public $orphan = true; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface ShouldQueue {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Queue.php",
+            "<?php\nnamespace Acme\\Queue;\nclass Queue { public function getJobTries($job) { return $job->tries ?? null; } }\n",
+        ),
+    ]);
+    assert!(!member_read_in_chain(&root, "App\\Jobs\\SyncJob", "orphan"));
+}
+
+#[test]
+fn method_call_in_consumer_is_not_a_property_read() {
+    // `$job->retry()` is a method call, not a property access — it must not
+    // prove a PROPERTY named `retry`.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nclass SyncJob implements ShouldQueue { public $retry = 3; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface ShouldQueue {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Queue.php",
+            "<?php\nnamespace Acme\\Queue;\nclass Queue { public function run($job) { return $job->retry(); } }\n",
+        ),
+    ]);
+    assert!(!member_read_in_chain(&root, "App\\Jobs\\SyncJob", "retry"));
+}
+
+#[test]
+fn app_side_interface_does_not_trigger_consumer_scan() {
+    // The interface resolves into app/, not vendor/ — app-side consumer reads
+    // are ordinary project references the index already counts, so the prover
+    // must not claim them.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse App\\Contracts\\Trackable;\nclass SyncJob implements Trackable { public $steps = 5; }\n",
+        ),
+        (
+            "app/Contracts/Trackable.php",
+            "<?php\nnamespace App\\Contracts;\ninterface Trackable {}\n",
+        ),
+        (
+            "app/Services/Tracker.php",
+            "<?php\nnamespace App\\Services;\nclass Tracker { public function f($t) { return $t->steps; } }\n",
+        ),
+    ]);
+    assert!(!member_read_in_chain(&root, "App\\Jobs\\SyncJob", "steps"));
+}
+
+#[test]
+fn interface_extends_cycle_terminates() {
+    // A extends B, B extends A — the hop walk in the consumer scan has its own
+    // visited-set + bound, textually separate from the chain walk's, so it
+    // needs its own termination pin (this test failing = an infinite loop /
+    // hang in `member_read_by_interface_consumers`).
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\A;\nclass SyncJob implements A { public $x = 1; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/A.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface A extends B {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/B.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface B extends A {}\n",
+        ),
+    ]);
+    assert!(!member_read_in_chain(&root, "App\\Jobs\\SyncJob", "x"));
+}
+
 #[test]
 fn extends_cycle_terminates() {
     // A extends B, B extends A — the visited-set must break the cycle and the

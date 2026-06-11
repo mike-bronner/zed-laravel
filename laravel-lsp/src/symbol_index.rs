@@ -366,6 +366,37 @@ impl SymbolIndex {
     }
 
     /// Total entry count across all symbols. Useful for logging.
+    /// Reconstruct every magic-member entry grouped by usage file — the
+    /// inverse of [`insert_magic_members`](Self::insert_magic_members).
+    /// Powers the incremental magic-cache persistence (#80): after a save
+    /// updates a file's entries in place, the cache re-save exports the
+    /// whole live index rather than re-resolving anything.
+    pub fn magic_members_by_file(&self) -> HashMap<PathBuf, Vec<MagicMemberEntry>> {
+        let mut out: HashMap<PathBuf, Vec<MagicMemberEntry>> = HashMap::new();
+        for (key, locations) in &self.forward {
+            if key.kind != SymbolKind::MagicMember {
+                continue;
+            }
+            // Key format is `<fqcn>#<member>` (see `magic_member_key_name`);
+            // FQCNs never contain `#`, so the first split is unambiguous.
+            let Some((fqcn, member)) = key.name.split_once('#') else {
+                continue;
+            };
+            for loc in locations {
+                out.entry(loc.file_path.clone())
+                    .or_default()
+                    .push(MagicMemberEntry {
+                        fqcn: fqcn.to_string(),
+                        member: member.to_string(),
+                        line: loc.line,
+                        column: loc.column,
+                        end_column: loc.end_column,
+                    });
+            }
+        }
+        out
+    }
+
     pub fn entry_count(&self) -> usize {
         self.forward.values().map(|v| v.len()).sum()
     }

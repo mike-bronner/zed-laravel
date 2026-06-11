@@ -88,6 +88,15 @@ impl MagicDependencyIndex {
         self.by_file.clear();
     }
 
+    /// Snapshot every file's recorded dependencies — the persistence side
+    /// of the incremental magic-cache re-save (#80).
+    pub fn export(&self) -> Vec<(PathBuf, HashSet<String>)> {
+        self.by_file
+            .iter()
+            .map(|(path, fqcns)| (path.clone(), fqcns.clone()))
+            .collect()
+    }
+
     /// Number of files with recorded dependencies. For logs.
     pub fn file_count(&self) -> usize {
         self.by_file.len()

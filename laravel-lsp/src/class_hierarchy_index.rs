@@ -147,6 +147,25 @@ pub fn surface_diff(old: &HashMap<String, u64>, new_nodes: &[ClassNode]) -> Vec<
     affected
 }
 
+/// FQCNs whose surface differs between two `file_surfaces` snapshots taken
+/// before and after a save: changed signatures, plus classes added or
+/// removed. The map-vs-map sibling of [`surface_diff`] — the save flow
+/// snapshots both sides through the actor, so it never holds `ClassNode`s.
+pub fn surface_map_diff(old: &HashMap<String, u64>, new: &HashMap<String, u64>) -> Vec<String> {
+    let mut affected = Vec::new();
+    for (fqcn, sig) in new {
+        if old.get(fqcn) != Some(sig) {
+            affected.push(fqcn.clone());
+        }
+    }
+    for fqcn in old.keys() {
+        if !new.contains_key(fqcn) {
+            affected.push(fqcn.clone());
+        }
+    }
+    affected
+}
+
 /// Inverted class-hierarchy index. Owned by the actor; never shared.
 #[derive(Default, Debug)]
 pub struct ClassHierarchyIndex {

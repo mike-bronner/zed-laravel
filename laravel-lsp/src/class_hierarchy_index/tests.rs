@@ -368,3 +368,28 @@ class Uses { use Helper; }
     let radius = idx.expand_with_descendants(&["App\\Helper".to_string()]);
     assert!(radius.contains("App\\Uses"));
 }
+
+#[test]
+fn surface_map_diff_matches_node_diff_semantics() {
+    let mut old = HashMap::new();
+    old.insert("App\\A".to_string(), 1u64);
+    old.insert("App\\B".to_string(), 2u64);
+
+    // Unchanged → empty.
+    assert!(surface_map_diff(&old, &old.clone()).is_empty());
+
+    // Changed signature + removed class + added class all report.
+    let mut new = HashMap::new();
+    new.insert("App\\A".to_string(), 9u64); // changed
+    new.insert("App\\C".to_string(), 3u64); // added
+    let mut diff = surface_map_diff(&old, &new);
+    diff.sort();
+    assert_eq!(
+        diff,
+        vec![
+            "App\\A".to_string(),
+            "App\\B".to_string(),
+            "App\\C".to_string(),
+        ]
+    );
+}

@@ -841,3 +841,35 @@ fn volt_deps_record_attempted_prop_types_even_on_unknown_member() {
     assert!(entries.is_empty(), "got {entries:?}");
     assert!(deps.contains("App\\Models\\User"), "{deps:?}");
 }
+
+#[test]
+fn remove_file_preserves_other_files_contributions() {
+    let mut idx = ViewVarIndex::new();
+    let a = PathBuf::from("/proj/app/Http/Controllers/A.php");
+    let b = PathBuf::from("/proj/app/Http/Controllers/B.php");
+    // Both controllers feed the same view with different types for `user`.
+    idx.insert_file(
+        a.clone(),
+        &[render("users.show", &[("user", "App\\Models\\User")])],
+    );
+    idx.insert_file(
+        b,
+        &[render("users.show", &[("user", "App\\Models\\Admin")])],
+    );
+
+    idx.remove_file(&a);
+    // B's contribution must survive A's eviction (the old implementation
+    // dropped the whole view).
+    let types = idx.var_types("users.show", "user");
+    assert_eq!(types, vec!["App\\Models\\Admin".to_string()]);
+}
+
+#[test]
+fn renders_for_returns_current_contribution() {
+    let mut idx = ViewVarIndex::new();
+    let a = PathBuf::from("/proj/app/Http/Controllers/A.php");
+    assert!(idx.renders_for(&a).is_none());
+    let r = render("users.show", &[("user", "App\\Models\\User")]);
+    idx.insert_file(a.clone(), std::slice::from_ref(&r));
+    assert_eq!(idx.renders_for(&a), Some(std::slice::from_ref(&r)));
+}

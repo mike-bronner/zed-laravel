@@ -511,3 +511,31 @@ fn remove_literal_entries_drops_by_file_when_no_magic_remains() {
     assert_eq!(idx.indexed_file_count(), 0);
     assert!(idx.find(&SymbolRefData::View("welcome".into())).is_empty());
 }
+
+#[test]
+fn magic_members_export_round_trips_insert() {
+    let mut idx = SymbolIndex::default();
+    let a = PathBuf::from("/proj/app/Http/Controllers/UserController.php");
+    let b = PathBuf::from("/proj/app/Jobs/SyncUsers.php");
+    let entry = |member: &str, line: u32| MagicMemberEntry {
+        fqcn: "App\\Models\\User".to_string(),
+        member: member.to_string(),
+        line,
+        column: 4,
+        end_column: 12,
+    };
+    idx.insert_magic_members(&a, &[entry("email", 10), entry("posts", 20)]);
+    idx.insert_magic_members(&b, &[entry("email", 5)]);
+    // Literal symbols must NOT leak into the magic export.
+    idx.insert_file(&a, &fixture("welcome", "home"));
+
+    let export = idx.magic_members_by_file();
+    assert_eq!(export.len(), 2);
+    let mut a_entries = export.get(&a).unwrap().clone();
+    a_entries.sort_by_key(|e| e.line);
+    assert_eq!(a_entries.len(), 2);
+    assert_eq!(a_entries[0].fqcn, "App\\Models\\User");
+    assert_eq!(a_entries[0].member, "email");
+    assert_eq!(a_entries[1].member, "posts");
+    assert_eq!(export.get(&b).unwrap().len(), 1);
+}

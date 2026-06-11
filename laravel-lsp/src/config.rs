@@ -482,43 +482,9 @@ fn extract_provider_blade_aliases(source: &str, aliases: &mut HashMap<String, St
 /// pulling out single-quoted alias/view pairs. Skips entries whose value is a
 /// `Class::class` reference (those are PHP component classes, not view paths).
 fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) {
-    // Find the start of the aliases block: 'aliases' => [
-    let Some(aliases_pos) = source
-        .find("'aliases'")
-        .or_else(|| source.find("\"aliases\""))
-    else {
+    let Some(block) = php_array_block(source, "aliases") else {
         return;
     };
-
-    // Find the opening bracket of the alias array after 'aliases' =>
-    let after_key = &source[aliases_pos..];
-    let Some(open_bracket_rel) = after_key.find('[') else {
-        return;
-    };
-
-    // Walk character-by-character to find the matching close bracket so we
-    // don't pick up entries from sibling top-level config keys.
-    let block_start = aliases_pos + open_bracket_rel + 1;
-    let mut depth: i32 = 1;
-    let mut block_end = block_start;
-    for (idx, ch) in source[block_start..].char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    block_end = block_start + idx;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth != 0 {
-        return;
-    }
-
-    let block = &source[block_start..block_end];
 
     for raw_line in block.lines() {
         let line = raw_line.trim();
@@ -548,6 +514,238 @@ fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) 
 
         aliases.insert(alias_name.to_string(), view_path.to_string());
     }
+}
+
+// ============================================================================
+// Livewire component namespaces (Livewire v4)
+// ============================================================================
+
+/// Anonymous component namespaces Livewire v4 registers at boot.
+///
+/// Livewire v4's service provider loops over
+/// `config('livewire.component_namespaces')` — defaulting to
+/// `['layouts' => resource_path('views/layouts'), 'pages' =>
+/// resource_path('views/pages')]` — calling
+/// `Blade::anonymousComponentPath($location, $namespace)` for each entry,
+/// which is what makes `<x-layouts::app>` resolve to
+/// `resources/views/layouts/app.blade.php`. The registration is config-driven
+/// and runs in a loop, so provider parsing never sees it; reconstruct it from
+/// the config instead: the app's `config/livewire.php` when it defines the
+/// key, else the package's own config (Livewire merges vendor defaults
+/// underneath the app's). Livewire v3 has no such key, so this is a no-op
+/// there.
+pub fn livewire_component_namespaces(root: &Path) -> Vec<(String, PathBuf)> {
+    let candidates = [
+        root.join("config/livewire.php"),
+        root.join("vendor/livewire/livewire/config/livewire.php"),
+    ];
+    for config_path in candidates {
+        let Ok(source) = fs::read_to_string(&config_path) else {
+            continue;
+        };
+        // A present key is authoritative even when its array is empty —
+        // `'component_namespaces' => []` is how an app *disables* Livewire's
+        // defaults (Laravel's config merge replaces the array wholesale).
+        // Only a missing key falls through to the vendor defaults.
+        if let Some(parsed) = parse_livewire_component_namespaces(&source, root) {
+            return parsed;
+        }
+    }
+    Vec::new()
+}
+
+/// Returns `None` when the `component_namespaces` key is absent from the
+/// source, `Some(entries)` (possibly empty) when it is present.
+fn parse_livewire_component_namespaces(
+    source: &str,
+    root: &Path,
+) -> Option<Vec<(String, PathBuf)>> {
+    let mut namespaces = Vec::new();
+    let block = php_array_block(source, "component_namespaces")?;
+
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+        {
+            continue;
+        }
+
+        let Some((key, value)) = split_arrow_pair(line) else {
+            continue;
+        };
+        let Some(namespace) = unquote(key) else {
+            continue;
+        };
+        let Some(path) = resolve_php_path_expression(value, root) else {
+            continue;
+        };
+        namespaces.push((namespace.to_string(), path));
+    }
+
+    Some(namespaces)
+}
+
+/// Resolve a dotted config key (`mary.prefix`) to its string value the way
+/// Laravel would at boot: the app's `config/{file}.php` wins; otherwise the
+/// registering package's own bundled `config/{file}.php` default (packages
+/// `mergeConfigFrom` their config under the same key). The package config is
+/// located by walking up from the provider file to the nearest `config/`
+/// sibling, stopping at the project root. Returns `None` when neither
+/// defines the key — PHP's `config()` would yield null there.
+pub fn resolve_config_string_for_package(
+    root: &Path,
+    dotted_key: &str,
+    provider_path: &Path,
+) -> Option<String> {
+    let (file, key) = dotted_key.split_once('.')?;
+    let config_file = format!("{file}.php");
+
+    // App override.
+    if let Ok(source) = fs::read_to_string(root.join("config").join(&config_file)) {
+        if let Some(value) = php_top_level_string_value(&source, key) {
+            return Some(value);
+        }
+    }
+
+    // Package default: provider at `<pkg>/src/FooServiceProvider.php` →
+    // `<pkg>/config/{file}.php`.
+    let mut dir = provider_path.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("config").join(&config_file);
+        if candidate.exists() {
+            let source = fs::read_to_string(&candidate).ok()?;
+            return php_top_level_string_value(&source, key);
+        }
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+
+    None
+}
+
+/// Find the string value of a **top-level** key in a PHP config file
+/// (`return ['prefix' => 'mary-', ...]`), ignoring same-named keys nested
+/// inside sub-arrays. Handles plain string literals and the
+/// `env('NAME', 'default')` form (the default is taken — .env overrides are
+/// out of static reach).
+pub fn php_top_level_string_value(source: &str, key: &str) -> Option<String> {
+    let return_pos = source.find("return")?;
+    let open_rel = source[return_pos..].find('[')?;
+    let block_start = return_pos + open_rel + 1;
+
+    let mut depth: i32 = 1;
+    let mut block_end = None;
+    for (idx, ch) in source[block_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    block_end = Some(block_start + idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &source[block_start..block_end?];
+
+    let needle_sq = format!("'{key}'");
+    let needle_dq = format!("\"{key}\"");
+    let mut rel_depth: i32 = 0;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if rel_depth == 0 && (trimmed.starts_with(&needle_sq) || trimmed.starts_with(&needle_dq)) {
+            let (_, value) = split_arrow_pair(trimmed)?;
+            if let Some(literal) = unquote(value) {
+                return Some(literal.to_string());
+            }
+            // env('NAME', 'default') → the default argument.
+            if let Some(rest) = value.strip_prefix("env(") {
+                let inner = rest.rsplit_once(')')?.0;
+                let default = inner.split_once(',')?.1.trim();
+                return unquote(default).map(str::to_string);
+            }
+            return None;
+        }
+        for ch in line.chars() {
+            match ch {
+                '[' => rel_depth += 1,
+                ']' => rel_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve a PHP path expression from a config value to an absolute path.
+/// Handles the Laravel path helpers (`resource_path('x')`, `base_path('x')`,
+/// `app_path('x')`) and plain string literals (absolute, or root-relative).
+fn resolve_php_path_expression(value: &str, root: &Path) -> Option<PathBuf> {
+    let value = value.trim();
+
+    for (helper, base) in [
+        ("resource_path", Some("resources")),
+        ("base_path", None),
+        ("app_path", Some("app")),
+    ] {
+        if let Some(rest) = value.strip_prefix(helper) {
+            let inner = rest.trim().strip_prefix('(')?.rsplit_once(')')?.0;
+            let arg = unquote(inner.trim()).unwrap_or("");
+            let mut path = root.to_path_buf();
+            if let Some(base) = base {
+                path.push(base);
+            }
+            if !arg.is_empty() {
+                path.push(arg);
+            }
+            return Some(path);
+        }
+    }
+
+    let literal = unquote(value)?;
+    let path = PathBuf::from(literal);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(literal)
+    })
+}
+
+/// Find the contents of the PHP array literal assigned to `key` in a config
+/// source: `'{key}' => [ ... ]`. Walks character-by-character to the matching
+/// close bracket so entries from sibling top-level config keys are never
+/// picked up. Returns the text between the brackets.
+fn php_array_block<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let key_pos = source
+        .find(&format!("'{key}'"))
+        .or_else(|| source.find(&format!("\"{key}\"")))?;
+
+    let after_key = &source[key_pos..];
+    let open_bracket_rel = after_key.find('[')?;
+
+    let block_start = key_pos + open_bracket_rel + 1;
+    let mut depth: i32 = 1;
+    for (idx, ch) in source[block_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[block_start..block_start + idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Split a PHP array entry like `'alias' => 'view.path',` into (key, value).

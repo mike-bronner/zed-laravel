@@ -1627,6 +1627,20 @@ pub fn parse_service_provider_source<'db>(
             r#"(?:Blade::|\$\w+->)component\s*\(\s*\\?([A-Za-z0-9_\\]+)::class\s*,\s*['"]([^'"]+)['"]\s*\)"#
         ).unwrap();
 
+        /// Matches a class-backed registration whose tag is a config-driven
+        /// prefix concatenation: `Blade::component($prefix . 'card', Card::class)`.
+        /// MaryUI registers its whole catalog this way, reading the prefix
+        /// from `config('mary.prefix')` once at the top of the method.
+        static ref BLADE_COMPONENT_PREFIXED_RE: Regex = Regex::new(
+            r#"(?:Blade::|\$\w+->)component\s*\(\s*\$(\w+)\s*\.\s*['"]([^'"]+)['"]\s*,\s*\\?([A-Za-z0-9_\\]+)::class\s*\)"#
+        ).unwrap();
+
+        /// Matches the prefix-variable assignment feeding the form above:
+        /// `$prefix = config('mary.prefix');` (with or without a default arg).
+        static ref CONFIG_VAR_ASSIGN_RE: Regex = Regex::new(
+            r#"\$(\w+)\s*=\s*config\(\s*['"]([\w.-]+)['"]\s*[,)]"#
+        ).unwrap();
+
         /// Matches Blade::componentNamespace('Namespace\\Path', 'prefix')
         static ref COMPONENT_NAMESPACE_RE: Regex = Regex::new(
             r#"Blade::componentNamespace\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#
@@ -1959,36 +1973,67 @@ pub fn parse_service_provider_source<'db>(
     // the file's `use` statements before file resolution, mirroring how PHP
     // itself resolves the reference.
     {
-        let mut push_blade_component = |tag_match: regex::Match, class_match: regex::Match| {
-            let tag_name_str = tag_match.as_str();
-            let class_str = expand_class_via_use_statements(
-                class_match.as_str().trim_start_matches('\\'),
-                text,
-            );
+        let mut push_blade_component =
+            |tag_name_str: &str, tag_offset: usize, class_match: regex::Match| {
+                let class_str = expand_class_via_use_statements(
+                    class_match.as_str().trim_start_matches('\\'),
+                    text,
+                );
 
-            let line = text[..tag_match.start()].lines().count() as u32;
-            let file_path = resolve_class_to_file_internal(&class_str, &root);
+                let line = text[..tag_offset].lines().count() as u32;
+                let file_path = resolve_class_to_file_internal(&class_str, &root);
 
-            let component_name = ComponentName::new(db, tag_name_str.to_string());
-            blade_components.push(ParsedBladeComponentReg::new(
-                db,
-                component_name,
-                class_str,
-                file_path,
-                line,
-                priority,
-                path.clone(),
-            ));
-        };
+                let component_name = ComponentName::new(db, tag_name_str.to_string());
+                blade_components.push(ParsedBladeComponentReg::new(
+                    db,
+                    component_name,
+                    class_str,
+                    file_path,
+                    line,
+                    priority,
+                    path.clone(),
+                ));
+            };
 
         for cap in BLADE_COMPONENT_RE.captures_iter(text) {
             if let (Some(tag_name), Some(class)) = (cap.get(1), cap.get(2)) {
-                push_blade_component(tag_name, class);
+                push_blade_component(tag_name.as_str(), tag_name.start(), class);
             }
         }
         for cap in BLADE_COMPONENT_CLASS_FIRST_RE.captures_iter(text) {
             if let (Some(class), Some(tag_name)) = (cap.get(1), cap.get(2)) {
-                push_blade_component(tag_name, class);
+                push_blade_component(tag_name.as_str(), tag_name.start(), class);
+            }
+        }
+
+        // Prefix-computed registrations (MaryUI's catalog form):
+        //   $prefix = config('mary.prefix');
+        //   Blade::component($prefix . 'card', Card::class);
+        // The tag only exists after concatenating a config value, so resolve
+        // the variable's config key from the same file and read the value the
+        // way Laravel would at boot — the app's config override wins, else the
+        // package's bundled config default. A key neither defines is PHP null,
+        // which string-concatenates to '' (MaryUI's actual default).
+        let config_vars: HashMap<&str, &str> = CONFIG_VAR_ASSIGN_RE
+            .captures_iter(text)
+            .filter_map(|cap| match (cap.get(1), cap.get(2)) {
+                (Some(var), Some(key)) => Some((var.as_str(), key.as_str())),
+                _ => None,
+            })
+            .collect();
+        if !config_vars.is_empty() {
+            for cap in BLADE_COMPONENT_PREFIXED_RE.captures_iter(text) {
+                if let (Some(var), Some(suffix), Some(class)) = (cap.get(1), cap.get(2), cap.get(3))
+                {
+                    let Some(key) = config_vars.get(var.as_str()) else {
+                        continue;
+                    };
+                    let prefix =
+                        crate::config::resolve_config_string_for_package(&root, key, path)
+                            .unwrap_or_default();
+                    let tag = format!("{prefix}{}", suffix.as_str());
+                    push_blade_component(&tag, suffix.start(), class);
+                }
             }
         }
     }
@@ -2309,6 +2354,19 @@ fn expand_class_via_use_statements(class_name: &str, source: &str) -> String {
 
 /// Resolve a class name to a file path using PSR-4 conventions
 fn resolve_class_to_file_internal(class_name: &str, root_path: &Path) -> Option<PathBuf> {
+    // PSR-4 via the composer autoload map first — the authoritative answer
+    // for any installed package (vendor or app). The legacy prefix mappings
+    // below stay as fallbacks for projects without a readable autoload map.
+    if let Some((namespace, class)) = class_name.rsplit_once('\\') {
+        let autoload = crate::composer_autoload::ComposerAutoload::for_project(root_path);
+        for dir in autoload.resolve_namespace_dirs(namespace) {
+            let file = dir.join(class).with_extension("php");
+            if file.exists() {
+                return Some(file);
+            }
+        }
+    }
+
     // Common namespace to directory mappings
     let mappings = [
         ("App\\", "app/"),
@@ -2880,17 +2938,34 @@ impl LaravelConfigData {
         let component_path = actual_component.replace('.', "/");
 
         if let Some(ns) = namespace {
+            // Markdown mail components are hardcoded in Laravel's
+            // ComponentTagCompiler: `<x-mail::message>` maps straight to view
+            // `mail::message`, and at render time `Markdown` points the `mail`
+            // namespace at `{path}/html` for each configured path — the
+            // published `resources/views/vendor/mail` first, then the
+            // framework's bundled views. There is no `components/` segment.
+            // Pushed first so the published path is `paths.first()` — the
+            // diagnostic reports that as the "Expected at:" location.
+            if ns == "mail" {
+                let mut published = self
+                    .root
+                    .join("resources/views/vendor/mail/html")
+                    .join(&component_path);
+                published.set_extension("blade.php");
+                paths.push(published);
+                let mut framework = self
+                    .root
+                    .join("vendor/laravel/framework/src/Illuminate/Mail/resources/views/html")
+                    .join(&component_path);
+                framework.set_extension("blade.php");
+                paths.push(framework);
+            }
+
             // Anonymous component path (Blade::anonymousComponentPath): the
             // registered directory IS the components directory, so resolve
-            // directly with no `components/` segment. Both the flat file and
-            // Laravel's `{component}/index.blade.php` index convention are valid.
-            // Pushed first so the correct path is `paths.first()` — the
-            // diagnostic reports that as the "Expected at:" location.
+            // directly with no `components/` segment.
             if let Some(dir) = self.anonymous_component_paths.get(ns) {
-                let mut direct = dir.join(&component_path);
-                direct.set_extension("blade.php");
-                paths.push(direct);
-                paths.push(dir.join(&component_path).join("index.blade.php"));
+                push_component_file_candidates(&mut paths, dir.join(&component_path));
             }
 
             // Anonymous component namespace (Blade::anonymousComponentNamespace):
@@ -2898,19 +2973,17 @@ impl LaravelConfigData {
             if let Some(dir) = self.anonymous_component_namespaces.get(ns) {
                 for view_path in &self.view_paths {
                     let base = self.root.join(view_path).join(dir);
-                    let mut direct = base.join(&component_path);
-                    direct.set_extension("blade.php");
-                    paths.push(direct);
-                    paths.push(base.join(&component_path).join("index.blade.php"));
+                    push_component_file_candidates(&mut paths, base.join(&component_path));
                 }
             }
 
             // Package component - check package view path first
             if let Some(package_view_path) = self.view_namespaces.get(ns) {
                 // Anonymous package component: {package_views}/components/{component}.blade.php
-                let mut full_path = package_view_path.join("components").join(&component_path);
-                full_path.set_extension("blade.php");
-                paths.push(full_path);
+                push_component_file_candidates(
+                    &mut paths,
+                    package_view_path.join("components").join(&component_path),
+                );
             }
 
             // Also check component namespace (Blade::componentNamespace)
@@ -2930,14 +3003,14 @@ impl LaravelConfigData {
             }
 
             // Check vendor published components: resources/views/vendor/{namespace}/components/
-            let mut vendor_path = self
-                .root
-                .join("resources/views/vendor")
-                .join(ns)
-                .join("components")
-                .join(&component_path);
-            vendor_path.set_extension("blade.php");
-            paths.push(vendor_path);
+            push_component_file_candidates(
+                &mut paths,
+                self.root
+                    .join("resources/views/vendor")
+                    .join(ns)
+                    .join("components")
+                    .join(&component_path),
+            );
         } else {
             // Regular component - check each component path
             for (_namespace, base_path) in &self.component_paths {
@@ -2987,6 +3060,24 @@ impl LaravelConfigData {
         }
 
         Some(path)
+    }
+}
+
+/// Push the three file shapes Laravel accepts for an anonymous component at
+/// `base` (the component's path under its directory, *without* extension),
+/// mirroring `ComponentTagCompiler`'s guess order:
+///   1. `{base}.blade.php`            — flat file
+///   2. `{base}/index.blade.php`      — directory-index convention
+///   3. `{base}/{last}.blade.php`     — directory-self convention
+///      (`<x-ns::button>` → `button/button.blade.php`)
+fn push_component_file_candidates(paths: &mut Vec<PathBuf>, base: PathBuf) {
+    let mut direct = base.clone();
+    direct.set_extension("blade.php");
+    paths.push(direct);
+    paths.push(base.join("index.blade.php"));
+    if let Some(last) = base.file_name().and_then(|s| s.to_str()) {
+        let self_named = format!("{last}.blade.php");
+        paths.push(base.join(self_named));
     }
 }
 
@@ -6557,6 +6648,18 @@ impl SalsaActor {
                     .entry(tag.clone())
                     .or_insert_with(|| (data.priority, file.clone()));
             }
+        }
+
+        // Livewire v4 registers an anonymous component path for every entry
+        // of config('livewire.component_namespaces') at boot (`layouts` and
+        // `pages` by default) — a config-driven loop no provider parse can
+        // see. Merged last so explicit Blade::anonymousComponentPath
+        // registrations win. Not gated on `has_livewire`: that flag only
+        // sees direct composer.json requires, while Livewire commonly
+        // arrives transitively (Flux, Filament, MaryUI); the loader
+        // self-gates on the config files existing.
+        for (ns, dir) in crate::config::livewire_component_namespaces(&root) {
+            anonymous_component_paths.entry(ns).or_insert(dir);
         }
 
         // Convert to data transfer type

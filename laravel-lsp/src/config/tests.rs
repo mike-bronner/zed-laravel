@@ -429,3 +429,210 @@ return [
     assert!(aliases.contains_key("light-button"));
     assert!(!aliases.contains_key("unrelated-alias"));
 }
+
+// ─── Livewire v4 component namespaces (issue #79, case 3) ────────────────
+
+const LIVEWIRE_VENDOR_CONFIG: &str = r#"<?php
+return [
+    'component_namespaces' => [
+        'layouts' => resource_path('views/layouts'),
+        'pages' => resource_path('views/pages'),
+    ],
+];
+"#;
+
+#[test]
+fn livewire_component_namespaces_reads_vendor_defaults() {
+    let tmp =
+        std::env::temp_dir().join(format!("laravel-lsp-test-lw-vendor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let config_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+
+    let namespaces = livewire_component_namespaces(&tmp);
+    assert_eq!(
+        namespaces,
+        vec![
+            ("layouts".to_string(), tmp.join("resources/views/layouts")),
+            ("pages".to_string(), tmp.join("resources/views/pages")),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn livewire_app_config_overrides_vendor_defaults() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-lw-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let vendor_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+    let app_dir = tmp.join("config");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("livewire.php"),
+        r#"<?php
+return [
+    'component_namespaces' => [
+        'shells' => base_path('themes/shells'),
+    ],
+];
+"#,
+    )
+    .unwrap();
+
+    let namespaces = livewire_component_namespaces(&tmp);
+    assert_eq!(
+        namespaces,
+        vec![("shells".to_string(), tmp.join("themes/shells"))]
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn livewire_component_namespaces_empty_without_livewire() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-lw-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    assert!(livewire_component_namespaces(&tmp).is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn resolve_php_path_expression_handles_helpers_and_literals() {
+    let root = Path::new("/proj");
+    assert_eq!(
+        resolve_php_path_expression("resource_path('views/layouts')", root),
+        Some(PathBuf::from("/proj/resources/views/layouts"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("base_path('themes')", root),
+        Some(PathBuf::from("/proj/themes"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("app_path('Views')", root),
+        Some(PathBuf::from("/proj/app/Views"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("'relative/dir'", root),
+        Some(PathBuf::from("/proj/relative/dir"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("'/absolute/dir'", root),
+        Some(PathBuf::from("/absolute/dir"))
+    );
+    // Unparseable expressions are skipped, not mangled.
+    assert_eq!(resolve_php_path_expression("env('SOME_DIR')", root), None);
+}
+
+#[test]
+fn livewire_empty_app_override_disables_vendor_defaults() {
+    // 'component_namespaces' => [] in the app config is a deliberate
+    // disable — it must NOT fall through to the vendor defaults.
+    let tmp =
+        std::env::temp_dir().join(format!("laravel-lsp-test-lw-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let vendor_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+    let app_dir = tmp.join("config");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("livewire.php"),
+        "<?php return ['component_namespaces' => []];",
+    )
+    .unwrap();
+
+    assert!(
+        livewire_component_namespaces(&tmp).is_empty(),
+        "an explicit empty override must disable the vendor defaults"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ─── Config string value resolution (MaryUI prefix, issue #79) ────────────
+
+#[test]
+fn php_top_level_string_value_ignores_nested_keys() {
+    let source = r#"<?php
+return [
+    'components' => [
+        'prefix' => 'nested-should-not-match',
+    ],
+    'prefix' => 'mary-',
+];
+"#;
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some("mary-".to_string())
+    );
+}
+
+#[test]
+fn php_top_level_string_value_takes_env_default() {
+    let source = r#"<?php
+return [
+    'prefix' => env('MARY_PREFIX', 'mary-'),
+];
+"#;
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some("mary-".to_string())
+    );
+}
+
+#[test]
+fn php_top_level_string_value_handles_empty_string() {
+    let source = "<?php\nreturn [\n    'prefix' => '',\n];\n";
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn resolve_config_string_app_override_wins_over_package_default() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-cfgstr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let pkg_config = tmp.join("vendor/robsontenorio/mary/config");
+    std::fs::create_dir_all(&pkg_config).unwrap();
+    std::fs::write(
+        pkg_config.join("mary.php"),
+        "<?php return ['prefix' => ''];",
+    )
+    .unwrap();
+    let provider_path = tmp.join("vendor/robsontenorio/mary/src/MaryServiceProvider.php");
+
+    // Package default only.
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.prefix", &provider_path),
+        Some(String::new())
+    );
+
+    // App override wins.
+    let app_config = tmp.join("config");
+    std::fs::create_dir_all(&app_config).unwrap();
+    std::fs::write(
+        app_config.join("mary.php"),
+        "<?php return ['prefix' => 'mary-'];",
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.prefix", &provider_path),
+        Some("mary-".to_string())
+    );
+
+    // Unknown key resolves to None (PHP null).
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.nonexistent", &provider_path),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

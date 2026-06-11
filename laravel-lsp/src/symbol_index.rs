@@ -140,6 +140,40 @@ impl SymbolIndex {
         ingest!(middleware_refs, SymbolKind::Middleware, name);
         ingest!(binding_refs, SymbolKind::Binding, name);
 
+        // Chain-aware config/translation entries: a reference to a dotted key
+        // is also a reference to every ancestor in the chain —
+        // `config('reporting.redshift_sync.enabled')` reaches THROUGH
+        // `reporting.redshift_sync`, so the parent key's code lens and
+        // find-references must count it. Expanding at insert time keeps
+        // `find` an O(1) exact lookup; the extra entries are bounded by key
+        // depth (rarely more than 3-4 segments) and evicted with the file
+        // like every other entry.
+        macro_rules! ingest_ancestors {
+            ($field:ident, $kind:expr) => {
+                for p in &patterns.$field {
+                    for (i, ch) in p.key.char_indices() {
+                        if ch != '.' {
+                            continue;
+                        }
+                        let key = SymbolKey {
+                            kind: $kind,
+                            name: p.key[..i].to_string(),
+                        };
+                        let loc = ReferenceLocationData {
+                            file_path: path.to_path_buf(),
+                            line: p.line,
+                            column: p.column,
+                            end_column: p.end_column,
+                        };
+                        self.forward.entry(key.clone()).or_default().push(loc);
+                        keys.push(key);
+                    }
+                }
+            };
+        }
+        ingest_ancestors!(config_refs, SymbolKind::Config);
+        ingest_ancestors!(translation_refs, SymbolKind::Translation);
+
         if !keys.is_empty() {
             // Append rather than overwrite so a file's literal-symbol keys and
             // its magic-member keys (added via `insert_magic_members`) coexist

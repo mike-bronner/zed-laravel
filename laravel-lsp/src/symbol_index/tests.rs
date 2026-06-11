@@ -511,3 +511,95 @@ fn remove_literal_entries_drops_by_file_when_no_magic_remains() {
     assert_eq!(idx.indexed_file_count(), 0);
     assert!(idx.find(&SymbolRefData::View("welcome".into())).is_empty());
 }
+
+// ─── Chain-aware config/translation ancestor entries ────────────────────
+
+/// `ParsedPatternsData` with a single config ref under `key`.
+fn config_fixture(key: &str) -> ParsedPatternsData {
+    let mut d = ParsedPatternsData::default();
+    d.config_refs
+        .push(Arc::new(crate::salsa_impl::ConfigReferenceData {
+            key: key.to_string(),
+            line: 3,
+            column: 8,
+            end_column: 8 + key.len() as u32,
+        }));
+    d
+}
+
+#[test]
+fn config_ref_counts_toward_every_ancestor_key() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Jobs/Sync.php");
+    idx.insert_file(&path, &config_fixture("reporting.redshift_sync.enabled"));
+
+    // Exact key.
+    assert_eq!(
+        idx.find(&SymbolRefData::Config(
+            "reporting.redshift_sync.enabled".into()
+        ))
+        .len(),
+        1
+    );
+    // Parent: `config('reporting.redshift_sync.enabled')` reaches THROUGH
+    // the `redshift_sync` array, so the parent's lens must count it.
+    assert_eq!(
+        idx.find(&SymbolRefData::Config("reporting.redshift_sync".into()))
+            .len(),
+        1
+    );
+    // Grandparent (file level).
+    assert_eq!(
+        idx.find(&SymbolRefData::Config("reporting".into())).len(),
+        1
+    );
+    // Non-ancestors must NOT match.
+    assert!(idx
+        .find(&SymbolRefData::Config("reporting.redshift".into()))
+        .is_empty());
+    assert!(idx
+        .find(&SymbolRefData::Config(
+            "reporting.redshift_sync.enabled.x".into()
+        ))
+        .is_empty());
+}
+
+#[test]
+fn translation_ref_counts_toward_ancestors() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Http/Controllers/Home.php");
+    let mut d = ParsedPatternsData::default();
+    d.translation_refs
+        .push(Arc::new(crate::salsa_impl::TranslationReferenceData {
+            key: "messages.errors.not_found".to_string(),
+            line: 5,
+            column: 4,
+            end_column: 30,
+        }));
+    idx.insert_file(&path, &d);
+
+    assert_eq!(
+        idx.find(&SymbolRefData::Translation("messages.errors".into()))
+            .len(),
+        1
+    );
+    assert_eq!(
+        idx.find(&SymbolRefData::Translation("messages".into()))
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn ancestor_entries_are_evicted_with_the_file() {
+    let mut idx = SymbolIndex::default();
+    let path = PathBuf::from("/proj/app/Jobs/Sync.php");
+    idx.insert_file(&path, &config_fixture("reporting.redshift_sync.enabled"));
+
+    idx.remove_file(&path);
+
+    assert!(idx
+        .find(&SymbolRefData::Config("reporting.redshift_sync".into()))
+        .is_empty());
+    assert_eq!(idx.entry_count(), 0, "no orphaned ancestor entries");
+}

@@ -74,6 +74,79 @@ pub struct ClassNode {
     pub properties: Vec<MemberDecl>,
 }
 
+impl ClassNode {
+    /// Position-blind fingerprint of this class's *surface* — the parts other
+    /// files' member resolution can observe: kind, inheritance edges, and
+    /// member names + staticness. Source spans are deliberately excluded
+    /// (a body edit shifts every later member's span without changing what
+    /// other files resolve against), and member order is normalized so
+    /// reordering declarations doesn't read as a surface change. The
+    /// save-time incremental path diffs these signatures to skip cross-file
+    /// re-resolution on body-only edits.
+    ///
+    /// Signatures are only comparable within one process lifetime —
+    /// `DefaultHasher` seeds per-process, so never persist them.
+    pub fn surface_signature(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h = DefaultHasher::new();
+        self.fqcn.hash(&mut h);
+        (match self.kind {
+            PhpStructureKind::Class => 0u8,
+            PhpStructureKind::Interface => 1,
+            PhpStructureKind::Trait => 2,
+            PhpStructureKind::Enum => 3,
+        })
+        .hash(&mut h);
+        self.extends.hash(&mut h);
+        let mut implements: Vec<&str> = self.implements.iter().map(String::as_str).collect();
+        implements.sort_unstable();
+        implements.hash(&mut h);
+        let mut traits: Vec<&str> = self.trait_uses.iter().map(String::as_str).collect();
+        traits.sort_unstable();
+        traits.hash(&mut h);
+        let mut methods: Vec<(&str, bool)> = self
+            .methods
+            .iter()
+            .map(|m| (m.name.as_str(), m.is_static))
+            .collect();
+        methods.sort_unstable();
+        methods.hash(&mut h);
+        let mut properties: Vec<(&str, bool)> = self
+            .properties
+            .iter()
+            .map(|p| (p.name.as_str(), p.is_static))
+            .collect();
+        properties.sort_unstable();
+        properties.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// FQCNs whose surface differs between `old` (a `file_surfaces` snapshot
+/// taken before re-indexing) and `new_nodes` (the freshly parsed
+/// replacements): changed signatures, plus classes added or removed
+/// entirely. Empty means a body-only edit — no other file's resolution
+/// can have been affected.
+pub fn surface_diff(old: &HashMap<String, u64>, new_nodes: &[ClassNode]) -> Vec<String> {
+    let mut affected = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(new_nodes.len());
+    for node in new_nodes {
+        seen.insert(node.fqcn.as_str());
+        match old.get(&node.fqcn) {
+            Some(sig) if *sig == node.surface_signature() => {}
+            _ => affected.push(node.fqcn.clone()),
+        }
+    }
+    for fqcn in old.keys() {
+        if !seen.contains(fqcn.as_str()) {
+            affected.push(fqcn.clone());
+        }
+    }
+    affected
+}
+
 /// Inverted class-hierarchy index. Owned by the actor; never shared.
 #[derive(Default, Debug)]
 pub struct ClassHierarchyIndex {
@@ -254,6 +327,49 @@ impl ClassHierarchyIndex {
         }
         let new: HashSet<&str> = nodes.iter().map(|n| n.fqcn.as_str()).collect();
         old != new
+    }
+
+    /// fqcn → surface signature for every class `path` currently
+    /// contributes. The save flow snapshots this before re-indexing a saved
+    /// file, then runs [`surface_diff`] against the fresh parse to decide
+    /// whether any other file could be affected.
+    pub fn file_surfaces(&self, path: &Path) -> HashMap<String, u64> {
+        match self.by_file.get(path) {
+            Some(fqcns) => fqcns
+                .iter()
+                .filter_map(|f| {
+                    self.classes
+                        .get(f)
+                        .map(|n| (f.clone(), n.surface_signature()))
+                })
+                .collect(),
+            None => HashMap::new(),
+        }
+    }
+
+    /// `seeds` plus every transitive descendant (subclasses, implementers,
+    /// trait users). A surface change to a class changes the resolved member
+    /// surface of everything that inherits from it, so the save-time blast
+    /// radius must cover the whole subtree.
+    pub fn expand_with_descendants(&self, seeds: &[String]) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::with_capacity(seeds.len());
+        let mut queue: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        while let Some(fqcn) = queue.pop() {
+            if !out.insert(fqcn.to_string()) {
+                continue;
+            }
+            for child in self
+                .subclasses_of(fqcn)
+                .iter()
+                .chain(self.implementers_of(fqcn))
+                .chain(self.trait_users_of(fqcn))
+            {
+                if !out.contains(child.as_str()) {
+                    queue.push(child);
+                }
+            }
+        }
+        out
     }
 
     pub fn indexed_file_count(&self) -> usize {

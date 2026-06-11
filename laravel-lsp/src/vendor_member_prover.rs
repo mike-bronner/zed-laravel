@@ -1,38 +1,77 @@
-//! Prove that a class member is *read* somewhere in its inheritance chain —
-//! including parent classes and used traits that live in `vendor/`.
+//! Prove that a class member is *read* by framework code — either through the
+//! class's own inheritance chain, or by a vendor package consuming the class
+//! through an interface it implements.
 //!
 //! ## Why this exists
 //!
 //! The unused-symbol diagnostic flags a code-lensed member with zero project
 //! references as "possibly dead code". That's wrong for **framework-read
-//! configuration properties**: a model's `public $timestamps = false;` is never
-//! referenced by *app* code, but `Illuminate\Database\Eloquent\Concerns\
-//! HasTimestamps` reads `$this->timestamps`. The property isn't dead — the
-//! framework reads it via inheritance.
+//! configuration properties**, which come in two structural flavors:
 //!
-//! Rather than maintain a hand-written allowlist of Eloquent's config
-//! properties (a heuristic that drifts with each Laravel release), this module
-//! *proves* the read deterministically: it walks the class's `extends` parents
-//! and `use`d traits — resolving each FQCN (app **or** vendor) to a file — and
-//! checks whether any of them reads `$this->member` (or `self::$member` /
-//! `static::$member`). If something in the chain reads it, it isn't dead.
+//! 1. **Chain reads**: a model's `public $timestamps = false;` is never
+//!    referenced by *app* code, but `Illuminate\Database\Eloquent\Concerns\
+//!    HasTimestamps` — a trait in the model's own chain — reads
+//!    `$this->timestamps`.
+//! 2. **Consumer reads**: a queued job's `public $tries = 1;` is read by
+//!    `Illuminate\Queue\Queue::getJobTries()` as `$job->tries ?? $job->tries()`
+//!    — a duck-typed read on an object the framework was *handed*. Nothing in
+//!    the job's chain (`Queueable`, `InteractsWithQueue`, …) ever touches
+//!    `$tries`; the read lives in the package that consumes the
+//!    `ShouldQueue` contract the job implements.
+//!
+//! Rather than maintain a hand-written allowlist of these properties (a
+//! heuristic that drifts with each Laravel release), this module *proves* the
+//! read deterministically:
+//!
+//! - **Chain walk**: resolve the class's `extends` parents and `use`d traits
+//!   (app **or** vendor) to files and check whether any of them reads
+//!   `$this->member` (or `self::$member` / `static::$member`).
+//! - **Consumer scan**: if the chain proves nothing, take every interface the
+//!   chain `implements`, resolve each to its `vendor/<vendor>/<package>/`
+//!   root, and scan that package's PHP files for a property access
+//!   `->member` on *any* receiver. The contract and its consumer normally
+//!   share a package (`ShouldQueue` and `Queue` both live in
+//!   `laravel/framework`), so the scan is bounded to one package tree.
 //!
 //! ## Scope — we do NOT index all of `vendor/`
 //!
-//! Only the files actually *in the chain* are resolved and parsed. For a real
-//! Eloquent model that's `Model` plus its concern traits — roughly two dozen
-//! small files — resolved lazily and parsed once. The full `vendor/` tree
-//! (often 10k+ files) is never walked.
+//! The chain walk only resolves the files actually *in the chain* — for a real
+//! Eloquent model that's `Model` plus its concern traits, roughly two dozen
+//! small files. The consumer scan walks at most the packages owning the
+//! chain's interfaces (typically just `laravel/framework`), with a cheap
+//! `->member` substring prefilter so tree-sitter only parses candidate files,
+//! and memoizes the per-`(package, member)` verdict for the process lifetime
+//! (vendor trees don't change mid-session; a `composer update` warrants a
+//! server restart anyway). The full `vendor/` tree (often 10k+ files across
+//! dozens of packages) is never walked.
+//!
+//! ## Known trade-off — suppression strength scales inversely with name rarity
+//!
+//! The consumer scan matches `->member` on ANY receiver, because the
+//! framework's read sites don't reliably type-hint the contract
+//! (`Queue::getJobTries($job)` takes an untyped parameter — requiring the
+//! interface to be named in the reading file would regress the very case this
+//! module exists for). The cost: a zero-reference property with a *common*
+//! name (`$name`, `$id`) on a class whose chain implements any framework
+//! interface is effectively never flagged — some file in `laravel/framework`
+//! touches `->name`. That is the safe failure direction for a WARNING-level
+//! hint: a false negative hides a nudge, a false positive nags about live
+//! code.
 //!
 //! ## Concurrency
 //!
-//! [`member_read_in_chain`] is pure and **synchronous**: it does filesystem IO
-//! and tree-sitter parsing inline. Call it from `spawn_blocking`, never from
+//! [`member_read_in_chain`] is **synchronous**: it does filesystem IO and
+//! tree-sitter parsing inline. Call it from `spawn_blocking`, never from
 //! inside the Salsa actor — a slow walk there would serialize with every other
-//! in-flight LSP request.
+//! in-flight LSP request. The memo cache behind the consumer scan is a
+//! `Mutex`ed map; contention is negligible (the lock is held only for a
+//! lookup/insert, never across IO).
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+use walkdir::WalkDir;
 
 use tree_sitter::Node;
 
@@ -46,14 +85,24 @@ use crate::parser::parse_php;
 /// resolution cycle the visited-set somehow doesn't catch).
 const MAX_CHAIN_VISITS: usize = 256;
 
+/// Safety bound on how many files a single package consumer scan will visit.
+/// `laravel/framework` — by far the largest package this scan ever meets — is
+/// ~3k PHP files; 8192 is generous headroom while still capping a pathological
+/// vendor tree (a package that bundles fixtures, generated code, etc.).
+const MAX_PACKAGE_FILES: usize = 8192;
+
 /// Whether `member` is read as `$this->member` — or `self::$member` /
 /// `static::$member` / `Foo::$member` — in `fqcn`'s own source or in any class
-/// or trait reachable by walking its `extends` parents and `use`d traits.
+/// or trait reachable by walking its `extends` parents and `use`d traits; or,
+/// failing that, whether a vendor package owning an interface the chain
+/// `implements` reads `->member` on any receiver (a duck-typed consumer read —
+/// see the module docs for the `$tries` example).
 ///
 /// Each FQCN (app or vendor) is resolved to a file via
 /// [`find_php_class_file_in_app_or_vendor`], parsed, and scanned; its parent and
 /// traits are then enqueued. The walk is cycle-safe (each FQCN visited once) and
-/// bounded by [`MAX_CHAIN_VISITS`].
+/// bounded by [`MAX_CHAIN_VISITS`]. Interfaces collected along the way feed the
+/// consumer scan, which runs only if the chain walk proves nothing.
 ///
 /// Returns `false` for inputs that don't name a resolvable class — an empty
 /// FQCN, or a synthetic key like `volt::/path/to/file` (which carries `::`) —
@@ -70,6 +119,9 @@ pub fn member_read_in_chain(root: &Path, fqcn: &str, member: &str) -> bool {
 
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = vec![normalize(fqcn)];
+    // Interfaces implemented anywhere in the chain (the class itself or a
+    // vendor parent), for the consumer scan after the chain walk comes up dry.
+    let mut interfaces: HashSet<String> = HashSet::new();
 
     while let Some(current) = queue.pop() {
         if visited.len() >= MAX_CHAIN_VISITS {
@@ -98,9 +150,137 @@ pub fn member_read_in_chain(root: &Path, fqcn: &str, member: &str) -> bool {
             for tr in node.trait_uses {
                 queue.push(normalize(&tr));
             }
+            for iface in node.implements {
+                interfaces.insert(normalize(&iface));
+            }
         }
     }
-    false
+
+    member_read_by_interface_consumers(root, &interfaces, member)
+}
+
+/// Whether any vendor package owning one of `interfaces` — or a parent
+/// contract one of them `extends` — touches `->member` on any receiver. This
+/// is the duck-typed half of the proof: the framework reads `$job->tries` in
+/// `Illuminate\Queue\Queue`, which is in NO job's inheritance chain — but it
+/// IS in the package that owns the `ShouldQueue` contract the job implements.
+///
+/// Parent contracts are followed because an interface may `extends` one from a
+/// *different* package, and the consumer reads can live with the parent. The
+/// hop walk reuses the chain walk's visited-set + bound discipline. (The
+/// structure extractor captures one `extends` parent per declaration — a
+/// pre-existing walker limitation — so multi-parent interfaces contribute
+/// their first parent only.)
+///
+/// Interfaces that resolve outside `vendor/` (app-side contracts) are skipped:
+/// app-side consumer reads are ordinary project references the index already
+/// counts. Each package is scanned at most once per (package, member) — see
+/// [`package_touches_member`] for the memoization.
+fn member_read_by_interface_consumers(
+    root: &Path,
+    interfaces: &HashSet<String>,
+    member: &str,
+) -> bool {
+    let mut packages: HashSet<PathBuf> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = interfaces.iter().cloned().collect();
+
+    while let Some(iface) = queue.pop() {
+        if visited.len() >= MAX_CHAIN_VISITS {
+            break;
+        }
+        if iface.is_empty() || !visited.insert(iface.clone()) {
+            continue;
+        }
+        let Some(path) = find_php_class_file_in_app_or_vendor(&iface, root) else {
+            continue;
+        };
+        if let Some(pkg) = vendor_package_root(root, &path) {
+            packages.insert(pkg);
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // `interface A extends B` lands in `extends`; `implements` is taken
+        // too in case a basename-fallback resolution landed on a class.
+        for node in classes_in_file(&path, &content) {
+            if let Some(parent) = node.extends {
+                queue.push(normalize(&parent));
+            }
+            for parent in node.implements {
+                queue.push(normalize(&parent));
+            }
+        }
+    }
+
+    packages
+        .iter()
+        .any(|pkg| package_touches_member(pkg, member))
+}
+
+/// `<root>/vendor/<vendor>/<package>` for a file under it, or `None` for any
+/// path not inside the project's `vendor/` tree.
+fn vendor_package_root(root: &Path, file: &Path) -> Option<PathBuf> {
+    let rel = file.strip_prefix(root).ok()?;
+    let mut comps = rel.components();
+    if comps.next()?.as_os_str() != "vendor" {
+        return None;
+    }
+    let vendor = comps.next()?;
+    let package = comps.next()?;
+    // A file directly under vendor/<v>/ has no package segment to own it.
+    comps.next()?;
+    Some(root.join("vendor").join(vendor).join(package))
+}
+
+/// Process-lifetime memo of consumer-scan verdicts, keyed by
+/// `(package root, member)`. Vendor packages don't change mid-session, and the
+/// diagnostics pass re-proves the same handful of members on every debounced
+/// edit — without this, each keystroke batch would re-walk `laravel/framework`.
+static PACKAGE_MEMBER_READS: LazyLock<Mutex<HashMap<(PathBuf, String), bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether any PHP file in the package tree touches `->member` on any
+/// receiver. Memoized in [`PACKAGE_MEMBER_READS`]. Files are prefiltered with
+/// a cheap `->member` substring check so tree-sitter only parses candidates;
+/// the walk is bounded by [`MAX_PACKAGE_FILES`].
+fn package_touches_member(package_root: &Path, member: &str) -> bool {
+    let key = (package_root.to_path_buf(), member.to_string());
+    if let Some(&hit) = PACKAGE_MEMBER_READS.lock().unwrap().get(&key) {
+        return hit;
+    }
+
+    let needle = format!("->{member}");
+    let mut seen = 0usize;
+    let mut found = false;
+    let walker = WalkDir::new(package_root).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        !matches!(name.as_ref(), "node_modules" | ".git")
+    });
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|e| e.to_str()) != Some("php")
+        {
+            continue;
+        }
+        seen += 1;
+        if seen > MAX_PACKAGE_FILES {
+            break;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if !content.contains(&needle) {
+            continue;
+        }
+        if source_touches_member_any_receiver(&content, member) {
+            found = true;
+            break;
+        }
+    }
+
+    PACKAGE_MEMBER_READS.lock().unwrap().insert(key, found);
+    found
 }
 
 /// Strip a leading `\` and surrounding whitespace so FQCNs compare/dedup
@@ -120,6 +300,43 @@ fn source_reads_member(source: &str, member: &str) -> bool {
     while let Some(n) = stack.pop() {
         if node_reads_member(n, bytes, member) {
             return true;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    false
+}
+
+/// Whether `source` contains a property access `->member` (or `?->member`) on
+/// ANY receiver — `$job->tries`, `$this->tries`, `$x?->tries`. Used by the
+/// consumer scan, where the framework reads the property off an object it was
+/// handed, so the receiver variable can be anything. "Touches", not "reads":
+/// an access on an assignment's left side matches too, and that's deliberate —
+/// a framework that *writes* the property is equally proof the member isn't
+/// dead. Method calls (`$job->tries()`) are a different tree-sitter node kind
+/// (`member_call_expression`) and intentionally do NOT match: the diagnostic
+/// only lenses properties, so only property accesses count as proof.
+fn source_touches_member_any_receiver(source: &str, member: &str) -> bool {
+    let Ok(tree) = parse_php(source) else {
+        return false;
+    };
+    let bytes = source.as_bytes();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "member_access_expression" | "nullsafe_member_access_expression"
+        ) {
+            let matched = n
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(|t| t.trim_start_matches('$') == member)
+                .unwrap_or(false);
+            if matched {
+                return true;
+            }
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {

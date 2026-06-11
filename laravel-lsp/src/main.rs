@@ -18517,12 +18517,14 @@ impl LaravelLanguageServer {
                 continue;
             }
             // A member with zero project references may still be read by the
-            // framework through inheritance — a model's `$timestamps` is read by
-            // `HasTimestamps`, never by app code. Prove that across the chain
-            // (parents + traits, including vendor) before flagging it. Runs only
-            // for the already-zero-reference case (a handful of members per
-            // file) and off the async worker, since the walk does FS IO +
-            // parsing.
+            // framework — through inheritance (a model's `$timestamps` is read
+            // by `HasTimestamps`) or duck-typed by a consumer of an interface
+            // the class implements (a job's `$tries` is read by
+            // `Illuminate\Queue\Queue` via the ShouldQueue contract). Prove
+            // that across the chain and the interface packages before flagging
+            // it. Runs only for the already-zero-reference case (a handful of
+            // members per file) and off the async worker, since the walk does
+            // FS IO + parsing.
             if self.any_member_framework_read(&root, &item.symbols).await {
                 continue;
             }
@@ -18552,11 +18554,12 @@ impl LaravelLanguageServer {
     }
 
     /// Whether any `MagicMember` in `symbols` is read across its inheritance
-    /// chain (parents + traits, including vendor) — i.e. framework-read rather
-    /// than dead. Spares configuration properties like a model's `$timestamps`
-    /// from the unused-symbol warning. Each check runs on a blocking thread so
-    /// the filesystem IO + parsing never stalls the async worker or other
-    /// in-flight requests.
+    /// chain (parents + traits, including vendor) or by a vendor package
+    /// consuming an interface the chain implements — i.e. framework-read
+    /// rather than dead. Spares configuration properties like a model's
+    /// `$timestamps` and a queued job's `$tries` from the unused-symbol
+    /// warning. Each check runs on a blocking thread so the filesystem IO +
+    /// parsing never stalls the async worker or other in-flight requests.
     async fn any_member_framework_read(
         &self,
         root: &Path,

@@ -951,6 +951,128 @@ fn missing_namespaced_component_still_reports_not_found() {
     );
 }
 
+#[test]
+fn package_view_namespace_resolves_directory_component_shapes() {
+    // Laravel's ComponentTagCompiler accepts three file shapes for an
+    // anonymous component; package view namespaces (loadViewsFrom /
+    // fluent ->hasViews()) must honor the directory conventions too.
+    // Filament 5 ships `<x-filament::button>` as `button/index.blade.php`
+    // (issue #79, case 1).
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", r#"{"packages": []}"#),
+        (
+            "vendor/filament/support/resources/views/components/button/index.blade.php",
+            "<button></button>",
+        ),
+        (
+            "vendor/filament/support/resources/views/components/dropdown/dropdown.blade.php",
+            "<div></div>",
+        ),
+        (
+            "vendor/filament/support/resources/views/components/badge.blade.php",
+            "<span></span>",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let mut config = config_with_component_namespaces(&root, &[]);
+    config.view_namespaces.insert(
+        "filament".to_string(),
+        root.join("vendor/filament/support/resources/views"),
+    );
+
+    for component in ["filament::button", "filament::dropdown", "filament::badge"] {
+        assert!(
+            resolves(component, &config, &autoload),
+            "{component} must resolve via a directory-component shape: {:#?}",
+            component_candidate_paths(component, &config, &autoload),
+        );
+    }
+    assert!(
+        !resolves("filament::does-not-exist", &config, &autoload),
+        "a missing namespaced component must still report not-found",
+    );
+}
+
+#[test]
+fn vendor_published_component_resolves_directory_index() {
+    // Published package views (`resources/views/vendor/{ns}/components/`)
+    // get the same directory-index treatment.
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", r#"{"packages": []}"#),
+        (
+            "resources/views/vendor/courier/components/alert/index.blade.php",
+            "<div></div>",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(&root, &[]);
+
+    assert!(
+        resolves("courier::alert", &config, &autoload),
+        "published vendor component must resolve via index.blade.php: {:#?}",
+        component_candidate_paths("courier::alert", &config, &autoload),
+    );
+}
+
+#[test]
+fn markdown_mail_components_resolve_html_paths() {
+    // `<x-mail::message>` is hardcoded in Laravel's ComponentTagCompiler to
+    // the `mail::` view namespace, which Markdown points at `{path}/html` —
+    // the published vendor dir first, then the framework's bundled views.
+    // There is no `components/` segment (issue #79, case 2).
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", r#"{"packages": []}"#),
+        (
+            "vendor/laravel/framework/src/Illuminate/Mail/resources/views/html/message.blade.php",
+            "<html></html>",
+        ),
+        (
+            "resources/views/vendor/mail/html/header.blade.php",
+            "<tr></tr>",
+        ),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let config = config_with_component_namespaces(&root, &[]);
+
+    assert!(
+        resolves("mail::message", &config, &autoload),
+        "mail::message must resolve to the framework's html view: {:#?}",
+        component_candidate_paths("mail::message", &config, &autoload),
+    );
+    assert!(
+        resolves("mail::header", &config, &autoload),
+        "mail::header must resolve to the published html view: {:#?}",
+        component_candidate_paths("mail::header", &config, &autoload),
+    );
+    assert!(
+        !resolves("mail::does-not-exist", &config, &autoload),
+        "a missing mail component must still report not-found",
+    );
+}
+
+#[test]
+fn anonymous_component_path_resolves_livewire_layout_namespace() {
+    // The shape Livewire v4's config-driven registration produces:
+    // anonymous_component_paths['layouts'] → resources/views/layouts, so
+    // `<x-layouts::app>` resolves to resources/views/layouts/app.blade.php
+    // (issue #79, case 3).
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", r#"{"packages": []}"#),
+        ("resources/views/layouts/app.blade.php", "<html></html>"),
+    ]);
+    let autoload = ComposerAutoload::load(&root);
+    let mut config = config_with_component_namespaces(&root, &[]);
+    config
+        .anonymous_component_paths
+        .insert("layouts".to_string(), root.join("resources/views/layouts"));
+
+    assert!(
+        resolves("layouts::app", &config, &autoload),
+        "layouts::app must resolve via the anonymous component path: {:#?}",
+        component_candidate_paths("layouts::app", &config, &autoload),
+    );
+}
+
 // ─── Member-access capture data model (M2) ──────────────────────────────
 
 /// A captured property-form access with the capture-time defaults (the

@@ -2880,17 +2880,34 @@ impl LaravelConfigData {
         let component_path = actual_component.replace('.', "/");
 
         if let Some(ns) = namespace {
+            // Markdown mail components are hardcoded in Laravel's
+            // ComponentTagCompiler: `<x-mail::message>` maps straight to view
+            // `mail::message`, and at render time `Markdown` points the `mail`
+            // namespace at `{path}/html` for each configured path — the
+            // published `resources/views/vendor/mail` first, then the
+            // framework's bundled views. There is no `components/` segment.
+            // Pushed first so the published path is `paths.first()` — the
+            // diagnostic reports that as the "Expected at:" location.
+            if ns == "mail" {
+                let mut published = self
+                    .root
+                    .join("resources/views/vendor/mail/html")
+                    .join(&component_path);
+                published.set_extension("blade.php");
+                paths.push(published);
+                let mut framework = self
+                    .root
+                    .join("vendor/laravel/framework/src/Illuminate/Mail/resources/views/html")
+                    .join(&component_path);
+                framework.set_extension("blade.php");
+                paths.push(framework);
+            }
+
             // Anonymous component path (Blade::anonymousComponentPath): the
             // registered directory IS the components directory, so resolve
-            // directly with no `components/` segment. Both the flat file and
-            // Laravel's `{component}/index.blade.php` index convention are valid.
-            // Pushed first so the correct path is `paths.first()` — the
-            // diagnostic reports that as the "Expected at:" location.
+            // directly with no `components/` segment.
             if let Some(dir) = self.anonymous_component_paths.get(ns) {
-                let mut direct = dir.join(&component_path);
-                direct.set_extension("blade.php");
-                paths.push(direct);
-                paths.push(dir.join(&component_path).join("index.blade.php"));
+                push_component_file_candidates(&mut paths, dir.join(&component_path));
             }
 
             // Anonymous component namespace (Blade::anonymousComponentNamespace):
@@ -2898,19 +2915,17 @@ impl LaravelConfigData {
             if let Some(dir) = self.anonymous_component_namespaces.get(ns) {
                 for view_path in &self.view_paths {
                     let base = self.root.join(view_path).join(dir);
-                    let mut direct = base.join(&component_path);
-                    direct.set_extension("blade.php");
-                    paths.push(direct);
-                    paths.push(base.join(&component_path).join("index.blade.php"));
+                    push_component_file_candidates(&mut paths, base.join(&component_path));
                 }
             }
 
             // Package component - check package view path first
             if let Some(package_view_path) = self.view_namespaces.get(ns) {
                 // Anonymous package component: {package_views}/components/{component}.blade.php
-                let mut full_path = package_view_path.join("components").join(&component_path);
-                full_path.set_extension("blade.php");
-                paths.push(full_path);
+                push_component_file_candidates(
+                    &mut paths,
+                    package_view_path.join("components").join(&component_path),
+                );
             }
 
             // Also check component namespace (Blade::componentNamespace)
@@ -2930,14 +2945,14 @@ impl LaravelConfigData {
             }
 
             // Check vendor published components: resources/views/vendor/{namespace}/components/
-            let mut vendor_path = self
-                .root
-                .join("resources/views/vendor")
-                .join(ns)
-                .join("components")
-                .join(&component_path);
-            vendor_path.set_extension("blade.php");
-            paths.push(vendor_path);
+            push_component_file_candidates(
+                &mut paths,
+                self.root
+                    .join("resources/views/vendor")
+                    .join(ns)
+                    .join("components")
+                    .join(&component_path),
+            );
         } else {
             // Regular component - check each component path
             for (_namespace, base_path) in &self.component_paths {
@@ -2987,6 +3002,24 @@ impl LaravelConfigData {
         }
 
         Some(path)
+    }
+}
+
+/// Push the three file shapes Laravel accepts for an anonymous component at
+/// `base` (the component's path under its directory, *without* extension),
+/// mirroring `ComponentTagCompiler`'s guess order:
+///   1. `{base}.blade.php`            — flat file
+///   2. `{base}/index.blade.php`      — directory-index convention
+///   3. `{base}/{last}.blade.php`     — directory-self convention
+///      (`<x-ns::button>` → `button/button.blade.php`)
+fn push_component_file_candidates(paths: &mut Vec<PathBuf>, base: PathBuf) {
+    let mut direct = base.clone();
+    direct.set_extension("blade.php");
+    paths.push(direct);
+    paths.push(base.join("index.blade.php"));
+    if let Some(last) = base.file_name().and_then(|s| s.to_str()) {
+        let self_named = format!("{last}.blade.php");
+        paths.push(base.join(self_named));
     }
 }
 
@@ -6557,6 +6590,18 @@ impl SalsaActor {
                     .entry(tag.clone())
                     .or_insert_with(|| (data.priority, file.clone()));
             }
+        }
+
+        // Livewire v4 registers an anonymous component path for every entry
+        // of config('livewire.component_namespaces') at boot (`layouts` and
+        // `pages` by default) — a config-driven loop no provider parse can
+        // see. Merged last so explicit Blade::anonymousComponentPath
+        // registrations win. Not gated on `has_livewire`: that flag only
+        // sees direct composer.json requires, while Livewire commonly
+        // arrives transitively (Flux, Filament, MaryUI); the loader
+        // self-gates on the config files existing.
+        for (ns, dir) in crate::config::livewire_component_namespaces(&root) {
+            anonymous_component_paths.entry(ns).or_insert(dir);
         }
 
         // Convert to data transfer type

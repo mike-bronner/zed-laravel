@@ -429,3 +429,103 @@ return [
     assert!(aliases.contains_key("light-button"));
     assert!(!aliases.contains_key("unrelated-alias"));
 }
+
+// ─── Livewire v4 component namespaces (issue #79, case 3) ────────────────
+
+const LIVEWIRE_VENDOR_CONFIG: &str = r#"<?php
+return [
+    'component_namespaces' => [
+        'layouts' => resource_path('views/layouts'),
+        'pages' => resource_path('views/pages'),
+    ],
+];
+"#;
+
+#[test]
+fn livewire_component_namespaces_reads_vendor_defaults() {
+    let tmp =
+        std::env::temp_dir().join(format!("laravel-lsp-test-lw-vendor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let config_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+
+    let namespaces = livewire_component_namespaces(&tmp);
+    assert_eq!(
+        namespaces,
+        vec![
+            ("layouts".to_string(), tmp.join("resources/views/layouts")),
+            ("pages".to_string(), tmp.join("resources/views/pages")),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn livewire_app_config_overrides_vendor_defaults() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-lw-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let vendor_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+    let app_dir = tmp.join("config");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("livewire.php"),
+        r#"<?php
+return [
+    'component_namespaces' => [
+        'shells' => base_path('themes/shells'),
+    ],
+];
+"#,
+    )
+    .unwrap();
+
+    let namespaces = livewire_component_namespaces(&tmp);
+    assert_eq!(
+        namespaces,
+        vec![("shells".to_string(), tmp.join("themes/shells"))]
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn livewire_component_namespaces_empty_without_livewire() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-lw-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    assert!(livewire_component_namespaces(&tmp).is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn resolve_php_path_expression_handles_helpers_and_literals() {
+    let root = Path::new("/proj");
+    assert_eq!(
+        resolve_php_path_expression("resource_path('views/layouts')", root),
+        Some(PathBuf::from("/proj/resources/views/layouts"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("base_path('themes')", root),
+        Some(PathBuf::from("/proj/themes"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("app_path('Views')", root),
+        Some(PathBuf::from("/proj/app/Views"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("'relative/dir'", root),
+        Some(PathBuf::from("/proj/relative/dir"))
+    );
+    assert_eq!(
+        resolve_php_path_expression("'/absolute/dir'", root),
+        Some(PathBuf::from("/absolute/dir"))
+    );
+    // Unparseable expressions are skipped, not mangled.
+    assert_eq!(resolve_php_path_expression("env('SOME_DIR')", root), None);
+}

@@ -516,6 +516,106 @@ fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) 
     }
 }
 
+// ============================================================================
+// Livewire component namespaces (Livewire v4)
+// ============================================================================
+
+/// Anonymous component namespaces Livewire v4 registers at boot.
+///
+/// Livewire v4's service provider loops over
+/// `config('livewire.component_namespaces')` — defaulting to
+/// `['layouts' => resource_path('views/layouts'), 'pages' =>
+/// resource_path('views/pages')]` — calling
+/// `Blade::anonymousComponentPath($location, $namespace)` for each entry,
+/// which is what makes `<x-layouts::app>` resolve to
+/// `resources/views/layouts/app.blade.php`. The registration is config-driven
+/// and runs in a loop, so provider parsing never sees it; reconstruct it from
+/// the config instead: the app's `config/livewire.php` when it defines the
+/// key, else the package's own config (Livewire merges vendor defaults
+/// underneath the app's). Livewire v3 has no such key, so this is a no-op
+/// there.
+pub fn livewire_component_namespaces(root: &Path) -> Vec<(String, PathBuf)> {
+    let candidates = [
+        root.join("config/livewire.php"),
+        root.join("vendor/livewire/livewire/config/livewire.php"),
+    ];
+    for config_path in candidates {
+        let Ok(source) = fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let parsed = parse_livewire_component_namespaces(&source, root);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    Vec::new()
+}
+
+fn parse_livewire_component_namespaces(source: &str, root: &Path) -> Vec<(String, PathBuf)> {
+    let mut namespaces = Vec::new();
+    let Some(block) = php_array_block(source, "component_namespaces") else {
+        return namespaces;
+    };
+
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+        {
+            continue;
+        }
+
+        let Some((key, value)) = split_arrow_pair(line) else {
+            continue;
+        };
+        let Some(namespace) = unquote(key) else {
+            continue;
+        };
+        let Some(path) = resolve_php_path_expression(value, root) else {
+            continue;
+        };
+        namespaces.push((namespace.to_string(), path));
+    }
+
+    namespaces
+}
+
+/// Resolve a PHP path expression from a config value to an absolute path.
+/// Handles the Laravel path helpers (`resource_path('x')`, `base_path('x')`,
+/// `app_path('x')`) and plain string literals (absolute, or root-relative).
+fn resolve_php_path_expression(value: &str, root: &Path) -> Option<PathBuf> {
+    let value = value.trim();
+
+    for (helper, base) in [
+        ("resource_path", Some("resources")),
+        ("base_path", None),
+        ("app_path", Some("app")),
+    ] {
+        if let Some(rest) = value.strip_prefix(helper) {
+            let inner = rest.trim().strip_prefix('(')?.rsplit_once(')')?.0;
+            let arg = unquote(inner.trim()).unwrap_or("");
+            let mut path = root.to_path_buf();
+            if let Some(base) = base {
+                path.push(base);
+            }
+            if !arg.is_empty() {
+                path.push(arg);
+            }
+            return Some(path);
+        }
+    }
+
+    let literal = unquote(value)?;
+    let path = PathBuf::from(literal);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(literal)
+    })
+}
+
 /// Find the contents of the PHP array literal assigned to `key` in a config
 /// source: `'{key}' => [ ... ]`. Walks character-by-character to the matching
 /// close bracket so entries from sibling top-level config keys are never

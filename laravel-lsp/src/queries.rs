@@ -1106,6 +1106,8 @@ fn is_scope_boundary(kind: &str) -> bool {
 /// - `foreach (... as $var)` / `foreach (... as $k => $var)` rebinding
 /// - destructuring (`[$a, $var] = ...`, `list(..., $var) = ...`)
 /// - `static $var = ...` (persists across calls — not a constant)
+/// - reference aliasing (`$other = &$var` / `$var = &$other` — writes
+///   through either name are writes to both)
 ///
 /// Missing a binding shape here would let constant propagation resolve a STALE
 /// value — a wrong key is strictly worse than the phantom keys this machinery
@@ -1165,6 +1167,16 @@ fn collect_variable_bindings(
                 }
             }
             "static_variable_declaration" if subtree_binds_variable(child, source, var_text) => {
+                out.push((child.start_byte(), None));
+            }
+            // Reference aliasing (review finding M1, PR #84): after
+            // `$other = &$var`, a write through EITHER name changes the
+            // value both names see — no later write is provably absent, so
+            // any reference assignment touching the variable (either side)
+            // disqualifies it outright.
+            "reference_assignment_expression"
+                if subtree_binds_variable(child, source, var_text) =>
+            {
                 out.push((child.start_byte(), None));
             }
             _ => {}

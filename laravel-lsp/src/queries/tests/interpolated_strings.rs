@@ -276,6 +276,33 @@ function f($config, $override) {
 }
 
 #[test]
+fn skips_variable_aliased_by_reference() {
+    // Review finding M1 (PR #84): after `$other = &$config`, a write through
+    // the alias changes $config too — resolving the original literal would
+    // return a stale key.
+    let php = r#"<?php
+$config = 'reporting.redshift_sync';
+$other = &$config;
+$other = 'changed.prefix';
+$x = config("{$config}.enabled");
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_variable_declared_as_reference() {
+    // The other direction: `$config = &$other` makes $config an alias from
+    // birth. Must disqualify by design, not by the coincidence of having no
+    // other visible binding.
+    let php = r#"<?php
+$other = 'reporting.redshift_sync';
+$config = &$other;
+$x = config("{$config}.enabled");
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
 fn resolves_unconditional_reassignment_of_parameter() {
     // Counterpoint to the conditional case: a direct, unconditional literal
     // assignment before the use IS the value, parameter or not.

@@ -1977,6 +1977,30 @@ struct LaravelLanguageServer {
             >,
         >,
     >,
+
+    /// Reverse dependency map for the magic-member system: which files
+    /// resolved receivers against which classes. The incremental save flow
+    /// (#80) uses it to re-resolve only a surface change's actual blast
+    /// radius instead of the whole project. `std::sync::RwLock`, not tokio:
+    /// it's read/written inside `spawn_blocking` closures where `.await`
+    /// isn't available, and every critical section is a short map op.
+    magic_deps: Arc<std::sync::RwLock<laravel_lsp::magic_dependency_index::MagicDependencyIndex>>,
+
+    /// Persistent view-variable index (view name → var → FQCN types from
+    /// every render site). Previously rebuilt as a local inside each full
+    /// magic rebuild; the incremental save flow needs it long-lived so a
+    /// saved controller can update just its own render contribution and
+    /// affected Blade files can re-resolve without a project pass.
+    /// `std::sync::RwLock` for the same blocking-closure reason as
+    /// `magic_deps`.
+    view_vars: Arc<std::sync::RwLock<laravel_lsp::view_var_index::ViewVarIndex>>,
+
+    /// Handle for the debounced magic-cache re-save. Incremental refreshes
+    /// mutate the in-memory indexes; without re-persisting them the next
+    /// startup would discard the cache and re-resolve the project. Each
+    /// schedule call cancels the previous timer, so a burst of saves
+    /// produces one disk write after the burst settles.
+    magic_cache_save_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Default Salsa debounce delay in milliseconds
@@ -2942,12 +2966,16 @@ async fn build_magic_member_entries(
     // on a cache-warm start, so the bar otherwise sits frozen). `None` on the
     // incremental save-refresh path, which has no progress UI.
     mut progress: Option<&mut laravel_lsp::indexing_progress::IndexingProgress>,
-) -> Vec<(PathBuf, Vec<laravel_lsp::symbol_index::MagicMemberEntry>)> {
+    // Shared persistent view-var index. The pass-1 build publishes into it
+    // wholesale so the incremental save flow (#80) can later update single
+    // files and resolve Blade accesses without another project pass.
+    shared_view_vars: &Arc<std::sync::RwLock<laravel_lsp::view_var_index::ViewVarIndex>>,
+) -> laravel_lsp::magic_disk_cache::MagicCacheData {
     // `snapshot_class_files` already hands back a shared `Arc` (cached actor-
     // side), so the per-rebuild full-map clone is gone — just reuse it.
     let class_files = salsa.snapshot_class_files().await.unwrap_or_default();
     if class_files.is_empty() {
-        return Vec::new();
+        return Default::default();
     }
     let root = root.to_path_buf();
 
@@ -2964,6 +2992,7 @@ async fn build_magic_member_entries(
         .map(|e| e.key().clone())
         .collect();
     let mut view_var_index = laravel_lsp::view_var_index::ViewVarIndex::new();
+    let mut view_renders: Vec<(PathBuf, Vec<laravel_lsp::view_var_index::ViewRender>)> = Vec::new();
     {
         let vv_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         let mut vv_handles = Vec::with_capacity(view_targets.len());
@@ -2991,9 +3020,16 @@ async fn build_magic_member_entries(
         }
         for h in vv_handles {
             if let Ok(Some((path, renders))) = h.await {
-                view_var_index.insert_file(path, &renders);
+                view_var_index.insert_file(path.clone(), &renders);
+                view_renders.push((path, renders));
             }
         }
+    }
+    // Publish the fresh index for the incremental save flow, then keep an
+    // `Arc` of the same content for this build's pass 3 (blocking closures
+    // can't hold the lock across a project-sized pass).
+    if let Ok(mut shared) = shared_view_vars.write() {
+        *shared = view_var_index.clone();
     }
     let view_var_index = Arc::new(view_var_index);
 
@@ -3032,12 +3068,14 @@ async fn build_magic_member_entries(
             tokio::task::spawn_blocking(move || {
                 let source = std::fs::read_to_string(&path).ok()?;
                 let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                let mut deps = HashSet::new();
                 let mut entries = laravel_lsp::member_resolver::resolve_member_access_entries(
                     &source,
                     &data.member_access_refs,
                     &*class_files,
                     &mut classviews,
                     &root,
+                    Some(&mut deps),
                 );
                 // Volt SFC `.php` components: index `$this->member` reads under
                 // the component's synthetic key (no-op for plain/model .php).
@@ -3048,7 +3086,11 @@ async fn build_magic_member_entries(
                         &data.member_access_refs,
                     ),
                 );
-                (!entries.is_empty()).then_some((path, entries))
+                // Keep dep-only files: a file whose every classification
+                // failed still *depends* on those classes — dropping it here
+                // would blind the incremental save flow to exactly the
+                // "member added later" case the deps exist for.
+                (!entries.is_empty() || !deps.is_empty()).then_some((path, entries, deps))
             })
             .await
             .ok()
@@ -3141,6 +3183,7 @@ async fn build_magic_member_entries(
                         None
                     };
 
+                    let mut deps = HashSet::new();
                     let mut entries = if let Some(prop_types) = volt_props {
                         laravel_lsp::view_var_index::resolve_volt_member_accesses(
                             &data.member_access_refs,
@@ -3149,6 +3192,7 @@ async fn build_magic_member_entries(
                             &*class_files,
                             &mut classviews,
                             &root,
+                            Some(&mut deps),
                         )
                     } else {
                         let view_name =
@@ -3161,6 +3205,7 @@ async fn build_magic_member_entries(
                             &*class_files,
                             &mut classviews,
                             &root,
+                            Some(&mut deps),
                         )
                     };
                     // Component `$this->member` references (SFC own class, or MFC
@@ -3175,7 +3220,8 @@ async fn build_magic_member_entries(
                             ),
                         );
                     }
-                    (!entries.is_empty()).then_some((path, entries))
+                    // Dep-only files stay — see the pass-2 comment.
+                    (!entries.is_empty() || !deps.is_empty()).then_some((path, entries, deps))
                 })
                 .await
                 .ok()
@@ -3189,7 +3235,48 @@ async fn build_magic_member_entries(
         }
     }
 
-    magic_entries
+    laravel_lsp::magic_disk_cache::MagicCacheData {
+        entries: magic_entries,
+        view_renders,
+    }
+}
+
+/// Fold a magic build's (or disk restore's) per-file entries into the live
+/// indexes: replace the dependency index contents and bulk-import the
+/// resolved entries into the actor's symbol index. Returns the imported
+/// entry count.
+///
+/// The deps lock is scoped to drop before the actor await — `magic_deps` is
+/// a `std::sync::RwLock` and must never be held across a suspension point.
+async fn import_magic_data(
+    salsa: &SalsaHandle,
+    magic_deps: &Arc<std::sync::RwLock<laravel_lsp::magic_dependency_index::MagicDependencyIndex>>,
+    entries: Vec<(
+        PathBuf,
+        Vec<laravel_lsp::symbol_index::MagicMemberEntry>,
+        HashSet<String>,
+    )>,
+) -> Result<usize, &'static str> {
+    let mut import = Vec::with_capacity(entries.len());
+    if let Ok(mut deps_lock) = magic_deps.write() {
+        // Full replace: a build/restore is authoritative for the whole
+        // project, and clearing first drops entries for since-deleted files.
+        deps_lock.clear();
+        for (path, file_entries, deps) in entries {
+            deps_lock.replace_file(&path, deps);
+            if !file_entries.is_empty() {
+                import.push((path, file_entries));
+            }
+        }
+    } else {
+        // Poisoned lock — skip deps, still import entries so references work.
+        for (path, file_entries, _) in entries {
+            if !file_entries.is_empty() {
+                import.push((path, file_entries));
+            }
+        }
+    }
+    salsa.bulk_import_magic_members(import).await
 }
 
 impl LaravelLanguageServer {
@@ -3875,6 +3962,13 @@ impl LaravelLanguageServer {
             vendor_translation_namespaces: Arc::new(RwLock::new(None)),
             builder_method_index_cache: Arc::new(RwLock::new(HashMap::new())),
             route_decl_cache: Arc::new(RwLock::new(HashMap::new())),
+            magic_deps: Arc::new(std::sync::RwLock::new(
+                laravel_lsp::magic_dependency_index::MagicDependencyIndex::new(),
+            )),
+            view_vars: Arc::new(std::sync::RwLock::new(
+                laravel_lsp::view_var_index::ViewVarIndex::new(),
+            )),
+            magic_cache_save_handle: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -4225,6 +4319,14 @@ impl LaravelLanguageServer {
         // again here so the warming task can (a) skip files already in
         // cache from the load and (b) hand the same map to save_from.
         let pattern_cache_for_warm = pattern_cache.clone();
+        // Incremental save flow state (#80): the warm task populates both —
+        // from the disk cache on a clean restore, from the fresh build
+        // otherwise — so save-time blast-radius lookups work either way.
+        let magic_deps_for_warm = self.magic_deps.clone();
+        let view_vars_for_warm = self.view_vars.clone();
+        // For the granular restore's per-file re-resolution (it reuses the
+        // same machinery as the save-time dependents pass).
+        let server_for_warm = self.clone_for_spawn();
         tokio::spawn(async move {
             // `progress` moves into this task — when warming finishes (or
             // hits an early return) we call `end` to clear the status bar.
@@ -4271,6 +4373,9 @@ impl LaravelLanguageServer {
                 .into_iter()
                 .filter(|p| !pattern_cache_for_warm.contains_key(p))
                 .collect();
+            // The granular magic restore below re-resolves exactly these
+            // changed files plus their recorded blast radius.
+            let changed_paths = paths_to_parse.clone();
             let to_parse = paths_to_parse.len();
             let cached_hits = total - to_parse;
             if cached_hits > 0 {
@@ -4460,15 +4565,17 @@ impl LaravelLanguageServer {
             // every captured member access (PHP/Blade/Volt) against the class
             // hierarchy + view-variable index — the dominant warm cost.
             //
-            // Restore it from disk when the project is UNCHANGED since the last
-            // save (`to_parse == 0` → the pattern cache validated every file).
-            // Because resolution is cross-file, this all-or-nothing guard keeps
-            // the restored index correct: if even one file changed, the cached
-            // resolution could be stale, so we resolve fresh. The common
-            // reload-without-edits case becomes instant instead of ~30s.
+            // Granular restore (#80): the cache is restored whenever it
+            // exists; only the files that changed since it was saved — plus
+            // their recorded blast radius (dependents of their classes and
+            // descendants, plus Blade files of views they render) — are
+            // re-resolved through the per-file machinery. An earlier
+            // revision discarded the whole cache when even one file had
+            // changed, re-resolving every member access in the project
+            // (~135s on a real app) after any edit-then-restart.
             // Disk read on the blocking pool so it never stalls the async
             // runtime (the file can be large on a big project).
-            let restored = if to_parse == 0 {
+            let restored = {
                 let root_for_load = root_for_save.clone();
                 tokio::task::spawn_blocking(move || {
                     laravel_lsp::magic_disk_cache::load(&root_for_load)
@@ -4476,53 +4583,134 @@ impl LaravelLanguageServer {
                 .await
                 .ok()
                 .flatten()
-            } else {
-                None
             };
-            if let Some(entries) = restored {
-                match salsa.bulk_import_magic_members(entries).await {
+            if let Some(data) = restored {
+                let laravel_lsp::magic_disk_cache::MagicCacheData {
+                    entries,
+                    view_renders,
+                } = data;
+                // Rebuild the persistent view-var index from the persisted
+                // renders — the resolution pass that would otherwise build it
+                // never runs on a restore, and the incremental save flow
+                // needs it alive (#80).
+                if let Ok(mut vv) = view_vars_for_warm.write() {
+                    *vv = laravel_lsp::view_var_index::ViewVarIndex::new();
+                    for (path, renders) in &view_renders {
+                        vv.insert_file(path.clone(), renders);
+                    }
+                }
+                // Views rendered by since-changed controllers may pass
+                // different variable types now — their Blade files join the
+                // re-resolve set below.
+                let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
+                let changed_views: HashSet<String> = view_renders
+                    .iter()
+                    .filter(|(path, _)| changed_set.contains(path))
+                    .flat_map(|(_, renders)| renders.iter().map(|r| r.view_name.clone()))
+                    .collect();
+                match import_magic_data(&salsa, &magic_deps_for_warm, entries).await {
                     Ok(n) => info!("🪄 Magic-member index: {} entries (restored from disk)", n),
                     Err(e) => debug!("Magic-member restore import failed: {}", e),
+                }
+
+                if !changed_paths.is_empty() {
+                    // Class-level blast radius of the changed files. The
+                    // surfaces reflect the files' *current* classes; a class
+                    // deleted since the cache was saved keeps its stale
+                    // dependents until their next touch — the same
+                    // self-healing trade-off as the live incremental path.
+                    let mut seeds: Vec<String> = Vec::new();
+                    for path in &changed_paths {
+                        if let Ok(surfaces) = salsa.file_class_surfaces(path.clone()).await {
+                            seeds.extend(surfaces.into_keys());
+                        }
+                    }
+                    let radius = salsa
+                        .expand_class_descendants(seeds)
+                        .await
+                        .unwrap_or_default();
+                    // Changed files themselves (vendor excluded — the magic
+                    // index deliberately skips vendor usage sites, and a
+                    // composer update would otherwise re-resolve thousands
+                    // of files nobody references from).
+                    let mut work: HashSet<PathBuf> = changed_paths
+                        .iter()
+                        .filter(|p| {
+                            p.to_string_lossy().ends_with(".php")
+                                && !p.components().any(|c| c.as_os_str() == "vendor")
+                        })
+                        .cloned()
+                        .collect();
+                    if let Ok(deps) = magic_deps_for_warm.read() {
+                        work.extend(deps.dependents_of(radius.iter().map(String::as_str)));
+                    }
+                    if !changed_views.is_empty() {
+                        for entry in pattern_cache_for_warm.iter() {
+                            let p = entry.key();
+                            if !p.to_string_lossy().ends_with(".blade.php")
+                                || p.components().any(|c| c.as_os_str() == "vendor")
+                            {
+                                continue;
+                            }
+                            if let Some(name) = laravel_lsp::view_var_index::view_name_for_path(
+                                p,
+                                &view_paths_for_warm,
+                            ) {
+                                if changed_views.contains(name.as_str()) {
+                                    work.insert(p.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !work.is_empty() {
+                        info!(
+                            "🪄 Granular magic restore: re-resolving {} changed/dependent file(s)",
+                            work.len()
+                        );
+                        server_for_warm.refresh_files_magic(work).await;
+                    }
                 }
             } else {
                 // Resolve fresh, drive progress (the file-parse loop had nothing
                 // to report on a cache-warm start), persist for next time, then
                 // import. `build_magic_member_entries` is shared with the
-                // incremental save-refresh path.
-                let magic_entries = build_magic_member_entries(
+                // incremental save-refresh path. It publishes the view-var
+                // index into `view_vars_for_warm` itself.
+                let magic_data = build_magic_member_entries(
                     &salsa,
                     &pattern_cache_for_warm,
                     &root_for_save,
                     &view_paths_for_warm,
                     MAX_CONCURRENT_PARSES,
                     progress.as_mut(),
+                    &view_vars_for_warm,
                 )
                 .await;
-                if !magic_entries.is_empty() {
+                if !magic_data.entries.is_empty() {
                     // Persist on the blocking pool (sync I/O), handing the
-                    // entries back so the import below still owns them — no clone.
+                    // data back so the import below still owns it — no clone.
                     let root_for_msave = root_for_save.clone();
-                    let magic_entries = match tokio::task::spawn_blocking(move || {
-                        let res =
-                            laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_entries);
-                        (res, magic_entries)
+                    let magic_data = match tokio::task::spawn_blocking(move || {
+                        let res = laravel_lsp::magic_disk_cache::save(&root_for_msave, &magic_data);
+                        (res, magic_data)
                     })
                     .await
                     {
-                        Ok((Ok(n), entries)) => {
+                        Ok((Ok(n), data)) => {
                             info!("🗄️  Magic-member index: saved {} files to disk", n);
-                            entries
+                            data
                         }
-                        Ok((Err(e), entries)) => {
+                        Ok((Err(e), data)) => {
                             debug!("Magic-member disk save failed: {}", e);
-                            entries
+                            data
                         }
                         Err(e) => {
                             debug!("Magic-member disk save task panicked: {}", e);
-                            Vec::new()
+                            Default::default()
                         }
                     };
-                    match salsa.bulk_import_magic_members(magic_entries).await {
+                    match import_magic_data(&salsa, &magic_deps_for_warm, magic_data.entries).await
+                    {
                         Ok(n) => info!("🪄 Magic-member index: {} entries", n),
                         Err(e) => debug!("Magic-member index build failed: {}", e),
                     }
@@ -5391,11 +5579,20 @@ impl LaravelLanguageServer {
 
     /// Refresh the magic-member index when a source file is saved — the single
     /// entry point for incremental updates (typing-pause edits deliberately do
-    /// no magic work). Pushes the saved buffer into Salsa so resolution sees
-    /// current content, runs the instant per-file refresh (which also covers
-    /// very large projects where the full rebuild is gated off), then schedules
-    /// the debounced project-wide reconverge for cross-file ripples. Volt pages
-    /// are self-contained, so they skip the project-wide pass.
+    /// no magic work). The flow (#80):
+    ///
+    /// 1. Snapshot the file's pre-save class surfaces (the hierarchy still
+    ///    holds them — nothing has re-parsed yet).
+    /// 2. Push the saved buffer into Salsa, run the instant per-file refresh
+    ///    (which re-parses, updates the hierarchy, records receiver deps, and
+    ///    updates the file's view-render contribution).
+    /// 3. Diff pre/post surfaces and view renders. A body-only edit — the
+    ///    overwhelming majority of saves — diffs empty and stops here: no
+    ///    other file's resolution can have changed.
+    /// 4. Otherwise re-resolve only the actual blast radius (dependents of
+    ///    the changed classes + their descendants, plus Blade files of views
+    ///    whose variable types changed) in the background, at bounded
+    ///    concurrency, whatever the radius size.
     async fn refresh_magic_on_save(&self, uri: &Url, text: &str) {
         let Ok(path) = uri.to_file_path() else {
             return;
@@ -5405,6 +5602,14 @@ impl LaravelLanguageServer {
         if !path_str.ends_with(".php") {
             return;
         }
+
+        // Pre-save surface snapshot — MUST precede the Salsa update below,
+        // which is what eventually replaces the hierarchy's nodes.
+        let old_surfaces = self
+            .salsa
+            .file_class_surfaces(path.clone())
+            .await
+            .unwrap_or_default();
 
         // Ensure Salsa reflects the saved buffer before resolving — a pending
         // did_change debounce may not have fired yet. Use the buffer's version
@@ -5424,69 +5629,231 @@ impl LaravelLanguageServer {
             debug!("Failed to update Salsa on save for {}: {}", path_str, e);
         }
 
-        self.refresh_file_magic(&path, text).await;
+        let changed_views = self.refresh_file_magic(&path, text).await;
 
-        let is_volt_blade = path_str.ends_with(".blade.php")
-            && laravel_lsp::livewire_resolver::source_contains_volt_signature(text);
-        if !is_volt_blade {
-            self.schedule_magic_rebuild().await;
+        let new_surfaces = self
+            .salsa
+            .file_class_surfaces(path.clone())
+            .await
+            .unwrap_or_default();
+        let changed_classes =
+            laravel_lsp::class_hierarchy_index::surface_map_diff(&old_surfaces, &new_surfaces);
+
+        // The per-file refresh above already mutated the live indexes —
+        // keep the disk cache converging regardless of ripple size.
+        self.schedule_magic_cache_save().await;
+
+        if changed_classes.is_empty() && changed_views.is_empty() {
+            return; // body-only edit — nothing beyond this file can change
         }
+
+        // The ripple runs in the background so did_save returns promptly.
+        let server = self.clone_for_spawn();
+        tokio::spawn(async move {
+            server
+                .refresh_magic_dependents(&path, changed_classes, changed_views)
+                .await;
+        });
+    }
+
+    /// Re-resolve the blast radius of a surface or render change: dependents
+    /// of the changed classes (and their transitive descendants) from the
+    /// dependency index, plus the Blade files of views whose variable types
+    /// changed. The set is processed incrementally whatever its size — even
+    /// a base-class change rippling to thousands of files is cheaper than
+    /// the full three-pass rebuild a fallback would trigger, and the
+    /// semaphore keeps CPU bounded throughout. (An earlier revision fell
+    /// back to the full rebuild above 500 dependents; on a real project
+    /// that fallback *was* the long re-index it existed to prevent.)
+    async fn refresh_magic_dependents(
+        &self,
+        saved: &Path,
+        changed_classes: Vec<String>,
+        changed_views: Vec<String>,
+    ) {
+        let mut work: HashSet<PathBuf> = HashSet::new();
+
+        if !changed_classes.is_empty() {
+            let radius = self
+                .salsa
+                .expand_class_descendants(changed_classes)
+                .await
+                .unwrap_or_default();
+            if let Ok(deps) = self.magic_deps.read() {
+                work.extend(deps.dependents_of(radius.iter().map(String::as_str)));
+            }
+        }
+
+        if !changed_views.is_empty() {
+            let view_paths = self
+                .cached_config
+                .read()
+                .await
+                .as_ref()
+                .map(|c| c.view_paths.clone())
+                .unwrap_or_default();
+            let changed: HashSet<&str> = changed_views.iter().map(String::as_str).collect();
+            for entry in self.salsa.pattern_cache().iter() {
+                let p = entry.key();
+                if !p.to_string_lossy().ends_with(".blade.php")
+                    || p.components().any(|c| c.as_os_str() == "vendor")
+                {
+                    continue;
+                }
+                if let Some(name) = laravel_lsp::view_var_index::view_name_for_path(p, &view_paths)
+                {
+                    if changed.contains(name.as_str()) {
+                        work.insert(p.clone());
+                    }
+                }
+            }
+        }
+
+        work.remove(saved); // already refreshed by the per-file pass
+        if work.is_empty() {
+            return;
+        }
+        info!(
+            "🪄 Incremental magic refresh: re-resolving {} dependent file(s)",
+            work.len()
+        );
+        self.refresh_files_magic(work).await;
+    }
+
+    /// Re-resolve a set of files through the per-file magic refresh at
+    /// bounded concurrency. Shared by the save-time dependents pass and the
+    /// granular startup restore (#80). Open buffers are authoritative;
+    /// everything else reads from disk on the blocking pool.
+    async fn refresh_files_magic(&self, work: HashSet<PathBuf>) {
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MAGIC_PARSES));
+        let mut handles = Vec::with_capacity(work.len());
+        for dep in work {
+            let server = self.clone_for_spawn();
+            let permit_owner = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit_owner.acquire_owned().await.ok()?;
+                let buffered = match Url::from_file_path(&dep) {
+                    Ok(url) => server
+                        .documents
+                        .read()
+                        .await
+                        .get(&url)
+                        .map(|(content, _)| content.clone()),
+                    Err(()) => None,
+                };
+                let content = match buffered {
+                    Some(c) => c,
+                    None => {
+                        let dep_for_read = dep.clone();
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::read_to_string(&dep_for_read).ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten()?
+                    }
+                };
+                server.refresh_file_magic(&dep, &content).await;
+                Some(())
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        // Reference counts may have changed project-wide.
+        let _ = self.client.code_lens_refresh().await;
+        self.schedule_magic_cache_save().await;
     }
 
     /// Instant per-file magic-member refresh (the "instant" half of the
-    /// save-time refresh). Re-resolves just the saved file's member accesses
-    /// against the current hierarchy and replaces its entries in the reverse
-    /// index, so find-references on that file is current the moment the
-    /// project-wide reconverge is gated off (large projects) or still pending.
+    /// save-time refresh). Re-resolves the file's member accesses against the
+    /// current hierarchy, replaces its entries in the reverse index, records
+    /// its receiver dependencies, and (for controllers) updates its view-
+    /// render contribution in the persistent view-var index.
     ///
-    /// Handles PHP files and self-contained Volt pages. Controller-rendered
-    /// Blade needs the project-wide view-variable index (it must know which
-    /// controllers feed this view), so it is left to the debounced full rebuild.
-    async fn refresh_file_magic(&self, path: &Path, content: &str) {
+    /// Handles PHP, self-contained Volt pages, AND controller-rendered Blade
+    /// (resolved against the persistent view-var index — previously deferred
+    /// to the full rebuild, which #80 retired from the per-save path).
+    ///
+    /// Returns the view names whose variable types changed because of this
+    /// file's render sites — the caller feeds those into the Blade ripple.
+    async fn refresh_file_magic(&self, path: &Path, content: &str) -> Vec<String> {
         let path_str = path.to_string_lossy();
         // `.blade.php` also ends with `.php`, so this covers both.
         if !path_str.ends_with(".php") {
-            return;
+            return Vec::new();
         }
         let is_blade = path_str.ends_with(".blade.php");
         let Some(root) = self.root_path.read().await.clone() else {
-            return;
+            return Vec::new();
         };
 
         // Fresh parsed patterns for the edited file. `get_patterns` also updates
         // the class hierarchy for this file, so its own class is resolvable.
         let patterns = match self.salsa.get_patterns(path.to_path_buf()).await {
             Ok(Some(p)) => p,
-            _ => return,
+            _ => return Vec::new(),
         };
 
+        let class_files = self.salsa.snapshot_class_files().await.unwrap_or_default();
+
+        // View-render diff (controllers): recompute this file's render sites
+        // and replace its contribution. Runs BEFORE the member-access early
+        // return — a controller can pass variables to views without reading
+        // any `->member` itself.
+        let mut changed_views: Vec<String> = Vec::new();
+        if !is_blade && !class_files.is_empty() {
+            let had_renders = self
+                .view_vars
+                .read()
+                .map(|vv| vv.renders_for(path).is_some())
+                .unwrap_or(false);
+            if !patterns.views.is_empty() || had_renders {
+                let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+                let renders = laravel_lsp::view_var_index::view_renders_in_file(
+                    content,
+                    &*class_files,
+                    &mut classviews,
+                    &root,
+                );
+                if let Ok(mut vv) = self.view_vars.write() {
+                    let old = vv.renders_for(path).map(|r| r.to_vec()).unwrap_or_default();
+                    if old != renders {
+                        let mut views: HashSet<String> = old
+                            .iter()
+                            .chain(renders.iter())
+                            .map(|r| r.view_name.clone())
+                            .collect();
+                        vv.insert_file(path.to_path_buf(), &renders);
+                        changed_views.extend(views.drain());
+                    }
+                }
+            }
+        }
+
         // No member accesses → nothing to resolve. Still re-index with an empty
-        // set so a *removed* last access clears its stale entry; this skips the
-        // class-files snapshot and the resolver entirely (the common edit on a
-        // file with no `->member` reads, e.g. a config or a plain function).
+        // set so a *removed* last access clears its stale entry, and clear the
+        // file's recorded dependencies for the same reason.
         if patterns.member_access_refs.is_empty() {
             let _ = self
                 .salsa
                 .reindex_file_magic(path.to_path_buf(), Vec::new())
                 .await;
-            return;
+            if let Ok(mut deps) = self.magic_deps.write() {
+                deps.remove_file(path);
+            }
+            return changed_views;
         }
 
-        // Controller-rendered Blade needs the project-wide view-variable index —
-        // defer it to the debounced full rebuild. Self-contained Volt resolves
-        // locally below.
+        if class_files.is_empty() {
+            return changed_views;
+        }
+
         let is_volt =
             is_blade && laravel_lsp::livewire_resolver::source_contains_volt_signature(content);
-        if is_blade && !is_volt {
-            return;
-        }
-
-        let class_files = self.salsa.snapshot_class_files().await.unwrap_or_default();
-        if class_files.is_empty() {
-            return;
-        }
 
         let mut classviews = laravel_lsp::member_resolver::ClassViewCache::new();
+        let mut deps: HashSet<String> = HashSet::new();
         let mut entries = if is_volt {
             let prop_types = laravel_lsp::view_var_index::volt_property_types(
                 content,
@@ -5501,7 +5868,35 @@ impl LaravelLanguageServer {
                 &*class_files,
                 &mut classviews,
                 &root,
+                Some(&mut deps),
             )
+        } else if is_blade {
+            // Controller-rendered Blade: resolve against the persistent
+            // view-var index. The read guard spans only this sync call —
+            // no awaits while held.
+            let view_paths = self
+                .cached_config
+                .read()
+                .await
+                .as_ref()
+                .map(|c| c.view_paths.clone())
+                .unwrap_or_default();
+            match laravel_lsp::view_var_index::view_name_for_path(path, &view_paths) {
+                Some(view_name) => match self.view_vars.read() {
+                    Ok(vv) => laravel_lsp::view_var_index::resolve_blade_member_accesses(
+                        &patterns.member_access_refs,
+                        &view_name,
+                        &vv,
+                        &patterns.blade_loops,
+                        &*class_files,
+                        &mut classviews,
+                        &root,
+                        Some(&mut deps),
+                    ),
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            }
         } else {
             laravel_lsp::member_resolver::resolve_member_access_entries(
                 content,
@@ -5509,6 +5904,7 @@ impl LaravelLanguageServer {
                 &*class_files,
                 &mut classviews,
                 &root,
+                Some(&mut deps),
             )
         };
         // Component `$this->member` references (Volt SFC `.php` or Blade SFC).
@@ -5527,13 +5923,92 @@ impl LaravelLanguageServer {
         {
             debug!("Per-file magic refresh failed for {}: {}", path_str, e);
         }
+        if let Ok(mut deps_lock) = self.magic_deps.write() {
+            deps_lock.replace_file(path, deps);
+        }
+
+        changed_views
     }
 
-    /// Schedule the debounced project-wide magic-member reconverge (the "full"
-    /// half of the save-time refresh). Coalesces rapid saves (save-all, format-
-    /// on-save bursts): each call cancels the previous pending rebuild and
-    /// starts a fresh timer, so cross-file ripples (controller→Blade,
-    /// model→usages) reconverge shortly after the save settles.
+    /// Schedule the debounced re-save of the magic disk cache. Call after
+    /// anything that mutates the in-memory magic state (per-file refresh,
+    /// dependents pass, full reconverge) — the debounce coalesces a burst
+    /// of saves into one disk write, and the export runs against whatever
+    /// the indexes hold when the timer fires.
+    async fn schedule_magic_cache_save(&self) {
+        const MAGIC_CACHE_SAVE_DEBOUNCE_MS: u64 = 10_000;
+        if let Some(handle) = self.magic_cache_save_handle.write().await.take() {
+            handle.abort();
+        }
+        let server = self.clone_for_spawn();
+        let handle = tokio::spawn(async move {
+            sleep(Duration::from_millis(MAGIC_CACHE_SAVE_DEBOUNCE_MS)).await;
+            server.save_magic_cache().await;
+        });
+        *self.magic_cache_save_handle.write().await = Some(handle);
+    }
+
+    /// Export the live magic state (resolved entries from the actor's
+    /// symbol index, receiver deps, view renders) and persist it. Keeping
+    /// the cache current after incremental refreshes is what lets the next
+    /// startup restore instead of re-resolving (#80) — without this, any
+    /// edit invalidated the cache for the whole next session.
+    async fn save_magic_cache(&self) {
+        let Some(root) = self.root_path.read().await.clone() else {
+            return;
+        };
+        let Ok(entries_by_file) = self.salsa.export_magic_members().await else {
+            return;
+        };
+        let deps = self
+            .magic_deps
+            .read()
+            .map(|d| d.export())
+            .unwrap_or_default();
+        let view_renders = self
+            .view_vars
+            .read()
+            .map(|v| v.export())
+            .unwrap_or_default();
+
+        // Merge entries and deps per file — a file can have either without
+        // the other (dep-only files matter; see magic_dependency_index).
+        let mut by_file: HashMap<
+            PathBuf,
+            (
+                Vec<laravel_lsp::symbol_index::MagicMemberEntry>,
+                HashSet<String>,
+            ),
+        > = HashMap::new();
+        for (path, entries) in entries_by_file {
+            by_file.entry(path).or_default().0 = entries;
+        }
+        for (path, dep_set) in deps {
+            by_file.entry(path).or_default().1 = dep_set;
+        }
+        let data = laravel_lsp::magic_disk_cache::MagicCacheData {
+            entries: by_file
+                .into_iter()
+                .map(|(path, (entries, dep_set))| (path, entries, dep_set))
+                .collect(),
+            view_renders,
+        };
+
+        match tokio::task::spawn_blocking(move || laravel_lsp::magic_disk_cache::save(&root, &data))
+            .await
+        {
+            Ok(Ok(n)) => info!("🗄️  Magic cache re-saved: {} files", n),
+            Ok(Err(e)) => debug!("Magic cache re-save failed: {}", e),
+            Err(e) => debug!("Magic cache re-save task panicked: {}", e),
+        }
+    }
+
+    /// Schedule the debounced project-wide magic-member reconverge. No longer
+    /// part of the per-save path (#80 — saves use the dependency-tracked
+    /// incremental refresh); this remains the reconverge after external
+    /// (watched-file) changes, whose ripples the save-time diff never saw.
+    /// The debounce coalesces bursts (git checkout touching hundreds of
+    /// files) into one rebuild.
     async fn schedule_magic_rebuild(&self) {
         if let Some(handle) = self.magic_rebuild_handle.write().await.take() {
             handle.abort();
@@ -5577,21 +6052,23 @@ impl LaravelLanguageServer {
             debug!("Symbol index rebuild failed: {}", e);
             return;
         }
-        let entries = build_magic_member_entries(
+        let data = build_magic_member_entries(
             &self.salsa,
             &pattern_cache,
             &root,
             &view_paths,
             MAX_CONCURRENT_MAGIC_PARSES,
             None, // save-refresh path has no first-load progress UI
+            &self.view_vars,
         )
         .await;
-        match self.salsa.bulk_import_magic_members(entries).await {
+        match import_magic_data(&self.salsa, &self.magic_deps, data.entries).await {
             Ok(n) => info!("🪄 Magic-member index reconverged: {} entries", n),
             Err(e) => debug!("Magic reconverge failed: {}", e),
         }
         // Counts changed — ask the client to re-resolve code lenses.
         let _ = self.client.code_lens_refresh().await;
+        self.schedule_magic_cache_save().await;
     }
 
     /// Execute all pending rescans
@@ -14566,6 +15043,9 @@ return [
             vendor_translation_namespaces: self.vendor_translation_namespaces.clone(),
             builder_method_index_cache: self.builder_method_index_cache.clone(),
             route_decl_cache: self.route_decl_cache.clone(),
+            magic_deps: self.magic_deps.clone(),
+            view_vars: self.view_vars.clone(),
+            magic_cache_save_handle: self.magic_cache_save_handle.clone(),
         }
     }
 
@@ -18981,6 +19461,17 @@ impl LanguageServer for LaravelLanguageServer {
             if let Some(root) = self.initialized_root.read().await.clone() {
                 self.rebuild_command_index(&root).await;
             }
+        }
+
+        // External PHP changes (git pull, formatter outside Zed) bypass the
+        // save-time incremental refresh entirely — their surface diffs were
+        // never computed, so the dependency-tracked path can't see their
+        // ripples. The debounced full reconverge (still gated on project
+        // size) restores the old guarantee that the magic index converges
+        // after disk-level changes. Saves no longer trigger this (#80);
+        // external edits are the one remaining caller.
+        if created_or_changed + deleted > 0 {
+            self.schedule_magic_rebuild().await;
         }
     }
 

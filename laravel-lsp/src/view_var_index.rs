@@ -29,7 +29,9 @@ use crate::symbol_index::MagicMemberEntry;
 
 /// One `view('name', …)` render site: the rendered view and the variable →
 /// FQCN types it passes in (only the variables whose type resolved).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Serialize`/`Deserialize` so the magic disk cache can persist renders and
+/// rebuild the view-variable index on a cache-warm restart (#80).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ViewRender {
     pub view_name: String,
     pub vars: HashMap<String, String>,
@@ -47,12 +49,15 @@ pub struct ViewRender {
 /// **No persistence.** This index is rebuilt every warm from re-read source +
 /// the (already-persisted) hierarchy, so it never hits the empty-on-restart
 /// trap. `by_file` exists only for incremental eviction within a live session.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ViewVarIndex {
     /// view name → (variable name → set of FQCN types).
     forward: HashMap<String, HashMap<String, HashSet<String>>>,
-    /// file → the view names it contributed render sites for (for eviction).
-    by_file: HashMap<PathBuf, Vec<String>>,
+    /// file → the full render sites it contributed. Keeping whole renders
+    /// (not just view names) gives `remove_file` per-file type provenance
+    /// for a precise rebuild, and lets the incremental save flow (#80) diff
+    /// a saved controller's renders against its previous contribution.
+    by_file: HashMap<PathBuf, Vec<ViewRender>>,
 }
 
 impl ViewVarIndex {
@@ -65,35 +70,55 @@ impl ViewVarIndex {
     /// edited controller doesn't leave stale types behind.
     pub fn insert_file(&mut self, path: PathBuf, renders: &[ViewRender]) {
         self.remove_file(&path);
-        let mut contributed = Vec::new();
         for render in renders {
             let view = self.forward.entry(render.view_name.clone()).or_default();
             for (var, fqcn) in &render.vars {
                 view.entry(var.clone()).or_default().insert(fqcn.clone());
             }
-            contributed.push(render.view_name.clone());
         }
-        if !contributed.is_empty() {
-            self.by_file.insert(path, contributed);
+        if !renders.is_empty() {
+            self.by_file.insert(path, renders.to_vec());
         }
     }
 
     /// Drop a file's contribution. Because `forward` is a union across files,
-    /// eviction does a targeted rebuild of only the affected views from the
-    /// surviving files — correct, if not the cheapest possible.
+    /// eviction rebuilds only the affected views from the surviving files'
+    /// stored renders — precise, at O(files × renders) for the touched views.
     pub fn remove_file(&mut self, path: &Path) {
-        let Some(views) = self.by_file.remove(path) else {
+        let Some(renders) = self.by_file.remove(path) else {
             return;
         };
-        for view in views {
-            // Clearing the whole view entry is imprecise (other files may feed
-            // it), but a per-file rebuild needs per-file type provenance we
-            // don't keep. The warm rebuild clears the whole index anyway; this
-            // path only matters for live single-session edits, where dropping
-            // the view's vars and letting the still-open renderers re-add them
-            // on their next parse is acceptable.
-            self.forward.remove(&view);
+        let affected: HashSet<&str> = renders.iter().map(|r| r.view_name.as_str()).collect();
+        for view in &affected {
+            self.forward.remove(*view);
         }
+        for other_renders in self.by_file.values() {
+            for render in other_renders {
+                if !affected.contains(render.view_name.as_str()) {
+                    continue;
+                }
+                let view = self.forward.entry(render.view_name.clone()).or_default();
+                for (var, fqcn) in &render.vars {
+                    view.entry(var.clone()).or_default().insert(fqcn.clone());
+                }
+            }
+        }
+    }
+
+    /// The render sites `path` currently contributes, if any. The save flow
+    /// diffs this against a fresh `view_renders_in_file` to decide whether
+    /// the saved controller's Blade views need re-resolution (#80).
+    pub fn renders_for(&self, path: &Path) -> Option<&[ViewRender]> {
+        self.by_file.get(path).map(Vec::as_slice)
+    }
+
+    /// Snapshot every file's render contribution — the persistence side of
+    /// the incremental magic-cache re-save (#80).
+    pub fn export(&self) -> Vec<(PathBuf, Vec<ViewRender>)> {
+        self.by_file
+            .iter()
+            .map(|(path, renders)| (path.clone(), renders.clone()))
+            .collect()
     }
 
     /// All FQCN types observed for `var` in `view_name`, across every render
@@ -169,6 +194,7 @@ pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String>
 /// Positions come straight from the captured refs (already mapped to outer
 /// Blade-file coordinates by the capture pass), so entries point at the member
 /// name in the `.blade.php`. Sites that don't resolve are dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_blade_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     view_name: &str,
@@ -177,6 +203,7 @@ pub fn resolve_blade_member_accesses(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
     let mut out: Vec<MagicMemberEntry> = Vec::new();
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
@@ -209,6 +236,12 @@ pub fn resolve_blade_member_accesses(
             var_types(var, m.line)
                 .into_iter()
                 .filter_map(|fqcn| {
+                    // Attempted receiver type → dependency, even when the
+                    // member classification below fails (see
+                    // `magic_dependency_index` for why attempts matter).
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
                     classify_fqcn_member(
                         &fqcn,
                         &m.member,
@@ -228,6 +261,7 @@ pub fn resolve_blade_member_accesses(
                 resolver,
                 classviews,
                 project_root,
+                deps.as_deref_mut(),
             )
             .map(|c| vec![c.declaring_fqcn])
             .unwrap_or_default()
@@ -280,6 +314,7 @@ fn classify_fqcn_member(
 /// by parsing it as a standalone PHP expression and running the shared receiver
 /// resolver, then classify `member`. Only HIGH/MEDIUM receiver confidence is
 /// accepted — the find-references gate.
+#[allow(clippy::too_many_arguments)]
 fn resolve_chain_receiver(
     receiver_text: &str,
     member: &str,
@@ -287,6 +322,7 @@ fn resolve_chain_receiver(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    deps: Option<&mut HashSet<String>>,
 ) -> Option<ClassifiedMember> {
     let snippet = format!("<?php {receiver_text};");
     let tree = parse_php(&snippet).ok()?;
@@ -297,6 +333,9 @@ fn resolve_chain_receiver(
         resolve_expression_type(expr, bytes, &aliases, resolver, classviews, project_root)?;
     if !matches!(confidence, Confidence::High | Confidence::Medium) {
         return None;
+    }
+    if let Some(d) = deps {
+        d.insert(fqcn.clone());
     }
     classify_fqcn_member(&fqcn, member, form, resolver, classviews, project_root)
 }
@@ -765,6 +804,7 @@ pub fn mfc_volt_property_types(
 /// types. Receivers `$this->prop` and bare `$prop` are typed from `prop_types`;
 /// other shapes (`auth()->user()->email`) fall back to standalone resolution.
 /// Entries land in the same reverse index as PHP/Blade accesses.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_volt_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     prop_types: &HashMap<String, String>,
@@ -772,6 +812,7 @@ pub fn resolve_volt_member_accesses(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
     let mut out: Vec<MagicMemberEntry> = Vec::new();
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
@@ -781,6 +822,11 @@ pub fn resolve_volt_member_accesses(
         let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
             // Direct prop read (`$this->user`, or a bare public-prop/state read).
             let direct = prop_types.get(prop).and_then(|fqcn| {
+                // Attempted receiver type → dependency, even when member
+                // classification fails (see `magic_dependency_index`).
+                if let Some(d) = deps.as_deref_mut() {
+                    d.insert(fqcn.clone());
+                }
                 classify_fqcn_member(fqcn, &m.member, m.form, resolver, classviews, project_root)
                     .map(|c| c.declaring_fqcn)
             });
@@ -792,6 +838,9 @@ pub fn resolve_volt_member_accesses(
                 let iter = enclosing_loop_iterable(blade_loops, var, m.line)?;
                 let iter_prop = volt_base_prop(iter)?;
                 prop_types.get(iter_prop).and_then(|fqcn| {
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
                     classify_fqcn_member(
                         fqcn,
                         &m.member,
@@ -811,6 +860,7 @@ pub fn resolve_volt_member_accesses(
                 resolver,
                 classviews,
                 project_root,
+                deps.as_deref_mut(),
             )
             .map(|c| c.declaring_fqcn)
         };

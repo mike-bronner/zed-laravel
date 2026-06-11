@@ -24,7 +24,7 @@ use crate::query_chain::flow;
 use crate::query_chain::use_aliases::{extract_use_aliases, resolve_class_name, UseAliases};
 use crate::salsa_impl::{Confidence, MagicMemberKind, MemberAccessReferenceData};
 use crate::symbol_index::MagicMemberEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -205,12 +205,19 @@ impl ClassViewCache {
 ///
 /// `classviews` is reused across files by the caller so each model is analyzed
 /// once per build pass.
+///
+/// `deps`, when provided, accumulates every receiver FQCN resolution
+/// *attempted* — including accesses whose member classification fails — for
+/// the magic dependency index (see `magic_dependency_index`). Recording
+/// attempts rather than successes is what lets a later "member added to
+/// class" save re-resolve the files that were waiting on it.
 pub fn resolve_member_access_entries(
     source: &str,
     member_refs: &[Arc<MemberAccessReferenceData>],
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
     if member_refs.is_empty() {
         return Vec::new();
@@ -238,6 +245,7 @@ pub fn resolve_member_access_entries(
             resolver,
             classviews,
             project_root,
+            deps.as_deref_mut(),
         ) else {
             continue;
         };
@@ -275,6 +283,10 @@ pub fn resolve_member_access_entries(
 ///
 /// This is the M3 engine; M4 calls it during the reverse-index build and
 /// writes the result into each site's reserved scaffold.
+///
+/// `deps`, when provided, records the receiver FQCN(s) this access resolves
+/// to — *before* member classification, so failed lookups still register a
+/// dependency on the receiver's class.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_and_classify(
     receiver: Node,
@@ -285,6 +297,7 @@ pub fn resolve_and_classify(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Option<ResolvedMemberAccess> {
     let (fqcn, confidence) =
         match resolve_receiver(receiver, bytes, aliases, resolver, classviews, project_root) {
@@ -306,6 +319,10 @@ pub fn resolve_and_classify(
             )?,
             None => return None,
         };
+
+    if let Some(d) = deps.as_deref_mut() {
+        d.insert(fqcn.clone());
+    }
 
     if let Some(resolved) = classify_against(
         &fqcn,
@@ -332,6 +349,9 @@ pub fn resolve_and_classify(
     // the actual safety here.
     if form.is_call() && is_eloquent_builder(&fqcn) && is_scope_param_receiver(receiver, bytes) {
         let model = enclosing_class_fqcn(receiver, bytes)?;
+        if let Some(d) = deps {
+            d.insert(model.clone());
+        }
         let resolved = classify_against(
             &model,
             member,

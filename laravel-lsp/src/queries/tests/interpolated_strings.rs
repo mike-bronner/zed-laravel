@@ -182,6 +182,112 @@ $b = config("database.default");
     assert_eq!(config_keys(php), vec!["app.name", "database.default"]);
 }
 
+// ─── Review findings (PR #84): dedup + binding-shape hardening ──────────
+
+#[test]
+fn middle_interpolation_resolves_exactly_once() {
+    // Two literal fragments around one variable → two query captures of the
+    // SAME encapsed string. Must yield one match, not a doubled count (B1).
+    let php = r#"<?php
+$provider = 'stripe';
+$key = config("services.{$provider}.key");
+"#;
+    assert_eq!(config_keys(php), vec!["services.stripe.key"]);
+}
+
+#[test]
+fn unresolvable_middle_interpolation_yields_nothing() {
+    // Same two-fragment shape, but unresolvable — neither fragment may leak.
+    let php = r#"<?php
+$key = config("services.{$provider}.key");
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_augmented_assignment() {
+    // `.=` mutates after the literal assignment — resolving the original
+    // value would produce a stale key (S1).
+    let php = r#"<?php
+$config = 'reporting';
+$config .= '.redshift_sync';
+$x = config("{$config}.enabled");
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_foreach_rebinding() {
+    let php = r#"<?php
+$config = 'reporting.redshift_sync';
+foreach ($sections as $config) {
+    $x = config("{$config}.enabled");
+}
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_foreach_key_rebinding() {
+    let php = r#"<?php
+$config = 'reporting.redshift_sync';
+foreach ($map as $config => $value) {
+    $x = config("{$config}.enabled");
+}
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_destructuring_rebinding() {
+    let php = r#"<?php
+$config = 'reporting.redshift_sync';
+[$other, $config] = $pair;
+$x = config("{$config}.enabled");
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_static_declaration() {
+    // `static` persists across calls — its initializer is not its value.
+    let php = r#"<?php
+function f() {
+    static $config = 'reporting.redshift_sync';
+    return config("{$config}.enabled");
+}
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn skips_conditional_assignment_shadowing_parameter() {
+    // One branch assigns, the other path keeps the parameter — no single
+    // provable value at the use site (S2).
+    let php = r#"<?php
+function f($config, $override) {
+    if ($override) {
+        $config = 'alt.prefix';
+    }
+    return config("{$config}.enabled");
+}
+"#;
+    assert!(config_keys(php).is_empty());
+}
+
+#[test]
+fn resolves_unconditional_reassignment_of_parameter() {
+    // Counterpoint to the conditional case: a direct, unconditional literal
+    // assignment before the use IS the value, parameter or not.
+    let php = r#"<?php
+function f($config) {
+    $config = 'reporting.redshift_sync';
+    return config("{$config}.enabled");
+}
+"#;
+    assert_eq!(config_keys(php), vec!["reporting.redshift_sync.enabled"]);
+}
+
 // ─── Fragment skipping for non-config patterns ──────────────────────────
 
 #[test]

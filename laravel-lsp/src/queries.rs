@@ -518,6 +518,22 @@ pub fn extract_all_php_patterns<'a>(
             // Config patterns
             "config_key" => {
                 if let Some(encapsed) = interpolated_parent {
+                    // One encapsed string can hold several literal fragments
+                    // (`"services.{$x}.key"` has two), and the query yields one
+                    // capture per fragment. Resolve the string ONCE, on its
+                    // first fragment only — otherwise every fragment pushes an
+                    // identical match and reference counts double.
+                    let first_fragment = {
+                        let mut c = encapsed.walk();
+                        let id = encapsed
+                            .named_children(&mut c)
+                            .find(|n| n.kind() == "string_content")
+                            .map(|n| n.id());
+                        id
+                    };
+                    if first_fragment != Some(node.id()) {
+                        continue;
+                    }
                     // Dynamic key: try to reconstruct the full dotted key by
                     // substituting same-scope literal assignments
                     // (`$config = 'reporting.redshift_sync';` →
@@ -1033,19 +1049,23 @@ fn resolve_interpolated_string(encapsed: tree_sitter::Node, source: &[u8]) -> Op
 
 /// Resolve a `variable_name` interpolation to a string literal assigned to it
 /// in the same scope, before the use site. Returns `None` unless the variable
-/// has exactly one assignment in scope, that assignment precedes the use, and
-/// its right-hand side is a plain string literal. "Exactly one" keeps control
-/// flow honest — a variable assigned in two branches has no single value.
+/// has exactly one binding in scope, that binding is an unconditional plain
+/// `$var = '<literal>'` assignment, and it precedes the use. "Exactly one"
+/// keeps control flow honest — a variable bound twice (or bound once inside a
+/// branch, where the other path may carry a parameter or stale value) has no
+/// single provable value. Bindings of every other shape — `.=`, `foreach`
+/// rebinding, destructuring, `static` — are collected as unresolvable so they
+/// disqualify the count rather than being silently invisible.
 fn resolve_variable_literal(var: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let var_text = var.utf8_text(source).ok()?;
     let use_byte = var.start_byte();
     let scope = enclosing_scope(var);
 
-    let mut assignments: Vec<(usize, Option<String>)> = Vec::new();
-    collect_variable_assignments(scope, source, var_text, &mut assignments);
+    let mut bindings: Vec<(usize, Option<String>)> = Vec::new();
+    collect_variable_bindings(scope, scope, source, var_text, &mut bindings);
 
-    match assignments.as_slice() {
-        [(assign_byte, value)] if *assign_byte < use_byte => value.clone(),
+    match bindings.as_slice() {
+        [(bind_byte, value)] if *bind_byte < use_byte => value.clone(),
         _ => None,
     }
 }
@@ -1071,32 +1091,132 @@ fn is_scope_boundary(kind: &str) -> bool {
     )
 }
 
-/// Collect every `$var = <expr>` assignment inside `scope` (excluding nested
+/// Collect every construct that BINDS `$var` inside `scope` (excluding nested
 /// function scopes — their `$var` is a different variable) as
-/// `(start_byte, literal value or None)`. A `None` value marks a non-literal
-/// assignment, which the caller treats as unresolvable.
-fn collect_variable_assignments(
+/// `(start_byte, literal value or None)`.
+///
+/// A `Some` value is produced only by an unconditional, top-level-of-scope
+/// `$var = '<literal>'` assignment. Everything else that writes the variable
+/// records `None` so it disqualifies resolution instead of being invisible:
+///
+/// - non-literal RHS (`$var = get_prefix()`)
+/// - assignment nested under control flow (`if (...) { $var = 'x'; }` — the
+///   other path may carry a parameter or earlier value)
+/// - compound assignment (`$var .= 'x'`)
+/// - `foreach (... as $var)` / `foreach (... as $k => $var)` rebinding
+/// - destructuring (`[$a, $var] = ...`, `list(..., $var) = ...`)
+/// - `static $var = ...` (persists across calls — not a constant)
+///
+/// Missing a binding shape here would let constant propagation resolve a STALE
+/// value — a wrong key is strictly worse than the phantom keys this machinery
+/// exists to remove, so unknown-but-writing shapes must always land in the
+/// disqualify bucket.
+fn collect_variable_bindings(
+    node: tree_sitter::Node,
     scope: tree_sitter::Node,
     source: &[u8],
     var_text: &str,
     out: &mut Vec<(usize, Option<String>)>,
 ) {
-    let mut cursor = scope.walk();
-    for child in scope.children(&mut cursor) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         if is_scope_boundary(child.kind()) {
             continue;
         }
-        if child.kind() == "assignment_expression" {
-            let left = child.child_by_field_name("left");
-            let right = child.child_by_field_name("right");
-            if let (Some(left), Some(right)) = (left, right) {
-                if left.kind() == "variable_name" && left.utf8_text(source).ok() == Some(var_text) {
-                    out.push((child.start_byte(), literal_string_value(right, source)));
+        match child.kind() {
+            "assignment_expression" => {
+                let left = child.child_by_field_name("left");
+                let right = child.child_by_field_name("right");
+                if let (Some(left), Some(right)) = (left, right) {
+                    if left.kind() == "variable_name"
+                        && left.utf8_text(source).ok() == Some(var_text)
+                    {
+                        let value = if is_conditionally_nested(child, scope) {
+                            None
+                        } else {
+                            literal_string_value(right, source)
+                        };
+                        out.push((child.start_byte(), value));
+                    } else if subtree_binds_variable(left, source, var_text) {
+                        // Destructuring: `[$a, $var] = ...` / `list(...)`.
+                        out.push((child.start_byte(), None));
+                    }
                 }
             }
+            "augmented_assignment_expression"
+                if child
+                    .child_by_field_name("left")
+                    .is_some_and(|l| l.utf8_text(source).ok() == Some(var_text)) =>
+            {
+                out.push((child.start_byte(), None));
+            }
+            "foreach_statement" => {
+                // The binding targets live in the header — every child except
+                // the loop body. The iterable is also matched here; treating a
+                // read as a binding only over-bails, never mis-resolves.
+                let mut c = child.walk();
+                for header in child.named_children(&mut c) {
+                    if header.kind() != "compound_statement"
+                        && subtree_binds_variable(header, source, var_text)
+                    {
+                        out.push((child.start_byte(), None));
+                        break;
+                    }
+                }
+            }
+            "static_variable_declaration" if subtree_binds_variable(child, source, var_text) => {
+                out.push((child.start_byte(), None));
+            }
+            _ => {}
         }
-        collect_variable_assignments(child, source, var_text, out);
+        collect_variable_bindings(child, scope, source, var_text, out);
     }
+}
+
+/// Whether any `variable_name` in `node`'s subtree is exactly `var_text`.
+fn subtree_binds_variable(node: tree_sitter::Node, source: &[u8], var_text: &str) -> bool {
+    if node.kind() == "variable_name" {
+        return node.utf8_text(source).ok() == Some(var_text);
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .any(|c| subtree_binds_variable(c, source, var_text));
+    found
+}
+
+/// Whether `node` sits under control flow between itself and `scope` — an
+/// `if`/loop/`switch`/`try`/`match` ancestor means the binding may not execute
+/// on every path, so its value can't be treated as THE value at the use site.
+fn is_conditionally_nested(node: tree_sitter::Node, scope: tree_sitter::Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == scope.id() {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "if_statement"
+                | "else_clause"
+                | "else_if_clause"
+                | "conditional_expression"
+                | "while_statement"
+                | "do_statement"
+                | "for_statement"
+                | "foreach_statement"
+                | "switch_statement"
+                | "case_statement"
+                | "default_statement"
+                | "try_statement"
+                | "catch_clause"
+                | "finally_clause"
+                | "match_expression"
+        ) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// The content of `node` if it is a plain (non-interpolated) string literal —

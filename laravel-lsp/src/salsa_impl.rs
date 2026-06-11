@@ -7130,6 +7130,7 @@ impl SalsaActor {
                 &self.class_hierarchy_index,
                 &mut classviews,
                 &project_root,
+                None, // query-time path — no dependency recording
             ) {
                 // find-references threshold: HIGH + MEDIUM.
                 if matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
@@ -7204,6 +7205,7 @@ impl SalsaActor {
                 &self.class_hierarchy_index,
                 &mut classviews,
                 &project_root,
+                None, // query-time path — no dependency recording
             ) {
                 Some(r) if matches!(r.confidence, Confidence::High | Confidence::Medium) => {
                     (r.declaring_fqcn, r.kind, r.confidence, false)
@@ -7307,6 +7309,7 @@ impl SalsaActor {
             &self.class_hierarchy_index,
             &mut classviews,
             &project_root,
+            None, // query-time path — no dependency recording
         )?;
         if !matches!(resolved.confidence, Confidence::High | Confidence::Medium) {
             return None;

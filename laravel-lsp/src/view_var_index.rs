@@ -169,6 +169,7 @@ pub fn view_name_for_path(file: &Path, view_roots: &[PathBuf]) -> Option<String>
 /// Positions come straight from the captured refs (already mapped to outer
 /// Blade-file coordinates by the capture pass), so entries point at the member
 /// name in the `.blade.php`. Sites that don't resolve are dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_blade_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     view_name: &str,
@@ -177,6 +178,7 @@ pub fn resolve_blade_member_accesses(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
     let mut out: Vec<MagicMemberEntry> = Vec::new();
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
@@ -209,6 +211,12 @@ pub fn resolve_blade_member_accesses(
             var_types(var, m.line)
                 .into_iter()
                 .filter_map(|fqcn| {
+                    // Attempted receiver type → dependency, even when the
+                    // member classification below fails (see
+                    // `magic_dependency_index` for why attempts matter).
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
                     classify_fqcn_member(
                         &fqcn,
                         &m.member,
@@ -228,6 +236,7 @@ pub fn resolve_blade_member_accesses(
                 resolver,
                 classviews,
                 project_root,
+                deps.as_deref_mut(),
             )
             .map(|c| vec![c.declaring_fqcn])
             .unwrap_or_default()
@@ -280,6 +289,7 @@ fn classify_fqcn_member(
 /// by parsing it as a standalone PHP expression and running the shared receiver
 /// resolver, then classify `member`. Only HIGH/MEDIUM receiver confidence is
 /// accepted — the find-references gate.
+#[allow(clippy::too_many_arguments)]
 fn resolve_chain_receiver(
     receiver_text: &str,
     member: &str,
@@ -287,6 +297,7 @@ fn resolve_chain_receiver(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    deps: Option<&mut HashSet<String>>,
 ) -> Option<ClassifiedMember> {
     let snippet = format!("<?php {receiver_text};");
     let tree = parse_php(&snippet).ok()?;
@@ -297,6 +308,9 @@ fn resolve_chain_receiver(
         resolve_expression_type(expr, bytes, &aliases, resolver, classviews, project_root)?;
     if !matches!(confidence, Confidence::High | Confidence::Medium) {
         return None;
+    }
+    if let Some(d) = deps {
+        d.insert(fqcn.clone());
     }
     classify_fqcn_member(&fqcn, member, form, resolver, classviews, project_root)
 }
@@ -765,6 +779,7 @@ pub fn mfc_volt_property_types(
 /// types. Receivers `$this->prop` and bare `$prop` are typed from `prop_types`;
 /// other shapes (`auth()->user()->email`) fall back to standalone resolution.
 /// Entries land in the same reverse index as PHP/Blade accesses.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_volt_member_accesses(
     member_refs: &[Arc<MemberAccessReferenceData>],
     prop_types: &HashMap<String, String>,
@@ -772,6 +787,7 @@ pub fn resolve_volt_member_accesses(
     resolver: &impl ClassFileResolver,
     classviews: &mut ClassViewCache,
     project_root: &Path,
+    mut deps: Option<&mut HashSet<String>>,
 ) -> Vec<MagicMemberEntry> {
     let mut out: Vec<MagicMemberEntry> = Vec::new();
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
@@ -781,6 +797,11 @@ pub fn resolve_volt_member_accesses(
         let declaring: Option<String> = if let Some(prop) = volt_base_prop(receiver) {
             // Direct prop read (`$this->user`, or a bare public-prop/state read).
             let direct = prop_types.get(prop).and_then(|fqcn| {
+                // Attempted receiver type → dependency, even when member
+                // classification fails (see `magic_dependency_index`).
+                if let Some(d) = deps.as_deref_mut() {
+                    d.insert(fqcn.clone());
+                }
                 classify_fqcn_member(fqcn, &m.member, m.form, resolver, classviews, project_root)
                     .map(|c| c.declaring_fqcn)
             });
@@ -792,6 +813,9 @@ pub fn resolve_volt_member_accesses(
                 let iter = enclosing_loop_iterable(blade_loops, var, m.line)?;
                 let iter_prop = volt_base_prop(iter)?;
                 prop_types.get(iter_prop).and_then(|fqcn| {
+                    if let Some(d) = deps.as_deref_mut() {
+                        d.insert(fqcn.clone());
+                    }
                     classify_fqcn_member(
                         fqcn,
                         &m.member,
@@ -811,6 +835,7 @@ pub fn resolve_volt_member_accesses(
                 resolver,
                 classviews,
                 project_root,
+                deps.as_deref_mut(),
             )
             .map(|c| c.declaring_fqcn)
         };

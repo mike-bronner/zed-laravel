@@ -3038,6 +3038,7 @@ async fn build_magic_member_entries(
                     &*class_files,
                     &mut classviews,
                     &root,
+                    None, // deps recorded once the actor ingests them (#80)
                 );
                 // Volt SFC `.php` components: index `$this->member` reads under
                 // the component's synthetic key (no-op for plain/model .php).
@@ -3149,6 +3150,7 @@ async fn build_magic_member_entries(
                             &*class_files,
                             &mut classviews,
                             &root,
+                            None, // deps recorded once the actor ingests them (#80)
                         )
                     } else {
                         let view_name =
@@ -3161,6 +3163,7 @@ async fn build_magic_member_entries(
                             &*class_files,
                             &mut classviews,
                             &root,
+                            None, // deps recorded once the actor ingests them (#80)
                         )
                     };
                     // Component `$this->member` references (SFC own class, or MFC
@@ -5501,6 +5504,7 @@ impl LaravelLanguageServer {
                 &*class_files,
                 &mut classviews,
                 &root,
+                None, // deps recorded once the actor ingests them (#80)
             )
         } else {
             laravel_lsp::member_resolver::resolve_member_access_entries(
@@ -5509,6 +5513,7 @@ impl LaravelLanguageServer {
                 &*class_files,
                 &mut classviews,
                 &root,
+                None, // deps recorded once the actor ingests them (#80)
             )
         };
         // Component `$this->member` references (Volt SFC `.php` or Blade SFC).

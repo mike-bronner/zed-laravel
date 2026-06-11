@@ -204,3 +204,192 @@ fn contains_file_tracks_indexed_paths() {
     idx.remove_file(&path);
     assert!(!idx.contains_file(&path));
 }
+
+// ── Surface signatures (incremental save gate, #80) ─────────────────────
+
+#[test]
+fn surface_signature_ignores_body_edits_and_span_shifts() {
+    let original = r#"<?php
+namespace App\Models;
+class User {
+    public $name;
+    public function show() { return 1; }
+}
+"#;
+    // Same surface: a fatter body and extra blank lines shift every span.
+    let body_edit = r#"<?php
+namespace App\Models;
+
+
+class User {
+    public $name;
+    public function show() {
+        $value = compute();
+        return $value + 41;
+    }
+}
+"#;
+    let a = extract("/proj/app/Models/User.php", original);
+    let b = extract("/proj/app/Models/User.php", body_edit);
+    assert_eq!(a[0].surface_signature(), b[0].surface_signature());
+}
+
+#[test]
+fn surface_signature_ignores_member_order() {
+    let ab = r#"<?php
+class User {
+    public function alpha() {}
+    public function beta() {}
+}
+"#;
+    let ba = r#"<?php
+class User {
+    public function beta() {}
+    public function alpha() {}
+}
+"#;
+    let a = extract("/proj/User.php", ab);
+    let b = extract("/proj/User.php", ba);
+    assert_eq!(a[0].surface_signature(), b[0].surface_signature());
+}
+
+#[test]
+fn surface_signature_changes_on_surface_edits() {
+    let base = r#"<?php
+namespace App\Models;
+class User extends Base {
+    public $name;
+    public function show() {}
+}
+"#;
+    let base_sig = extract("/proj/User.php", base)[0].surface_signature();
+
+    // Added method.
+    let added = base.replace(
+        "public function show() {}",
+        "public function show() {}\n    public function hide() {}",
+    );
+    assert_ne!(
+        base_sig,
+        extract("/proj/User.php", &added)[0].surface_signature()
+    );
+
+    // Changed parent.
+    let reparented = base.replace("extends Base", "extends Other");
+    assert_ne!(
+        base_sig,
+        extract("/proj/User.php", &reparented)[0].surface_signature()
+    );
+
+    // Static-ness flip on a member.
+    let statified = base.replace("public function show()", "public static function show()");
+    assert_ne!(
+        base_sig,
+        extract("/proj/User.php", &statified)[0].surface_signature()
+    );
+
+    // Added trait use.
+    let traited = base.replace("public $name;", "use Sluggable;\n    public $name;");
+    assert_ne!(
+        base_sig,
+        extract("/proj/User.php", &traited)[0].surface_signature()
+    );
+}
+
+#[test]
+fn surface_diff_reports_changed_added_and_removed() {
+    let mut idx = ClassHierarchyIndex::default();
+    let path = PathBuf::from("/proj/app/Models/User.php");
+    let original = r#"<?php
+namespace App\Models;
+class User { public function show() {} }
+class Profile { public $bio; }
+"#;
+    idx.insert_file(&path, extract("/proj/app/Models/User.php", original));
+    let old = idx.file_surfaces(&path);
+    assert_eq!(old.len(), 2);
+
+    // Body-only edit → empty diff.
+    let body_edit = r#"<?php
+namespace App\Models;
+class User { public function show() { return 7; } }
+class Profile { public $bio; }
+"#;
+    let nodes = extract("/proj/app/Models/User.php", body_edit);
+    assert!(surface_diff(&old, &nodes).is_empty());
+
+    // User gains a method (changed), Profile is dropped (removed),
+    // Avatar appears (added) → all three FQCNs reported.
+    let reshaped = r#"<?php
+namespace App\Models;
+class User { public function show() {} public function hide() {} }
+class Avatar {}
+"#;
+    let nodes = extract("/proj/app/Models/User.php", reshaped);
+    let mut diff = surface_diff(&old, &nodes);
+    diff.sort();
+    assert_eq!(
+        diff,
+        vec![
+            "App\\Models\\Avatar".to_string(),
+            "App\\Models\\Profile".to_string(),
+            "App\\Models\\User".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn expand_with_descendants_walks_all_edge_kinds_transitively() {
+    let mut idx = ClassHierarchyIndex::default();
+    let src = r#"<?php
+namespace App;
+interface Contract {}
+trait Helper {}
+class Base {}
+class Child extends Base {}
+class GrandChild extends Child {}
+class Impl implements Contract {}
+class Uses { use Helper; }
+"#;
+    idx.insert_file(
+        &PathBuf::from("/proj/app/All.php"),
+        extract("/proj/app/All.php", src),
+    );
+
+    let radius = idx.expand_with_descendants(&["App\\Base".to_string()]);
+    assert!(radius.contains("App\\Base"));
+    assert!(radius.contains("App\\Child"));
+    assert!(radius.contains("App\\GrandChild"));
+    assert!(!radius.contains("App\\Impl"));
+
+    let radius = idx.expand_with_descendants(&["App\\Contract".to_string()]);
+    assert!(radius.contains("App\\Impl"));
+
+    let radius = idx.expand_with_descendants(&["App\\Helper".to_string()]);
+    assert!(radius.contains("App\\Uses"));
+}
+
+#[test]
+fn surface_map_diff_matches_node_diff_semantics() {
+    let mut old = HashMap::new();
+    old.insert("App\\A".to_string(), 1u64);
+    old.insert("App\\B".to_string(), 2u64);
+
+    // Unchanged → empty.
+    assert!(surface_map_diff(&old, &old.clone()).is_empty());
+
+    // Changed signature + removed class + added class all report.
+    let mut new = HashMap::new();
+    new.insert("App\\A".to_string(), 9u64); // changed
+    new.insert("App\\C".to_string(), 3u64); // added
+    let mut diff = surface_map_diff(&old, &new);
+    diff.sort();
+    assert_eq!(
+        diff,
+        vec![
+            "App\\A".to_string(),
+            "App\\B".to_string(),
+            "App\\C".to_string(),
+        ]
+    );
+}

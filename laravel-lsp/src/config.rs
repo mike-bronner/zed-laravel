@@ -482,43 +482,9 @@ fn extract_provider_blade_aliases(source: &str, aliases: &mut HashMap<String, St
 /// pulling out single-quoted alias/view pairs. Skips entries whose value is a
 /// `Class::class` reference (those are PHP component classes, not view paths).
 fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) {
-    // Find the start of the aliases block: 'aliases' => [
-    let Some(aliases_pos) = source
-        .find("'aliases'")
-        .or_else(|| source.find("\"aliases\""))
-    else {
+    let Some(block) = php_array_block(source, "aliases") else {
         return;
     };
-
-    // Find the opening bracket of the alias array after 'aliases' =>
-    let after_key = &source[aliases_pos..];
-    let Some(open_bracket_rel) = after_key.find('[') else {
-        return;
-    };
-
-    // Walk character-by-character to find the matching close bracket so we
-    // don't pick up entries from sibling top-level config keys.
-    let block_start = aliases_pos + open_bracket_rel + 1;
-    let mut depth: i32 = 1;
-    let mut block_end = block_start;
-    for (idx, ch) in source[block_start..].char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    block_end = block_start + idx;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth != 0 {
-        return;
-    }
-
-    let block = &source[block_start..block_end];
 
     for raw_line in block.lines() {
         let line = raw_line.trim();
@@ -548,6 +514,35 @@ fn parse_component_aliases(source: &str, aliases: &mut HashMap<String, String>) 
 
         aliases.insert(alias_name.to_string(), view_path.to_string());
     }
+}
+
+/// Find the contents of the PHP array literal assigned to `key` in a config
+/// source: `'{key}' => [ ... ]`. Walks character-by-character to the matching
+/// close bracket so entries from sibling top-level config keys are never
+/// picked up. Returns the text between the brackets.
+fn php_array_block<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let key_pos = source
+        .find(&format!("'{key}'"))
+        .or_else(|| source.find(&format!("\"{key}\"")))?;
+
+    let after_key = &source[key_pos..];
+    let open_bracket_rel = after_key.find('[')?;
+
+    let block_start = key_pos + open_bracket_rel + 1;
+    let mut depth: i32 = 1;
+    for (idx, ch) in source[block_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[block_start..block_start + idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Split a PHP array entry like `'alias' => 'view.path',` into (key, value).

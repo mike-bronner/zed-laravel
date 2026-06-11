@@ -529,3 +529,31 @@ fn resolve_php_path_expression_handles_helpers_and_literals() {
     // Unparseable expressions are skipped, not mangled.
     assert_eq!(resolve_php_path_expression("env('SOME_DIR')", root), None);
 }
+
+#[test]
+fn livewire_empty_app_override_disables_vendor_defaults() {
+    // 'component_namespaces' => [] in the app config is a deliberate
+    // disable — it must NOT fall through to the vendor defaults.
+    let tmp = std::env::temp_dir().join(format!(
+        "laravel-lsp-test-lw-empty-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let vendor_dir = tmp.join("vendor/livewire/livewire/config");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("livewire.php"), LIVEWIRE_VENDOR_CONFIG).unwrap();
+    let app_dir = tmp.join("config");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("livewire.php"),
+        "<?php return ['component_namespaces' => []];",
+    )
+    .unwrap();
+
+    assert!(
+        livewire_component_namespaces(&tmp).is_empty(),
+        "an explicit empty override must disable the vendor defaults"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

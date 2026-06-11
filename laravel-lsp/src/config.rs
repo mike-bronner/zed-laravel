@@ -543,19 +543,25 @@ pub fn livewire_component_namespaces(root: &Path) -> Vec<(String, PathBuf)> {
         let Ok(source) = fs::read_to_string(&config_path) else {
             continue;
         };
-        let parsed = parse_livewire_component_namespaces(&source, root);
-        if !parsed.is_empty() {
+        // A present key is authoritative even when its array is empty —
+        // `'component_namespaces' => []` is how an app *disables* Livewire's
+        // defaults (Laravel's config merge replaces the array wholesale).
+        // Only a missing key falls through to the vendor defaults.
+        if let Some(parsed) = parse_livewire_component_namespaces(&source, root) {
             return parsed;
         }
     }
     Vec::new()
 }
 
-fn parse_livewire_component_namespaces(source: &str, root: &Path) -> Vec<(String, PathBuf)> {
+/// Returns `None` when the `component_namespaces` key is absent from the
+/// source, `Some(entries)` (possibly empty) when it is present.
+fn parse_livewire_component_namespaces(
+    source: &str,
+    root: &Path,
+) -> Option<Vec<(String, PathBuf)>> {
     let mut namespaces = Vec::new();
-    let Some(block) = php_array_block(source, "component_namespaces") else {
-        return namespaces;
-    };
+    let block = php_array_block(source, "component_namespaces")?;
 
     for raw_line in block.lines() {
         let line = raw_line.trim();
@@ -579,7 +585,7 @@ fn parse_livewire_component_namespaces(source: &str, root: &Path) -> Vec<(String
         namespaces.push((namespace.to_string(), path));
     }
 
-    namespaces
+    Some(namespaces)
 }
 
 /// Resolve a PHP path expression from a config value to an absolute path.

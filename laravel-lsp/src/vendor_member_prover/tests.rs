@@ -273,6 +273,29 @@ fn app_side_interface_does_not_trigger_consumer_scan() {
 }
 
 #[test]
+fn interface_extends_cycle_terminates() {
+    // A extends B, B extends A — the hop walk in the consumer scan has its own
+    // visited-set + bound, textually separate from the chain walk's, so it
+    // needs its own termination pin (this test failing = an infinite loop /
+    // hang in `member_read_by_interface_consumers`).
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\A;\nclass SyncJob implements A { public $x = 1; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/A.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface A extends B {}\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/B.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\ninterface B extends A {}\n",
+        ),
+    ]);
+    assert!(!member_read_in_chain(&root, "App\\Jobs\\SyncJob", "x"));
+}
+
+#[test]
 fn extends_cycle_terminates() {
     // A extends B, B extends A — the visited-set must break the cycle and the
     // walk must return (this test failing = an infinite loop / hang).

@@ -179,6 +179,36 @@ fn proves_read_via_interface_implemented_by_vendor_parent() {
 }
 
 #[test]
+fn proves_read_via_parent_contract_in_different_package() {
+    // The implemented interface extends a contract in a DIFFERENT package, and
+    // the consumer read lives with the parent — the hop walk must follow
+    // `interface A extends B` across package boundaries.
+    let (_dir, root) = project_with_files(&[
+        (
+            "app/Jobs/SyncJob.php",
+            "<?php\nnamespace App\\Jobs;\nuse Acme\\Queue\\Contracts\\ShouldQueue;\nclass SyncJob implements ShouldQueue { public int $attempts = 2; }\n",
+        ),
+        (
+            "vendor/acme/queue/src/Contracts/ShouldQueue.php",
+            "<?php\nnamespace Acme\\Queue\\Contracts;\nuse Base\\Contracts\\Job;\ninterface ShouldQueue extends Job {}\n",
+        ),
+        (
+            "vendor/base/contracts/src/Job.php",
+            "<?php\nnamespace Base\\Contracts;\ninterface Job {}\n",
+        ),
+        (
+            "vendor/base/contracts/src/Runner.php",
+            "<?php\nnamespace Base\\Contracts;\nclass Runner { public function f($j) { return $j->attempts; } }\n",
+        ),
+    ]);
+    assert!(member_read_in_chain(
+        &root,
+        "App\\Jobs\\SyncJob",
+        "attempts"
+    ));
+}
+
+#[test]
 fn member_unread_by_interface_package_is_not_proven() {
     // The package owns the interface but never touches the member — the scan
     // must not turn "implements a vendor interface" into blanket immunity.

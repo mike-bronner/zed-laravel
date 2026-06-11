@@ -45,6 +45,19 @@
 //! server restart anyway). The full `vendor/` tree (often 10k+ files across
 //! dozens of packages) is never walked.
 //!
+//! ## Known trade-off — suppression strength scales inversely with name rarity
+//!
+//! The consumer scan matches `->member` on ANY receiver, because the
+//! framework's read sites don't reliably type-hint the contract
+//! (`Queue::getJobTries($job)` takes an untyped parameter — requiring the
+//! interface to be named in the reading file would regress the very case this
+//! module exists for). The cost: a zero-reference property with a *common*
+//! name (`$name`, `$id`) on a class whose chain implements any framework
+//! interface is effectively never flagged — some file in `laravel/framework`
+//! touches `->name`. That is the safe failure direction for a WARNING-level
+//! hint: a false negative hides a nudge, a false positive nags about live
+//! code.
+//!
 //! ## Concurrency
 //!
 //! [`member_read_in_chain`] is **synchronous**: it does filesystem IO and
@@ -146,31 +159,63 @@ pub fn member_read_in_chain(root: &Path, fqcn: &str, member: &str) -> bool {
     member_read_by_interface_consumers(root, &interfaces, member)
 }
 
-/// Whether any vendor package owning one of `interfaces` reads `->member` on
-/// any receiver. This is the duck-typed half of the proof: the framework reads
-/// `$job->tries` in `Illuminate\Queue\Queue`, which is in NO job's inheritance
-/// chain — but it IS in the package that owns the `ShouldQueue` contract the
-/// job implements.
+/// Whether any vendor package owning one of `interfaces` — or a parent
+/// contract one of them `extends` — touches `->member` on any receiver. This
+/// is the duck-typed half of the proof: the framework reads `$job->tries` in
+/// `Illuminate\Queue\Queue`, which is in NO job's inheritance chain — but it
+/// IS in the package that owns the `ShouldQueue` contract the job implements.
+///
+/// Parent contracts are followed because an interface may `extends` one from a
+/// *different* package, and the consumer reads can live with the parent. The
+/// hop walk reuses the chain walk's visited-set + bound discipline. (The
+/// structure extractor captures one `extends` parent per declaration — a
+/// pre-existing walker limitation — so multi-parent interfaces contribute
+/// their first parent only.)
 ///
 /// Interfaces that resolve outside `vendor/` (app-side contracts) are skipped:
 /// app-side consumer reads are ordinary project references the index already
 /// counts. Each package is scanned at most once per (package, member) — see
-/// [`package_reads_member`] for the memoization.
+/// [`package_touches_member`] for the memoization.
 fn member_read_by_interface_consumers(
     root: &Path,
     interfaces: &HashSet<String>,
     member: &str,
 ) -> bool {
     let mut packages: HashSet<PathBuf> = HashSet::new();
-    for iface in interfaces {
-        let Some(path) = find_php_class_file_in_app_or_vendor(iface, root) else {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = interfaces.iter().cloned().collect();
+
+    while let Some(iface) = queue.pop() {
+        if visited.len() >= MAX_CHAIN_VISITS {
+            break;
+        }
+        if iface.is_empty() || !visited.insert(iface.clone()) {
+            continue;
+        }
+        let Some(path) = find_php_class_file_in_app_or_vendor(&iface, root) else {
             continue;
         };
         if let Some(pkg) = vendor_package_root(root, &path) {
             packages.insert(pkg);
         }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // `interface A extends B` lands in `extends`; `implements` is taken
+        // too in case a basename-fallback resolution landed on a class.
+        for node in classes_in_file(&path, &content) {
+            if let Some(parent) = node.extends {
+                queue.push(normalize(&parent));
+            }
+            for parent in node.implements {
+                queue.push(normalize(&parent));
+            }
+        }
     }
-    packages.iter().any(|pkg| package_reads_member(pkg, member))
+
+    packages
+        .iter()
+        .any(|pkg| package_touches_member(pkg, member))
 }
 
 /// `<root>/vendor/<vendor>/<package>` for a file under it, or `None` for any
@@ -195,11 +240,11 @@ fn vendor_package_root(root: &Path, file: &Path) -> Option<PathBuf> {
 static PACKAGE_MEMBER_READS: LazyLock<Mutex<HashMap<(PathBuf, String), bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Whether any PHP file in the package tree reads `->member` on any receiver.
-/// Memoized in [`PACKAGE_MEMBER_READS`]. Files are prefiltered with a cheap
-/// `->member` substring check so tree-sitter only parses candidates; the walk
-/// is bounded by [`MAX_PACKAGE_FILES`].
-fn package_reads_member(package_root: &Path, member: &str) -> bool {
+/// Whether any PHP file in the package tree touches `->member` on any
+/// receiver. Memoized in [`PACKAGE_MEMBER_READS`]. Files are prefiltered with
+/// a cheap `->member` substring check so tree-sitter only parses candidates;
+/// the walk is bounded by [`MAX_PACKAGE_FILES`].
+fn package_touches_member(package_root: &Path, member: &str) -> bool {
     let key = (package_root.to_path_buf(), member.to_string());
     if let Some(&hit) = PACKAGE_MEMBER_READS.lock().unwrap().get(&key) {
         return hit;
@@ -228,7 +273,7 @@ fn package_reads_member(package_root: &Path, member: &str) -> bool {
         if !content.contains(&needle) {
             continue;
         }
-        if source_reads_member_any_receiver(&content, member) {
+        if source_touches_member_any_receiver(&content, member) {
             found = true;
             break;
         }
@@ -267,11 +312,13 @@ fn source_reads_member(source: &str, member: &str) -> bool {
 /// Whether `source` contains a property access `->member` (or `?->member`) on
 /// ANY receiver — `$job->tries`, `$this->tries`, `$x?->tries`. Used by the
 /// consumer scan, where the framework reads the property off an object it was
-/// handed, so the receiver variable can be anything. Method calls
-/// (`$job->tries()`) are a different tree-sitter node kind
+/// handed, so the receiver variable can be anything. "Touches", not "reads":
+/// an access on an assignment's left side matches too, and that's deliberate —
+/// a framework that *writes* the property is equally proof the member isn't
+/// dead. Method calls (`$job->tries()`) are a different tree-sitter node kind
 /// (`member_call_expression`) and intentionally do NOT match: the diagnostic
-/// only lenses properties, so only property reads count as proof.
-fn source_reads_member_any_receiver(source: &str, member: &str) -> bool {
+/// only lenses properties, so only property accesses count as proof.
+fn source_touches_member_any_receiver(source: &str, member: &str) -> bool {
     let Ok(tree) = parse_php(source) else {
         return false;
     };

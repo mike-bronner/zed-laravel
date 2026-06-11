@@ -74,7 +74,11 @@ $h = config()->array('app.providers');
     let patterns =
         extract_all_php_patterns(&tree, php_code, &lang).expect("Should extract patterns");
 
-    let keys: Vec<&str> = patterns.config_calls.iter().map(|c| c.config_key).collect();
+    let keys: Vec<&str> = patterns
+        .config_calls
+        .iter()
+        .map(|c| c.config_key.as_ref())
+        .collect();
 
     // Existing function call still works
     assert!(

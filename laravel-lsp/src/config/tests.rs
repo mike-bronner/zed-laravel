@@ -534,10 +534,8 @@ fn resolve_php_path_expression_handles_helpers_and_literals() {
 fn livewire_empty_app_override_disables_vendor_defaults() {
     // 'component_namespaces' => [] in the app config is a deliberate
     // disable — it must NOT fall through to the vendor defaults.
-    let tmp = std::env::temp_dir().join(format!(
-        "laravel-lsp-test-lw-empty-{}",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("laravel-lsp-test-lw-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let vendor_dir = tmp.join("vendor/livewire/livewire/config");
     std::fs::create_dir_all(&vendor_dir).unwrap();
@@ -553,6 +551,87 @@ fn livewire_empty_app_override_disables_vendor_defaults() {
     assert!(
         livewire_component_namespaces(&tmp).is_empty(),
         "an explicit empty override must disable the vendor defaults"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ─── Config string value resolution (MaryUI prefix, issue #79) ────────────
+
+#[test]
+fn php_top_level_string_value_ignores_nested_keys() {
+    let source = r#"<?php
+return [
+    'components' => [
+        'prefix' => 'nested-should-not-match',
+    ],
+    'prefix' => 'mary-',
+];
+"#;
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some("mary-".to_string())
+    );
+}
+
+#[test]
+fn php_top_level_string_value_takes_env_default() {
+    let source = r#"<?php
+return [
+    'prefix' => env('MARY_PREFIX', 'mary-'),
+];
+"#;
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some("mary-".to_string())
+    );
+}
+
+#[test]
+fn php_top_level_string_value_handles_empty_string() {
+    let source = "<?php\nreturn [\n    'prefix' => '',\n];\n";
+    assert_eq!(
+        php_top_level_string_value(source, "prefix"),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn resolve_config_string_app_override_wins_over_package_default() {
+    let tmp = std::env::temp_dir().join(format!("laravel-lsp-test-cfgstr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let pkg_config = tmp.join("vendor/robsontenorio/mary/config");
+    std::fs::create_dir_all(&pkg_config).unwrap();
+    std::fs::write(
+        pkg_config.join("mary.php"),
+        "<?php return ['prefix' => ''];",
+    )
+    .unwrap();
+    let provider_path = tmp.join("vendor/robsontenorio/mary/src/MaryServiceProvider.php");
+
+    // Package default only.
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.prefix", &provider_path),
+        Some(String::new())
+    );
+
+    // App override wins.
+    let app_config = tmp.join("config");
+    std::fs::create_dir_all(&app_config).unwrap();
+    std::fs::write(
+        app_config.join("mary.php"),
+        "<?php return ['prefix' => 'mary-'];",
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.prefix", &provider_path),
+        Some("mary-".to_string())
+    );
+
+    // Unknown key resolves to None (PHP null).
+    assert_eq!(
+        resolve_config_string_for_package(&tmp, "mary.nonexistent", &provider_path),
+        None
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

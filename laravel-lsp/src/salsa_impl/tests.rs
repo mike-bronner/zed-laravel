@@ -1736,6 +1736,205 @@ class AppServiceProvider
 }
 
 #[test]
+fn vendor_literal_registration_resolves_class_via_psr4() {
+    // MaryUI's literal form: `Blade::component('mary-card', Card::class)` in
+    // a vendor provider. The class file must resolve through the composer
+    // PSR-4 map — `Mary\` is in no hardcoded namespace mapping (issue #79,
+    // the <x-mary-card> case).
+    let provider = r#"<?php
+namespace Mary;
+
+use Mary\View\Components\Card;
+
+class MaryServiceProvider
+{
+    public function registerComponents()
+    {
+        Blade::component('mary-card', Card::class);
+    }
+}
+"#;
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "robsontenorio/mary",
+                "autoload": { "psr-4": { "Mary\\": "src/" } },
+                "install-path": "../robsontenorio/mary"
+            }
+        ]
+    }"#;
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        (
+            "vendor/robsontenorio/mary/src/View/Components/Card.php",
+            "<?php namespace Mary\\View\\Components; class Card {}",
+        ),
+    ]);
+
+    let found = parsed_blade_components(
+        provider,
+        root.join("vendor/robsontenorio/mary/src/MaryServiceProvider.php"),
+        root.clone(),
+    );
+
+    assert!(
+        found.iter().any(|(tag, class, file)| {
+            tag == "mary-card"
+                && class == "Mary\\View\\Components\\Card"
+                && file
+                    .as_ref()
+                    .is_some_and(|f| f.ends_with("src/View/Components/Card.php"))
+        }),
+        "vendor literal registration must resolve its class via PSR-4, got {found:?}"
+    );
+}
+
+#[test]
+fn prefix_computed_registration_resolves_config_prefix() {
+    // MaryUI's catalog form: the tag is computed from a config value.
+    //   $prefix = config('mary.prefix');
+    //   Blade::component($prefix . 'card', Card::class);
+    // With the package's bundled default ('') the tag is `card`; an app
+    // config override ('mary-') changes it to `mary-card`.
+    let provider = r#"<?php
+namespace Mary;
+
+use Mary\View\Components\Card;
+
+class MaryServiceProvider
+{
+    public function registerComponents()
+    {
+        $prefix = config('mary.prefix');
+
+        Blade::component($prefix . 'card', Card::class);
+    }
+}
+"#;
+    let installed = r#"{
+        "packages": [
+            {
+                "name": "robsontenorio/mary",
+                "autoload": { "psr-4": { "Mary\\": "src/" } },
+                "install-path": "../robsontenorio/mary"
+            }
+        ]
+    }"#;
+    let package_config = r#"<?php
+return [
+    'prefix' => '',
+];
+"#;
+
+    // Package default prefix: ''.
+    let (_dir, root) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        ("vendor/robsontenorio/mary/config/mary.php", package_config),
+        (
+            "vendor/robsontenorio/mary/src/View/Components/Card.php",
+            "<?php namespace Mary\\View\\Components; class Card {}",
+        ),
+    ]);
+    let found = parsed_blade_components(
+        provider,
+        root.join("vendor/robsontenorio/mary/src/MaryServiceProvider.php"),
+        root.clone(),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(tag, _, file)| tag == "card" && file.is_some()),
+        "default '' prefix must register the bare tag, got {found:?}"
+    );
+
+    // App config override: 'mary-'.
+    let (_dir2, root2) = project_with_files(&[
+        ("vendor/composer/installed.json", installed),
+        ("vendor/robsontenorio/mary/config/mary.php", package_config),
+        ("config/mary.php", "<?php return ['prefix' => 'mary-'];"),
+        (
+            "vendor/robsontenorio/mary/src/View/Components/Card.php",
+            "<?php namespace Mary\\View\\Components; class Card {}",
+        ),
+    ]);
+    let found = parsed_blade_components(
+        provider,
+        root2.join("vendor/robsontenorio/mary/src/MaryServiceProvider.php"),
+        root2.clone(),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(tag, _, file)| tag == "mary-card" && file.is_some()),
+        "app config prefix override must win, got {found:?}"
+    );
+}
+
+#[tokio::test]
+async fn livewire_config_namespaces_merge_into_laravel_config() {
+    // The SalsaActor assembly wiring (the `or_insert` merge): a vendor
+    // Livewire v4 config's component_namespaces must surface in
+    // LaravelConfigData.anonymous_component_paths, and an explicit
+    // Blade::anonymousComponentPath registration for the same namespace
+    // must win over the Livewire-derived entry.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let lw_config = root.join("vendor/livewire/livewire/config/livewire.php");
+    std::fs::create_dir_all(lw_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &lw_config,
+        "<?php return ['component_namespaces' => ['layouts' => resource_path('views/layouts')]];",
+    )
+    .unwrap();
+
+    let handle = SalsaActor::spawn();
+    handle
+        .register_config_files(root.clone(), None, None, None)
+        .await
+        .unwrap();
+    let config = handle
+        .get_laravel_config()
+        .await
+        .unwrap()
+        .expect("config should build");
+    assert_eq!(
+        config.anonymous_component_paths.get("layouts"),
+        Some(&root.join("resources/views/layouts")),
+        "Livewire config namespaces must merge into anonymous_component_paths"
+    );
+
+    // Explicit registration wins.
+    let provider = r#"<?php
+class AppServiceProvider
+{
+    public function boot()
+    {
+        Blade::anonymousComponentPath(resource_path('views/custom-layouts'), 'layouts');
+    }
+}
+"#;
+    handle
+        .register_service_provider_source(
+            root.join("app/Providers/AppServiceProvider.php"),
+            provider.to_string(),
+            2,
+            root.clone(),
+        )
+        .await
+        .unwrap();
+    let config = handle
+        .get_laravel_config()
+        .await
+        .unwrap()
+        .expect("config should rebuild");
+    assert_eq!(
+        config.anonymous_component_paths.get("layouts"),
+        Some(&root.join("resources/views/custom-layouts")),
+        "an explicit anonymousComponentPath registration must win over the Livewire default"
+    );
+}
+
+#[test]
 fn class_component_registration_resolves_via_candidate_paths() {
     // End of the chain: a tag present in `class_component_files` must surface
     // from `component_candidate_paths`, so the shared diagnostic/goto resolver

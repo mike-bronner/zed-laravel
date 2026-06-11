@@ -588,6 +588,103 @@ fn parse_livewire_component_namespaces(
     Some(namespaces)
 }
 
+/// Resolve a dotted config key (`mary.prefix`) to its string value the way
+/// Laravel would at boot: the app's `config/{file}.php` wins; otherwise the
+/// registering package's own bundled `config/{file}.php` default (packages
+/// `mergeConfigFrom` their config under the same key). The package config is
+/// located by walking up from the provider file to the nearest `config/`
+/// sibling, stopping at the project root. Returns `None` when neither
+/// defines the key — PHP's `config()` would yield null there.
+pub fn resolve_config_string_for_package(
+    root: &Path,
+    dotted_key: &str,
+    provider_path: &Path,
+) -> Option<String> {
+    let (file, key) = dotted_key.split_once('.')?;
+    let config_file = format!("{file}.php");
+
+    // App override.
+    if let Ok(source) = fs::read_to_string(root.join("config").join(&config_file)) {
+        if let Some(value) = php_top_level_string_value(&source, key) {
+            return Some(value);
+        }
+    }
+
+    // Package default: provider at `<pkg>/src/FooServiceProvider.php` →
+    // `<pkg>/config/{file}.php`.
+    let mut dir = provider_path.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("config").join(&config_file);
+        if candidate.exists() {
+            let source = fs::read_to_string(&candidate).ok()?;
+            return php_top_level_string_value(&source, key);
+        }
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+
+    None
+}
+
+/// Find the string value of a **top-level** key in a PHP config file
+/// (`return ['prefix' => 'mary-', ...]`), ignoring same-named keys nested
+/// inside sub-arrays. Handles plain string literals and the
+/// `env('NAME', 'default')` form (the default is taken — .env overrides are
+/// out of static reach).
+pub fn php_top_level_string_value(source: &str, key: &str) -> Option<String> {
+    let return_pos = source.find("return")?;
+    let open_rel = source[return_pos..].find('[')?;
+    let block_start = return_pos + open_rel + 1;
+
+    let mut depth: i32 = 1;
+    let mut block_end = None;
+    for (idx, ch) in source[block_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    block_end = Some(block_start + idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &source[block_start..block_end?];
+
+    let needle_sq = format!("'{key}'");
+    let needle_dq = format!("\"{key}\"");
+    let mut rel_depth: i32 = 0;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if rel_depth == 0 && (trimmed.starts_with(&needle_sq) || trimmed.starts_with(&needle_dq)) {
+            let (_, value) = split_arrow_pair(trimmed)?;
+            if let Some(literal) = unquote(value) {
+                return Some(literal.to_string());
+            }
+            // env('NAME', 'default') → the default argument.
+            if let Some(rest) = value.strip_prefix("env(") {
+                let inner = rest.rsplit_once(')')?.0;
+                let default = inner.split_once(',')?.1.trim();
+                return unquote(default).map(str::to_string);
+            }
+            return None;
+        }
+        for ch in line.chars() {
+            match ch {
+                '[' => rel_depth += 1,
+                ']' => rel_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
 /// Resolve a PHP path expression from a config value to an absolute path.
 /// Handles the Laravel path helpers (`resource_path('x')`, `base_path('x')`,
 /// `app_path('x')`) and plain string literals (absolute, or root-relative).

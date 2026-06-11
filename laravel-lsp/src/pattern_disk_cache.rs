@@ -84,7 +84,14 @@ use crate::salsa_impl::ParsedPatternsData;
 ///   v9 — call-form member accesses (`->active()`, `User::whereEmail()`, #77)
 ///        now captured with an `AccessForm` field. Caches from before lack
 ///        every call-form site; bump to force a re-parse.
-const SCHEMA_VERSION: u32 = 9;
+///   v10 — interpolated-string extraction changed (#84): fragments are
+///        skipped, config keys constant-propagate to full dotted keys.
+///        Cached patterns from older extractors still carry fragment keys
+///        (`.export_connection`) on restored files; bump to force a
+///        re-parse. The envelope SHAPE didn't change — only the extraction
+///        OUTPUT — which is exactly why an output-affecting change must
+///        bump this even when serde would happily decode the old bytes.
+const SCHEMA_VERSION: u32 = 10;
 
 const CACHE_FILENAME: &str = "pattern_cache.bin";
 

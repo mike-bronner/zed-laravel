@@ -18351,6 +18351,21 @@ fn symbol_entry_kind_to_lsp(kind: laravel_lsp::document_symbols::SymbolEntryKind
     }
 }
 
+/// A zero-width range at the top of the file — the compound file-level lens
+/// anchor for a declaration-less Blade view (or a class-less PHP fallback).
+fn zero_anchor() -> Range {
+    Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 0,
+            character: 0,
+        },
+    }
+}
+
 impl LaravelLanguageServer {
     /// Collect every code-lens item for a file — each a `(range, symbols)` pair.
     /// Position lenses (magic members, routes, env, config, translation) carry
@@ -18446,17 +18461,30 @@ impl LaravelLanguageServer {
                 }
             }
             if !file_symbols.is_empty() {
+                // Anchor the compound lens. A Blade view has no declaration to
+                // attach to, so it keeps the line-0 anchor. A PHP class file
+                // anchors on its `class` declaration so the lens renders above
+                // the class name, not at line 0 (#78); a class-less `.php`
+                // (e.g. an anonymous Volt component) falls back to line 0.
+                let range = if file_name.ends_with(".blade.php") {
+                    zero_anchor()
+                } else {
+                    match laravel_lsp::code_lens::class_declaration_position(source) {
+                        Some((line, column, end_column)) => Range {
+                            start: Position {
+                                line,
+                                character: column,
+                            },
+                            end: Position {
+                                line,
+                                character: end_column,
+                            },
+                        },
+                        None => zero_anchor(),
+                    }
+                };
                 items.push(LensItem {
-                    range: Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                    },
+                    range,
                     symbols: file_symbols,
                 });
             }

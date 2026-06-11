@@ -365,3 +365,66 @@ fn file_level_symbols_empty_for_non_blade() {
     let config = lens_config(&root);
     assert!(file_level_symbols(&root.join("app/Models/User.php"), &config).is_empty());
 }
+
+#[test]
+fn class_declaration_position_anchors_on_the_class_name() {
+    // A Livewire component class file — the compound lens must anchor on the
+    // `class` declaration, not line 0 (#78).
+    let src = r#"<?php
+
+namespace App\Livewire;
+
+use Livewire\Component;
+
+class Counter extends Component
+{
+    public int $count = 0;
+}
+"#;
+    let (line, col, end) = class_declaration_position(src).expect("named class has a position");
+    // `class Counter` sits on line 6 (0-based).
+    assert_eq!(line, 6);
+    let text = src.lines().nth(line as usize).unwrap();
+    // The anchor spans the class name `Counter`, not the `class` keyword.
+    assert_eq!(col, text.find("Counter").unwrap() as u32);
+    assert_eq!(end, col + "Counter".len() as u32);
+}
+
+#[test]
+fn class_declaration_position_none_for_anonymous_class() {
+    // An anonymous Volt component (`new class extends Component`) has no name
+    // node — the caller falls back to the line-0 anchor.
+    let src = r#"<?php
+
+use Livewire\Volt\Component;
+
+new class extends Component {
+    public int $count = 0;
+};
+"#;
+    assert!(class_declaration_position(src).is_none());
+}
+
+#[test]
+fn class_declaration_position_none_without_a_class() {
+    // A class-less PHP file (e.g. a plain config array) has nothing to anchor.
+    let src = "<?php\n\nreturn ['name' => 'Laravel'];\n";
+    assert!(class_declaration_position(src).is_none());
+}
+
+#[test]
+fn class_declaration_position_takes_the_earliest_class() {
+    // Two top-level classes — the anchor is the first by source position.
+    let src = r#"<?php
+
+namespace App;
+
+class First {}
+
+class Second {}
+"#;
+    let (line, col, _) = class_declaration_position(src).expect("a named class exists");
+    assert_eq!(line, 4);
+    let text = src.lines().nth(line as usize).unwrap();
+    assert_eq!(col, text.find("First").unwrap() as u32);
+}

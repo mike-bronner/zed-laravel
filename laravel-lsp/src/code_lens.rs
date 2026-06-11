@@ -437,5 +437,35 @@ fn first_class_fqcn(root: Node, bytes: &[u8]) -> Option<String> {
     })
 }
 
+/// The earliest named `class_declaration`'s name position (0-based row, start
+/// col, end col), or `None` for a file with no named class — an anonymous class
+/// (`new class extends Component`) or no class at all. Used to anchor the
+/// compound file-level lens on the `class` declaration line for a PHP class
+/// file (#78) instead of line 0, which is only correct for declaration-less
+/// Blade views. Reuses [`name_position`], the same machinery
+/// [`component_targets`] anchors member lenses with.
+pub fn class_declaration_position(source: &str) -> Option<(u32, u32, u32)> {
+    let tree = parse_php(source).ok()?;
+    let bytes = source.as_bytes();
+    let mut best: Option<(u32, u32, u32)> = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "class_declaration" {
+            if let Some((_, line, col, end)) = name_position(n, bytes) {
+                // Keep the earliest by source position — DFS pop order isn't
+                // source order, so compare rather than take the first popped.
+                if best.is_none_or(|(bl, bc, _)| (line, col) < (bl, bc)) {
+                    best = Some((line, col, end));
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests;

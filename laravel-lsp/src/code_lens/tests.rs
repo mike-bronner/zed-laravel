@@ -365,3 +365,114 @@ fn file_level_symbols_empty_for_non_blade() {
     let config = lens_config(&root);
     assert!(file_level_symbols(&root.join("app/Models/User.php"), &config).is_empty());
 }
+
+#[test]
+fn class_declaration_position_anchors_on_the_class_name() {
+    // A Livewire component class file — the compound lens must anchor on the
+    // `class` declaration, not line 0 (#78).
+    let src = r#"<?php
+
+namespace App\Livewire;
+
+use Livewire\Component;
+
+class Counter extends Component
+{
+    public int $count = 0;
+}
+"#;
+    let (line, col, end) = class_declaration_position(src).expect("named class has a position");
+    // `class Counter` sits on line 6 (0-based).
+    assert_eq!(line, 6);
+    let text = src.lines().nth(line as usize).unwrap();
+    // The anchor spans the class name `Counter`, not the `class` keyword.
+    assert_eq!(col, text.find("Counter").unwrap() as u32);
+    assert_eq!(end, col + "Counter".len() as u32);
+}
+
+#[test]
+fn class_declaration_position_none_for_anonymous_class() {
+    // An anonymous Volt component (`new class extends Component`) has no name
+    // node — the caller falls back to the line-0 anchor.
+    let src = r#"<?php
+
+use Livewire\Volt\Component;
+
+new class extends Component {
+    public int $count = 0;
+};
+"#;
+    assert!(class_declaration_position(src).is_none());
+}
+
+#[test]
+fn class_declaration_position_none_without_a_class() {
+    // A class-less PHP file (e.g. a plain config array) has nothing to anchor.
+    let src = "<?php\n\nreturn ['name' => 'Laravel'];\n";
+    assert!(class_declaration_position(src).is_none());
+}
+
+#[test]
+fn class_declaration_position_takes_the_earliest_class() {
+    // Two top-level classes — the anchor is the first by source position.
+    let src = r#"<?php
+
+namespace App;
+
+class First {}
+
+class Second {}
+"#;
+    let (line, col, _) = class_declaration_position(src).expect("a named class exists");
+    assert_eq!(line, 4);
+    let text = src.lines().nth(line as usize).unwrap();
+    assert_eq!(col, text.find("First").unwrap() as u32);
+}
+
+#[test]
+fn compound_lens_anchor_blade_view_anchors_at_line_zero() {
+    // A Blade view has no class declaration to attach to — the compound lens
+    // must keep the line-0 anchor (#78). `None` tells the caller to use the
+    // zero-width top-of-file range.
+    let src = "<div>{{ $count }}</div>\n";
+    assert!(
+        compound_lens_anchor("counter.blade.php", src).is_none(),
+        "a Blade view must anchor at line 0, never on a class declaration"
+    );
+}
+
+#[test]
+fn compound_lens_anchor_php_class_anchors_on_the_declaration() {
+    // A Livewire-style PHP class file routes to the `class` declaration
+    // position, not line 0 (#78).
+    let src = r#"<?php
+
+namespace App\Livewire;
+
+use Livewire\Component;
+
+class Counter extends Component
+{
+    public int $count = 0;
+}
+"#;
+    let (line, col, end) =
+        compound_lens_anchor("Counter.php", src).expect("a named PHP class produces an anchor");
+    // Identical to `class_declaration_position` — the helper routes straight
+    // through for a non-Blade file. `class Counter` sits on line 6 (0-based).
+    assert_eq!((line, col, end), class_declaration_position(src).unwrap());
+    assert_eq!(line, 6);
+    let text = src.lines().nth(line as usize).unwrap();
+    assert_eq!(col, text.find("Counter").unwrap() as u32);
+}
+
+#[test]
+fn compound_lens_anchor_class_less_php_falls_back_to_line_zero() {
+    // A class-less `.php` file (e.g. a plain config array or an anonymous Volt
+    // component) has nothing to anchor — fall back to line 0.
+    let src = "<?php\n\nreturn ['name' => 'Laravel'];\n";
+    assert!(
+        compound_lens_anchor("config.php", src).is_none(),
+        "a class-less PHP file must fall back to the line-0 anchor"
+    );
+}

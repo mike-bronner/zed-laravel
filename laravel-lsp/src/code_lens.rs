@@ -437,5 +437,50 @@ fn first_class_fqcn(root: Node, bytes: &[u8]) -> Option<String> {
     })
 }
 
+/// The earliest named `class_declaration`'s name position (0-based row, start
+/// col, end col), or `None` for a file with no named class — an anonymous class
+/// (`new class extends Component`) or no class at all. Used to anchor the
+/// compound file-level lens on the `class` declaration line for a PHP class
+/// file (#78) instead of line 0, which is only correct for declaration-less
+/// Blade views. Reuses [`name_position`], the same machinery
+/// [`component_targets`] anchors member lenses with.
+pub fn class_declaration_position(source: &str) -> Option<(u32, u32, u32)> {
+    let tree = parse_php(source).ok()?;
+    let bytes = source.as_bytes();
+    let mut best: Option<(u32, u32, u32)> = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "class_declaration" {
+            if let Some((_, line, col, end)) = name_position(n, bytes) {
+                // Keep the earliest by source position — DFS pop order isn't
+                // source order, so compare rather than take the first popped.
+                if best.is_none_or(|(bl, bc, _)| (line, col) < (bl, bc)) {
+                    best = Some((line, col, end));
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    best
+}
+
+/// Select the compound file-level lens anchor for a file. A `.blade.php` view
+/// has no class declaration to attach to, so it anchors at line 0 (`None` here
+/// — the caller substitutes a zero-width top-of-file range). Any other file is
+/// treated as a PHP source: a named class anchors on its `class` declaration
+/// (#78), while an anonymous or class-less file falls back to line 0 (also
+/// `None`). Returning `None` for both the Blade and class-less cases lets the
+/// caller share a single zero-anchor fallback.
+pub fn compound_lens_anchor(file_name: &str, source: &str) -> Option<(u32, u32, u32)> {
+    if file_name.ends_with(".blade.php") {
+        None
+    } else {
+        class_declaration_position(source)
+    }
+}
+
 #[cfg(test)]
 mod tests;

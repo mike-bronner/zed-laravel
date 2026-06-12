@@ -467,5 +467,20 @@ pub fn class_declaration_position(source: &str) -> Option<(u32, u32, u32)> {
     best
 }
 
+/// Select the compound file-level lens anchor for a file. A `.blade.php` view
+/// has no class declaration to attach to, so it anchors at line 0 (`None` here
+/// — the caller substitutes a zero-width top-of-file range). Any other file is
+/// treated as a PHP source: a named class anchors on its `class` declaration
+/// (#78), while an anonymous or class-less file falls back to line 0 (also
+/// `None`). Returning `None` for both the Blade and class-less cases lets the
+/// caller share a single zero-anchor fallback.
+pub fn compound_lens_anchor(file_name: &str, source: &str) -> Option<(u32, u32, u32)> {
+    if file_name.ends_with(".blade.php") {
+        None
+    } else {
+        class_declaration_position(source)
+    }
+}
+
 #[cfg(test)]
 mod tests;

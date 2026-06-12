@@ -18465,23 +18465,21 @@ impl LaravelLanguageServer {
                 // attach to, so it keeps the line-0 anchor. A PHP class file
                 // anchors on its `class` declaration so the lens renders above
                 // the class name, not at line 0 (#78); a class-less `.php`
-                // (e.g. an anonymous Volt component) falls back to line 0.
-                let range = if file_name.ends_with(".blade.php") {
-                    zero_anchor()
-                } else {
-                    match laravel_lsp::code_lens::class_declaration_position(source) {
-                        Some((line, column, end_column)) => Range {
-                            start: Position {
-                                line,
-                                character: column,
-                            },
-                            end: Position {
-                                line,
-                                character: end_column,
-                            },
+                // (e.g. an anonymous Volt component) falls back to line 0. The
+                // routing decision lives in `compound_lens_anchor` so it can be
+                // unit-tested independently of this async server method.
+                let range = match laravel_lsp::code_lens::compound_lens_anchor(file_name, source) {
+                    Some((line, column, end_column)) => Range {
+                        start: Position {
+                            line,
+                            character: column,
                         },
-                        None => zero_anchor(),
-                    }
+                        end: Position {
+                            line,
+                            character: end_column,
+                        },
+                    },
+                    None => zero_anchor(),
                 };
                 items.push(LensItem {
                     range,

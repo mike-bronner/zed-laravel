@@ -18608,6 +18608,225 @@ impl LaravelLanguageServer {
         }
         false
     }
+    /// Read a document's current text — the open editor buffer if the client
+    /// has it open, else the on-disk copy. Mirrors the read pattern used by
+    /// the goto/hover handlers (issue #55 rename helpers).
+    async fn rename_document_text(&self, uri: &Url, path: &str) -> Option<String> {
+        match self.documents.read().await.get(uri).cloned() {
+            Some((content, _version)) => Some(content),
+            None => std::fs::read_to_string(path).ok(),
+        }
+    }
+
+    /// issue #55 — prepare_rename for a Blade `$variable`. Returns the
+    /// name-only range (after the `$`) when the cursor sits on a plain
+    /// variable token in a `.blade.php` file. `None` for property accesses
+    /// (`$x->prop`) or when the cursor isn't on a variable, so the caller
+    /// falls through to the other classifiers.
+    async fn prepare_blade_var_rename(&self, uri: &Url, position: Position) -> Option<Range> {
+        let path = uri.to_file_path().ok()?;
+        let path_str = path.to_str()?;
+        let content = self.rename_document_text(uri, path_str).await?;
+        let line_text = content.lines().nth(position.line as usize)?;
+        let (var_name, property) = extract_blade_variable_at_cursor(line_text, position.character)?;
+        if property.is_some() || var_name.is_empty() {
+            return None;
+        }
+        let span = laravel_lsp::blade_var_rename::variable_spans(line_text, &var_name)
+            .into_iter()
+            .find(|s| {
+                position.character >= s.start_col.saturating_sub(1)
+                    && position.character <= s.end_col
+            })?;
+        Some(Range {
+            start: Position {
+                line: position.line,
+                character: span.start_col,
+            },
+            end: Position {
+                line: position.line,
+                character: span.end_col,
+            },
+        })
+    }
+
+    /// issue #55 — prepare_rename for a controller view-data binding key
+    /// (`view('v', ['name' => …])` / `compact('name')`). Returns the key-text
+    /// range so the editor highlights just the key.
+    async fn prepare_view_binding_rename(&self, uri: &Url, position: Position) -> Option<Range> {
+        let path = uri.to_file_path().ok()?;
+        let path_str = path.to_str()?;
+        let content = self.rename_document_text(uri, path_str).await?;
+        let binding = laravel_lsp::blade_var_rename::view_binding_key_at(
+            &content,
+            position.line,
+            position.character,
+        )?;
+        Some(Range {
+            start: Position {
+                line: binding.key_span.line,
+                character: binding.key_span.start_col,
+            },
+            end: Position {
+                line: binding.key_span.line,
+                character: binding.key_span.end_col,
+            },
+        })
+    }
+
+    /// issue #55 — build the `WorkspaceEdit` for a scope-aware Blade variable
+    /// rename. Rewrites only the in-scope `$var` occurrences within the
+    /// template (loop-block scoped when the variable is loop-introduced, else
+    /// file-scoped minus any nested loop that re-binds the same name).
+    async fn blade_var_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        let path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let Some(path_str) = path.to_str() else {
+            return Ok(None);
+        };
+        let Some(content) = self.rename_document_text(uri, path_str).await else {
+            return Ok(None);
+        };
+        let Some(line_text) = content.lines().nth(position.line as usize) else {
+            return Ok(None);
+        };
+        let Some((var_name, property)) =
+            extract_blade_variable_at_cursor(line_text, position.character)
+        else {
+            return Ok(None);
+        };
+        if property.is_some() || var_name.is_empty() {
+            return Ok(None);
+        }
+
+        let new_bare = laravel_lsp::blade_var_rename::normalize_new_var_name(new_name);
+        if !laravel_lsp::blade_var_rename::is_valid_identifier(&new_bare) {
+            return Err(laravel_lsp::rename::rename_error(
+                "invalid variable name: must be a letter or underscore followed by \
+                 letters, digits, or underscores.",
+            ));
+        }
+
+        let spans =
+            laravel_lsp::blade_var_rename::in_scope_spans(&content, &var_name, position.line);
+        let targets: Vec<laravel_lsp::rename::EditTarget> = spans
+            .into_iter()
+            .map(|s| laravel_lsp::rename::EditTarget {
+                file_path: path.clone(),
+                line: s.line,
+                start_column: s.start_col,
+                end_column: s.end_col,
+                new_text: new_bare.clone(),
+            })
+            .collect();
+        Ok(laravel_lsp::rename::build_rename_edit(&targets))
+    }
+
+    /// issue #55 — build the `WorkspaceEdit` for a controller→view binding-key
+    /// rename. Rewrites the controller key string, the in-view file-scoped
+    /// `$key` usages, and (for `compact('key')`) the enclosing-function local
+    /// `$key` so the controller stays valid.
+    async fn view_binding_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        use laravel_lsp::blade_var_rename::{self, BindingForm};
+
+        let path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let Some(path_str) = path.to_str() else {
+            return Ok(None);
+        };
+        let Some(content) = self.rename_document_text(uri, path_str).await else {
+            return Ok(None);
+        };
+        let Some(binding) =
+            blade_var_rename::view_binding_key_at(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
+
+        let new_bare = blade_var_rename::normalize_new_var_name(new_name);
+        if !blade_var_rename::is_valid_identifier(&new_bare) {
+            return Err(laravel_lsp::rename::rename_error(
+                "invalid binding key: must be a letter or underscore followed by \
+                 letters, digits, or underscores.",
+            ));
+        }
+        if new_bare == binding.key {
+            return Err(laravel_lsp::rename::rename_error(
+                "new binding name must differ from the current name.",
+            ));
+        }
+
+        let mut targets: Vec<laravel_lsp::rename::EditTarget> = Vec::new();
+
+        // 1. The controller key string (array key or compact arg).
+        targets.push(laravel_lsp::rename::EditTarget {
+            file_path: path.clone(),
+            line: binding.key_span.line,
+            start_column: binding.key_span.start_col,
+            end_column: binding.key_span.end_col,
+            new_text: new_bare.clone(),
+        });
+
+        // 2. compact: the enclosing-function local `$key` moves with the key,
+        //    because compact binds the view variable BY the local's name.
+        if binding.form == BindingForm::Compact {
+            for s in blade_var_rename::enclosing_function_local_spans(
+                &content,
+                &binding.key,
+                binding.key_span,
+            ) {
+                targets.push(laravel_lsp::rename::EditTarget {
+                    file_path: path.clone(),
+                    line: s.line,
+                    start_column: s.start_col,
+                    end_column: s.end_col,
+                    new_text: new_bare.clone(),
+                });
+            }
+        }
+
+        // 3. In-view `$key` usages (file-scoped, minus loop re-binds).
+        if let Some(config) = self.get_cached_config().await {
+            if let Some(view_path) =
+                laravel_lsp::view_declaration_locator::locate_view_file(&binding.view_name, &config)
+            {
+                if let Some(view_str) = view_path.to_str() {
+                    if let Ok(view_uri) = Url::from_file_path(&view_path) {
+                        if let Some(view_content) =
+                            self.rename_document_text(&view_uri, view_str).await
+                        {
+                            for s in blade_var_rename::file_scope_spans(&view_content, &binding.key)
+                            {
+                                targets.push(laravel_lsp::rename::EditTarget {
+                                    file_path: view_path.clone(),
+                                    line: s.line,
+                                    start_column: s.start_col,
+                                    end_column: s.end_col,
+                                    new_text: new_bare.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(laravel_lsp::rename::build_rename_edit(&targets))
+    }
 }
 #[tower_lsp::async_trait]
 impl LanguageServer for LaravelLanguageServer {
@@ -20071,6 +20290,19 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
+        // issue #55 — Blade variable (`$foo` in a .blade.php template). Checked
+        // before the literal-symbol classifier, which never tags a variable.
+        if path_str.ends_with(".blade.php") {
+            if let Some(range) = self.prepare_blade_var_rename(uri, position).await {
+                return Ok(Some(PrepareRenameResponse::Range(range)));
+            }
+        } else if let Some(range) = self.prepare_view_binding_rename(uri, position).await {
+            // issue #55 — controller view-data binding key. Only in plain
+            // `.php` files; the `else` keeps a Blade `view(...)` from
+            // shadowing the variable path above.
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(
             self,
@@ -20178,6 +20410,29 @@ impl LanguageServer for LaravelLanguageServer {
             .await
         {
             return Ok(Some(edit));
+        }
+
+        // issue #55 — scope-aware Blade variable rename (`$foo` in a template)
+        // and controller→view binding-key rename. Both run before the
+        // literal-symbol classifier: a variable / binding key is never tagged
+        // as a Laravel string-keyed pattern, so this can't shadow route /
+        // config / view renames (a cursor on the view NAME returns `None` from
+        // `view_binding_key_at` and falls through).
+        if path_str.ends_with(".blade.php") {
+            match self.blade_var_rename_edit(uri, position, &new_name).await {
+                Ok(Some(edit)) => return Ok(Some(edit)),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            match self
+                .view_binding_rename_edit(uri, position, &new_name)
+                .await
+            {
+                Ok(Some(edit)) => return Ok(Some(edit)),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         let root_path = self.root_path.read().await.clone();

@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / scope / accessor), database column, or a function-local PHP variable. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, PHP class (Eloquent model, controller, job, service, form request, or any other project class), magic member (relationship / scope / accessor), database column, or a function-local PHP variable. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
 
 You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
@@ -80,7 +80,7 @@ return view('users.account');
 
 **Container bindings** follow the same shape as middleware aliases: the quoted name at the registration site PLUS every `app('x')`, `resolve('x')`, `app()->make('x')` call site.
 
-**Eloquent model classes** rename project-wide. Press `F2` on a model class name and every reference rewrites in one pass — `use` imports, `User::` static calls, `new User`, type hints, `::class` references, `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside. Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
+**PHP classes** rename project-wide — Eloquent models, controllers, jobs, services, form requests, and any other first-class project class share one FQCN rename engine. Press `F2` on a class name and every reference rewrites in one pass — `use` imports, `User::`/`UserController::` static calls, `new User`, type hints (constructor injection, action arguments, return types), `::class` references (including `[UserController::class, 'index']` route actions), `extends`/`implements`, `instanceof`, and `@param`/`@return`/`@var` docblocks — and the backing `.php` file is renamed alongside (same directory, basename swapped). Aliased imports are respected (`use App\Models\User as U;` keeps `U`), and members that just happen to share the class's name are left untouched. Vendor-located classes refuse to rename. Same-namespace renames only — moving a class to a different namespace returns a status message rather than a half-applied move.
 
 **Eloquent magic members** rename from their usage sites. Press `F2` on a relationship, scope, or accessor usage and the declaring method renames with the *inverse name transform* applied — every cached usage follows:
 

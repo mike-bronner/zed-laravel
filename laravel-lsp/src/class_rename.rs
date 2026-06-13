@@ -63,6 +63,19 @@ pub fn is_dependency_path(path: &Path) -> bool {
     })
 }
 
+/// The new path for a renamed class's declaring file: same directory, basename
+/// swapped to `new_basename`, `.php` extension preserved.
+///
+/// PSR-4 puts one class per file with the file basename equal to the class
+/// basename, so renaming `App\Http\Controllers\UserController` →
+/// `AdminController` moves `app/Http/Controllers/UserController.php` →
+/// `app/Http/Controllers/AdminController.php` — the class kind (controller, job,
+/// service, form request, model) doesn't change the rule. Same-directory only:
+/// a same-namespace rename never crosses directories.
+pub fn renamed_file_path(decl_path: &Path, new_basename: &str) -> PathBuf {
+    decl_path.with_file_name(format!("{new_basename}.php"))
+}
+
 /// A resolved class-name occurrence: the FQCN it refers to and the byte span of
 /// the **basename segment** to rewrite (just `User` in `App\Models\User`).
 #[derive(Debug, Clone, PartialEq, Eq)]

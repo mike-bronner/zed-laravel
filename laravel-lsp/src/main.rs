@@ -14808,7 +14808,7 @@ return [
 
         // Rename the declaring file (same dir, new basename). Emitted AFTER the
         // text edits so the `class User → class NewName` edit lands first.
-        let new_path = decl_path.with_file_name(format!("{new_basename}.php"));
+        let new_path = laravel_lsp::class_rename::renamed_file_path(&decl_path, &new_basename);
         if new_path != decl_path {
             if let (Ok(old_uri), Ok(new_uri)) = (
                 Url::from_file_path(&decl_path),

@@ -60,7 +60,7 @@ Each feature has a focused reference under [`docs/`](docs/) — click through to
 | [🔗 Go-to-Definition](docs/go-to-definition.md) | Jump to views, components, routes, config, translations, env, assets, middleware, bindings, Artisan commands — plus query-chain columns / relations / tables and Eloquent magic members |
 | [ℹ️ Hover](docs/hover.md) | Intelephense-style summary cards for every recognised pattern, including semantic cards for Eloquent magic (scopes, accessors, relationships, cast-aware column types) |
 | [🔍 Find References](docs/find-references.md) | Every call site across the project, vendor packages included — including the magic-member usages Intelephense can't see |
-| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, PHP classes (models, controllers, jobs, services, form requests), magic members — and database columns, migration included |
+| [✏️ Rename](docs/rename.md) | Atomic rename of routes, configs, translations, env vars, views, components, Livewire, middleware, bindings, PHP classes (models, controllers, jobs, services, form requests), magic members, function-local PHP variables — and database columns, migration included |
 | [🔢 Code Lens](docs/code-lens.md) | Opt-in reference counts above magic members, routes, config / translation / env keys, and Blade templates — plus an unused-symbol warning |
 | [💡 Autocomplete](docs/autocomplete.md) | Cast types, model properties, query chains, builder methods, Blade / loop / slot variables, Pennant flags |
 | [❌ Diagnostics](docs/diagnostics.md) | Missing views / components / features, invalid rules, query-chain typos against your real schema |
@@ -228,10 +228,10 @@ After saving, restart Intelephense (`Cmd+Shift+P → lsp: restart`). For the lic
 
 ## 🚧 Planned Features
 
-**Rename — remaining work** (the class-backed kinds, the FQCN class-rename engine across all common PHP class kinds, magic members, and database columns shipped; variables didn't):
+**Rename — remaining work** (the class-backed kinds, the FQCN class-rename engine across all common PHP class kinds, magic members, database columns, and function-local PHP variables shipped):
 
 - 📝 **Blade variable rename** — scope-aware within a template (`@foreach`, `@php`, etc.), plus cross-file via the `view('x', ['key' => …])` / `compact('key')` linkage from controller into view.
-- 🔧 **PHP variable rename** — scope-aware function-local. Class properties (`$this->foo`) are out of scope for this round and folded into a future class-property rename.
+- 🔧 **Class-property rename** — `$this->foo`, `self::$bar`, and dynamic property access have different reference shapes than local variables, so they get their own scope-aware pass. (Function-local PHP variable rename shipped.)
 
 **Framework integrations:**
 

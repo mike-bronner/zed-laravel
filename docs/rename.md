@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / scope / accessor), or database column. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, Eloquent model class, magic member (relationship / scope / accessor), database column, or a function-local PHP variable. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
 
 You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
@@ -110,4 +110,19 @@ The transforms run both ways: `active` ↔ `scopeActive`, `full_name` ↔ `getFu
 
 **Vendor-located files refuse to rename** — never moves a Composer-installed view, component, or Livewire class, and never rewrites a middleware alias or binding registered inside `vendor/`. You'll see a toast explaining why instead of a silent no-op.
 
-**Not yet renameable** (out of scope for this round, planned follow-up): Blade variables (`@foreach`, `@php` locals + the `view('x', ['key' => …])` / `compact('key')` linkage), PHP function-local variables. `prepare_rename` returns nothing for these so F2 silently does nothing.
+**Function-local PHP variables** rename scope-aware, within a single file. Press `F2` on a `$variable` and every occurrence that resolves to the *same lexical binding* is rewritten — and nothing else:
+
+```php
+function greet($user) {        // F2 on any $user here…
+    $user = trim($user);
+    return "Hello " . $user;   // …renames all four occurrences to $account
+}
+```
+
+Scope boundaries are respected exactly:
+
+- **Nested closures isolate.** A `function () { … }` does not auto-capture, so an identically-named `$user` inside it is a separate binding — renaming the outer one leaves it alone (and vice versa). A `use ($user)` capture *does* tie the two together, so the rename cascades across the `use (…)` clause and the closure body in lockstep.
+- **Arrow functions auto-capture.** `fn () => $base` shares `$base` with the enclosing scope, so renaming `$base` reaches inside the arrow body. The arrow's *own* parameters still shadow: `fn ($user) => $user` is its own binding.
+- **Properties are never touched.** `$this->user` and `$obj->prop` are property accesses, not variables; `self::$bar` / `Foo::$bar` are class properties even though they're spelled with a `$`. `$this` itself is never renameable. Renaming a class property is a separate, scope-different operation tracked as a follow-up.
+
+**Not yet renameable** (out of scope for this round, planned follow-up): Blade variables (`@foreach`, `@php` locals + the `view('x', ['key' => …])` / `compact('key')` linkage), and class properties (`$this->foo`, `self::$bar`). `prepare_rename` returns nothing for these so F2 silently does nothing.

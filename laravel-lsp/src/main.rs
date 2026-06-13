@@ -14835,6 +14835,69 @@ return [
         }))
     }
 
+    /// prepare-rename for a plain PHP local variable (`$user`): return the
+    /// range of the `$name` token under the cursor, or `None` if the cursor
+    /// isn't on a renameable local variable. Pure-PHP, single-file —
+    /// scope-aware analysis lives in [`laravel_lsp::php_variable_rename`].
+    async fn variable_rename_at(&self, uri: &Url, position: Position) -> Option<Range> {
+        use laravel_lsp::query_chain::position_to_byte_offset;
+        let content = self
+            .documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(c, _)| c.clone())?;
+        let byte = position_to_byte_offset(&content, position.line, position.character)?;
+        let (line, start, end) =
+            laravel_lsp::php_variable_rename::variable_at_cursor(&content, byte)?;
+        Some(Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        })
+    }
+
+    /// rename for a plain PHP local variable: rewrite every occurrence that
+    /// resolves to the same binding scope (function-local, scope-aware).
+    ///
+    /// Returns `Ok(None)` when the cursor isn't on a local variable, so the
+    /// caller can fall through to the Laravel-pattern / class rename pipeline.
+    /// Returns `Err` only when the cursor *is* on a variable but the new name
+    /// isn't a legal PHP identifier — surfaced to the user as a toast.
+    async fn variable_rename_edit(
+        &self,
+        uri: &Url,
+        position: Position,
+        new_name: &str,
+    ) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        use laravel_lsp::query_chain::position_to_byte_offset;
+        let Some(content) = self.documents.read().await.get(uri).map(|(c, _)| c.clone()) else {
+            return Ok(None);
+        };
+        let Ok(file_path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        let Some(byte) = position_to_byte_offset(&content, position.line, position.character)
+        else {
+            return Ok(None);
+        };
+        // Not on a local variable → let the caller continue the pipeline.
+        if laravel_lsp::php_variable_rename::variable_at_cursor(&content, byte).is_none() {
+            return Ok(None);
+        }
+        match laravel_lsp::php_variable_rename::variable_rename_targets(
+            &content, &file_path, byte, new_name,
+        ) {
+            Ok(targets) => Ok(laravel_lsp::rename::build_rename_edit(&targets)),
+            Err(msg) => Err(laravel_lsp::rename::rename_error(msg)),
+        }
+    }
+
     /// Create a goto location for a url('path') call
     /// Navigates to the file in public directory if it exists
     async fn create_url_location_from_salsa(
@@ -20071,6 +20134,15 @@ impl LanguageServer for LaravelLanguageServer {
             }
         }
 
+        // Plain PHP local variable (`$user`): pure-PHP, single-file,
+        // scope-aware rename. Checked after the property-oriented magic /
+        // column member renames above (so `$user->email` still routes there)
+        // and before the Laravel-pattern classifier, which never classifies a
+        // bare `$variable`.
+        if let Some(range) = self.variable_rename_at(uri, position).await {
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+
         let root_path = self.root_path.read().await.clone();
         let symbol = match classify_with_decl_fallback(
             self,
@@ -20178,6 +20250,18 @@ impl LanguageServer for LaravelLanguageServer {
             .await
         {
             return Ok(Some(edit));
+        }
+
+        // Plain PHP local variable (`$user`): function-local, scope-aware
+        // rewrite of every in-scope occurrence. Checked after the
+        // property-oriented column / magic-member renames (so `$user->email`
+        // still routes there) and before the Laravel-pattern classifier, which
+        // never classifies a bare `$variable`. `Ok(None)` here means "not a
+        // local variable" — fall through to the rest of the pipeline.
+        match self.variable_rename_edit(uri, position, &new_name).await {
+            Ok(Some(edit)) => return Ok(Some(edit)),
+            Err(e) => return Err(e),
+            Ok(None) => {}
         }
 
         let root_path = self.root_path.read().await.clone();

@@ -148,6 +148,74 @@ function make() {
     assert!(targets.iter().all(|t| t.new_text == "$total"));
 }
 
+#[test]
+fn closure_use_by_reference_cascades() {
+    let src = "\
+<?php
+function make() {
+    $count = 0;
+    $inc = function () use (&$count) {
+        $count++;
+    };
+    $inc();
+    return $count;
+}
+";
+    // The by-reference capture `use (&$count)` binds to the OUTER $count, so a
+    // rename must cascade through the assignment, the `use (&...)` capture, the
+    // closure body, and the final return — leaving the closure intact. Missing
+    // the capture (the `by_ref` wrapper hides the `variable_name`) would sever
+    // it and silently corrupt valid code.
+    let targets = rename(src, "$count", 0, "$total");
+    assert_eq!(
+        targets.len(),
+        4,
+        "assignment + use(&...) capture + body + return"
+    );
+    assert!(targets.iter().all(|t| t.new_text == "$total"));
+    // Every edit lands on the `$count` token only — the `&` reference marker is
+    // preserved (`use (&$total)`, not `&$total` mangled).
+    for t in &targets {
+        assert_eq!(target_text(src, t), "$count");
+    }
+    // The capture site and the body site must both be among the rewritten
+    // offsets — the cascade reaches into the closure, not just the outer scope.
+    let edited = edited_offsets(src, &targets);
+    let capture_site = abs_byte_of_match(src, "$count", 1); // `use (&$count)`
+    let body_site = abs_byte_of_match(src, "$count", 2); // `$count++`
+    assert!(
+        edited.contains(&capture_site),
+        "use(&...) capture rewritten"
+    );
+    assert!(edited.contains(&body_site), "closure body rewritten");
+}
+
+#[test]
+fn dynamic_property_access_renames_the_variable_not_the_property() {
+    let src = "\
+<?php
+function f($obj, $key) {
+    $val = $obj->$key;
+    return $this->{$key} . $val;
+}
+";
+    // `$obj->$key` and `$this->{$key}` use `$key` as a *real local variable*
+    // (the dynamic member name), so renaming $key must rewrite all three of its
+    // occurrences while leaving the property mechanism (`$obj`, `$this`) and the
+    // unrelated `$val` untouched.
+    let targets = rename(src, "$key", 0, "$prop");
+    assert_eq!(targets.len(), 3, "param + $obj->$key + $this->{{$key}}");
+    for t in &targets {
+        assert_eq!(target_text(src, t), "$key");
+        assert_eq!(t.new_text, "$prop");
+    }
+    let edited = edited_offsets(src, &targets);
+    // The objects and the unrelated local stay put.
+    assert!(!edited.contains(&abs_byte_of_match(src, "$obj", 0)));
+    assert!(!edited.contains(&abs_byte_of_match(src, "$this", 0)));
+    assert!(!edited.contains(&abs_byte_of_match(src, "$val", 0)));
+}
+
 // ── Arrow-function captures + shadowing ───────────────────────────────────
 
 #[test]

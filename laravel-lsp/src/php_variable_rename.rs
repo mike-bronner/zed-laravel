@@ -115,16 +115,37 @@ fn scope_declares_param(scope: Node, name: &str, bytes: &[u8]) -> bool {
     false
 }
 
+/// The `variable_name` captured by one child of an
+/// `anonymous_function_use_clause`, unwrapping the `by_ref` wrapper that the
+/// reference form `use (&$x)` introduces. Returns `None` for children that
+/// aren't a simple variable capture (e.g. punctuation, or a `by_ref` over a
+/// non-variable expression). In tree-sitter-php the value form `use ($x)`
+/// places the `variable_name` as a direct child, while the reference form
+/// `use (&$x)` wraps it in a `by_ref` node — both must be recognised so that a
+/// by-reference capture isn't mistaken for a fresh closure-local.
+fn use_clause_capture<'t>(child: Node<'t>) -> Option<Node<'t>> {
+    match child.kind() {
+        "variable_name" => Some(child),
+        // `by_ref` wraps exactly one expression; for `use (&$x)` that's the
+        // `variable_name` (the `&` is an anonymous token). Other by-ref targets
+        // aren't simple variable captures, so filter to `variable_name`.
+        "by_ref" => child.named_child(0).filter(|n| n.kind() == "variable_name"),
+        _ => None,
+    }
+}
+
 /// Whether `scope` (an anonymous function) captures `name` via a `use (…)`
-/// clause. Mirrors the capture detection used by the chain-flow analyzer.
+/// clause — both the value form `use ($x)` and the reference form `use (&$x)`.
 fn scope_captures_use(scope: Node, name: &str, bytes: &[u8]) -> bool {
     let mut c = scope.walk();
     for child in scope.children(&mut c) {
         if child.kind() == "anonymous_function_use_clause" {
             let mut inner = child.walk();
             for v in child.children(&mut inner) {
-                if v.kind() == "variable_name" && var_ident(v, bytes) == Some(name) {
-                    return true;
+                if let Some(var) = use_clause_capture(v) {
+                    if var_ident(var, bytes) == Some(name) {
+                        return true;
+                    }
                 }
             }
             return false;

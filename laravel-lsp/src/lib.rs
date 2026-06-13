@@ -15,6 +15,7 @@ pub mod blade_embedded_php;
 pub mod blade_loops;
 pub mod blade_php_block;
 pub mod blade_props;
+pub mod blade_var_rename;
 pub mod cache_manager;
 pub mod class_locator;
 pub mod class_rename;

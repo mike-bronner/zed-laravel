@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, PHP class (Eloquent model, controller, job, service, form request, or any other project class), magic member (relationship / scope / accessor), or database column. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
+Press `F2` (or right-click → **"Rename Symbol"**) on a route name, config key, translation key, environment variable, view, Blade component, Livewire component, middleware alias, container binding, PHP class (Eloquent model, controller, job, service, form request, or any other project class), magic member (relationship / scope / accessor), database column, scope-aware Blade template variable, or controller→view binding key. The extension rewrites every call site AND the declaration site (or moves the backing file, or generates the migration) in one atomic operation.
 
 You can also right-click a `.blade.php` file in Zed's file explorer → **Rename** → call sites update atomically with the file move.
 
@@ -104,10 +104,33 @@ The transforms run both ways: `active` ↔ `scopeActive`, `full_name` ↔ `getFu
 3. **Model array entries** — the `'email'` string in `$fillable`, `$casts`, `$hidden`, `$guarded`, `$dates`.
 4. **Query-chain column literals project-wide** — `where('email', …)`, `orderBy('email')`, `pluck('email')`, … rewritten *only* when the chain resolves to the column's table (with an enclosing-model fallback for local scopes). A qualified literal `'users.email'` rewrites only the `email` segment and only when the qualifier matches; the database itself is never touched — you review the diff, then run the migration.
 
+**Blade template variables** rename scope-aware, straight from the `.blade.php` file. Press `F2` on a `$variable` and only the occurrences in its *actual* scope are rewritten:
+
+```blade
+{{-- F2 on $item inside the loop renames only the loop's $item --}}
+@foreach ($items as $item)
+    {{ $item->name }}      {{-- renamed --}}
+@endforeach
+{{ $item }}                {{-- an unrelated, file-level $item — left alone --}}
+```
+
+A variable introduced by `@foreach` / `@forelse` / `@for` is block-scoped — the rewrite stops at the loop's open/close directives, and a nested loop that re-binds the same name is treated as a separate scope (rename one without clobbering the other). A variable that *isn't* loop-introduced (a controller-passed view variable, an inline `@php $x = …; @endphp`) is file-scoped, but still skips any nested loop that shadows the name. Occurrences inside `{{-- … --}}` comments and `@verbatim` blocks are never touched.
+
+**Controller → view binding rename** follows the data linkage so the key and its in-view usages move together. Press `F2` on the binding key in a controller:
+
+```php
+// F2 on 'name' in the controller:
+return view('users.profile', ['name' => $user->name]);
+//                             ^^^^ renamed to 'fullName'
+// → resources/views/users/profile.blade.php: every file-scoped $name becomes $fullName
+```
+
+The same works for `view('users.profile', compact('name'))` — the `compact('name')` string AND the enclosing method's local `$name` are renamed alongside the in-view usages, so the controller stays valid (compact binds the view key *by the local's name*). When a view is rendered from several controllers under different key names, each rename touches only its own key's usages — different key names never cross-contaminate. The array value expression (`$user->name` above) is the controller's own data and is left untouched.
+
 > ⚠️ **Intelephense overlap on relationship renames.** A relationship's usage name equals its method name, so Intelephense *also* understands `posts()` as a renameable method — on F2 both language servers may contribute edits for the declaration and the call-form sites. Scopes, accessors, and columns don't overlap (Intelephense can't connect `->active()` to `scopeActive()`), so this extension owns those cleanly. There's no surgical way to disable just Intelephense's rename — it has no `rename.enable` setting, and Zed has no per-capability toggle — though `intelephense.rename.exclude` can narrow its scope by glob. Tracked in [#74](https://github.com/mike-bronner/zed-laravel/issues/74).
 
 **Same parser-classified guarantee as [Find References](find-references.md)** — only positions the parser has tagged as the matching kind are mutated. A random string `'home'` in an unrelated literal is never touched.
 
 **Vendor-located files refuse to rename** — never moves a Composer-installed view, component, or Livewire class, and never rewrites a middleware alias or binding registered inside `vendor/`. You'll see a toast explaining why instead of a silent no-op.
 
-**Not yet renameable** (out of scope for this round, planned follow-up): Blade variables (`@foreach`, `@php` locals + the `view('x', ['key' => …])` / `compact('key')` linkage), PHP function-local variables. `prepare_rename` returns nothing for these so F2 silently does nothing.
+**Not yet renameable** (out of scope for this round, planned follow-up): PHP function-local variables (a plain `$local` in a controller method that isn't a view-binding key), and class properties (`$this->foo`). `prepare_rename` returns nothing for these so F2 silently does nothing.

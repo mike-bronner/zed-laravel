@@ -3,6 +3,7 @@
 //! part of the `queries` module so they can exercise private helpers
 //! (e.g. `calculate_string_column_range`) via `use super::*`.
 
+mod blade_grammar_gap;
 mod blade_pattern_extraction;
 mod call_site_variants;
 mod column_positions;

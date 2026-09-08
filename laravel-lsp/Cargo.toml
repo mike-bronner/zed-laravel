@@ -82,23 +82,6 @@ dashmap = "6"
 # it), so this direct dep adds no new crate to the build.
 rayon = "1"
 
-# TEMPORARY — remove once tinyvec ships the fix in Lokathor/tinyvec#226.
-#
-# Not used by this crate. It is declared only to constrain a TRANSITIVE
-# resolution: sqlx -> sqlx-postgres -> stringprep -> unicode-normalization ->
-# tinyvec. Version 1.13.0 (published 2026-09-03) added `with_initial_len`,
-# whose body calls `vec![]` — but tinyvec is `no_std` and the file imports
-# `alloc::vec` as a MODULE, so the macro is not in scope and the crate fails
-# to compile for every consumer that does not enable its `std` feature.
-# Reported upstream as Lokathor/tinyvec#225; 1.13.0 is not yanked, so cargo
-# still selects it.
-#
-# The range needs BOTH bounds. Verified against the resolver:
-#   "1.10"          -> 1.13.0  (caret means >=1.10,<2.0 — pins nothing)
-#   "<1.13"         -> 0.4.1 AND 1.13.0  (two majors; spec becomes ambiguous)
-#   ">=1.10, <1.13" -> 1.12.0 alone, builds clean
-tinyvec = ">=1.10, <1.13"
-
 # The release binaries for Linux are statically-linked musl builds (one
 # binary runs on glibc distros, Alpine, and NixOS alike), but musl's
 # default allocator serializes multithreaded allocation behind a global

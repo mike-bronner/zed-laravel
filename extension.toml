@@ -1,14 +1,14 @@
 id = "laravel"
 name = "Laravel (Community Edition)"
 description = "Laravel (Community Edition) support for Zed — go-to-definition, hover & find-references for Blade, Livewire, Flux, views, routes, and config. Community-maintained, not affiliated with Laravel LLC. 📖 See the README for setup & configuration; custom PHP/Blade language servers need a one-line settings tweak."
-version = "0.7.5"
+version = "0.7.6"
 schema_version = 1
 authors = ["Mike Bronner <mike.bronner@icloud.com>"]
 repository = "https://github.com/mike-bronner/zed-laravel"
 
 [lib]
 kind = "Rust"
-version = "0.7.5"
+version = "0.7.6"
 
 [language_servers.laravel-lsp]
 # Short form: this is Zed's compact status-bar / language-server-list slot.

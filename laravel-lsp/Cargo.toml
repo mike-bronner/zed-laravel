@@ -97,7 +97,7 @@ rayon = "1"
 #   "1.10"          -> 1.13.0  (caret means >=1.10,<2.0 — pins nothing)
 #   "<1.13"         -> 0.4.1 AND 1.13.0  (two majors; spec becomes ambiguous)
 #   ">=1.10, <1.13" -> 1.12.0 alone, builds clean
-tinyvec = ">=1.10, <1.13"
+tinyvec = ">=1.10, <1.14"
 
 # The release binaries for Linux are statically-linked musl builds (one
 # binary runs on glibc distros, Alpine, and NixOS alike), but musl's

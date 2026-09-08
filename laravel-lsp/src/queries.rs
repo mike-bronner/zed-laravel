@@ -496,7 +496,7 @@ pub fn extract_all_php_patterns<'a>(
     let mut captures = cursor.captures(query, root_node, source_bytes);
 
     while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
+        let capture = &query_match.captures()[*capture_index];
         let capture_name = query.capture_names()[capture.index as usize];
         let node = capture.node;
 
@@ -659,7 +659,7 @@ pub fn extract_all_php_patterns<'a>(
             // ($blade->component('view.path', 'alias') or Blade::component(...))
             "blade_alias_name" => {
                 let view = query_match
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| query.capture_names()[c.index as usize] == "blade_alias_view")
                     .and_then(|c| c.node.utf8_text(source_bytes).ok());
@@ -681,7 +681,7 @@ pub fn extract_all_php_patterns<'a>(
             "middleware_alias_key" => {
                 // Find the corresponding class capture in the same match
                 let class_name = query_match
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| query.capture_names()[c.index as usize] == "middleware_alias_class")
                     .and_then(|c| c.node.utf8_text(source_bytes).ok());
@@ -1500,7 +1500,7 @@ pub fn extract_all_blade_patterns<'a>(
     let mut captures = cursor.captures(query, root_node, source_bytes);
 
     while let Some((query_match, capture_index)) = captures.next() {
-        let capture = &query_match.captures[*capture_index];
+        let capture = &query_match.captures()[*capture_index];
         let capture_name = query.capture_names()[capture.index as usize];
         let node = capture.node;
 
@@ -1834,7 +1834,7 @@ fn get_feature_method_name<'a>(
     query: &Query,
     source: &'a [u8],
 ) -> Option<&'a str> {
-    for capture in query_match.captures.iter() {
+    for capture in query_match.captures().iter() {
         let capture_name = query.capture_names()[capture.index as usize];
         if capture_name == "feature_method_name" {
             return capture.node.utf8_text(source).ok();
@@ -1851,7 +1851,7 @@ fn check_has_fallback_argument(node: tree_sitter::Node) -> bool {
             if let Some(arguments_node) = argument_node.parent() {
                 let mut argument_count = 0;
                 for i in 0..arguments_node.child_count() {
-                    if let Some(child) = arguments_node.child(i as u32) {
+                    if let Some(child) = arguments_node.child(i) {
                         if child.kind() == "argument" {
                             argument_count += 1;
                         }

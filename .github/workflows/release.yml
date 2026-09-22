@@ -237,7 +237,7 @@ jobs:
 
       - name: Install cargo-zigbuild (Linux cross-compilation)
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2.87.12
+        uses: taiki-e/install-action@v2.87.16
         with:
           tool: cargo-zigbuild
 

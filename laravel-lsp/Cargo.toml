@@ -66,7 +66,7 @@ url = "2.5"
 # Tree-sitter parsers
 # Using latest version to match the Blade grammar from GitHub
 tree-sitter = "0.27"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 
 # Additional dependencies for Salsa integration
 arc-swap = "1.9"

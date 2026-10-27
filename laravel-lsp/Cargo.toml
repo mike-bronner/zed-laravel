@@ -17,7 +17,7 @@ salsa = "0.28"
 tokio = { version = "1.52", features = ["full"] }
 
 # LRU cache for memory management
-lru = "0.18"
+lru = "0.19"
 
 # Serialization. The `rc` feature lets us derive Serialize/Deserialize on
 # types that contain `Arc<T>` (the parsed-pattern data structures fanned

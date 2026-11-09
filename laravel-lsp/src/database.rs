@@ -212,6 +212,10 @@ pub const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sized well above the ~2.5s a 600-table schema costs.
 pub const DB_FETCH_QUERY_BUDGET: Duration = Duration::from_secs(30);
 
+/// The framework's default `config/database.php`, which Laravel 11+ merges the
+/// app's own `config/database.php` over. Relative to the project root.
+const FRAMEWORK_DATABASE_CONFIG: &str = "vendor/laravel/framework/config/database.php";
+
 /// What a caller may do right now, per [`CircuitBreaker::allow_attempt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
@@ -950,58 +954,57 @@ impl DatabaseSchemaProvider {
         "string".to_string()
     }
 
-    /// Get all available database connection names from config/database.php
+    /// Get all available database connection names from the app config and
+    /// the framework config Laravel merges it over: the app's own connections
+    /// first, then the framework's, each name once.
     pub fn get_connections(&self) -> Vec<String> {
-        let config_path = self.project_root.join("config/database.php");
-
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        // Find the 'connections' => [ block
-        let connections_regex = match Regex::new(r#"['"]connections['"]\s*=>\s*\["#) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        let match_start = match connections_regex.find(&content) {
-            Some(m) => m.end(),
-            None => return Vec::new(),
-        };
-
-        // Find all connection names: 'name' => [
-        let connection_name_regex =
-            match Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#) {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
-
-        let remaining = &content[match_start..];
-
-        // Find the end of the connections block (matching bracket)
-        let mut depth = 1;
-        let mut end_pos = remaining.len();
-        for (i, c) in remaining.chars().enumerate() {
-            match c {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_pos = i;
-                        break;
-                    }
+        let mut names: Vec<String> = Vec::new();
+        for content in self.database_config_sources() {
+            for name in Self::connection_names(&content) {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
-                _ => {}
             }
         }
+        names
+    }
 
-        let connections_block = &remaining[..end_pos];
+    /// The top-level keys of the `'connections' => [...]` array in one config
+    /// file. Nested keys such as `'options' => [` or `'pragmas' => [` belong to
+    /// a connection, not to the list of connections, and are skipped.
+    fn connection_names(content: &str) -> Vec<String> {
+        let Some(connections_start) = Regex::new(r#"['"]connections['"]\s*=>\s*\["#)
+            .ok()
+            .and_then(|re| re.find(content))
+        else {
+            return Vec::new();
+        };
+        let Ok(connection_name_regex) = Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#)
+        else {
+            return Vec::new();
+        };
 
-        // Extract connection names
+        // An unbalanced file falls back to everything after the opening
+        // bracket, as before.
+        let connections_block = Self::extract_bracketed_block(content, connections_start.end())
+            .unwrap_or_else(|| content[connections_start.end()..].to_string());
+
+        let mut depth = 0i32;
+        let mut scanned = 0;
         connection_name_regex
-            .captures_iter(connections_block)
-            .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .captures_iter(&connections_block)
+            .filter_map(|caps| {
+                let key = caps.get(0)?;
+                for c in connections_block[scanned..key.start()].chars() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                scanned = key.start();
+                (depth == 0).then(|| caps[1].to_string())
+            })
             .collect()
     }
 
@@ -1092,58 +1095,51 @@ impl DatabaseSchemaProvider {
     /// 2. Find the connection block for that driver
     /// 3. Parse env('VAR', 'default') patterns from the connection block
     /// 4. Resolve env vars from .env, falling back to parsed defaults
+    ///
+    /// Since Laravel 11 the framework merges the app's `config/database.php`
+    /// over `vendor/laravel/framework/config/database.php`, so an app may only
+    /// define its extra connections (or ship no `config/database.php` at all).
+    /// Steps 1 and 2 therefore look in the app config first and fall back to
+    /// the framework config, mirroring that merge.
     fn parse_database_config(&self) -> Option<DatabaseConfig> {
-        let config_path = self.project_root.join("config/database.php");
-        info!("🗄️  Parsing database config from: {:?}", config_path);
+        let sources = self.database_config_sources();
+        if sources.is_empty() {
+            warn!(
+                "🗄️  Neither config/database.php nor the framework's database config is readable"
+            );
+            return None;
+        }
 
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("🗄️  Failed to read config/database.php: {}", e);
-                return None;
-            }
-        };
-
-        // Step 1: Parse 'default' => env('DB_CONNECTION', 'fallback')
+        // Step 1: Find the `default` key. The first source that sets it
+        // decides, so the app's entry wins over the framework's in any form:
+        // env('VAR', 'fallback'), env('VAR') or a literal 'name'. A nested
+        // array such as redis' 'default' => [...] is not the key.
         let default_regex = Regex::new(
-            r#"['"]default['"]\s*=>\s*env\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#,
+            r#"['"]default['"]\s*=>\s*(?:env\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)|['"]([^'"]+)['"]|[^\[\s])"#,
         )
         .ok()?;
 
-        let (default_env_var, default_fallback) = default_regex
-            .captures(&content)
-            .map(|caps| {
-                let var = caps
-                    .get(1)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "DB_CONNECTION".to_string());
-                let fallback = caps
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "mysql".to_string());
-                (var, fallback)
-            })
-            .unwrap_or_else(|| ("DB_CONNECTION".to_string(), "mysql".to_string()));
+        let default_key = sources
+            .iter()
+            .find_map(|content| default_regex.captures(content));
 
-        info!(
-            "🗄️  default => env('{}', '{}')",
-            default_env_var, default_fallback
-        );
-
-        // Resolve the default connection name
-        let driver = self
-            .resolve_env(&default_env_var)
-            .unwrap_or(default_fallback.clone());
-        info!(
-            "🗄️  Resolved driver: {} (from .env: {}, fallback: {})",
-            driver,
-            self.resolve_env(&default_env_var).is_some(),
-            default_fallback
-        );
+        let driver = match &default_key {
+            Some(caps) if caps.get(3).is_some() => caps[3].to_string(),
+            Some(caps) if caps.get(1).is_some() => self
+                .resolve_env(&caps[1])
+                .or_else(|| caps.get(2).map(|m| m.as_str().to_string()))
+                .unwrap_or_else(|| "mysql".to_string()),
+            _ => self
+                .resolve_env("DB_CONNECTION")
+                .unwrap_or_else(|| "mysql".to_string()),
+        };
+        info!("🗄️  Resolved default connection: {}", driver);
 
         // Step 2: Find the connection block for this driver
         // Pattern: 'driver_name' => [...]
-        let connection_block = self.extract_connection_block(&content, &driver);
+        let connection_block = sources
+            .iter()
+            .find_map(|content| self.extract_connection_block(content, &driver));
 
         if connection_block.is_none() {
             warn!("🗄️  Could not find connection block for driver: {}", driver);
@@ -1226,6 +1222,22 @@ impl DatabaseSchemaProvider {
             charset,
             collation,
         })
+    }
+
+    /// Read the database config files in merge-precedence order: the app's
+    /// `config/database.php` first, then the framework's defaults it is merged
+    /// over. Unreadable files are skipped.
+    fn database_config_sources(&self) -> Vec<String> {
+        ["config/database.php", FRAMEWORK_DATABASE_CONFIG]
+            .iter()
+            .filter_map(|relative| {
+                let path = self.project_root.join(relative);
+                debug!("🗄️  Reading database config from: {:?}", path);
+                std::fs::read_to_string(&path)
+                    .inspect_err(|e| debug!("🗄️    not readable: {}", e))
+                    .ok()
+            })
+            .collect()
     }
 
     /// Extract the connection block for a specific connection name from

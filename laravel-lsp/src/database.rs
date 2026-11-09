@@ -212,6 +212,10 @@ pub const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sized well above the ~2.5s a 600-table schema costs.
 pub const DB_FETCH_QUERY_BUDGET: Duration = Duration::from_secs(30);
 
+/// The framework's default `config/database.php`, which Laravel 11+ merges the
+/// app's own `config/database.php` over. Relative to the project root.
+const FRAMEWORK_DATABASE_CONFIG: &str = "vendor/laravel/framework/config/database.php";
+
 /// What a caller may do right now, per [`CircuitBreaker::allow_attempt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
@@ -1092,17 +1096,20 @@ impl DatabaseSchemaProvider {
     /// 2. Find the connection block for that driver
     /// 3. Parse env('VAR', 'default') patterns from the connection block
     /// 4. Resolve env vars from .env, falling back to parsed defaults
+    ///
+    /// Since Laravel 11 the framework merges the app's `config/database.php`
+    /// over `vendor/laravel/framework/config/database.php`, so an app may only
+    /// define its extra connections (or ship no `config/database.php` at all).
+    /// Steps 1 and 2 therefore look in the app config first and fall back to
+    /// the framework config, mirroring that merge.
     fn parse_database_config(&self) -> Option<DatabaseConfig> {
-        let config_path = self.project_root.join("config/database.php");
-        info!("🗄️  Parsing database config from: {:?}", config_path);
-
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("🗄️  Failed to read config/database.php: {}", e);
-                return None;
-            }
-        };
+        let sources = self.database_config_sources();
+        if sources.is_empty() {
+            warn!(
+                "🗄️  Neither config/database.php nor the framework's database config is readable"
+            );
+            return None;
+        }
 
         // Step 1: Parse 'default' => env('DB_CONNECTION', 'fallback')
         let default_regex = Regex::new(
@@ -1110,8 +1117,9 @@ impl DatabaseSchemaProvider {
         )
         .ok()?;
 
-        let (default_env_var, default_fallback) = default_regex
-            .captures(&content)
+        let (default_env_var, default_fallback) = sources
+            .iter()
+            .find_map(|content| default_regex.captures(content))
             .map(|caps| {
                 let var = caps
                     .get(1)
@@ -1143,7 +1151,9 @@ impl DatabaseSchemaProvider {
 
         // Step 2: Find the connection block for this driver
         // Pattern: 'driver_name' => [...]
-        let connection_block = self.extract_connection_block(&content, &driver);
+        let connection_block = sources
+            .iter()
+            .find_map(|content| self.extract_connection_block(content, &driver));
 
         if connection_block.is_none() {
             warn!("🗄️  Could not find connection block for driver: {}", driver);
@@ -1226,6 +1236,22 @@ impl DatabaseSchemaProvider {
             charset,
             collation,
         })
+    }
+
+    /// Read the database config files in merge-precedence order: the app's
+    /// `config/database.php` first, then the framework's defaults it is merged
+    /// over. Unreadable files are skipped.
+    fn database_config_sources(&self) -> Vec<String> {
+        ["config/database.php", FRAMEWORK_DATABASE_CONFIG]
+            .iter()
+            .filter_map(|relative| {
+                let path = self.project_root.join(relative);
+                info!("🗄️  Reading database config from: {:?}", path);
+                std::fs::read_to_string(&path)
+                    .inspect_err(|e| info!("🗄️    not readable: {}", e))
+                    .ok()
+            })
+            .collect()
     }
 
     /// Extract the connection block for a specific connection name from

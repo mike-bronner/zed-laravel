@@ -2139,6 +2139,64 @@ return [
 }
 
 #[tokio::test]
+async fn literal_app_default_wins_over_framework_default_key() {
+    // `pgsql` is neither the hard-coded fallback (`mysql`) nor the
+    // framework's (`sqlite`), so it can only come from the app's literal.
+    let app_config = r#"<?php
+return [
+    'default' => 'pgsql',
+    'connections' => [],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "pgsql");
+
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "DB_CONNECTION=mysql\n");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "pgsql");
+}
+
+#[tokio::test]
+async fn single_argument_env_default_keeps_hard_coded_fallback() {
+    let app_config = r#"<?php
+return [
+    'default' => env('APP_DB_CONNECTION'),
+    'connections' => [],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "mysql");
+
+    let (_dir, provider) =
+        merged_config_provider(Some(app_config), true, "APP_DB_CONNECTION=pgsql\n");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "pgsql");
+}
+
+#[tokio::test]
+async fn redis_default_block_in_app_config_does_not_mask_framework_default() {
+    let app_config = r#"<?php
+return [
+    'connections' => [
+        'legacy' => [
+            'driver' => 'mysql',
+        ],
+    ],
+    'redis' => [
+        'default' => [
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+        ],
+    ],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "sqlite");
+}
+
+#[tokio::test]
 async fn app_block_replaces_framework_block_whole() {
     // The partial app block has no `database` key. Laravel's merge replaces
     // the framework block whole, so the value is the hard-coded fallback,

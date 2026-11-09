@@ -954,9 +954,9 @@ impl DatabaseSchemaProvider {
         "string".to_string()
     }
 
-    /// Get all available database connection names, merged the way Laravel
-    /// merges the config: the app's own connections first, then the
-    /// framework's, each name once.
+    /// Get all available database connection names from the app config and
+    /// the framework config Laravel merges it over: the app's own connections
+    /// first, then the framework's, each name once.
     pub fn get_connections(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         for content in self.database_config_sources() {
@@ -1110,43 +1110,30 @@ impl DatabaseSchemaProvider {
             return None;
         }
 
-        // Step 1: Parse 'default' => env('DB_CONNECTION', 'fallback')
+        // Step 1: Find the `default` key. The first source that sets it
+        // decides, so the app's entry wins over the framework's in any form:
+        // env('VAR', 'fallback'), env('VAR') or a literal 'name'. A nested
+        // array such as redis' 'default' => [...] is not the key.
         let default_regex = Regex::new(
-            r#"['"]default['"]\s*=>\s*env\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#,
+            r#"['"]default['"]\s*=>\s*(?:env\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)|['"]([^'"]+)['"]|[^\[\s])"#,
         )
         .ok()?;
 
-        let (default_env_var, default_fallback) = sources
+        let default_key = sources
             .iter()
-            .find_map(|content| default_regex.captures(content))
-            .map(|caps| {
-                let var = caps
-                    .get(1)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "DB_CONNECTION".to_string());
-                let fallback = caps
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "mysql".to_string());
-                (var, fallback)
-            })
-            .unwrap_or_else(|| ("DB_CONNECTION".to_string(), "mysql".to_string()));
+            .find_map(|content| default_regex.captures(content));
 
-        info!(
-            "🗄️  default => env('{}', '{}')",
-            default_env_var, default_fallback
-        );
-
-        // Resolve the default connection name
-        let driver = self
-            .resolve_env(&default_env_var)
-            .unwrap_or(default_fallback.clone());
-        info!(
-            "🗄️  Resolved driver: {} (from .env: {}, fallback: {})",
-            driver,
-            self.resolve_env(&default_env_var).is_some(),
-            default_fallback
-        );
+        let driver = match &default_key {
+            Some(caps) if caps.get(3).is_some() => caps[3].to_string(),
+            Some(caps) if caps.get(1).is_some() => self
+                .resolve_env(&caps[1])
+                .or_else(|| caps.get(2).map(|m| m.as_str().to_string()))
+                .unwrap_or_else(|| "mysql".to_string()),
+            _ => self
+                .resolve_env("DB_CONNECTION")
+                .unwrap_or_else(|| "mysql".to_string()),
+        };
+        info!("🗄️  Resolved default connection: {}", driver);
 
         // Step 2: Find the connection block for this driver
         // Pattern: 'driver_name' => [...]

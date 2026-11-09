@@ -954,58 +954,57 @@ impl DatabaseSchemaProvider {
         "string".to_string()
     }
 
-    /// Get all available database connection names from config/database.php
+    /// Get all available database connection names, merged the way Laravel
+    /// merges the config: the app's own connections first, then the
+    /// framework's, each name once.
     pub fn get_connections(&self) -> Vec<String> {
-        let config_path = self.project_root.join("config/database.php");
-
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        // Find the 'connections' => [ block
-        let connections_regex = match Regex::new(r#"['"]connections['"]\s*=>\s*\["#) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        let match_start = match connections_regex.find(&content) {
-            Some(m) => m.end(),
-            None => return Vec::new(),
-        };
-
-        // Find all connection names: 'name' => [
-        let connection_name_regex =
-            match Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#) {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
-
-        let remaining = &content[match_start..];
-
-        // Find the end of the connections block (matching bracket)
-        let mut depth = 1;
-        let mut end_pos = remaining.len();
-        for (i, c) in remaining.chars().enumerate() {
-            match c {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_pos = i;
-                        break;
-                    }
+        let mut names: Vec<String> = Vec::new();
+        for content in self.database_config_sources() {
+            for name in Self::connection_names(&content) {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
-                _ => {}
             }
         }
+        names
+    }
 
-        let connections_block = &remaining[..end_pos];
+    /// The top-level keys of the `'connections' => [...]` array in one config
+    /// file. Nested keys such as `'options' => [` or `'pragmas' => [` belong to
+    /// a connection, not to the list of connections, and are skipped.
+    fn connection_names(content: &str) -> Vec<String> {
+        let Some(connections_start) = Regex::new(r#"['"]connections['"]\s*=>\s*\["#)
+            .ok()
+            .and_then(|re| re.find(content))
+        else {
+            return Vec::new();
+        };
+        let Ok(connection_name_regex) = Regex::new(r#"['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*=>\s*\["#)
+        else {
+            return Vec::new();
+        };
 
-        // Extract connection names
+        // An unbalanced file falls back to everything after the opening
+        // bracket, as before.
+        let connections_block = Self::extract_bracketed_block(content, connections_start.end())
+            .unwrap_or_else(|| content[connections_start.end()..].to_string());
+
+        let mut depth = 0i32;
+        let mut scanned = 0;
         connection_name_regex
-            .captures_iter(connections_block)
-            .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .captures_iter(&connections_block)
+            .filter_map(|caps| {
+                let key = caps.get(0)?;
+                for c in connections_block[scanned..key.start()].chars() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                scanned = key.start();
+                (depth == 0).then(|| caps[1].to_string())
+            })
             .collect()
     }
 
@@ -1246,9 +1245,9 @@ impl DatabaseSchemaProvider {
             .iter()
             .filter_map(|relative| {
                 let path = self.project_root.join(relative);
-                info!("🗄️  Reading database config from: {:?}", path);
+                debug!("🗄️  Reading database config from: {:?}", path);
                 std::fs::read_to_string(&path)
-                    .inspect_err(|e| info!("🗄️    not readable: {}", e))
+                    .inspect_err(|e| debug!("🗄️    not readable: {}", e))
                     .ok()
             })
             .collect()

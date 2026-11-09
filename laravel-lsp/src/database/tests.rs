@@ -2028,29 +2028,15 @@ async fn variable_referenced_connection_resolves_env_not_defaults() {
     assert_eq!(cfg.port, 3306);
 }
 
-// ---- framework config fallback (Laravel 11+ merged config) ----
+// ---- framework config fallback (Laravel 11+ merged config, issue #398) ----
 
-/// The framework's `vendor/laravel/framework/config/database.php`, trimmed to
-/// what the parser reads. Laravel 11+ merges the app config over this file.
-const FRAMEWORK_CONFIG: &str = r#"<?php
-return [
-    'default' => env('DB_CONNECTION', 'sqlite'),
-    'connections' => [
-        'mysql' => [
-            'driver' => 'mysql',
-            'host' => env('DB_HOST', '127.0.0.1'),
-            'port' => env('DB_PORT', '3306'),
-            'database' => env('DB_DATABASE', 'laravel'),
-            'username' => env('DB_USERNAME', 'root'),
-            'password' => env('DB_PASSWORD', ''),
-        ],
-    ],
-];
-"#;
+/// A verbatim copy of `vendor/laravel/framework/config/database.php` from
+/// laravel/framework v12.70.1. Laravel 11+ merges the app config over it.
+const FRAMEWORK_CONFIG: &str = include_str!("fixtures/laravel-12-framework-database.php");
 
 /// An app config that only adds its own connection and relies on the
-/// framework merge for `mysql` and `default`.
-const APP_CONFIG_EXTRA_CONNECTION_ONLY: &str = r#"<?php
+/// framework merge for `default` and the standard connections.
+const APP_CONFIG_CUSTOM_ONLY: &str = r#"<?php
 return [
     'connections' => [
         'legacy' => [
@@ -2061,64 +2047,212 @@ return [
 ];
 "#;
 
+/// Every value differs from the hard-coded fallbacks (127.0.0.1, 3306,
+/// laravel, root, empty), so a match can only come from `.env`.
+const CUSTOM_ENV: &str = "DB_CONNECTION=mysql\nDB_HOST=db.internal\nDB_PORT=3307\nDB_DATABASE=app_db\nDB_USERNAME=app_user\nDB_PASSWORD=app_secret\n";
+
 fn write_framework_config_php(dir: &std::path::Path) {
     let config_dir = dir.join("vendor/laravel/framework/config");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("database.php"), FRAMEWORK_CONFIG).unwrap();
 }
 
-#[tokio::test]
-async fn connection_missing_from_app_config_falls_back_to_framework_config() {
+/// Build a provider over a temp project with the given files.
+fn merged_config_provider(
+    app_config: Option<&str>,
+    with_framework_config: bool,
+    env: &str,
+) -> (TempDir, DatabaseSchemaProvider) {
     let dir = TempDir::new().unwrap();
-    write_config_php(dir.path(), APP_CONFIG_EXTRA_CONNECTION_ONLY);
-    write_framework_config_php(dir.path());
-    write(dir.path(), ".env", DC_ENV);
+    if let Some(content) = app_config {
+        write_config_php(dir.path(), content);
+    }
+    if with_framework_config {
+        write_framework_config_php(dir.path());
+    }
+    write(dir.path(), ".env", env);
     let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
-    let cfg = provider.get_database_config().await.expect("config parsed");
-    // Before the fix the empty block fell back to hardcoded defaults, so the
-    // LSP connected to `laravel` regardless of .env.
+    (dir, provider)
+}
+
+fn assert_custom_env_values(cfg: &super::DatabaseConfig) {
     assert_eq!(cfg.driver, "mysql");
+    assert_eq!(cfg.host, "db.internal");
+    assert_eq!(cfg.port, 3307);
+    assert_eq!(cfg.database, "app_db");
+    assert_eq!(cfg.username, "app_user");
+    assert_eq!(cfg.password, "app_secret");
+}
+
+#[tokio::test]
+async fn custom_only_app_config_resolves_env_through_framework_block() {
+    let (_dir, provider) = merged_config_provider(Some(APP_CONFIG_CUSTOM_ONLY), true, CUSTOM_ENV);
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_custom_env_values(&cfg);
+}
+
+#[tokio::test]
+async fn missing_app_config_resolves_env_through_framework_block() {
+    let (_dir, provider) = merged_config_provider(None, true, CUSTOM_ENV);
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_custom_env_values(&cfg);
+}
+
+#[tokio::test]
+async fn framework_block_env_default_applies_when_env_is_silent() {
+    let (_dir, provider) = merged_config_provider(None, true, "DB_CONNECTION=sqlite\n");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "sqlite");
+    assert_eq!(cfg.database, "database/database.sqlite");
+}
+
+#[tokio::test]
+async fn framework_default_key_follows_db_connection_in_env() {
+    let (_dir, provider) = merged_config_provider(
+        Some(APP_CONFIG_CUSTOM_ONLY),
+        true,
+        "DB_CONNECTION=pgsql\nDB_DATABASE=pg_app\n",
+    );
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "pgsql");
+    assert_eq!(cfg.database, "pg_app");
+}
+
+#[tokio::test]
+async fn framework_default_key_falls_back_to_sqlite_when_db_connection_is_unset() {
+    let (_dir, provider) = merged_config_provider(Some(APP_CONFIG_CUSTOM_ONLY), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "sqlite");
+}
+
+#[tokio::test]
+async fn app_default_key_wins_over_framework_default_key() {
+    let app_config = r#"<?php
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "mysql");
+}
+
+#[tokio::test]
+async fn app_block_replaces_framework_block_whole() {
+    // The partial app block has no `database` key. Laravel's merge replaces
+    // the framework block whole, so the value is the hard-coded fallback,
+    // never the framework block's `env('DB_DATABASE', ...)` → `from_env`.
+    let app_config = r#"<?php
+return [
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'host' => env('DB_HOST', '127.0.0.1'),
+        ],
+    ],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(
+        Some(app_config),
+        true,
+        "DB_CONNECTION=mysql\nDB_DATABASE=from_env\n",
+    );
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.database, "laravel");
+}
+
+#[tokio::test]
+async fn full_app_config_ignores_framework_config() {
+    // A Laravel 10-style app config holding its own `default` and `mysql`
+    // block, with defaults that differ from the framework file's.
+    let app_config = r#"<?php
+return [
+    'default' => env('DB_CONNECTION', 'mysql'),
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'host' => env('DB_HOST', 'app-host'),
+            'port' => env('DB_PORT', '3310'),
+            'database' => env('DB_DATABASE', 'app_default_db'),
+            'username' => env('DB_USERNAME', 'app_default_user'),
+            'password' => env('DB_PASSWORD', ''),
+        ],
+    ],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    let cfg = provider.get_database_config().await.expect("config parsed");
+    assert_eq!(cfg.driver, "mysql");
+    assert_eq!(cfg.host, "app-host");
+    assert_eq!(cfg.port, 3310);
+    assert_eq!(cfg.database, "app_default_db");
+    assert_eq!(cfg.username, "app_default_user");
+}
+
+#[tokio::test]
+async fn missing_framework_config_keeps_app_only_resolution() {
+    let (_dir, provider) = merged_config_provider(Some(CONFIG_VAR_FORM), false, DC_ENV);
+    let cfg = provider.get_database_config().await.expect("config parsed");
     assert_eq!(cfg.host, "mysql");
     assert_eq!(cfg.database, "cashlender");
-    assert_eq!(cfg.username, "sail");
-    assert_eq!(cfg.password, "password");
-}
 
-#[tokio::test]
-async fn missing_app_config_falls_back_to_framework_config() {
-    let dir = TempDir::new().unwrap();
-    write_framework_config_php(dir.path());
-    write(dir.path(), ".env", DC_ENV);
-    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
-    let cfg = provider.get_database_config().await.expect("config parsed");
-    assert_eq!(cfg.driver, "mysql");
-    assert_eq!(cfg.database, "cashlender");
-}
-
-#[tokio::test]
-async fn app_connection_block_wins_over_framework_block() {
-    let dir = TempDir::new().unwrap();
-    write_config_php(
-        dir.path(),
-        "<?php\nreturn [\n    'connections' => [\n        'mysql' => [\n            'database' => env('APP_DB_NAME', 'from_app'),\n        ],\n    ],\n];\n",
-    );
-    write_framework_config_php(dir.path());
-    write(
-        dir.path(),
-        ".env",
-        "DB_CONNECTION=mysql\nDB_DATABASE=from_framework_env\n",
-    );
-    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
-    let cfg = provider.get_database_config().await.expect("config parsed");
-    assert_eq!(cfg.database, "from_app");
+    let (_dir, provider) = merged_config_provider(Some(APP_CONFIG_CUSTOM_ONLY), false, "");
+    assert_eq!(provider.get_connections(), vec!["legacy".to_string()]);
 }
 
 #[tokio::test]
 async fn no_database_config_at_all_is_none() {
-    let dir = TempDir::new().unwrap();
-    write(dir.path(), ".env", DC_ENV);
-    let provider = DatabaseSchemaProvider::new(dir.path().to_path_buf());
+    let (_dir, provider) = merged_config_provider(None, false, CUSTOM_ENV);
     assert!(provider.get_database_config().await.is_none());
+    assert!(provider.get_connections().is_empty());
+}
+
+#[test]
+fn connection_names_merge_app_and_framework_top_level_keys() {
+    let (_dir, provider) = merged_config_provider(Some(APP_CONFIG_CUSTOM_ONLY), true, "");
+    // `pragmas` (sqlite) is a nested key in the framework file and must not
+    // be offered as a connection.
+    assert_eq!(
+        provider.get_connections(),
+        ["legacy", "sqlite", "mysql", "mariadb", "pgsql", "sqlsrv"]
+            .map(String::from)
+            .to_vec()
+    );
+}
+
+#[test]
+fn connection_names_list_a_redefined_framework_connection_once() {
+    let app_config = r#"<?php
+return [
+    'connections' => [
+        'mysql' => [
+            'driver' => 'mysql',
+            'options' => [
+                'timeout' => 5,
+            ],
+        ],
+    ],
+];
+"#;
+    let (_dir, provider) = merged_config_provider(Some(app_config), true, "");
+    assert_eq!(
+        provider.get_connections(),
+        ["mysql", "sqlite", "mariadb", "pgsql", "sqlsrv"]
+            .map(String::from)
+            .to_vec()
+    );
+}
+
+#[test]
+fn connection_names_come_from_framework_when_app_config_is_missing() {
+    let (_dir, provider) = merged_config_provider(None, true, "");
+    assert_eq!(
+        provider.get_connections(),
+        ["sqlite", "mysql", "mariadb", "pgsql", "sqlsrv"]
+            .map(String::from)
+            .to_vec()
+    );
 }
 
 #[tokio::test]
